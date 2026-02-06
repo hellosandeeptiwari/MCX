@@ -1231,14 +1231,32 @@ class ZerodhaTools:
                 import random
                 paper_order_id = f"PAPER_{random.randint(100000, 999999)}"
                 
+                # ALWAYS use CURRENT LTP as entry price (not what LLM passed)
+                try:
+                    quote = self.kite.quote([symbol])
+                    current_ltp = quote[symbol]['last_price']
+                except:
+                    current_ltp = order.get('entry_price', 0)
+                
+                # Calculate proper SL and target based on ACTUAL entry
+                side = order['side']
+                if side == 'BUY':
+                    # For BUY: SL below entry, target above
+                    stop_loss = current_ltp * 0.99  # 1% below
+                    target = current_ltp * 1.015     # 1.5% above
+                else:
+                    # For SELL/SHORT: SL above entry, target below
+                    stop_loss = current_ltp * 1.01  # 1% above
+                    target = current_ltp * 0.985    # 1.5% below
+                
                 # Add to paper positions
                 position = {
                     'symbol': symbol,
                     'quantity': order['quantity'],
-                    'avg_price': order['entry_price'],
-                    'side': order['side'],
-                    'stop_loss': order['stop_loss'],
-                    'target': order.get('target', order['entry_price'] * (1.02 if order['side'] == 'BUY' else 0.98)),
+                    'avg_price': current_ltp,  # ACTUAL market price
+                    'side': side,
+                    'stop_loss': stop_loss,
+                    'target': target,
                     'order_id': paper_order_id,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'OPEN',
@@ -1250,17 +1268,21 @@ class ZerodhaTools:
                 self._save_active_trades()
                 
                 # Update paper capital (reduce by position value)
-                position_value = order['quantity'] * order['entry_price']
+                position_value = order['quantity'] * current_ltp
+                
+                print(f"   ✅ {side} {order['quantity']} {symbol} @ ₹{current_ltp:.2f}")
+                print(f"      SL: ₹{stop_loss:.2f} | Target: ₹{target:.2f}")
                 
                 return {
                     "success": True,
                     "paper_trade": True,
                     "order_id": paper_order_id,
                     "sl_order_id": f"PAPER_SL_{random.randint(100000, 999999)}",
-                    "message": f"📝 PAPER ORDER: {order['side']} {order['quantity']} {symbol} @ ₹{order['entry_price']:.2f}",
+                    "message": f"📝 PAPER ORDER: {side} {order['quantity']} {symbol} @ ₹{current_ltp:.2f}",
                     "position_value": position_value,
-                    "stop_loss": order['stop_loss'],
-                    "target": order.get('target'),
+                    "entry_price": current_ltp,
+                    "stop_loss": stop_loss,
+                    "target": target,
                     "details": order
                 }
             
