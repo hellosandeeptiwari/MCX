@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCX Options Dashboard - Live</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --bg-card-hover: #1f2937;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --text-bright: #ffffff;
+            --accent-green: #3fb950;
+            --accent-red: #f85149;
+            --accent-blue: #58a6ff;
+            --accent-yellow: #d29922;
+            --accent-purple: #a371f7;
+            --accent-cyan: #39d353;
+            --border-color: #30363d;
+        }
+        
+        * {
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        body {
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            min-height: 100vh;
+            font-size: 14px;
+            line-height: 1.5;
+            letter-spacing: 0.01em;
+        }
+        
+        .navbar {
+            background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+        }
+        
+        .navbar-brand {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent-green) !important;
+            text-shadow: 0 0 20px rgba(63, 185, 80, 0.3);
+        }
+        
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            transition: all 0.3s ease;
+        }
+        
+        .card:hover {
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        .card-header {
+            background: transparent;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            padding: 1rem 1.5rem;
+        }
+        
+        .stat-card {
+            text-align: center;
+            padding: 1.5rem;
+        }
+        
+        .stat-value {
+            font-size: 1.75rem;
+            font-weight: 800;
+            color: var(--text-bright);
+            text-shadow: 0 2px 10px rgba(255, 255, 255, 0.1);
+        }
+        
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            font-weight: 500;
+            margin-top: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        .options-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+        }
+        
+        .options-table th {
+            background: var(--bg-card-hover);
+            color: var(--text-secondary);
+            font-weight: 600;
+            padding: 0.875rem 1rem;
+            text-transform: uppercase;
+            font-size: 0.7rem;
+            letter-spacing: 0.08em;
+        }
+        
+        .options-table td {
+            padding: 0.625rem 0.875rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.875rem;
+            font-weight: 500;
+            font-family: 'JetBrains Mono', 'Consolas', monospace;
+        }
+        
+        .options-table tr:hover td {
+            background: rgba(88, 166, 255, 0.08);
+        }
+        
+        .options-table .atm-row {
+            background: rgba(63, 185, 80, 0.12) !important;
+        }
+        
+        .options-table .atm-row td {
+            border-top: 2px solid var(--accent-green);
+            border-bottom: 2px solid var(--accent-green);
+        }
+        
+        .ce-section {
+            background: rgba(63, 185, 80, 0.04);
+        }
+        
+        .pe-section {
+            background: rgba(248, 81, 73, 0.04);
+        }
+        
+        .strike-col {
+            background: var(--bg-card) !important;
+            font-weight: 700;
+            text-align: center;
+            font-size: 0.9rem;
+            color: var(--text-bright);
+        }
+        
+        .oi-high {
+            color: var(--accent-yellow);
+            font-weight: 600;
+        }
+        
+        .strategy-card {
+            border-left: 4px solid;
+            margin-bottom: 1rem;
+        }
+        
+        .strategy-card.success { border-left-color: var(--accent-green); }
+        .strategy-card.warning { border-left-color: var(--accent-yellow); }
+        .strategy-card.primary { border-left-color: var(--accent-blue); }
+        .strategy-card.danger { border-left-color: var(--accent-red); }
+        .strategy-card.info { border-left-color: var(--accent-cyan); }
+        
+        .strategy-name {
+            font-size: 1rem;
+            font-weight: 700;
+            margin-bottom: 0.375rem;
+            color: var(--text-bright);
+        }
+        
+        .strategy-desc {
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            font-family: 'JetBrains Mono', 'Consolas', monospace;
+            font-weight: 500;
+        }
+        
+        .strategy-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.75rem;
+            margin-top: 0.875rem;
+        }
+        
+        .strategy-stat {
+            text-align: center;
+            padding: 0.625rem;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .strategy-stat-value {
+            font-size: 1rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', 'Consolas', monospace;
+        }
+        
+        .strategy-stat-label {
+            font-size: 0.65rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            margin-top: 0.25rem;
+        }
+        
+        .profit { color: var(--accent-green); text-shadow: 0 0 10px rgba(63, 185, 80, 0.3); }
+        .loss { color: var(--accent-red); text-shadow: 0 0 10px rgba(248, 81, 73, 0.3); }
+        
+        .badge-sentiment {
+            padding: 0.375rem 0.75rem;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.75rem;
+        }
+        
+        .badge-bullish { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); border: 1px solid rgba(63, 185, 80, 0.3); }
+        .badge-bearish { background: rgba(248, 81, 73, 0.15); color: var(--accent-red); border: 1px solid rgba(248, 81, 73, 0.3); }
+        .badge-neutral { background: rgba(210, 153, 34, 0.15); color: var(--accent-yellow); border: 1px solid rgba(210, 153, 34, 0.3); }
+        
+        .refresh-btn {
+            background: var(--accent-green);
+            border: none;
+            padding: 0.625rem 1.25rem;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.875rem;
+            transition: all 0.2s ease;
+        }
+        
+        .refresh-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(63, 185, 80, 0.4);
+            background: #46c763;
+        }
+        
+        .live-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--accent-green);
+        }
+        
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(0.95); }
+        }
+        
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            margin-bottom: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.625rem;
+            color: var(--text-bright);
+        }
+        
+        .section-title i {
+            color: var(--accent-blue);
+        }
+        
+        .top-strategy {
+            background: linear-gradient(135deg, rgba(63, 185, 80, 0.08), rgba(88, 166, 255, 0.08));
+            border: 2px solid var(--accent-green);
+            position: relative;
+        }
+        
+        .top-badge {
+            position: absolute;
+            top: -10px;
+            right: 20px;
+            background: var(--accent-green);
+            color: #0d1117;
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+        }
+        
+        .scrollable-table {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        .scrollable-table::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .scrollable-table::-webkit-scrollbar-track {
+            background: var(--bg-dark);
+        }
+        
+        .scrollable-table::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+        
+        .scrollable-table::-webkit-scrollbar-thumb:hover {
+            background: var(--text-secondary);
+        }
+        
+        .badge {
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+        
+        .text-secondary {
+            color: var(--text-secondary) !important;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navbar -->
+    <nav class="navbar navbar-dark">
+        <div class="container-fluid">
+            <span class="navbar-brand">
+                <i class="fas fa-chart-line me-2"></i>MCX Options Dashboard
+            </span>
+            <div class="d-flex align-items-center gap-4">
+                <div class="live-indicator">
+                    <span class="live-dot"></span>
+                    <span>LIVE</span>
+                </div>
+                <span class="text-secondary">{{ timestamp }}</span>
+                <button class="refresh-btn text-white" onclick="location.reload()">
+                    <i class="fas fa-sync-alt me-2"></i>Refresh
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid py-4 px-4">
+        <!-- Stats Row -->
+        <div class="row g-4 mb-4">
+            <div class="col-md-3">
+                <div class="card stat-card">
+                    <div class="stat-value">₹{{ "%.2f"|format(spot) }}</div>
+                    <div class="stat-label">MCX Spot Price</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card stat-card">
+                    <div class="stat-value">{{ data.expiry if data else 'N/A' }}</div>
+                    <div class="stat-label">Expiry Date</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card stat-card">
+                    <div class="stat-value">{{ "%.2f"|format(pcr) }}</div>
+                    <div class="stat-label">
+                        Put-Call Ratio
+                        {% if pcr > 1.2 %}
+                        <span class="badge badge-bullish ms-2">Bullish</span>
+                        {% elif pcr < 0.8 %}
+                        <span class="badge badge-bearish ms-2">Bearish</span>
+                        {% else %}
+                        <span class="badge badge-neutral ms-2">Neutral</span>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card stat-card">
+                    <div class="stat-value">₹{{ "%.0f"|format(max_pain) }}</div>
+                    <div class="stat-label">Max Pain Strike</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row g-4">
+            <!-- Options Chain -->
+            <div class="col-lg-7">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span class="section-title mb-0">
+                            <i class="fas fa-table"></i>Options Chain
+                        </span>
+                        <span class="text-secondary">Lot Size: {{ lot_size }}</span>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="scrollable-table">
+                            <table class="options-table">
+                                <thead>
+                                    <tr>
+                                        <th class="ce-section text-center" colspan="2">CALLS</th>
+                                        <th class="text-center">STRIKE</th>
+                                        <th class="pe-section text-center" colspan="2">PUTS</th>
+                                    </tr>
+                                    <tr>
+                                        <th class="ce-section text-end">OI</th>
+                                        <th class="ce-section text-end">LTP</th>
+                                        <th class="text-center"></th>
+                                        <th class="pe-section text-start">LTP</th>
+                                        <th class="pe-section text-start">OI</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% if data and data.chain %}
+                                    {% for strike, values in data.chain|dictsort %}
+                                    {% set strike_f = strike|float %}
+                                    {% set is_atm = (strike_f - spot)|abs < 30 %}
+                                    <tr class="{{ 'atm-row' if is_atm else '' }}">
+                                        <td class="ce-section text-end {% if values.CE.oi > 500000 %}oi-high{% endif %}">
+                                            {{ "{:,.0f}".format(values.CE.oi|default(0)) }}
+                                        </td>
+                                        <td class="ce-section text-end profit">
+                                            ₹{{ "%.2f"|format(values.CE.ltp|default(0)) }}
+                                        </td>
+                                        <td class="strike-col">
+                                            {{ "%.0f"|format(strike_f) }}
+                                            {% if is_atm %}<span class="badge bg-success ms-1">ATM</span>{% endif %}
+                                        </td>
+                                        <td class="pe-section text-start loss">
+                                            ₹{{ "%.2f"|format(values.PE.ltp|default(0)) }}
+                                        </td>
+                                        <td class="pe-section text-start {% if values.PE.oi > 500000 %}oi-high{% endif %}">
+                                            {{ "{:,.0f}".format(values.PE.oi|default(0)) }}
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                    {% else %}
+                                    <tr>
+                                        <td colspan="5" class="text-center py-5">
+                                            <i class="fas fa-exclamation-triangle text-warning fa-2x mb-3"></i>
+                                            <p>No data available. Run zerodha_mcx_options.py first.</p>
+                                        </td>
+                                    </tr>
+                                    {% endif %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Strategies -->
+            <div class="col-lg-5">
+                <div class="section-title">
+                    <i class="fas fa-chess"></i>Strategy Analysis
+                </div>
+                
+                <!-- Best Strategy Hero Card -->
+                {% if best_strategy %}
+                <div class="card p-4 mb-4" style="background: linear-gradient(135deg, rgba(0, 212, 170, 0.2), rgba(59, 130, 246, 0.15)); border: 2px solid var(--accent-green);">
+                    <div class="d-flex justify-content-between align-items-start mb-3">
+                        <div>
+                            <span class="badge bg-success mb-2" style="font-size: 0.9rem;">
+                                <i class="fas fa-crown me-1"></i>TODAY'S BEST BUY STRATEGY
+                            </span>
+                            <h3 class="mb-1" style="color: var(--accent-green);">{{ best_strategy.name }}</h3>
+                        </div>
+                        <div class="text-end">
+                            <div style="font-size: 2rem; font-weight: 700; color: var(--accent-green);">{{ best_strategy.score }}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-secondary);">SCORE</div>
+                        </div>
+                    </div>
+                    
+                    <div class="strategy-desc mb-2" style="font-size: 0.9rem;">{{ best_strategy.description }}</div>
+                    
+                    {% if best_strategy.spread_info %}
+                    <div class="mb-3 p-2 rounded" style="background: rgba(251, 191, 36, 0.15); font-size: 0.85rem;">
+                        <i class="fas fa-exchange-alt text-warning me-1"></i>{{ best_strategy.spread_info }}
+                        {% if best_strategy.liquidity_score %}
+                        <span class="float-end badge {% if best_strategy.liquidity_score >= 70 %}bg-success{% elif best_strategy.liquidity_score >= 40 %}bg-warning{% else %}bg-danger{% endif %}">
+                            <i class="fas fa-tint me-1"></i>Liquidity: {{ best_strategy.liquidity_score }}/100
+                        </span>
+                        {% endif %}
+                    </div>
+                    {% endif %}
+                    
+                    <div class="row g-3 mb-3">
+                        <div class="col-4">
+                            <div class="p-2 rounded" style="background: rgba(0,0,0,0.3); text-align: center;">
+                                <div class="loss" style="font-size: 1.3rem; font-weight: 700;">
+                                    ₹{{ "{:,.0f}".format(best_strategy.total_cost|default(best_strategy.max_loss|abs)) }}
+                                </div>
+                                <div style="font-size: 0.7rem; color: var(--text-secondary);">TOTAL COST</div>
+                            </div>
+                        </div>
+                        <div class="col-4">
+                            <div class="p-2 rounded" style="background: rgba(0,0,0,0.3); text-align: center;">
+                                <div class="profit" style="font-size: 1.3rem; font-weight: 700;">
+                                    {% if best_strategy.max_profit is number %}₹{{ "{:,.0f}".format(best_strategy.max_profit) }}{% else %}{{ best_strategy.max_profit }}{% endif %}
+                                </div>
+                                <div style="font-size: 0.7rem; color: var(--text-secondary);">MAX PROFIT</div>
+                            </div>
+                        </div>
+                        <div class="col-4">
+                            <div class="p-2 rounded" style="background: rgba(0,0,0,0.3); text-align: center;">
+                                <div style="font-size: 1.3rem; font-weight: 700; color: var(--accent-blue);">
+                                    {{ best_strategy.lots_possible|default(1) }}
+                                </div>
+                                <div style="font-size: 0.7rem; color: var(--text-secondary);">LOTS</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    {% if best_strategy.profit_scenario %}
+                    <div class="mb-2 p-2 rounded" style="background: rgba(0, 212, 170, 0.1); font-size: 0.9rem;">
+                        <i class="fas fa-chart-line text-success me-2"></i>
+                        <strong>{{ best_strategy.profit_scenario }}</strong>
+                    </div>
+                    {% endif %}
+                    
+                    {% if best_strategy.reasons %}
+                    <div class="mb-2" style="font-size: 0.85rem; color: var(--text-secondary);">
+                        <i class="fas fa-check-circle text-success me-1"></i>
+                        {{ best_strategy.reasons[:3]|join(' • ') }}
+                    </div>
+                    {% endif %}
+                    
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span class="badge badge-neutral">{{ best_strategy.view }}</span>
+                        <span style="color: var(--accent-green); font-size: 0.85rem;">
+                            <i class="fas fa-arrows-alt-h me-1"></i>
+                            Breakeven: ₹{{ "%.0f"|format(best_strategy.breakeven_low) }} - ₹{{ "%.0f"|format(best_strategy.breakeven_high) }}
+                        </span>
+                    </div>
+                </div>
+                {% endif %}
+                
+                <div class="section-title" style="font-size: 1rem;">
+                    <i class="fas fa-list"></i>All Strategies
+                </div>
+                
+                {% for strategy in strategies %}
+                <div class="card strategy-card {{ strategy.color }} p-3">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <div class="strategy-name">{{ strategy.name }}</div>
+                        <div>
+                            {% if strategy.liquidity_score %}
+                            <span class="badge {% if strategy.liquidity_score >= 70 %}bg-success{% elif strategy.liquidity_score >= 40 %}bg-warning{% else %}bg-danger{% endif %} me-1" style="font-size: 0.65rem;" title="Liquidity Score">
+                                <i class="fas fa-tint me-1"></i>{{ strategy.liquidity_score }}
+                            </span>
+                            {% endif %}
+                            {% if strategy.lots_possible %}
+                            <span class="badge bg-info me-1" style="font-size: 0.7rem;">{{ strategy.lots_possible }} lots</span>
+                            {% endif %}
+                            <span class="badge bg-secondary" style="font-size: 0.7rem;">Score: {{ strategy.score }}</span>
+                        </div>
+                    </div>
+                    <div class="strategy-desc">{{ strategy.description }}</div>
+                    
+                    {% if strategy.spread_info %}
+                    <div class="mt-1" style="font-size: 0.75rem; color: var(--accent-yellow);">
+                        <i class="fas fa-exchange-alt me-1"></i>{{ strategy.spread_info }}
+                    </div>
+                    {% endif %}
+                    
+                    <div class="strategy-stats">
+                        <div class="strategy-stat">
+                            <div class="strategy-stat-value loss">
+                                ₹{{ "{:,.0f}".format(strategy.total_cost|default(strategy.premium|abs)) }}
+                            </div>
+                            <div class="strategy-stat-label">Cost</div>
+                        </div>
+                        <div class="strategy-stat">
+                            <div class="strategy-stat-value profit">
+                                {% if strategy.max_profit is number %}
+                                ₹{{ "{:,.0f}".format(strategy.max_profit) }}
+                                {% else %}
+                                {{ strategy.max_profit }}
+                                {% endif %}
+                            </div>
+                            <div class="strategy-stat-label">Max Profit</div>
+                        </div>
+                        <div class="strategy-stat">
+                            <div class="strategy-stat-value loss">
+                                {% if strategy.max_loss is number %}
+                                ₹{{ "{:,.0f}".format(strategy.max_loss) }}
+                                {% else %}
+                                {{ strategy.max_loss }}
+                                {% endif %}
+                            </div>
+                            <div class="strategy-stat-label">Max Loss</div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3 d-flex justify-content-between align-items-center">
+                        <span class="badge badge-neutral">{{ strategy.view }}</span>
+                        {% if strategy.risk_reward %}
+                        <span class="text-success fw-bold">
+                            <i class="fas fa-balance-scale me-1"></i>{{ strategy.risk_reward }}
+                        </span>
+                        {% endif %}
+                    </div>
+                    
+                    {% if strategy.profit_scenario %}
+                    <div class="mt-2 p-2 rounded" style="background: rgba(0, 212, 170, 0.1); font-size: 0.8rem;">
+                        <i class="fas fa-chart-line text-success me-1"></i>{{ strategy.profit_scenario }}
+                    </div>
+                    {% endif %}
+                    
+                    <div class="mt-2 text-secondary" style="font-size: 0.8rem;">
+                        <i class="fas fa-arrows-alt-h me-1"></i>
+                        Breakeven: ₹{{ "%.0f"|format(strategy.breakeven_low) }} - ₹{{ "%.0f"|format(strategy.breakeven_high) }}
+                    </div>
+                </div>
+                {% endfor %}
+                
+                <!-- Quick Tips -->
+                <div class="card p-3 mt-4">
+                    <div class="section-title mb-2">
+                        <i class="fas fa-lightbulb text-warning"></i>Quick Tips for Buying Options
+                    </div>
+                    <ul class="mb-0 text-secondary" style="font-size: 0.85rem;">
+                        <li>Buy CE when bullish, Buy PE when bearish</li>
+                        <li>Long Straddle/Strangle profits from big moves in either direction</li>
+                        <li>Max loss is limited to premium paid (no margin required)</li>
+                        <li>ATM options have highest delta - move faster with stock</li>
+                        <li>OTM options are cheaper but need bigger moves to profit</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Auto refresh every 60 seconds
+        setTimeout(() => location.reload(), 60000);
+    </script>
+</body>
+</html>

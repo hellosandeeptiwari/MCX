@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCX Dashboard - BlackRock Strategy</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --bg-card2: #334155;
+            --accent-green: #22c55e;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+            --accent-yellow: #eab308;
+            --accent-purple: #a855f7;
+            --accent-cyan: #06b6d4;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-bright: #ffffff;
+        }
+        body {
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+        }
+        
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border-bottom: 2px solid var(--accent-blue);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+        .logo-text {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: var(--text-bright);
+        }
+        .logo-sub {
+            font-size: 0.7rem;
+            color: var(--accent-cyan);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+        }
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+            color: var(--accent-green);
+        }
+        .live-dot {
+            width: 10px;
+            height: 10px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+        }
+        
+        .btn-refresh {
+            background: var(--accent-blue);
+            border: none;
+            color: white;
+            padding: 0.5rem 1.25rem;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-refresh:hover { background: #2563eb; transform: translateY(-1px); }
+        
+        /* Main Layout */
+        .main-container { padding: 1.5rem; max-width: 1900px; margin: 0 auto; }
+        
+        .card {
+            background: var(--bg-card);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            overflow: hidden;
+        }
+        .card-header {
+            background: var(--bg-card2);
+            padding: 0.75rem 1rem;
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--text-bright);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .card-body { padding: 1rem; }
+        
+        /* Price Section */
+        .price-section {
+            text-align: center;
+            padding: 1.5rem;
+        }
+        .price-main {
+            font-size: 3rem;
+            font-weight: 800;
+            color: var(--text-bright);
+            line-height: 1;
+        }
+        .price-change {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-top: 0.5rem;
+        }
+        .price-change.up { color: var(--accent-green); }
+        .price-change.down { color: var(--accent-red); }
+        
+        /* Signal Badge */
+        .signal-container {
+            text-align: center;
+            padding: 1.5rem;
+        }
+        .signal-badge {
+            display: inline-block;
+            padding: 0.75rem 2rem;
+            border-radius: 30px;
+            font-weight: 700;
+            font-size: 1.1rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .signal-badge.strong-buy, .signal-badge.buy { 
+            background: rgba(34,197,94,0.2);
+            color: var(--accent-green);
+            border: 2px solid var(--accent-green);
+        }
+        .signal-badge.neutral { 
+            background: rgba(234,179,8,0.2);
+            color: var(--accent-yellow);
+            border: 2px solid var(--accent-yellow);
+        }
+        .signal-badge.cautious, .signal-badge.bearish { 
+            background: rgba(239,68,68,0.2);
+            color: var(--accent-red);
+            border: 2px solid var(--accent-red);
+        }
+        
+        .score-display {
+            margin-top: 1rem;
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        
+        /* Strategy Box */
+        .strategy-box {
+            background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(168,85,247,0.15));
+            border: 2px solid var(--accent-blue);
+            border-radius: 12px;
+            padding: 1.25rem;
+            margin-top: 1rem;
+            text-align: center;
+        }
+        .strategy-name {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent-cyan);
+        }
+        .strategy-detail {
+            color: var(--text-secondary);
+            margin-top: 0.5rem;
+        }
+        
+        /* Factor Cards */
+        .factor-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 0.75rem;
+        }
+        .factor-card {
+            background: var(--bg-card2);
+            border-radius: 10px;
+            padding: 1rem;
+            text-align: center;
+            border: 2px solid transparent;
+            transition: all 0.3s;
+        }
+        .factor-card.favored { border-color: var(--accent-green); }
+        .factor-card.avoid { border-color: var(--accent-red); opacity: 0.7; }
+        
+        .factor-icon {
+            width: 45px;
+            height: 45px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 0.75rem;
+            font-size: 1.2rem;
+        }
+        .factor-icon.value { background: rgba(234,179,8,0.2); color: var(--accent-yellow); }
+        .factor-icon.quality { background: rgba(168,85,247,0.2); color: var(--accent-purple); }
+        .factor-icon.momentum { background: rgba(59,130,246,0.2); color: var(--accent-blue); }
+        .factor-icon.size { background: rgba(6,182,212,0.2); color: var(--accent-cyan); }
+        .factor-icon.volatility { background: rgba(34,197,94,0.2); color: var(--accent-green); }
+        
+        .factor-name {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+        .factor-score {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--text-bright);
+            margin: 0.5rem 0;
+        }
+        .factor-signal {
+            font-size: 0.7rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .factor-signal.good { background: rgba(34,197,94,0.2); color: var(--accent-green); }
+        .factor-signal.bad { background: rgba(239,68,68,0.2); color: var(--accent-red); }
+        .factor-signal.neutral { background: rgba(234,179,8,0.2); color: var(--accent-yellow); }
+        
+        /* Regime Box */
+        .regime-box {
+            background: var(--bg-card2);
+            border-radius: 10px;
+            padding: 1rem;
+            text-align: center;
+        }
+        .regime-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+        .regime-value {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: var(--text-bright);
+            margin-top: 0.25rem;
+        }
+        .regime-value.bullish { color: var(--accent-green); }
+        .regime-value.bearish { color: var(--accent-red); }
+        .regime-value.neutral { color: var(--accent-yellow); }
+        
+        /* Reasons List */
+        .reason-item {
+            padding: 0.5rem 0;
+            font-size: 0.9rem;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            color: var(--text-primary);
+        }
+        .reason-item:last-child { border-bottom: none; }
+        
+        /* Weights Bar */
+        .weights-bar {
+            display: flex;
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 1rem 0;
+        }
+        .weight-segment {
+            transition: width 0.5s;
+        }
+        .weight-segment.value { background: var(--accent-yellow); }
+        .weight-segment.quality { background: var(--accent-purple); }
+        .weight-segment.momentum { background: var(--accent-blue); }
+        .weight-segment.size { background: var(--accent-cyan); }
+        .weight-segment.volatility { background: var(--accent-green); }
+        
+        .weights-legend {
+            display: flex;
+            justify-content: space-around;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+        }
+        .weight-item {
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+        .weight-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 2px;
+        }
+        
+        /* Option Table */
+        .option-table {
+            width: 100%;
+            font-size: 0.8rem;
+        }
+        .option-table th {
+            background: var(--bg-card2);
+            padding: 0.6rem;
+            text-align: center;
+            font-weight: 600;
+            color: var(--text-bright);
+        }
+        .option-table td {
+            padding: 0.5rem;
+            text-align: center;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .option-table .atm { background: rgba(59,130,246,0.15); }
+        .option-table .call { color: var(--accent-green); font-weight: 600; }
+        .option-table .put { color: var(--accent-red); font-weight: 600; }
+        .option-table .strike { 
+            background: var(--bg-card2);
+            font-weight: 700;
+            color: var(--accent-cyan);
+        }
+        
+        /* Strengths/Weaknesses */
+        .strength-item {
+            padding: 0.4rem 0;
+            font-size: 0.85rem;
+            color: var(--accent-green);
+        }
+        .weakness-item {
+            padding: 0.4rem 0;
+            font-size: 0.85rem;
+            color: var(--accent-yellow);
+        }
+        
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .factor-grid { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (max-width: 768px) {
+            .factor-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="logo">
+            <div class="logo-icon">🏦</div>
+            <div>
+                <div class="logo-text">MCX Trading Dashboard</div>
+                <div class="logo-sub">BlackRock Factor Strategy</div>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="live-indicator">
+                <span class="live-dot"></span>
+                <span>LIVE</span>
+                <span id="lastUpdate" style="color: var(--text-secondary); margin-left: 0.5rem;">--</span>
+            </div>
+            <button class="btn-refresh" onclick="forceRefresh()">
+                🔄 Refresh
+            </button>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <div class="row">
+            <!-- Left Column: Price & Signal -->
+            <div class="col-lg-4">
+                <!-- Price Card -->
+                <div class="card">
+                    <div class="card-header">
+                        📈 MCX Ltd (NSE) <span id="dataSource" class="ms-auto badge bg-success" style="font-size: 0.7rem;">--</span>
+                    </div>
+                    <div class="price-section">
+                        <div class="price-main" id="currentPrice">₹--</div>
+                        <div class="price-change up" id="priceChange">--</div>
+                        <div class="price-ref" id="priceRef" style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.3rem;">vs. --</div>
+                        <div class="row mt-3 text-center" style="font-size: 0.85rem;">
+                            <div class="col-4">
+                                <div style="color: var(--text-secondary);">High</div>
+                                <div id="dayHigh" style="font-weight: 600;">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div style="color: var(--text-secondary);">Low</div>
+                                <div id="dayLow" style="font-weight: 600;">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div style="color: var(--text-secondary);">Volume</div>
+                                <div id="volume" style="font-weight: 600;">--</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Signal Card -->
+                <div class="card">
+                    <div class="card-header">
+                        🎯 Trading Signal
+                    </div>
+                    <div class="signal-container">
+                        <div class="signal-badge neutral" id="signalBadge">--</div>
+                        <div class="score-display">
+                            Score: <span id="compositeScore">--</span>/100
+                        </div>
+                        <div style="color: var(--text-secondary); font-size: 0.9rem;">
+                            Confidence: <span id="confidence">--</span>%
+                        </div>
+                        
+                        <div class="strategy-box">
+                            <div class="strategy-name" id="strategy">--</div>
+                            <div class="strategy-detail" id="strategyDetail">--</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Regime Card -->
+                <div class="card">
+                    <div class="card-header">
+                        🧭 Market Regime
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <div class="regime-box">
+                                    <div class="regime-label">Current Regime</div>
+                                    <div class="regime-value" id="currentRegime">--</div>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="regime-box">
+                                    <div class="regime-label">Volatility</div>
+                                    <div class="regime-value" id="volRegime">--</div>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="regime-box">
+                                    <div class="regime-label">Trend</div>
+                                    <div class="regime-value" id="trendRegime">--</div>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="regime-box">
+                                    <div class="regime-label">Favor Factors</div>
+                                    <div class="regime-value" id="favoredFactors" style="font-size: 0.9rem;">--</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Middle Column: 5 Factors -->
+            <div class="col-lg-5">
+                <!-- 5 Factor Model -->
+                <div class="card">
+                    <div class="card-header">
+                        📊 BlackRock 5-Factor Model
+                    </div>
+                    <div class="card-body">
+                        <div class="factor-grid" id="factorGrid">
+                            <!-- Factors will be populated by JS -->
+                        </div>
+                        
+                        <!-- Factor Weights Bar -->
+                        <div style="margin-top: 1.5rem;">
+                            <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+                                Dynamic Factor Weights (Regime-Adjusted)
+                            </div>
+                            <div class="weights-bar" id="weightsBar"></div>
+                            <div class="weights-legend" id="weightsLegend"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Signal Reasons -->
+                <div class="card">
+                    <div class="card-header">
+                        ✅ Signal Reasoning
+                    </div>
+                    <div class="card-body" id="signalReasons">
+                        <!-- Reasons populated by JS -->
+                    </div>
+                </div>
+
+                <!-- Screener Analysis -->
+                <div class="card">
+                    <div class="card-header">
+                        🔍 Screener.in Analysis
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-6">
+                                <div style="font-weight: 600; color: var(--accent-green); font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                    ✅ Strengths
+                                </div>
+                                <div id="strengths"></div>
+                            </div>
+                            <div class="col-6">
+                                <div style="font-weight: 600; color: var(--accent-yellow); font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                    ⚠️ Weaknesses
+                                </div>
+                                <div id="weaknesses"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Tomorrow Prediction Card -->
+                <div class="card">
+                    <div class="card-header">
+                        🔮 Tomorrow Prediction
+                        <span class="ms-auto badge" id="predictionDirection" style="font-size: 0.7rem;">--</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="text-center mb-3">
+                            <div style="font-size: 0.8rem; color: #94a3b8;">Predicted Price</div>
+                            <div id="predictedPrice" style="font-size: 2rem; font-weight: 700; color: #ffffff;">--</div>
+                            <div id="predictedChange" style="font-size: 1rem; font-weight: 600; color: #22c55e;">--</div>
+                        </div>
+                        
+                        <div class="row text-center mb-3" style="font-size: 0.8rem;">
+                            <div class="col-6">
+                                <div style="color: #94a3b8;">Likely Range</div>
+                                <div id="likelyRange" style="font-weight: 600; color: #ffffff;">--</div>
+                            </div>
+                            <div class="col-6">
+                                <div style="color: #94a3b8;">Confidence</div>
+                                <div id="predictionConfidence" style="font-weight: 600; color: #3b82f6;">--</div>
+                            </div>
+                        </div>
+                        
+                        <div style="font-size: 0.8rem; margin-bottom: 0.5rem; color: #ffffff; font-weight: 600;">Model Predictions:</div>
+                        <div id="modelPredictions" style="font-size: 0.8rem; color: #f1f5f9;"></div>
+                        
+                        <div style="margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid rgba(255,255,255,0.1);">
+                            <div style="font-size: 0.8rem; color: #ffffff; margin-bottom: 0.5rem; font-weight: 600;">Key Levels:</div>
+                            <div class="row" style="font-size: 0.85rem;">
+                                <div class="col-6">
+                                    <div><span style="color: #22c55e; font-weight: 600;">R1:</span> <span id="predR1" style="color: #ffffff;">--</span></div>
+                                    <div><span style="color: #22c55e; font-weight: 600;">R2:</span> <span id="predR2" style="color: #ffffff;">--</span></div>
+                                </div>
+                                <div class="col-6">
+                                    <div><span style="color: #ef4444; font-weight: 600;">S1:</span> <span id="predS1" style="color: #ffffff;">--</span></div>
+                                    <div><span style="color: #ef4444; font-weight: 600;">S2:</span> <span id="predS2" style="color: #ffffff;">--</span></div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="margin-top: 0.75rem; padding: 0.5rem; background: rgba(255,255,255,0.08); border-radius: 6px; font-size: 0.8rem;">
+                            <div style="color: #06b6d4; font-weight: 600;">📊 Pattern Insight (after big days):</div>
+                            <div id="patternInsight" style="color: #ffffff; margin-top: 0.3rem;">--</div>
+                        </div>
+                        
+                        <div style="margin-top: 0.5rem; font-size: 0.7rem; color: #94a3b8; text-align: center;">
+                            ⚠️ ~55-60% accuracy. Not financial advice.
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ML Prediction Engine Card -->
+                <div class="card" style="border: 2px solid #a855f7;">
+                    <div class="card-header" style="background: linear-gradient(135deg, #a855f7 0%, #6366f1 100%);">
+                        🤖 ML Engine (2.1% MAE)
+                        <span class="ms-auto badge" id="mlDirection" style="font-size: 0.7rem; background: #ffffff; color: #0f172a;">--</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="text-center mb-3">
+                            <div style="font-size: 0.75rem; color: #94a3b8;">ML Predicted Price</div>
+                            <div id="mlPredictedPrice" style="font-size: 2.2rem; font-weight: 700; color: #a855f7;">--</div>
+                            <div id="mlPredictedChange" style="font-size: 1.1rem; font-weight: 600;">--</div>
+                        </div>
+                        
+                        <div class="row text-center mb-3" style="font-size: 0.8rem;">
+                            <div class="col-4">
+                                <div style="color: #94a3b8;">Range</div>
+                                <div id="mlRange" style="font-weight: 600; color: #ffffff; font-size: 0.75rem;">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div style="color: #94a3b8;">Confidence</div>
+                                <div id="mlConfidence" style="font-weight: 600; color: #a855f7;">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div style="color: #94a3b8;">Accuracy</div>
+                                <div id="mlAccuracy" style="font-weight: 600; color: #22c55e;">91.8%</div>
+                            </div>
+                        </div>
+                        
+                        <div style="font-size: 0.8rem; margin-bottom: 0.5rem; color: #ffffff; font-weight: 600;">🧠 Model Ensemble:</div>
+                        <div id="mlModelPredictions" style="font-size: 0.8rem; color: #f1f5f9;"></div>
+                        
+                        <div style="margin-top: 0.75rem; padding: 0.5rem; background: rgba(168, 85, 247, 0.15); border-radius: 6px; font-size: 0.8rem;">
+                            <div class="row">
+                                <div class="col-4">
+                                    <div style="color: #94a3b8; font-size: 0.7rem;">RSI</div>
+                                    <div id="mlRsi" style="font-weight: 600; color: #ffffff;">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div style="color: #94a3b8; font-size: 0.7rem;">Z-Score</div>
+                                    <div id="mlZscore" style="font-weight: 600; color: #ffffff;">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div style="color: #94a3b8; font-size: 0.7rem;">Volatility</div>
+                                    <div id="mlVolatility" style="font-weight: 600; color: #ffffff;">--</div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="margin-top: 0.5rem; font-size: 0.65rem; color: #94a3b8; text-align: center;">
+                            4 ML Models | 65 Features | Walk-Forward Validated
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Commodities Impact Card -->
+                <div class="card">
+                    <div class="card-header">
+                        🛢️ Commodity Impact
+                        <span class="ms-auto badge" id="commoditySignal" style="font-size: 0.7rem;">--</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="text-center mb-2">
+                            <div style="font-size: 0.75rem; color: #94a3b8;">Composite Change</div>
+                            <div id="compositeChange" style="font-size: 1.5rem; font-weight: 700; color: #ffffff;">--</div>
+                        </div>
+                        <div id="commodityList" style="font-size: 0.8rem;">
+                            <!-- Commodities populated by JS -->
+                        </div>
+                        <div style="margin-top: 0.5rem; font-size: 0.7rem; color: #94a3b8; text-align: center;">
+                            Weighted by MCX Ltd revenue exposure
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Options -->
+            <div class="col-lg-3">
+                <div class="card">
+                    <div class="card-header">
+                        📊 Option Chain
+                        <select id="expiryDays" class="form-select form-select-sm" style="width: auto; margin-left: auto; background: var(--bg-dark); color: var(--text-primary); border-color: rgba(255,255,255,0.2); font-size: 0.75rem;">
+                            <option value="7">Weekly</option>
+                            <option value="30" selected>Monthly</option>
+                            <option value="60">2 Months</option>
+                        </select>
+                    </div>
+                    <div class="card-body p-0" style="max-height: 400px; overflow-y: auto;">
+                        <table class="option-table">
+                            <thead>
+                                <tr>
+                                    <th class="call">Call ₹</th>
+                                    <th class="call">Δ</th>
+                                    <th>Strike</th>
+                                    <th class="put">Δ</th>
+                                    <th class="put">Put ₹</th>
+                                </tr>
+                            </thead>
+                            <tbody id="optionBody">
+                                <tr><td colspan="5">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Position Calculator -->
+                <div class="card">
+                    <div class="card-header">
+                        🧮 Position Calculator
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label style="font-size: 0.7rem; color: var(--text-secondary);">Capital</label>
+                                <input type="number" id="capital" value="500000" class="form-control form-control-sm" style="background: var(--bg-card2); color: var(--text-primary); border-color: rgba(255,255,255,0.1);">
+                            </div>
+                            <div class="col-6">
+                                <label style="font-size: 0.7rem; color: var(--text-secondary);">Risk %</label>
+                                <input type="number" id="riskPct" value="2" class="form-control form-control-sm" style="background: var(--bg-card2); color: var(--text-primary); border-color: rgba(255,255,255,0.1);">
+                            </div>
+                            <div class="col-6">
+                                <label style="font-size: 0.7rem; color: var(--text-secondary);">Entry</label>
+                                <input type="number" id="entry" class="form-control form-control-sm" style="background: var(--bg-card2); color: var(--text-primary); border-color: rgba(255,255,255,0.1);">
+                            </div>
+                            <div class="col-6">
+                                <label style="font-size: 0.7rem; color: var(--text-secondary);">Stop Loss</label>
+                                <input type="number" id="stopLoss" class="form-control form-control-sm" style="background: var(--bg-card2); color: var(--text-primary); border-color: rgba(255,255,255,0.1);">
+                            </div>
+                        </div>
+                        <button class="btn btn-sm w-100 mt-2" style="background: var(--accent-blue); color: white;" onclick="calcPosition()">Calculate</button>
+                        <div id="positionResult" class="mt-2" style="font-size: 0.85rem;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const factorConfig = {
+            value: { name: 'VALUE', icon: '💰', desc: 'Buy cheap stocks' },
+            quality: { name: 'QUALITY', icon: '👑', desc: 'Strong balance sheets' },
+            momentum: { name: 'MOMENTUM', icon: '🚀', desc: 'Trend following' },
+            size: { name: 'SIZE', icon: '📊', desc: 'Small cap premium' },
+            volatility: { name: 'LOW VOL', icon: '🛡️', desc: 'Risk-adjusted returns' }
+        };
+        
+        async function fetchData() {
+            try {
+                const res = await fetch('/api/live');
+                const result = await res.json();
+                if (result.success) {
+                    updateUI(result.data);
+                    document.getElementById('lastUpdate').textContent = result.timestamp;
+                }
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+
+        async function forceRefresh() {
+            await fetchData();
+            await fetchOptionChain();
+        }
+
+        function updateUI(data) {
+            // Price
+            if (data.price) {
+                document.getElementById('currentPrice').textContent = '₹' + data.price.price.toFixed(2);
+                const changeEl = document.getElementById('priceChange');
+                const change = data.price.change_pct;
+                changeEl.textContent = (change >= 0 ? '▲ +' : '▼ ') + change.toFixed(2) + '%';
+                changeEl.className = 'price-change ' + (change >= 0 ? 'up' : 'down');
+                
+                // Show reference date/price and source
+                const refEl = document.getElementById('priceRef');
+                if (data.price.prev_date && data.price.prev_close) {
+                    refEl.textContent = 'vs. ₹' + data.price.prev_close.toFixed(2) + ' (' + data.price.prev_date + ')';
+                }
+                
+                // Show data source
+                const sourceEl = document.getElementById('dataSource');
+                if (data.price.source) {
+                    sourceEl.textContent = data.price.source;
+                    sourceEl.className = data.price.source === 'NSE India' ? 'ms-auto badge bg-success' : 'ms-auto badge bg-warning';
+                }
+                
+                document.getElementById('dayHigh').textContent = '₹' + data.price.high.toFixed(0);
+                document.getElementById('dayLow').textContent = '₹' + data.price.low.toFixed(0);
+                document.getElementById('volume').textContent = (data.price.volume / 1000).toFixed(0) + 'K';
+                
+                document.getElementById('entry').value = Math.round(data.price.price);
+                document.getElementById('stopLoss').value = Math.round(data.price.price * 0.95);
+            }
+
+            // Signal
+            if (data.signal) {
+                const badge = document.getElementById('signalBadge');
+                badge.textContent = data.signal.signal;
+                badge.className = 'signal-badge ' + data.signal.signal.toLowerCase().replace(' ', '-');
+                
+                document.getElementById('compositeScore').textContent = data.signal.composite_score;
+                document.getElementById('confidence').textContent = data.signal.confidence;
+                document.getElementById('strategy').textContent = data.signal.strategy;
+                document.getElementById('strategyDetail').textContent = data.signal.strategy_detail;
+                
+                // Reasons
+                let reasonsHtml = '';
+                if (data.signal.reasons) {
+                    data.signal.reasons.forEach(r => {
+                        reasonsHtml += '<div class="reason-item">' + r + '</div>';
+                    });
+                }
+                document.getElementById('signalReasons').innerHTML = reasonsHtml;
+                
+                // Weights bar
+                if (data.signal.weights_used) {
+                    const w = data.signal.weights_used;
+                    document.getElementById('weightsBar').innerHTML = 
+                        '<div class="weight-segment value" style="width:' + w.VALUE + '%"></div>' +
+                        '<div class="weight-segment quality" style="width:' + w.QUALITY + '%"></div>' +
+                        '<div class="weight-segment momentum" style="width:' + w.MOMENTUM + '%"></div>' +
+                        '<div class="weight-segment size" style="width:' + w.SIZE + '%"></div>' +
+                        '<div class="weight-segment volatility" style="width:' + w.LOW_VOLATILITY + '%"></div>';
+                    
+                    document.getElementById('weightsLegend').innerHTML = 
+                        '<span class="weight-item"><span class="weight-dot" style="background:var(--accent-yellow)"></span>Value ' + w.VALUE + '%</span>' +
+                        '<span class="weight-item"><span class="weight-dot" style="background:var(--accent-purple)"></span>Quality ' + w.QUALITY + '%</span>' +
+                        '<span class="weight-item"><span class="weight-dot" style="background:var(--accent-blue)"></span>Mom ' + w.MOMENTUM + '%</span>' +
+                        '<span class="weight-item"><span class="weight-dot" style="background:var(--accent-cyan)"></span>Size ' + w.SIZE + '%</span>' +
+                        '<span class="weight-item"><span class="weight-dot" style="background:var(--accent-green)"></span>LowVol ' + w.LOW_VOLATILITY + '%</span>';
+                }
+            }
+
+            // Regime
+            if (data.regime) {
+                const r = data.regime;
+                const regimeEl = document.getElementById('currentRegime');
+                regimeEl.textContent = r.current;
+                regimeEl.className = 'regime-value ' + (r.current.includes('BULL') || r.current.includes('RECOVERY') ? 'bullish' : (r.current.includes('BEAR') ? 'bearish' : 'neutral'));
+                
+                document.getElementById('volRegime').textContent = r.volatility_regime;
+                document.getElementById('trendRegime').textContent = r.trend_regime;
+                document.getElementById('favoredFactors').textContent = r.favored_factors.join(', ') || 'None';
+            }
+
+            // 5 Factors
+            if (data.factors) {
+                const favored = data.regime?.favored_factors || [];
+                const avoid = data.regime?.avoid_factors || [];
+                
+                let factorHtml = '';
+                for (const [key, config] of Object.entries(factorConfig)) {
+                    const f = data.factors[key];
+                    if (!f) continue;
+                    
+                    const isFavored = favored.includes(config.name.replace(' ', '_'));
+                    const isAvoid = avoid.includes(config.name.replace(' ', '_'));
+                    const cardClass = isFavored ? 'favored' : (isAvoid ? 'avoid' : '');
+                    
+                    let signalClass = 'neutral';
+                    if (f.score >= 60) signalClass = 'good';
+                    else if (f.score < 40) signalClass = 'bad';
+                    
+                    factorHtml += `
+                        <div class="factor-card ${cardClass}">
+                            <div class="factor-icon ${key}">${config.icon}</div>
+                            <div class="factor-name">${config.name}</div>
+                            <div class="factor-score">${f.score}</div>
+                            <div class="factor-signal ${signalClass}">${f.signal}</div>
+                        </div>
+                    `;
+                }
+                document.getElementById('factorGrid').innerHTML = factorHtml;
+            }
+
+            // Screener
+            if (data.screener) {
+                let strengthsHtml = '';
+                if (data.screener.strengths) {
+                    data.screener.strengths.forEach(s => {
+                        strengthsHtml += '<div class="strength-item">• ' + s + '</div>';
+                    });
+                }
+                document.getElementById('strengths').innerHTML = strengthsHtml || 'Loading...';
+                
+                let weaknessesHtml = '';
+                if (data.screener.weaknesses) {
+                    data.screener.weaknesses.forEach(w => {
+                        weaknessesHtml += '<div class="weakness-item">• ' + w + '</div>';
+                    });
+                }
+                document.getElementById('weaknesses').innerHTML = weaknessesHtml || 'Loading...';
+            }
+        }
+
+        async function fetchOptionChain() {
+            const days = document.getElementById('expiryDays').value;
+            try {
+                const res = await fetch('/api/option-chain?days=' + days);
+                const result = await res.json();
+                if (result.success) {
+                    let html = '';
+                    result.data.forEach(row => {
+                        const atmClass = row.is_atm ? 'atm' : '';
+                        html += `<tr class="${atmClass}">
+                            <td class="call">${row.call_price}</td>
+                            <td class="call">${row.call_delta}</td>
+                            <td class="strike">${row.strike}</td>
+                            <td class="put">${row.put_delta}</td>
+                            <td class="put">${row.put_price}</td>
+                        </tr>`;
+                    });
+                    document.getElementById('optionBody').innerHTML = html;
+                }
+            } catch (e) {
+                console.error('Option chain error:', e);
+            }
+        }
+
+        async function calcPosition() {
+            const data = {
+                capital: parseFloat(document.getElementById('capital').value),
+                risk_percent: parseFloat(document.getElementById('riskPct').value),
+                entry_price: parseFloat(document.getElementById('entry').value),
+                stop_loss: parseFloat(document.getElementById('stopLoss').value)
+            };
+            
+            try {
+                const res = await fetch('/api/position-size', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                if (result.success) {
+                    const d = result.data;
+                    document.getElementById('positionResult').innerHTML = 
+                        `<div style="color: var(--accent-green); font-weight: 600;">${d.lots} Lots (${d.shares} shares)</div>
+                         <div style="color: var(--text-secondary);">Risk: ₹${d.risk_amount.toFixed(0)} | Capital: ₹${d.capital_required.toFixed(0)}</div>`;
+                }
+            } catch (e) {
+                console.error('Position calc error:', e);
+            }
+        }
+
+        document.getElementById('expiryDays').addEventListener('change', fetchOptionChain);
+
+        async function fetchPrediction() {
+            try {
+                const res = await fetch('/api/prediction');
+                const result = await res.json();
+                if (result.success) {
+                    const d = result.data;
+                    
+                    // Main prediction
+                    document.getElementById('predictedPrice').textContent = '₹' + d.prediction.toLocaleString();
+                    
+                    const changeEl = document.getElementById('predictedChange');
+                    const isUp = d.change_pct >= 0;
+                    changeEl.textContent = (isUp ? '▲ +' : '▼ ') + d.change_pct + '%';
+                    changeEl.style.color = isUp ? 'var(--accent-green)' : 'var(--accent-red)';
+                    
+                    // Direction badge
+                    const dirEl = document.getElementById('predictionDirection');
+                    dirEl.textContent = d.direction + ' (' + d.confidence + '%)';
+                    dirEl.className = 'ms-auto badge ' + (d.direction === 'BULLISH' ? 'bg-success' : d.direction === 'BEARISH' ? 'bg-danger' : 'bg-warning');
+                    
+                    // Range and confidence
+                    document.getElementById('likelyRange').textContent = '₹' + d.range.likely_low + ' - ₹' + d.range.likely_high;
+                    document.getElementById('predictionConfidence').textContent = d.confidence + '%';
+                    
+                    // Model predictions
+                    let modelsHtml = '';
+                    for (const [name, model] of Object.entries(d.models)) {
+                        const arrow = model.change >= 0 ? '↑' : '↓';
+                        const color = model.change >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                        modelsHtml += `<div style="display: flex; justify-content: space-between; padding: 2px 0;">
+                            <span>${name.charAt(0).toUpperCase() + name.slice(1).replace('_', ' ')}</span>
+                            <span style="color: ${color}">₹${model.price} ${arrow} ${model.change}%</span>
+                        </div>`;
+                    }
+                    document.getElementById('modelPredictions').innerHTML = modelsHtml;
+                    
+                    // Key levels
+                    document.getElementById('predR1').textContent = '₹' + d.levels.resistance1;
+                    document.getElementById('predR2').textContent = '₹' + d.levels.resistance2;
+                    document.getElementById('predS1').textContent = '₹' + d.levels.support1;
+                    document.getElementById('predS2').textContent = '₹' + d.levels.support2;
+                    
+                    // Pattern insight
+                    document.getElementById('patternInsight').textContent = 
+                        `${d.pattern_stats.sample_size} instances | Avg: ${d.pattern_stats.avg_return}% | Win rate: ${d.pattern_stats.win_rate}%`;
+                }
+            } catch (e) {
+                console.error('Prediction error:', e);
+            }
+        }
+
+        // Fetch commodities data
+        async function fetchCommodities() {
+            try {
+                const res = await fetch('/api/commodities');
+                const json = await res.json();
+                if (json.success) {
+                    const d = json.data;
+                    
+                    // Composite change
+                    const compositeEl = document.getElementById('compositeChange');
+                    const changeSign = d.composite_change >= 0 ? '+' : '';
+                    compositeEl.textContent = changeSign + d.composite_change.toFixed(2) + '%';
+                    compositeEl.style.color = d.composite_change >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                    
+                    // Signal badge
+                    const signalEl = document.getElementById('commoditySignal');
+                    signalEl.textContent = d.signal;
+                    if (d.signal === 'BULLISH') {
+                        signalEl.style.background = 'var(--accent-green)';
+                    } else if (d.signal === 'BEARISH') {
+                        signalEl.style.background = 'var(--accent-red)';
+                    } else {
+                        signalEl.style.background = 'var(--accent-yellow)';
+                    }
+                    
+                    // Commodity list
+                    let html = '';
+                    const categories = {};
+                    d.commodities.forEach(c => {
+                        if (!categories[c.category]) categories[c.category] = [];
+                        categories[c.category].push(c);
+                    });
+                    
+                    for (const [cat, items] of Object.entries(categories)) {
+                        html += `<div style="font-size: 0.7rem; color: #06b6d4; margin-top: 0.5rem; font-weight: 600;">${cat}</div>`;
+                        items.forEach(c => {
+                            const arrow = c.change_pct >= 0 ? '↑' : '↓';
+                            const color = c.change_pct >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                            html += `<div style="display: flex; justify-content: space-between; padding: 2px 0;">
+                                <span>${c.name} (${(c.weight*100).toFixed(0)}%)</span>
+                                <span style="color: ${color}">${arrow} ${c.change_pct.toFixed(1)}%</span>
+                            </div>`;
+                        });
+                    }
+                    document.getElementById('commodityList').innerHTML = html;
+                }
+            } catch (e) {
+                console.error('Commodity fetch error:', e);
+            }
+        }
+
+        // Fetch ML Prediction
+        async function fetchMLPrediction() {
+            try {
+                document.getElementById('mlPredictedPrice').textContent = '⏳';
+                const res = await fetch('/api/ml-prediction');
+                const json = await res.json();
+                if (json.success) {
+                    const d = json.data;
+                    
+                    // Main prediction
+                    document.getElementById('mlPredictedPrice').textContent = '₹' + d.adjusted_prediction.toLocaleString();
+                    
+                    const changeSign = d.change_pct >= 0 ? '+' : '';
+                    const changeColor = d.change_pct >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                    document.getElementById('mlPredictedChange').textContent = changeSign + d.change_pct.toFixed(2) + '%';
+                    document.getElementById('mlPredictedChange').style.color = changeColor;
+                    
+                    // Direction badge
+                    const dirEl = document.getElementById('mlDirection');
+                    dirEl.textContent = d.direction;
+                    if (d.direction === 'BULLISH') {
+                        dirEl.style.background = 'var(--accent-green)';
+                        dirEl.style.color = '#ffffff';
+                    } else if (d.direction === 'BEARISH') {
+                        dirEl.style.background = 'var(--accent-red)';
+                        dirEl.style.color = '#ffffff';
+                    } else {
+                        dirEl.style.background = 'var(--accent-yellow)';
+                        dirEl.style.color = '#0f172a';
+                    }
+                    
+                    // Range and confidence
+                    document.getElementById('mlRange').textContent = '₹' + d.range.low + '-' + d.range.high;
+                    document.getElementById('mlConfidence').textContent = d.confidence + '%';
+                    
+                    // Model predictions
+                    let modelsHtml = '';
+                    for (const [name, model] of Object.entries(d.models)) {
+                        const arrow = model.change >= 0 ? '↑' : '↓';
+                        const color = model.change >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                        const modelName = name.toUpperCase();
+                        modelsHtml += `<div style="display: flex; justify-content: space-between; padding: 2px 0;">
+                            <span>${modelName} <span style="color: #94a3b8; font-size: 0.7rem;">(${model.weight}%)</span></span>
+                            <span style="color: ${color}">₹${model.price} ${arrow}</span>
+                        </div>`;
+                    }
+                    document.getElementById('mlModelPredictions').innerHTML = modelsHtml;
+                    
+                    // Indicators
+                    document.getElementById('mlRsi').textContent = d.indicators.rsi;
+                    document.getElementById('mlZscore').textContent = d.indicators.zscore > 0 ? '+' + d.indicators.zscore : d.indicators.zscore;
+                    document.getElementById('mlVolatility').textContent = d.indicators.volatility + '%';
+                    
+                } else {
+                    document.getElementById('mlPredictedPrice').textContent = 'Error';
+                    console.error('ML Error:', json.error);
+                }
+            } catch (e) {
+                document.getElementById('mlPredictedPrice').textContent = 'Error';
+                console.error('ML Prediction error:', e);
+            }
+        }
+
+        // Initial load
+        fetchData();
+        fetchOptionChain();
+        fetchPrediction();
+        fetchCommodities();
+        fetchMLPrediction();
+
+        // Auto-refresh every 30 seconds
+        setInterval(fetchData, 30000);
+        setInterval(fetchPrediction, 60000);
+        setInterval(fetchCommodities, 120000);
+        setInterval(fetchMLPrediction, 120000);

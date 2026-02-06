@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Sensitive files - DO NOT COMMIT
+zerodha_token.json
+*.env
+.env
+
+# Logs and temporary data
+*.log
+trade_log.json
+active_trades.json
+trade_history.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCX Dashboard - Volatility + ChatGPT</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, sans-serif;
+            background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        
+        header {
+            text-align: center;
+            padding: 20px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 15px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        h1 {
+            font-size: 2em;
+            background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { color: #888; margin-top: 5px; }
+        
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        
+        .card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .card-title {
+            color: #00d4ff;
+            font-size: 1.1em;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        /* Price */
+        .price-big { font-size: 2.5em; font-weight: bold; text-align: center; }
+        .price-change {
+            text-align: center;
+            font-size: 1.3em;
+            padding: 8px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+        .price-change.up { background: rgba(0,255,127,0.2); color: #00ff7f; }
+        .price-change.down { background: rgba(255,99,71,0.2); color: #ff6347; }
+        
+        /* Volatility Score */
+        .vol-score {
+            text-align: center;
+            padding: 30px;
+            border-radius: 15px;
+            position: relative;
+        }
+        .vol-score.high { background: linear-gradient(135deg, rgba(255,99,71,0.3), rgba(255,0,0,0.2)); border: 2px solid #ff6347; }
+        .vol-score.medium { background: linear-gradient(135deg, rgba(255,217,61,0.3), rgba(255,165,0,0.2)); border: 2px solid #ffd93d; }
+        .vol-score.low { background: linear-gradient(135deg, rgba(0,255,127,0.3), rgba(0,128,0,0.2)); border: 2px solid #00ff7f; }
+        
+        .vol-number { font-size: 4em; font-weight: bold; }
+        .vol-label { font-size: 1.2em; color: #aaa; margin-top: 5px; }
+        
+        /* Strategy Box */
+        .strategy-box {
+            background: linear-gradient(135deg, rgba(123,44,191,0.3), rgba(0,212,255,0.2));
+            border: 2px solid #7b2cbf;
+            border-radius: 15px;
+            padding: 25px;
+            text-align: center;
+        }
+        .strategy-name { font-size: 1.8em; font-weight: bold; color: #00d4ff; }
+        .strategy-desc { color: #aaa; margin-top: 10px; }
+        
+        /* Direction */
+        .direction-box { text-align: center; padding: 15px; border-radius: 10px; }
+        .direction-box.bullish { background: rgba(0,255,127,0.2); border: 1px solid #00ff7f; }
+        .direction-box.bearish { background: rgba(255,99,71,0.2); border: 1px solid #ff6347; }
+        .direction-box.neutral { background: rgba(255,217,61,0.2); border: 1px solid #ffd93d; }
+        .direction-text { font-size: 1.5em; font-weight: bold; }
+        .direction-conf { color: #888; font-size: 0.9em; margin-top: 5px; }
+        
+        /* Metrics Grid */
+        .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        .metric { background: rgba(255,255,255,0.03); padding: 12px; border-radius: 8px; text-align: center; }
+        .metric-label { color: #888; font-size: 0.85em; }
+        .metric-value { font-size: 1.2em; font-weight: bold; margin-top: 3px; }
+        
+        /* GPT Box */
+        .gpt-box {
+            background: rgba(16,163,127,0.15);
+            border: 1px solid #10a37f;
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        .gpt-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .gpt-icon { font-size: 1.3em; }
+        .gpt-title { color: #10a37f; font-weight: bold; }
+        .gpt-text { color: #ccc; font-size: 0.95em; line-height: 1.5; }
+        .gpt-risk { color: #ff6b6b; font-size: 0.9em; margin-top: 10px; }
+        
+        /* Options Strikes */
+        .strikes { display: flex; justify-content: space-around; text-align: center; margin-top: 15px; }
+        .strike { padding: 15px; }
+        .strike-label { color: #888; font-size: 0.85em; }
+        .strike-value { font-size: 1.4em; font-weight: bold; margin-top: 5px; }
+        .strike-value.green { color: #00ff7f; }
+        .strike-value.red { color: #ff6347; }
+        
+        /* Reasons */
+        .reasons { margin-top: 15px; }
+        .reason { padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 6px; font-size: 0.9em; color: #aaa; }
+        .reason::before { content: "• "; color: #00d4ff; }
+        
+        /* Last 5 Days */
+        .days-row { display: flex; gap: 8px; justify-content: center; }
+        .day {
+            flex: 1;
+            text-align: center;
+            padding: 10px 5px;
+            border-radius: 8px;
+            background: rgba(255,255,255,0.03);
+        }
+        .day.up { border: 1px solid #00ff7f; }
+        .day.down { border: 1px solid #ff6347; }
+        .day-num { font-size: 0.8em; color: #666; }
+        .day-val { font-weight: bold; margin-top: 3px; }
+        .day-val.up { color: #00ff7f; }
+        .day-val.down { color: #ff6347; }
+        
+        /* Risk Badge */
+        .risk-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+        .risk-badge.high { background: rgba(255,99,71,0.3); color: #ff6347; }
+        .risk-badge.medium { background: rgba(255,217,61,0.3); color: #ffd93d; }
+        .risk-badge.low { background: rgba(0,255,127,0.3); color: #00ff7f; }
+        
+        /* Weights */
+        .weights { display: flex; gap: 8px; margin-top: 15px; }
+        .weight { flex: 1; padding: 8px; border-radius: 8px; text-align: center; }
+        .weight.tech { background: rgba(0,212,255,0.2); border: 1px solid #00d4ff; }
+        .weight.gpt { background: rgba(16,163,127,0.2); border: 1px solid #10a37f; }
+        .weight.news { background: rgba(255,165,0,0.2); border: 1px solid #ffa500; }
+        .weight-pct { font-size: 1.3em; font-weight: bold; }
+        .weight-label { font-size: 0.75em; color: #888; }
+        
+        /* News Box */
+        .news-box {
+            background: rgba(255,165,0,0.1);
+            border: 1px solid #ffa500;
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 10px;
+        }
+        .news-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .news-icon { font-size: 1.2em; }
+        .news-title { color: #ffa500; font-weight: bold; }
+        .news-sentiment { font-size: 1.1em; font-weight: bold; margin: 10px 0; }
+        .news-sentiment.bullish { color: #00ff7f; }
+        .news-sentiment.bearish { color: #ff6347; }
+        .news-sentiment.neutral { color: #ffd93d; }
+        .news-headline { padding: 6px 10px; background: rgba(255,255,255,0.03); border-radius: 5px; margin-bottom: 5px; font-size: 0.85em; color: #aaa; }
+        .news-source { color: #888; font-size: 0.75em; }
+        
+        /* Refresh */
+        .refresh-btn {
+            position: fixed;
+            bottom: 25px;
+            right: 25px;
+            width: 55px;
+            height: 55px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #00d4ff, #7b2cbf);
+            border: none;
+            color: white;
+            font-size: 1.4em;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(0,212,255,0.4);
+        }
+        .refresh-btn:hover { transform: scale(1.1); }
+        
+        footer { text-align: center; padding: 20px; color: #555; font-size: 0.85em; }
+        
+        .loading { text-align: center; padding: 50px; color: #888; }
+        
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        .live { display: inline-block; width: 8px; height: 8px; background: #00ff7f; border-radius: 50%; animation: pulse 2s infinite; margin-right: 8px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 MCX Volatility Dashboard</h1>
+            <p class="subtitle">Technical 50% + ChatGPT 25% + News Sentiment 25%</p>
+        </header>
+        
+        <div id="dashboard" class="loading">Loading analysis...</div>
+        
+        <button class="refresh-btn" onclick="loadData()">🔄</button>
+    </div>
+    
+    <script>
+        async function loadData() {
+            try {
+                const res = await fetch('/api/analysis');
+                const json = await res.json();
+                if (json.success) render(json.data);
+                else document.getElementById('dashboard').innerHTML = `<p class="loading">Error: ${json.error}</p>`;
+            } catch(e) {
+                document.getElementById('dashboard').innerHTML = `<p class="loading">Error: ${e.message}</p>`;
+            }
+        }
+        
+        function render(d) {
+            const c = d.combined;
+            const volClass = c.vol_score > 65 ? 'high' : c.vol_score < 40 ? 'low' : 'medium';
+            const dirClass = c.direction.toLowerCase();
+            
+            document.getElementById('dashboard').innerHTML = `
+                <div class="grid">
+                    <!-- Price Card -->
+                    <div class="card">
+                        <div class="card-title"><span class="live"></span>MCX Ltd (NSE)</div>
+                        <div class="price-big">₹${d.price.toLocaleString()}</div>
+                        <div class="price-change ${d.change >= 0 ? 'up' : 'down'}">
+                            ${d.change >= 0 ? '▲' : '▼'} ${Math.abs(d.change).toFixed(2)}%
+                        </div>
+                        <div style="text-align:center; margin-top:15px; color:#888;">
+                            Regime: <strong>${d.regime}</strong>
+                        </div>
+                    </div>
+                    
+                    <!-- Volatility Score -->
+                    <div class="card">
+                        <div class="card-title">🎯 Volatility Score</div>
+                        <div class="vol-score ${volClass}">
+                            <div class="vol-number">${c.vol_score}</div>
+                            <div class="vol-label">/ 100</div>
+                        </div>
+                        <div style="text-align:center; margin-top:15px;">
+                            Expected Range: <strong>${c.expected_range.toFixed(1)}%</strong> (±₹${c.expected_move})
+                        </div>
+                    </div>
+                    
+                    <!-- Strategy -->
+                    <div class="card">
+                        <div class="card-title">💡 Recommended Strategy</div>
+                        <div class="strategy-box">
+                            <div class="strategy-name">${c.strategy}</div>
+                            <div class="strategy-desc">${c.strategy_desc}</div>
+                        </div>
+                        <div style="text-align:center; margin-top:15px;">
+                            Risk Level: <span class="risk-badge ${c.risk.toLowerCase()}">${c.risk}</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Direction (from GPT + News) -->
+                    <div class="card">
+                        <div class="card-title">📈 Combined Direction Signal</div>
+                        <div class="direction-box ${dirClass}">
+                            <div class="direction-text">${c.direction}</div>
+                            <div class="direction-conf">${c.dir_conf}% confidence</div>
+                        </div>
+                        <p style="text-align:center; margin-top:10px; color:#666; font-size:0.85em;">
+                            Combined from ChatGPT + News Sentiment
+                        </p>
+                        <div class="weights">
+                            <div class="weight tech">
+                                <div class="weight-pct">${c.weights?.tech || 50}%</div>
+                                <div class="weight-label">Technical</div>
+                            </div>
+                            <div class="weight gpt">
+                                <div class="weight-pct">${c.weights?.gpt || 25}%</div>
+                                <div class="weight-label">ChatGPT</div>
+                            </div>
+                            <div class="weight news">
+                                <div class="weight-pct">${c.weights?.news || 25}%</div>
+                                <div class="weight-label">News</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="grid">
+                    <!-- Volatility Metrics -->
+                    <div class="card">
+                        <div class="card-title">📊 Volatility Metrics</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-label">20-Day Vol</div>
+                                <div class="metric-value">${d.vol_20d}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">5-Day Vol</div>
+                                <div class="metric-value">${d.vol_5d}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">ATR</div>
+                                <div class="metric-value">₹${d.atr} (${d.atr_pct}%)</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">ATR vs Avg</div>
+                                <div class="metric-value" style="color:${d.atr_vs_avg > 1.2 ? '#ff6347' : '#00ff7f'}">${d.atr_vs_avg}x</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">Volume Ratio</div>
+                                <div class="metric-value">${d.vol_ratio}x</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">BB Width</div>
+                                <div class="metric-value">${d.bb_width}%</div>
+                            </div>
+                        </div>
+                        <div class="reasons">
+                            ${c.tech_reasons.map(r => `<div class="reason">${r}</div>`).join('')}
+                        </div>
+                    </div>
+                    
+                    <!-- ChatGPT Analysis -->
+                    <div class="card">
+                        <div class="card-title">🤖 ChatGPT Analysis</div>
+                        ${c.gpt_available ? `
+                            <div class="gpt-box">
+                                <div class="gpt-header">
+                                    <span class="gpt-icon">🧠</span>
+                                    <span class="gpt-title">GPT-4 Analysis (${c.gpt_direction || 'N/A'})</span>
+                                </div>
+                                <div class="gpt-text">${c.gpt_reasoning}</div>
+                                ${c.gpt_risk !== 'N/A' ? `<div class="gpt-risk">⚠️ ${c.gpt_risk}</div>` : ''}
+                            </div>
+                        ` : `
+                            <div style="text-align:center; padding:20px; color:#888;">
+                                ChatGPT API not configured
+                            </div>
+                        `}
+                        
+                        <!-- News Sentiment -->
+                        ${c.news_available ? `
+                            <div class="news-box">
+                                <div class="news-header">
+                                    <span class="news-icon">📰</span>
+                                    <span class="news-title">News Sentiment</span>
+                                </div>
+                                <div class="news-sentiment ${c.news_sentiment?.toLowerCase() || 'neutral'}">
+                                    ${c.news_sentiment || 'NEUTRAL'} (Score: ${c.news_score}/100, Conf: ${c.news_conf}%)
+                                </div>
+                                <div class="gpt-text" style="font-size:0.85em;">${c.news_reasoning || 'N/A'}</div>
+                                ${c.news_headlines && c.news_headlines.length > 0 ? `
+                                    <div style="margin-top:10px;">
+                                        ${c.news_headlines.slice(0, 3).map(h => `
+                                            <div class="news-headline">
+                                                <span class="news-source">[${h.source}]</span> ${h.title?.substring(0, 80)}...
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                ` : ''}
+                            </div>
+                        ` : `
+                            <div class="news-box" style="opacity:0.5;">
+                                <div class="news-header">
+                                    <span class="news-icon">📰</span>
+                                    <span class="news-title">News Sentiment</span>
+                                </div>
+                                <div style="color:#888; font-size:0.9em;">News agent loading...</div>
+                            </div>
+                        `}
+                        
+                        <div class="card-title" style="margin-top:20px;">📅 Last 5 Days</div>
+                        <div class="days-row">
+                            ${d.last_5.map((v, i) => `
+                                <div class="day ${v >= 0 ? 'up' : 'down'}">
+                                    <div class="day-num">D${i-4}</div>
+                                    <div class="day-val ${v >= 0 ? 'up' : 'down'}">${v >= 0 ? '+' : ''}${v}%</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                    
+                    <!-- Options Guidance -->
+                    <div class="card">
+                        <div class="card-title">📋 Options Guidance (Lot: ${d.options.lot_size})</div>
+                        <div class="strikes">
+                            <div class="strike">
+                                <div class="strike-label">Lower Target</div>
+                                <div class="strike-value red">₹${d.options.lower_target}</div>
+                            </div>
+                            <div class="strike">
+                                <div class="strike-label">ATM Strike</div>
+                                <div class="strike-value">₹${d.options.atm_strike}</div>
+                            </div>
+                            <div class="strike">
+                                <div class="strike-label">Upper Target</div>
+                                <div class="strike-value green">₹${d.options.upper_target}</div>
+                            </div>
+                        </div>
+                        
+                        <div style="margin-top:20px; padding:15px; background:rgba(255,255,255,0.03); border-radius:10px;">
+                            ${c.vol_score > 65 ? `
+                                <p><strong>🎯 HIGH VOL Strategy:</strong></p>
+                                <p style="color:#aaa; margin-top:5px;">Buy ATM Straddle/Strangle at ₹${d.options.atm_strike}</p>
+                                <p style="color:#888; font-size:0.85em; margin-top:5px;">Targets: ₹${d.options.lower_target} - ₹${d.options.upper_target}</p>
+                            ` : c.vol_score < 40 ? `
+                                <p><strong>😴 LOW VOL Strategy:</strong></p>
+                                <p style="color:#aaa; margin-top:5px;">Sell Straddle or Iron Condor</p>
+                                <p style="color:#888; font-size:0.85em; margin-top:5px;">Expect price to stay in range</p>
+                            ` : `
+                                <p><strong>📊 NORMAL VOL:</strong></p>
+                                <p style="color:#aaa; margin-top:5px;">${c.direction === 'BULLISH' ? 'Slight bullish lean - consider call spread' : c.direction === 'BEARISH' ? 'Slight bearish lean - consider put spread' : 'No clear edge - wait for better setup'}</p>
+                            `}
+                        </div>
+                    </div>
+                    
+                    <!-- Technical Indicators -->
+                    <div class="card">
+                        <div class="card-title">📈 Technical Levels</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-label">RSI (14)</div>
+                                <div class="metric-value" style="color:${d.rsi < 30 ? '#00ff7f' : d.rsi > 70 ? '#ff6347' : '#ffd93d'}">${d.rsi}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">MA5</div>
+                                <div class="metric-value">₹${d.ma5}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">MA20</div>
+                                <div class="metric-value">₹${d.ma20}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">Support</div>
+                                <div class="metric-value green">₹${d.support}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">Resistance</div>
+                                <div class="metric-value red">₹${d.resistance}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">MA Trend</div>
+                                <div class="metric-value" style="color:${d.ma5 > d.ma20 ? '#00ff7f' : '#ff6347'}">${d.ma5 > d.ma20 ? 'BULLISH' : 'BEARISH'}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <footer>
+                    MCX Volatility Dashboard v7.0 | Technical 70% + ChatGPT 30% | Last Update: ${d.timestamp}<br>
+                    <small style="color:#666;">⚠️ Not financial advice. Direction prediction is ~50% accurate. Focus on volatility and risk management.</small>
+                </footer>
+            `;
+        }
+        
+        loadData();
+        setInterval(loadData, 120000); // Refresh every 2 min
+    </script>
+</body>
+</html>

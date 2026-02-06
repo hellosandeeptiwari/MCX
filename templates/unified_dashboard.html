@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCX Trading Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            background: linear-gradient(90deg, #00d4ff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .header .subtitle {
+            color: #888;
+            margin-top: 5px;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        .card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .card h2 {
+            font-size: 1.2em;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .card h2 .icon {
+            font-size: 1.5em;
+        }
+        
+        /* Big recommendation card */
+        .recommendation-card {
+            grid-column: 1 / -1;
+            background: linear-gradient(135deg, rgba(0,212,255,0.1), rgba(0,255,136,0.1));
+            border: 2px solid rgba(0,212,255,0.3);
+        }
+        
+        .big-recommendation {
+            text-align: center;
+            padding: 30px;
+        }
+        
+        .big-recommendation .strategy {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+        
+        .big-recommendation .strategy.good {
+            color: #00ff88;
+        }
+        
+        .big-recommendation .strategy.marginal {
+            color: #ffaa00;
+        }
+        
+        .big-recommendation .strategy.avoid {
+            color: #ff4444;
+        }
+        
+        .big-recommendation .detail {
+            font-size: 1.3em;
+            color: #aaa;
+        }
+        
+        .quality-badge {
+            display: inline-block;
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        
+        .quality-badge.good {
+            background: rgba(0,255,136,0.2);
+            color: #00ff88;
+            border: 1px solid #00ff88;
+        }
+        
+        .quality-badge.marginal {
+            background: rgba(255,170,0,0.2);
+            color: #ffaa00;
+            border: 1px solid #ffaa00;
+        }
+        
+        .quality-badge.avoid {
+            background: rgba(255,68,68,0.2);
+            color: #ff4444;
+            border: 1px solid #ff4444;
+        }
+        
+        /* Price card */
+        .price-card .price {
+            font-size: 3em;
+            font-weight: bold;
+        }
+        
+        .change {
+            font-size: 1.5em;
+            margin-left: 10px;
+        }
+        
+        .change.positive { color: #00ff88; }
+        .change.negative { color: #ff4444; }
+        
+        /* Metrics grid */
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+        
+        .metric {
+            background: rgba(0,0,0,0.2);
+            padding: 12px;
+            border-radius: 8px;
+        }
+        
+        .metric .label {
+            font-size: 0.85em;
+            color: #888;
+        }
+        
+        .metric .value {
+            font-size: 1.3em;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+        
+        .metric .value.bullish { color: #00ff88; }
+        .metric .value.bearish { color: #ff4444; }
+        .metric .value.neutral { color: #ffaa00; }
+        
+        /* Options table */
+        .options-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        
+        .options-table th, .options-table td {
+            padding: 10px;
+            text-align: center;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .options-table th {
+            color: #888;
+            font-weight: normal;
+            font-size: 0.85em;
+        }
+        
+        .options-table tr.highlight {
+            background: rgba(0,212,255,0.1);
+        }
+        
+        /* GPT card */
+        .gpt-card {
+            border: 1px solid rgba(138,43,226,0.3);
+        }
+        
+        .gpt-card h2 {
+            color: #aa66ff;
+        }
+        
+        .gpt-situation {
+            font-style: italic;
+            color: #aaa;
+            margin-bottom: 15px;
+            padding: 10px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }
+        
+        /* Confidence bars */
+        .confidence-bar {
+            height: 8px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 4px;
+            margin-top: 5px;
+            overflow: hidden;
+        }
+        
+        .confidence-bar .fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s;
+        }
+        
+        .confidence-bar .fill.high { background: #00ff88; }
+        .confidence-bar .fill.medium { background: #ffaa00; }
+        .confidence-bar .fill.low { background: #ff4444; }
+        
+        /* Trade setup */
+        .trade-setup {
+            background: rgba(0,0,0,0.3);
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 15px;
+        }
+        
+        .trade-setup h3 {
+            color: #00d4ff;
+            margin-bottom: 10px;
+        }
+        
+        .trade-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .trade-row:last-child {
+            border-bottom: none;
+        }
+        
+        /* Warnings */
+        .warnings {
+            margin-top: 15px;
+        }
+        
+        .warning {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px;
+            background: rgba(255,170,0,0.1);
+            border-radius: 5px;
+            margin-bottom: 8px;
+            font-size: 0.9em;
+            color: #ffaa00;
+        }
+        
+        /* Loading */
+        .loading {
+            text-align: center;
+            padding: 50px;
+            color: #888;
+        }
+        
+        .spinner {
+            border: 4px solid rgba(255,255,255,0.1);
+            border-top: 4px solid #00d4ff;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Refresh button */
+        .refresh-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, #00d4ff, #00ff88);
+            color: #000;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 30px;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(0,212,255,0.4);
+            transition: transform 0.2s;
+        }
+        
+        .refresh-btn:hover {
+            transform: scale(1.05);
+        }
+        
+        .timestamp {
+            text-align: center;
+            color: #666;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 MCX TRADING DASHBOARD</h1>
+        <div class="subtitle">All Data • One Decision • Lot Size: 625</div>
+    </div>
+    
+    <div id="content">
+        <div class="loading">
+            <div class="spinner"></div>
+            <div>Loading all data...</div>
+        </div>
+    </div>
+    
+    <button class="refresh-btn" onclick="loadData()">🔄 Refresh</button>
+    
+    <script>
+        async function loadData() {
+            document.getElementById('content').innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <div>Fetching stock data, calculating options, getting GPT analysis...</div>
+                </div>
+            `;
+            
+            try {
+                const response = await fetch('/api/all-data');
+                const data = await response.json();
+                
+                if (data.success) {
+                    renderDashboard(data);
+                } else {
+                    document.getElementById('content').innerHTML = `
+                        <div class="loading">
+                            <div style="color: #ff4444;">Error: ${data.error}</div>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                document.getElementById('content').innerHTML = `
+                    <div class="loading">
+                        <div style="color: #ff4444;">Failed to load: ${error.message}</div>
+                    </div>
+                `;
+            }
+        }
+        
+        function renderDashboard(data) {
+            const s = data.stock;
+            const o = data.options;
+            const g = data.gpt || {};
+            const r = data.recommendation;
+            
+            const changeClass = s.change_today >= 0 ? 'positive' : 'negative';
+            const qualityClass = r.trade_quality.toLowerCase();
+            const strategyClass = r.trade_quality === 'GOOD' ? 'good' : r.trade_quality === 'MARGINAL' ? 'marginal' : 'avoid';
+            
+            // Determine active scenario (usually high IV post-crash)
+            const activeScenario = r.active_option_scenario;
+            
+            let html = `
+                <div class="grid">
+                    <!-- Big Recommendation -->
+                    <div class="card recommendation-card">
+                        <div class="big-recommendation">
+                            <div class="quality-badge ${qualityClass}">${r.trade_quality} TRADE</div>
+                            <div class="strategy ${strategyClass}">${r.strategy}</div>
+                            <div class="detail">${r.strategy_detail}</div>
+                            <div style="margin-top: 15px; color: #888;">${r.trade_quality_reason}</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Price Card -->
+                    <div class="card price-card">
+                        <h2><span class="icon">💰</span> MCX Ltd (NSE)</h2>
+                        <div>
+                            <span class="price">₹${s.price.toFixed(2)}</span>
+                            <span class="change ${changeClass}">${s.change_today >= 0 ? '+' : ''}${s.change_today.toFixed(2)}%</span>
+                        </div>
+                        <div class="metrics" style="margin-top: 20px;">
+                            <div class="metric">
+                                <div class="label">5-Day</div>
+                                <div class="value ${s.change_5d >= 0 ? 'bullish' : 'bearish'}">${s.change_5d >= 0 ? '+' : ''}${s.change_5d.toFixed(2)}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">20-Day</div>
+                                <div class="value ${s.change_20d >= 0 ? 'bullish' : 'bearish'}">${s.change_20d >= 0 ? '+' : ''}${s.change_20d.toFixed(2)}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">52W High</div>
+                                <div class="value">₹${s.high_52w.toFixed(0)}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">52W Low</div>
+                                <div class="value">₹${s.low_52w.toFixed(0)}</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Technical Signals -->
+                    <div class="card">
+                        <h2><span class="icon">📈</span> Technical Signals</h2>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="label">RSI (14)</div>
+                                <div class="value ${s.rsi < 30 ? 'bullish' : s.rsi > 70 ? 'bearish' : 'neutral'}">${s.rsi.toFixed(1)}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">vs MA20</div>
+                                <div class="value ${s.price_vs_ma20 > 0 ? 'bullish' : 'bearish'}">${s.price_vs_ma20 >= 0 ? '+' : ''}${s.price_vs_ma20.toFixed(1)}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">Bollinger</div>
+                                <div class="value">${(s.bb_position * 100).toFixed(0)}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">Volume</div>
+                                <div class="value ${s.volume_ratio > 1.5 ? 'bullish' : ''}">${s.volume_ratio.toFixed(2)}x avg</div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 15px;">
+                            <div class="label">Last 5 Days: ${s.last_5_returns.map(r => (r >= 0 ? '+' : '') + r + '%').join(', ')}</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Volatility -->
+                    <div class="card">
+                        <h2><span class="icon">🌊</span> Volatility Analysis</h2>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="label">5-Day Vol</div>
+                                <div class="value">${s.volatility_5d.toFixed(1)}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">20-Day Vol</div>
+                                <div class="value">${s.volatility_20d.toFixed(1)}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">ATR</div>
+                                <div class="value">₹${s.atr.toFixed(0)} (${s.atr_pct.toFixed(1)}%)</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">ATR vs Avg</div>
+                                <div class="value ${s.atr_vs_avg > 1.3 ? 'bearish' : ''}">${s.atr_vs_avg.toFixed(2)}x</div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 15px;">
+                            <strong style="color: ${r.volatility_level === 'HIGH' ? '#ff4444' : r.volatility_level === 'ELEVATED' ? '#ffaa00' : '#00ff88'}">
+                                Volatility: ${r.volatility_level} (${r.volatility_confidence}% confident)
+                            </strong>
+                        </div>
+                    </div>
+                    
+                    <!-- Direction -->
+                    <div class="card">
+                        <h2><span class="icon">🧭</span> Direction Assessment</h2>
+                        <div style="text-align: center; padding: 20px;">
+                            <div style="font-size: 2em; font-weight: bold; color: ${r.direction === 'BULLISH' ? '#00ff88' : r.direction === 'BEARISH' ? '#ff4444' : '#ffaa00'}">
+                                ${r.direction}
+                            </div>
+                            <div style="margin-top: 10px;">
+                                Confidence: ${r.direction_confidence}%
+                            </div>
+                            <div class="confidence-bar">
+                                <div class="fill ${r.direction_confidence > 55 ? 'medium' : 'low'}" style="width: ${r.direction_confidence}%"></div>
+                            </div>
+                            <div style="margin-top: 15px; color: #ff4444; font-size: 0.9em;">
+                                ⚠️ Direction is ~50% accurate (near random)
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- GPT Analysis -->
+                    <div class="card gpt-card">
+                        <h2><span class="icon">🤖</span> ChatGPT Analysis</h2>
+                        ${g.situation ? `<div class="gpt-situation">"${g.situation}"</div>` : ''}
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="label">GPT Direction</div>
+                                <div class="value ${g.direction === 'BULLISH' ? 'bullish' : g.direction === 'BEARISH' ? 'bearish' : 'neutral'}">${g.direction || 'N/A'}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">GPT Confidence</div>
+                                <div class="value">${g.direction_confidence || 'N/A'}%</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">GPT Volatility</div>
+                                <div class="value">${g.volatility || 'N/A'}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="label">GPT Recommendation</div>
+                                <div class="value" style="font-size: 1em;">${g.recommendation || 'N/A'}</div>
+                            </div>
+                        </div>
+                        ${g.risk ? `<div style="margin-top: 15px; color: #ffaa00;">⚠️ Risk: ${g.risk}</div>` : ''}
+                    </div>
+                    
+                    <!-- Options Pricing -->
+                    <div class="card" style="grid-column: span 2;">
+                        <h2><span class="icon">📋</span> Options Pricing (Estimated)</h2>
+                        <div style="margin-bottom: 10px; color: #888;">ATM Strike: ₹${o.atm_strike} | Days to Expiry: ~${o.days_to_expiry}</div>
+                        
+                        <table class="options-table">
+                            <tr>
+                                <th>Scenario</th>
+                                <th>IV</th>
+                                <th>CE Premium</th>
+                                <th>PE Premium</th>
+                                <th>Straddle</th>
+                                <th>Cost (625 lot)</th>
+                                <th>Breakeven</th>
+                                <th>Required Move</th>
+                            </tr>
+                            ${o.scenarios.map((sc, i) => `
+                                <tr class="${sc.label === activeScenario.label ? 'highlight' : ''}">
+                                    <td>${sc.label} ${sc.label === activeScenario.label ? '👈' : ''}</td>
+                                    <td>${sc.iv}%</td>
+                                    <td>₹${sc.ce_premium}</td>
+                                    <td>₹${sc.pe_premium}</td>
+                                    <td>₹${sc.straddle_premium}</td>
+                                    <td>₹${sc.straddle_cost.toLocaleString()}</td>
+                                    <td>₹${sc.lower_breakeven} - ₹${sc.upper_breakeven}</td>
+                                    <td>${sc.required_move_pct}%</td>
+                                </tr>
+                            `).join('')}
+                        </table>
+                        
+                        <div style="margin-top: 20px; display: flex; gap: 20px;">
+                            <div style="flex: 1;">
+                                <strong>Expected Move: ${r.expected_move_pct}% (±₹${r.expected_move})</strong>
+                            </div>
+                            <div style="flex: 1;">
+                                <strong>Breakeven Required: ${activeScenario.required_move_pct}%</strong>
+                            </div>
+                            <div style="flex: 1; color: ${r.trade_quality === 'GOOD' ? '#00ff88' : r.trade_quality === 'MARGINAL' ? '#ffaa00' : '#ff4444'};">
+                                <strong>${r.trade_quality}: ${r.expected_move_pct > activeScenario.required_move_pct ? 'Expected > Breakeven ✓' : 'Expected < Breakeven ✗'}</strong>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Trade Setup -->
+                    <div class="card">
+                        <h2><span class="icon">🎯</span> Trade Setup</h2>
+                        <div class="trade-setup">
+                            <h3>${r.strategy}</h3>
+                            <div class="trade-row">
+                                <span>Action</span>
+                                <span>${r.strategy_detail}</span>
+                            </div>
+                            <div class="trade-row">
+                                <span>Lot Size</span>
+                                <span>625 shares</span>
+                            </div>
+                            <div class="trade-row">
+                                <span>Est. Premium</span>
+                                <span>₹${activeScenario.straddle_premium}/share</span>
+                            </div>
+                            <div class="trade-row">
+                                <span>Total Cost</span>
+                                <span>₹${activeScenario.straddle_cost.toLocaleString()}</span>
+                            </div>
+                            <div class="trade-row">
+                                <span>Max Loss</span>
+                                <span>₹${activeScenario.straddle_cost.toLocaleString()} (premium paid)</span>
+                            </div>
+                            <div class="trade-row">
+                                <span>Breakeven</span>
+                                <span>₹${activeScenario.lower_breakeven} - ₹${activeScenario.upper_breakeven}</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Warnings -->
+                    <div class="card">
+                        <h2><span class="icon">⚠️</span> Honest Warnings</h2>
+                        <div class="warnings">
+                            <div class="warning">
+                                <span>⚡</span>
+                                <span>Direction prediction is ~${r.direction_confidence}% (near random)</span>
+                            </div>
+                            <div class="warning">
+                                <span>📊</span>
+                                <span>Volatility prediction more reliable: ${r.volatility_confidence}%</span>
+                            </div>
+                            <div class="warning">
+                                <span>📰</span>
+                                <span>Past news (crash) already priced in</span>
+                            </div>
+                            <div class="warning">
+                                <span>💰</span>
+                                <span>Max risk: 2% of capital per trade</span>
+                            </div>
+                            <div class="warning">
+                                <span>🔢</span>
+                                <span>Option prices are ESTIMATES - verify with broker</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="timestamp">
+                    Last updated: ${data.timestamp}
+                </div>
+            `;
+            
+            document.getElementById('content').innerHTML = html;
+        }
+        
+        // Load on page load
+        loadData();
+    </script>
+</body>
+</html>

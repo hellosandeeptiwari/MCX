@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCX Real-Time Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #1a1a2e;
+            --bg-card: #16213e;
+            --bg-card2: #0f3460;
+            --accent-green: #4ade80;
+            --accent-red: #f87171;
+            --accent-blue: #60a5fa;
+            --accent-orange: #fbbf24;
+            --accent-purple: #c084fc;
+            --text-primary: #f1f5f9;
+            --text-secondary: #cbd5e1;
+            --text-bright: #ffffff;
+        }
+        body {
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            font-family: 'Segoe UI', sans-serif;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: var(--bg-card) !important;
+            border-bottom: 2px solid var(--accent-blue);
+            padding: 0.75rem 1.5rem;
+        }
+        .navbar-brand { color: var(--text-bright) !important; font-weight: 700; font-size: 1.3rem; }
+        .main-container { padding: 1rem; max-width: 1800px; margin: 0 auto; }
+        
+        .card {
+            background: var(--bg-card);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 10px;
+            margin-bottom: 0.75rem;
+        }
+        .card-header {
+            background: var(--bg-card2);
+            border-bottom: 1px solid rgba(255,255,255,0.15);
+            padding: 0.6rem 1rem;
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--text-bright);
+        }
+        .card-body { padding: 0.75rem; color: var(--text-primary); }
+        
+        /* Price Display */
+        .price-main {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--text-bright);
+        }
+        .price-change {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+        .price-change.up { color: var(--accent-green); }
+        .price-change.down { color: var(--accent-red); }
+        
+        /* Signal Badge */
+        .signal-badge {
+            display: inline-block;
+            padding: 0.5rem 1.5rem;
+            border-radius: 25px;
+            font-weight: 700;
+            font-size: 1rem;
+        }
+        .signal-badge.strong_bullish, .signal-badge.bullish { 
+            background: rgba(74,222,128,0.25); 
+            color: var(--accent-green);
+            border: 2px solid var(--accent-green);
+        }
+        .signal-badge.strong_bearish, .signal-badge.bearish { 
+            background: rgba(248,113,113,0.25); 
+            color: var(--accent-red);
+            border: 2px solid var(--accent-red);
+        }
+        .signal-badge.neutral { 
+            background: rgba(251,191,36,0.25); 
+            color: var(--accent-orange);
+            border: 2px solid var(--accent-orange);
+        }
+        
+        /* Metrics */
+        .metric-box {
+            background: var(--bg-card2);
+            border-radius: 8px;
+            padding: 0.75rem;
+            text-align: center;
+            height: 100%;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .metric-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        .metric-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--text-bright);
+        }
+        .metric-value.good { color: var(--accent-green); }
+        .metric-value.bad { color: var(--accent-red); }
+        .metric-value.neutral { color: var(--accent-orange); }
+        
+        /* Strengths/Weaknesses */
+        .strength-item, .weakness-item {
+            padding: 0.5rem 0;
+            font-size: 0.85rem;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-primary);
+        }
+        .strength-item:last-child, .weakness-item:last-child { border-bottom: none; }
+        .strength-item::before { content: "✅ "; }
+        .weakness-item::before { content: "⚠️ "; }
+        .strength-item { color: var(--accent-green); }
+        .weakness-item { color: var(--accent-orange); }
+        
+        /* Strategy Box */
+        .strategy-box {
+            background: linear-gradient(135deg, rgba(96,165,250,0.2), rgba(192,132,252,0.2));
+            border: 2px solid var(--accent-blue);
+            border-radius: 10px;
+            padding: 1rem;
+        }
+        .strategy-name {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: var(--text-bright);
+        }
+        .strategy-detail {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-top: 0.5rem;
+        }
+        
+        /* Reason List */
+        .reason-item {
+            padding: 0.3rem 0;
+            font-size: 0.85rem;
+            color: var(--text-primary);
+        }
+        .reason-item::before {
+            content: "→ ";
+            color: var(--accent-blue);
+            font-weight: bold;
+        }
+        
+        /* Technical Indicators */
+        .tech-indicator {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            font-size: 0.9rem;
+            color: var(--text-primary);
+        }
+        .tech-indicator:last-child { border-bottom: none; }
+        .tech-indicator span:first-child { color: var(--text-secondary); }
+        .tech-indicator span:last-child { font-weight: 600; color: var(--text-bright); }
+        
+        /* Option Table */
+        .option-table {
+            width: 100%;
+            font-size: 0.8rem;
+        }
+        .option-table th {
+            background: var(--bg-card2);
+            padding: 0.5rem;
+            text-align: center;
+            font-weight: 700;
+            color: var(--text-bright);
+            border-bottom: 2px solid rgba(255,255,255,0.2);
+        }
+        .option-table td {
+            padding: 0.4rem;
+            text-align: center;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            color: var(--text-primary);
+        }
+        .option-table .atm { background: rgba(96,165,250,0.2); }
+        .option-table .call { color: var(--accent-green); font-weight: 600; }
+        .option-table .put { color: var(--accent-red); font-weight: 600; }
+        .option-table .strike { 
+            background: var(--bg-card2); 
+            font-weight: 700;
+            color: var(--accent-blue);
+        }
+        
+        /* Refresh */
+        .btn-refresh {
+            background: var(--accent-blue);
+            border: none;
+            color: #000;
+            padding: 0.5rem 1.2rem;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 0.9rem;
+        }
+        .btn-refresh:hover { background: #93c5fd; }
+        
+        .last-update {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        
+        .live-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            margin-right: 5px;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        
+        /* Auto-refresh indicator */
+        .auto-refresh {
+            font-size: 0.85rem;
+            color: var(--accent-purple);
+            font-weight: 600;
+        }
+        
+        /* Form controls */
+        .form-control, .form-select {
+            background: var(--bg-card2) !important;
+            color: var(--text-bright) !important;
+            border: 1px solid rgba(255,255,255,0.2) !important;
+        }
+        .form-control:focus, .form-select:focus {
+            border-color: var(--accent-blue) !important;
+            box-shadow: 0 0 0 2px rgba(96,165,250,0.3) !important;
+        }
+        
+        /* Labels */
+        label {
+            color: var(--text-secondary) !important;
+            font-weight: 600;
+        }
+        
+        /* General text visibility */
+        div, span, p { color: inherit; }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container-fluid">
+            <span class="navbar-brand">
+                <i class="fas fa-chart-line me-2"></i>MCX Real-Time Dashboard
+            </span>
+            <div class="d-flex align-items-center">
+                <span class="auto-refresh me-3">
+                    <i class="fas fa-sync-alt fa-spin me-1"></i>Auto-refresh: <span id="refreshCountdown">30</span>s
+                </span>
+                <span class="last-update me-3" id="lastUpdate">--</span>
+                <button class="btn-refresh" onclick="forceRefresh()">
+                    <i class="fas fa-sync-alt me-1"></i>Refresh Now
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <div class="main-container">
+        <div class="row">
+            <!-- Left Column: Price & Signal -->
+            <div class="col-lg-4">
+                <!-- Live Price -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="live-dot"></span>MCX Ltd (NSE)
+                    </div>
+                    <div class="card-body text-center">
+                        <div class="price-main" id="currentPrice">₹--</div>
+                        <div class="price-change" id="priceChange">--</div>
+                        <div class="row mt-3">
+                            <div class="col-4">
+                                <div class="metric-label">High</div>
+                                <div id="dayHigh" style="font-weight:600;">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-label">Low</div>
+                                <div id="dayLow" style="font-weight:600;">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-label">Volume</div>
+                                <div id="volume" style="font-weight:600;">--</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Trading Signal -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-bullseye me-2"></i>Trading Signal</div>
+                    <div class="card-body text-center">
+                        <div class="signal-badge neutral" id="signalBadge">--</div>
+                        <div class="mt-2" style="font-size:0.85rem;">
+                            Score: <span id="signalScore">--</span> | 
+                            Confidence: <span id="signalConfidence">--</span>%
+                        </div>
+                        <div class="strategy-box mt-3">
+                            <div class="strategy-name" id="strategy">--</div>
+                            <div class="strategy-detail" id="strategyDetail">--</div>
+                        </div>
+                        <div class="mt-3 text-start">
+                            <div style="font-size:0.75rem;color:var(--text-secondary);margin-bottom:0.5rem;">Signal Reasons:</div>
+                            <div id="signalReasons">--</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Strengths & Weaknesses -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-balance-scale me-2"></i>Screener Analysis</div>
+                    <div class="card-body">
+                        <div style="color:var(--accent-green);font-weight:600;font-size:0.8rem;">Strengths</div>
+                        <div id="strengths" class="mb-2">--</div>
+                        <div style="color:var(--accent-red);font-weight:600;font-size:0.8rem;">Weaknesses</div>
+                        <div id="weaknesses">--</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Middle Column: Fundamentals & Technicals -->
+            <div class="col-lg-4">
+                <!-- Fundamental Metrics -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-building me-2"></i>Fundamentals (Screener.in)</div>
+                    <div class="card-body">
+                        <div class="row g-2">
+                            <div class="col-4">
+                                <div class="metric-box">
+                                    <div class="metric-label">P/E</div>
+                                    <div class="metric-value" id="pe">--</div>
+                                </div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-box">
+                                    <div class="metric-label">P/B</div>
+                                    <div class="metric-value" id="pb">--</div>
+                                </div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-box">
+                                    <div class="metric-label">Div Yield</div>
+                                    <div class="metric-value" id="divYield">--</div>
+                                </div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-box">
+                                    <div class="metric-label">ROE</div>
+                                    <div class="metric-value good" id="roe">--</div>
+                                </div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-box">
+                                    <div class="metric-label">ROCE</div>
+                                    <div class="metric-value good" id="roce">--</div>
+                                </div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-box">
+                                    <div class="metric-label">Mkt Cap</div>
+                                    <div class="metric-value" id="marketCap">--</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Technical Indicators -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-chart-bar me-2"></i>Technical Indicators</div>
+                    <div class="card-body">
+                        <div class="tech-indicator">
+                            <span>RSI (14)</span>
+                            <span id="rsi">--</span>
+                        </div>
+                        <div class="tech-indicator">
+                            <span>MACD Signal</span>
+                            <span id="macd">--</span>
+                        </div>
+                        <div class="tech-indicator">
+                            <span>MA Signal</span>
+                            <span id="maSignal">--</span>
+                        </div>
+                        <div class="tech-indicator">
+                            <span>Bollinger Band</span>
+                            <span id="bbSignal">--</span>
+                        </div>
+                        <div class="tech-indicator">
+                            <span>Volume</span>
+                            <span id="volSignal">--</span>
+                        </div>
+                        <div class="tech-indicator">
+                            <span>ATR (Daily Range)</span>
+                            <span id="atr">--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Support/Resistance -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-arrows-alt-v me-2"></i>Support & Resistance</div>
+                    <div class="card-body">
+                        <div class="row text-center">
+                            <div class="col-4">
+                                <div class="metric-label">Resistance</div>
+                                <div style="font-size:1.2rem;font-weight:700;color:var(--accent-red);" id="resistance">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-label">Current</div>
+                                <div style="font-size:1.2rem;font-weight:700;color:var(--accent-blue);" id="currentLevel">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-label">Support</div>
+                                <div style="font-size:1.2rem;font-weight:700;color:var(--accent-green);" id="support">--</div>
+                            </div>
+                        </div>
+                        <div class="row text-center mt-3">
+                            <div class="col-4">
+                                <div class="metric-label">BB Upper</div>
+                                <div id="bbUpper">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-label">BB Middle</div>
+                                <div id="bbMiddle">--</div>
+                            </div>
+                            <div class="col-4">
+                                <div class="metric-label">BB Lower</div>
+                                <div id="bbLower">--</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Momentum -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-rocket me-2"></i>Momentum</div>
+                    <div class="card-body">
+                        <div class="row text-center g-2">
+                            <div class="col-4"><div class="metric-label">1 Week</div><div id="ret1w">--</div></div>
+                            <div class="col-4"><div class="metric-label">1 Month</div><div id="ret1m">--</div></div>
+                            <div class="col-4"><div class="metric-label">3 Months</div><div id="ret3m">--</div></div>
+                            <div class="col-4"><div class="metric-label">6 Months</div><div id="ret6m">--</div></div>
+                            <div class="col-4"><div class="metric-label">1 Year</div><div id="ret1y">--</div></div>
+                            <div class="col-4"><div class="metric-label">vs Nifty</div><div id="relStrength">--</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Option Chain -->
+            <div class="col-lg-4">
+                <div class="card">
+                    <div class="card-header">
+                        <i class="fas fa-th me-2"></i>Option Chain
+                        <select id="expiryDays" class="form-select form-select-sm d-inline-block" style="width:auto;margin-left:10px;background:var(--bg-dark);color:var(--text-primary);border-color:rgba(255,255,255,0.2);font-size:0.75rem;">
+                            <option value="7">Weekly</option>
+                            <option value="30" selected>Monthly</option>
+                            <option value="60">2 Months</option>
+                        </select>
+                    </div>
+                    <div class="card-body p-0" style="max-height:600px;overflow-y:auto;">
+                        <table class="option-table" id="optionTable">
+                            <thead>
+                                <tr>
+                                    <th class="call">Call ₹</th>
+                                    <th class="call">Delta</th>
+                                    <th>Strike</th>
+                                    <th class="put">Delta</th>
+                                    <th class="put">Put ₹</th>
+                                </tr>
+                            </thead>
+                            <tbody id="optionBody">
+                                <tr><td colspan="5">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Position Calculator -->
+                <div class="card">
+                    <div class="card-header"><i class="fas fa-calculator me-2"></i>Position Calculator</div>
+                    <div class="card-body">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label style="font-size:0.7rem;color:var(--text-secondary);">Capital</label>
+                                <input type="number" id="capital" value="500000" class="form-control form-control-sm" style="background:var(--bg-dark);color:var(--text-primary);border-color:rgba(255,255,255,0.2);">
+                            </div>
+                            <div class="col-6">
+                                <label style="font-size:0.7rem;color:var(--text-secondary);">Risk %</label>
+                                <input type="number" id="riskPct" value="2" class="form-control form-control-sm" style="background:var(--bg-dark);color:var(--text-primary);border-color:rgba(255,255,255,0.2);">
+                            </div>
+                            <div class="col-6">
+                                <label style="font-size:0.7rem;color:var(--text-secondary);">Entry</label>
+                                <input type="number" id="entry" class="form-control form-control-sm" style="background:var(--bg-dark);color:var(--text-primary);border-color:rgba(255,255,255,0.2);">
+                            </div>
+                            <div class="col-6">
+                                <label style="font-size:0.7rem;color:var(--text-secondary);">Stop Loss</label>
+                                <input type="number" id="stopLoss" class="form-control form-control-sm" style="background:var(--bg-dark);color:var(--text-primary);border-color:rgba(255,255,255,0.2);">
+                            </div>
+                        </div>
+                        <button class="btn btn-sm btn-primary w-100 mt-2" onclick="calcPosition()">Calculate</button>
+                        <div id="positionResult" class="mt-2" style="font-size:0.8rem;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let refreshInterval = 30;
+        let countdown = refreshInterval;
+
+        async function fetchData() {
+            try {
+                const res = await fetch('/api/live');
+                const result = await res.json();
+                
+                if (result.success) {
+                    updateUI(result.data);
+                    document.getElementById('lastUpdate').textContent = result.timestamp;
+                }
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+
+        async function forceRefresh() {
+            try {
+                const res = await fetch('/api/refresh');
+                const result = await res.json();
+                if (result.success) {
+                    updateUI(result.data);
+                    document.getElementById('lastUpdate').textContent = result.timestamp + ' (forced)';
+                }
+            } catch (e) {
+                console.error('Refresh error:', e);
+            }
+            countdown = refreshInterval;
+        }
+
+        function updateUI(data) {
+            // Price
+            if (data.price) {
+                document.getElementById('currentPrice').textContent = '₹' + data.price.price.toFixed(2);
+                const changeEl = document.getElementById('priceChange');
+                const change = data.price.change_pct;
+                changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                changeEl.className = 'price-change ' + (change >= 0 ? 'up' : 'down');
+                
+                document.getElementById('dayHigh').textContent = '₹' + data.price.high.toFixed(0);
+                document.getElementById('dayLow').textContent = '₹' + data.price.low.toFixed(0);
+                document.getElementById('volume').textContent = (data.price.volume / 1000).toFixed(0) + 'K';
+                
+                document.getElementById('entry').value = Math.round(data.price.price);
+                document.getElementById('stopLoss').value = Math.round(data.price.price * 0.95);
+            }
+
+            // Signal
+            if (data.signal) {
+                const badge = document.getElementById('signalBadge');
+                badge.textContent = data.signal.signal.replace('_', ' ');
+                badge.className = 'signal-badge ' + data.signal.signal.toLowerCase();
+                
+                document.getElementById('signalScore').textContent = data.signal.score;
+                document.getElementById('signalConfidence').textContent = data.signal.confidence;
+                document.getElementById('strategy').textContent = data.signal.strategy;
+                document.getElementById('strategyDetail').textContent = data.signal.strategy_detail;
+                
+                let reasonsHtml = '';
+                if (data.signal.reasons) {
+                    data.signal.reasons.forEach(r => {
+                        reasonsHtml += '<div class="reason-item">' + r + '</div>';
+                    });
+                }
+                document.getElementById('signalReasons').innerHTML = reasonsHtml;
+            }
+
+            // Screener data
+            if (data.screener && data.screener.metrics) {
+                const m = data.screener.metrics;
+                document.getElementById('pe').textContent = m['Stock P/E'] || '--';
+                document.getElementById('pb').textContent = (m['Current Price'] / m['Book Value']).toFixed(1) || '--';
+                document.getElementById('divYield').textContent = (m['Dividend Yield'] || '--') + '%';
+                document.getElementById('roe').textContent = (m['ROE'] || '--') + '%';
+                document.getElementById('roce').textContent = (m['ROCE'] || '--') + '%';
+                document.getElementById('marketCap').textContent = '₹' + (m['Market Cap'] / 1000).toFixed(1) + 'K Cr';
+                
+                // Strengths
+                let strengthsHtml = '';
+                if (data.screener.strengths) {
+                    data.screener.strengths.forEach(s => {
+                        strengthsHtml += '<div class="strength-item">' + s + '</div>';
+                    });
+                }
+                document.getElementById('strengths').innerHTML = strengthsHtml || 'No data';
+                
+                // Weaknesses
+                let weaknessesHtml = '';
+                if (data.screener.weaknesses) {
+                    data.screener.weaknesses.forEach(w => {
+                        weaknessesHtml += '<div class="weakness-item">' + w + '</div>';
+                    });
+                }
+                document.getElementById('weaknesses').innerHTML = weaknessesHtml || 'No data';
+            }
+
+            // Technicals
+            if (data.technicals) {
+                const t = data.technicals;
+                
+                const rsiEl = document.getElementById('rsi');
+                rsiEl.textContent = t.rsi.toFixed(0) + ' (' + t.rsi_signal + ')';
+                rsiEl.style.color = t.rsi_signal === 'OVERSOLD' ? 'var(--accent-green)' : 
+                                    (t.rsi_signal === 'OVERBOUGHT' ? 'var(--accent-red)' : 'var(--accent-orange)');
+                
+                const macdEl = document.getElementById('macd');
+                macdEl.textContent = t.macd_signal;
+                macdEl.style.color = t.macd_signal === 'BULLISH' ? 'var(--accent-green)' : 'var(--accent-red)';
+                
+                const maEl = document.getElementById('maSignal');
+                maEl.textContent = t.ma_signal;
+                maEl.style.color = t.ma_signal.includes('BULLISH') ? 'var(--accent-green)' : 
+                                   (t.ma_signal.includes('BEARISH') ? 'var(--accent-red)' : 'var(--accent-orange)');
+                
+                document.getElementById('bbSignal').textContent = t.bb_signal;
+                document.getElementById('volSignal').textContent = t.volume_ratio.toFixed(2) + 'x (' + t.volume_signal + ')';
+                document.getElementById('atr').textContent = '₹' + t.atr.toFixed(0) + ' (' + t.atr_pct.toFixed(1) + '%)';
+                
+                document.getElementById('support').textContent = '₹' + t.support.toFixed(0);
+                document.getElementById('resistance').textContent = '₹' + t.resistance.toFixed(0);
+                document.getElementById('currentLevel').textContent = '₹' + (data.price ? data.price.price.toFixed(0) : '--');
+                
+                document.getElementById('bbUpper').textContent = '₹' + t.bb_upper.toFixed(0);
+                document.getElementById('bbMiddle').textContent = '₹' + t.bb_middle.toFixed(0);
+                document.getElementById('bbLower').textContent = '₹' + t.bb_lower.toFixed(0);
+            }
+
+            // Momentum
+            if (data.momentum && data.momentum.returns) {
+                const r = data.momentum.returns;
+                
+                const formatRet = (val) => {
+                    if (!val) return '--';
+                    const color = val >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                    return '<span style="color:' + color + '">' + (val >= 0 ? '+' : '') + val.toFixed(1) + '%</span>';
+                };
+                
+                document.getElementById('ret1w').innerHTML = formatRet(r['1W']);
+                document.getElementById('ret1m').innerHTML = formatRet(r['1M']);
+                document.getElementById('ret3m').innerHTML = formatRet(r['3M']);
+                document.getElementById('ret6m').innerHTML = formatRet(r['6M']);
+                document.getElementById('ret1y').innerHTML = formatRet(r['1Y']);
+                document.getElementById('relStrength').innerHTML = formatRet(data.momentum.relative_strength);
+            }
+        }
+
+        async function fetchOptionChain() {
+            const days = document.getElementById('expiryDays').value;
+            try {
+                const res = await fetch('/api/option-chain?days=' + days);
+                const result = await res.json();
+                
+                if (result.success) {
+                    let html = '';
+                    result.data.forEach(row => {
+                        const atmClass = row.is_atm ? 'atm' : '';
+                        html += '<tr class="' + atmClass + '">' +
+                            '<td class="call">' + row.call_price + '</td>' +
+                            '<td class="call">' + row.call_delta + '</td>' +
+                            '<td class="strike">' + row.strike + '</td>' +
+                            '<td class="put">' + row.put_delta + '</td>' +
+                            '<td class="put">' + row.put_price + '</td>' +
+                        '</tr>';
+                    });
+                    document.getElementById('optionBody').innerHTML = html;
+                }
+            } catch (e) {
+                console.error('Option chain error:', e);
+            }
+        }
+
+        async function calcPosition() {
+            const data = {
+                capital: parseFloat(document.getElementById('capital').value),
+                risk_percent: parseFloat(document.getElementById('riskPct').value),
+                entry_price: parseFloat(document.getElementById('entry').value),
+                stop_loss: parseFloat(document.getElementById('stopLoss').value)
+            };
+            
+            try {
+                const res = await fetch('/api/position-size', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                
+                if (result.success) {
+                    const d = result.data;
+                    document.getElementById('positionResult').innerHTML = 
+                        '<div style="color:var(--accent-green);font-weight:600;">' + d.lots + ' Lots (' + d.shares + ' shares)</div>' +
+                        '<div style="color:var(--text-secondary);">Risk: ₹' + d.risk_amount.toFixed(0) + ' | Capital: ₹' + d.capital_required.toFixed(0) + '</div>';
+                }
+            } catch (e) {
+                console.error('Position calc error:', e);
+            }
+        }
+
+        // Countdown timer
+        function updateCountdown() {
+            countdown--;
+            document.getElementById('refreshCountdown').textContent = countdown;
+            
+            if (countdown <= 0) {
+                fetchData();
+                fetchOptionChain();
+                countdown = refreshInterval;
+            }
+        }
+
+        document.getElementById('expiryDays').addEventListener('change', fetchOptionChain);
+
+        // Initial load
+        fetchData();
+        fetchOptionChain();
+
+        // Auto-refresh every second (countdown)
+        setInterval(updateCountdown, 1000);
+    </script>
+</body>
+</html>

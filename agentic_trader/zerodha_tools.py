@@ -1,0 +1,1622 @@
+"""
+ZERODHA TOOLS FOR THE AGENT
+Provides structured tools that the LLM agent can call
+"""
+
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
+from kiteconnect import KiteConnect
+import pandas as pd
+import os
+
+from config import (
+    ZERODHA_API_KEY, ZERODHA_API_SECRET, 
+    HARD_RULES, TRADING_HOURS, APPROVED_UNIVERSE, FNO_CONFIG
+)
+
+
+@dataclass
+class AccountState:
+    """Current account state"""
+    available_margin: float
+    used_margin: float
+    total_equity: float
+    start_of_day_equity: float
+    realized_pnl: float
+    unrealized_pnl: float
+    open_positions: List[Dict]
+    pending_orders: List[Dict]
+    positions_count: int
+    daily_loss: float
+    daily_loss_pct: float
+    can_trade: bool
+    reason: str
+
+
+@dataclass
+class MarketData:
+    """Market data for a symbol"""
+    symbol: str
+    ltp: float
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    change_pct: float
+    timestamp: str
+    is_stale: bool
+    # Indicators
+    sma_20: float
+    sma_50: float
+    rsi_14: float
+    atr_14: float
+    # Enhanced context for better decisions
+    trend: str = "SIDEWAYS"
+    high_20d: float = 0
+    low_20d: float = 0
+    high_5d: float = 0
+    low_5d: float = 0
+    prev_high: float = 0
+    prev_low: float = 0
+    prev_close: float = 0
+    resistance_1: float = 0
+    resistance_2: float = 0
+    support_1: float = 0
+    support_2: float = 0
+    atr_target: float = 0
+    atr_stoploss: float = 0
+    volume_ratio: float = 1.0
+    volume_signal: str = "NORMAL"
+
+
+@dataclass 
+class TradePlan:
+    """A candidate trade plan"""
+    symbol: str
+    side: str  # BUY or SELL
+    entry_price: float
+    stop_loss: float
+    target: float
+    quantity: int
+    risk_amount: float
+    risk_pct: float
+    rationale: str
+    confidence: str  # LOW, MEDIUM, HIGH
+    rule_checks: Dict[str, bool]
+    approved: bool = False
+
+
+@dataclass
+class RiskCheck:
+    """Risk validation result"""
+    rule: str
+    passed: bool
+    current_value: Any
+    limit: Any
+    message: str
+
+
+class ZerodhaTools:
+    """
+    Tools that the LLM agent can call to interact with Zerodha
+    """
+    
+    # Trade tracking file path
+    TRADES_FILE = os.path.join(os.path.dirname(__file__), 'active_trades.json')
+    TRADE_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'trade_history.json')
+    
+    def __init__(self, paper_mode: bool = True, paper_capital: float = None):
+        self.kite = KiteConnect(api_key=ZERODHA_API_KEY)
+        self.access_token = None
+        self.start_of_day_equity = None
+        self.last_api_call = 0
+        self.api_call_count = 0
+        
+        # Paper trading state
+        self.paper_mode = paper_mode
+        self.paper_capital = paper_capital or HARD_RULES["CAPITAL"]
+        self.paper_positions = []
+        self.paper_orders = []
+        self.paper_pnl = 0
+        
+        # Load saved token
+        self._load_token()
+        
+        # Load active trades from file
+        self._load_active_trades()
+    
+    def _load_active_trades(self):
+        """Load active trades from JSON file"""
+        try:
+            if os.path.exists(self.TRADES_FILE):
+                with open(self.TRADES_FILE, 'r') as f:
+                    data = json.load(f)
+                    # Only load trades from today
+                    today = str(datetime.now().date())
+                    if data.get('date') == today:
+                        self.paper_positions = data.get('active_trades', [])
+                        self.paper_pnl = data.get('realized_pnl', 0)
+                        print(f"📂 Loaded {len(self.paper_positions)} active trades from file")
+                    else:
+                        # New day - start fresh
+                        self.paper_positions = []
+                        self.paper_pnl = 0
+                        print(f"📅 New trading day - starting fresh")
+            else:
+                self.paper_positions = []
+                self.paper_pnl = 0
+        except Exception as e:
+            print(f"⚠️ Error loading trades: {e}")
+            self.paper_positions = []
+            self.paper_pnl = 0
+    
+    def _save_active_trades(self):
+        """Save active trades to JSON file"""
+        try:
+            data = {
+                'date': str(datetime.now().date()),
+                'last_updated': datetime.now().isoformat(),
+                'active_trades': self.paper_positions,
+                'realized_pnl': self.paper_pnl,
+                'paper_capital': self.paper_capital
+            }
+            with open(self.TRADES_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ Error saving trades: {e}")
+    
+    def _save_to_history(self, trade: Dict, result: str, pnl: float):
+        """Save completed trade to history file"""
+        try:
+            history = []
+            if os.path.exists(self.TRADE_HISTORY_FILE):
+                with open(self.TRADE_HISTORY_FILE, 'r') as f:
+                    history = json.load(f)
+            
+            trade_record = {
+                **trade,
+                'result': result,  # 'TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT'
+                'pnl': pnl,
+                'closed_at': datetime.now().isoformat()
+            }
+            history.append(trade_record)
+            
+            with open(self.TRADE_HISTORY_FILE, 'w') as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ Error saving to history: {e}")
+    
+    def is_symbol_in_active_trades(self, symbol: str) -> bool:
+        """Check if symbol already has an active trade"""
+        for trade in self.paper_positions:
+            if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                return True
+        return False
+    
+    def get_active_trade(self, symbol: str) -> Optional[Dict]:
+        """Get active trade for a symbol if exists"""
+        for trade in self.paper_positions:
+            if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                return trade
+        return None
+    
+    def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None):
+        """Update trade status and move to history if closed"""
+        for i, trade in enumerate(self.paper_positions):
+            if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                trade['status'] = status
+                trade['exit_price'] = exit_price
+                trade['exit_time'] = datetime.now().isoformat()
+                
+                if pnl is not None:
+                    trade['pnl'] = pnl
+                    self.paper_pnl += pnl
+                
+                # Save to history and remove from active
+                if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT']:
+                    self._save_to_history(trade, status, pnl or 0)
+                    self.paper_positions.pop(i)
+                
+                self._save_active_trades()
+                return True
+        return False
+    
+    def check_and_update_trades(self) -> List[Dict]:
+        """Check all active trades for target/stoploss hits and update"""
+        updates = []
+        
+        if not self.paper_positions:
+            return updates
+        
+        # Get current prices for all active symbols
+        symbols = [t['symbol'] for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        if not symbols:
+            return updates
+        
+        try:
+            quotes = self.kite.quote(symbols)
+            
+            for trade in self.paper_positions[:]:  # Copy list to avoid modification during iteration
+                if trade.get('status', 'OPEN') != 'OPEN':
+                    continue
+                
+                symbol = trade['symbol']
+                if symbol not in quotes:
+                    continue
+                
+                ltp = quotes[symbol]['last_price']
+                entry = trade['avg_price']
+                sl = trade['stop_loss']
+                target = trade.get('target', entry * 1.02)
+                qty = trade['quantity']
+                side = trade['side']
+                
+                # Calculate P&L
+                if side == 'BUY':
+                    pnl = (ltp - entry) * qty
+                    # Check target hit (price went above target)
+                    if ltp >= target:
+                        self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
+                        updates.append({
+                            'symbol': symbol, 
+                            'result': 'TARGET_HIT', 
+                            'pnl': pnl,
+                            'entry': entry,
+                            'exit': ltp
+                        })
+                    # Check stoploss hit (price went below SL)
+                    elif ltp <= sl:
+                        self.update_trade_status(symbol, 'STOPLOSS_HIT', ltp, pnl)
+                        updates.append({
+                            'symbol': symbol, 
+                            'result': 'STOPLOSS_HIT', 
+                            'pnl': pnl,
+                            'entry': entry,
+                            'exit': ltp
+                        })
+                else:  # SHORT
+                    pnl = (entry - ltp) * qty
+                    # Check target hit (price went below target for shorts)
+                    if ltp <= target:
+                        self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
+                        updates.append({
+                            'symbol': symbol, 
+                            'result': 'TARGET_HIT', 
+                            'pnl': pnl,
+                            'entry': entry,
+                            'exit': ltp
+                        })
+                    # Check stoploss hit (price went above SL for shorts)
+                    elif ltp >= sl:
+                        self.update_trade_status(symbol, 'STOPLOSS_HIT', ltp, pnl)
+                        updates.append({
+                            'symbol': symbol, 
+                            'result': 'STOPLOSS_HIT', 
+                            'pnl': pnl,
+                            'entry': entry,
+                            'exit': ltp
+                        })
+        except Exception as e:
+            print(f"⚠️ Error checking trades: {e}")
+        
+        return updates
+    
+    def _load_token(self):
+        """Load access token from file"""
+        try:
+            token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
+            with open(token_path, 'r') as f:
+                data = json.load(f)
+            
+            if data.get('date') == str(datetime.now().date()):
+                self.access_token = data['access_token']
+                self.kite.set_access_token(self.access_token)
+                return True
+        except:
+            pass
+        return False
+    
+    def authenticate(self):
+        """Authenticate with Zerodha - run once daily"""
+        print("\n🔐 Zerodha Authentication")
+        print("="*50)
+        
+        login_url = self.kite.login_url()
+        print(f"\n1. Open this URL in your browser:")
+        print(f"   {login_url}")
+        
+        print(f"\n2. Login with your Zerodha credentials")
+        print(f"\n3. After login, copy the 'request_token' from the redirect URL")
+        print(f"   (It's in the URL like: ?request_token=XXXXXX)")
+        
+        request_token = input("\n4. Paste request_token here: ").strip()
+        
+        try:
+            data = self.kite.generate_session(request_token, api_secret=ZERODHA_API_SECRET)
+            self.access_token = data["access_token"]
+            self.kite.set_access_token(self.access_token)
+            
+            # Save token
+            token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
+            with open(token_path, 'w') as f:
+                json.dump({
+                    'access_token': self.access_token,
+                    'date': str(datetime.now().date())
+                }, f)
+            
+            print(f"\n✅ Authentication successful!")
+            print(f"   Token saved for today: {datetime.now().date()}")
+            
+            # Test the connection
+            profile = self.kite.profile()
+            print(f"   Logged in as: {profile.get('user_name', 'Unknown')}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n❌ Authentication failed: {e}")
+            return False
+    
+    def _rate_limit(self):
+        """Enforce API rate limiting"""
+        min_interval = HARD_RULES["API_RATE_LIMIT_MS"] / 1000
+        elapsed = time.time() - self.last_api_call
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        self.last_api_call = time.time()
+        self.api_call_count += 1
+    
+    def _is_trading_hours(self) -> tuple[bool, str]:
+        """Check if within trading hours"""
+        now = datetime.now().time()
+        start = datetime.strptime(TRADING_HOURS["start"], "%H:%M").time()
+        end = datetime.strptime(TRADING_HOURS["end"], "%H:%M").time()
+        no_new = datetime.strptime(TRADING_HOURS["no_new_after"], "%H:%M").time()
+        
+        if now < start:
+            return False, f"Market not open yet (opens at {TRADING_HOURS['start']})"
+        if now > end:
+            return False, f"Market closed (closed at {TRADING_HOURS['end']})"
+        if now > no_new:
+            return False, f"No new trades after {TRADING_HOURS['no_new_after']}"
+        
+        return True, "Within trading hours"
+    
+    def get_account_state(self) -> Dict:
+        """
+        Tool: Get current account state
+        Returns margins, positions, open orders, and risk status
+        """
+        self._rate_limit()
+        
+        try:
+            # In paper mode, use simulated capital
+            if self.paper_mode:
+                # Calculate used margin from paper positions
+                used = sum(abs(p.get('quantity', 0) * p.get('avg_price', 0)) for p in self.paper_positions)
+                available = self.paper_capital - used + self.paper_pnl
+                total_equity = self.paper_capital + self.paper_pnl
+                
+                # Initialize start of day equity
+                if self.start_of_day_equity is None:
+                    self.start_of_day_equity = self.paper_capital
+                
+                realized_pnl = self.paper_pnl
+                unrealized_pnl = 0  # Would need LTP to calculate
+                open_positions = self.paper_positions
+                pending_orders = self.paper_orders
+                
+            else:
+                # Get real margins from Zerodha
+                margins = self.kite.margins()
+                equity_margin = margins.get('equity', {})
+                available = equity_margin.get('available', {}).get('live_balance', 0)
+                used = equity_margin.get('utilised', {}).get('debits', 0)
+                
+                # Get positions
+                positions = self.kite.positions()
+                day_positions = positions.get('day', [])
+                
+                # Calculate P&L
+                realized_pnl = sum(p.get('realised', 0) for p in day_positions)
+                unrealized_pnl = sum(p.get('unrealised', 0) for p in day_positions)
+                
+                # Get open orders
+                orders = self.kite.orders()
+                pending_orders = [o for o in orders if o['status'] in ['OPEN', 'TRIGGER PENDING']]
+                
+                # Count open positions (non-zero quantity)
+                open_positions = [p for p in day_positions if p['quantity'] != 0]
+                
+                # Calculate daily loss
+                total_equity = available + used
+                if self.start_of_day_equity is None:
+                    self.start_of_day_equity = total_equity - realized_pnl - unrealized_pnl
+            
+            daily_pnl = realized_pnl + unrealized_pnl
+            daily_loss = min(0, daily_pnl)
+            daily_loss_pct = abs(daily_loss) / self.start_of_day_equity if self.start_of_day_equity > 0 else 0
+            
+            # Check if can trade
+            can_trade = True
+            reason = "OK"
+            
+            # Check daily loss limit
+            if daily_loss_pct >= HARD_RULES["MAX_DAILY_LOSS"]:
+                can_trade = False
+                reason = f"Daily loss limit hit ({daily_loss_pct*100:.2f}% >= {HARD_RULES['MAX_DAILY_LOSS']*100}%)"
+            
+            # Check max positions
+            positions_count = len(open_positions) if isinstance(open_positions, list) else 0
+            if positions_count >= HARD_RULES["MAX_POSITIONS"]:
+                can_trade = False
+                reason = f"Max positions reached ({positions_count} >= {HARD_RULES['MAX_POSITIONS']})"
+            
+            # Check trading hours
+            in_hours, hours_reason = self._is_trading_hours()
+            if not in_hours:
+                can_trade = False
+                reason = hours_reason
+            
+            # Format positions for output
+            if self.paper_mode:
+                formatted_positions = self.paper_positions
+                formatted_orders = self.paper_orders
+            else:
+                formatted_positions = [{
+                    'symbol': f"{p['exchange']}:{p['tradingsymbol']}",
+                    'quantity': p['quantity'],
+                    'avg_price': p['average_price'],
+                    'ltp': p['last_price'],
+                    'pnl': p['pnl'],
+                    'side': 'LONG' if p['quantity'] > 0 else 'SHORT'
+                } for p in open_positions]
+                formatted_orders = [{
+                    'order_id': o['order_id'],
+                    'symbol': f"{o['exchange']}:{o['tradingsymbol']}",
+                    'side': o['transaction_type'],
+                    'quantity': o['quantity'],
+                    'price': o['price'],
+                    'status': o['status']
+                } for o in pending_orders]
+            
+            state = AccountState(
+                available_margin=available,
+                used_margin=used,
+                total_equity=total_equity,
+                start_of_day_equity=self.start_of_day_equity,
+                realized_pnl=realized_pnl,
+                unrealized_pnl=unrealized_pnl,
+                open_positions=formatted_positions,
+                pending_orders=formatted_orders,
+                positions_count=positions_count,
+                daily_loss=daily_loss,
+                daily_loss_pct=daily_loss_pct,
+                can_trade=can_trade,
+                reason=reason
+            )
+            
+            return asdict(state)
+            
+        except Exception as e:
+            return {"error": str(e), "can_trade": False, "reason": f"API Error: {e}"}
+    
+    def get_volume_analysis(self, symbols: List[str]) -> Dict[str, Dict]:
+        """
+        Tool: Analyze intraday momentum using FUTURES OI (not delivery volume)
+        
+        Why Futures OI matters for EOD:
+        - Futures = 100% speculative, no delivery
+        - Long buildup = fresh longs, expect continuation
+        - Short buildup = fresh shorts, expect drop
+        - Short covering = shorts buying back, expect rally
+        - Long unwinding = longs exiting, expect weakness
+        
+        Order book depth shows PENDING orders (intent to buy/sell)
+        """
+        self._rate_limit()
+        
+        try:
+            # Get quote data (includes volume, bid/ask)
+            quotes = self.kite.quote(symbols)
+            
+            analysis = {}
+            
+            for symbol in symbols:
+                if symbol not in quotes:
+                    continue
+                
+                q = quotes[symbol]
+                ltp = q.get('last_price', 0)
+                volume = q.get('volume', 0)
+                
+                # OHLC data
+                ohlc = q.get('ohlc', {})
+                open_price = ohlc.get('open', ltp)
+                high = ohlc.get('high', ltp)
+                low = ohlc.get('low', ltp)
+                prev_close = ohlc.get('close', ltp)
+                
+                # Change calculations
+                change_from_open = ((ltp - open_price) / open_price * 100) if open_price else 0
+                
+                # Bid-Ask analysis (PENDING orders = real-time intent)
+                depth = q.get('depth', {})
+                buy_depth = depth.get('buy', [])
+                sell_depth = depth.get('sell', [])
+                
+                # Calculate buy vs sell PENDING volume
+                buy_pending = sum(b.get('quantity', 0) for b in buy_depth) if buy_depth else 0
+                sell_pending = sum(s.get('quantity', 0) for s in sell_depth) if sell_depth else 0
+                total_pending = buy_pending + sell_pending
+                
+                # Pending order imbalance (this is REAL-TIME intent, not executed)
+                if total_pending > 0:
+                    buy_pressure = buy_pending / total_pending
+                    sell_pressure = sell_pending / total_pending
+                else:
+                    buy_pressure = 0.5
+                    sell_pressure = 0.5
+                
+                # Intraday range analysis
+                day_range = high - low if high > low else 0.01
+                position_in_range = (ltp - low) / day_range if day_range > 0 else 0.5
+                
+                # Get FUTURES OI for this stock (the real speculative indicator)
+                oi_data = self._get_futures_oi_quick(symbol)
+                
+                # Initialize predictions
+                eod_prediction = "NEUTRAL"
+                eod_confidence = "LOW"
+                eod_reasoning = []
+                
+                if oi_data.get('has_futures'):
+                    oi_signal = oi_data.get('oi_signal', 'NEUTRAL')
+                    
+                    # OI-based EOD prediction (most reliable for intraday)
+                    if oi_signal == "LONG_BUILDUP":
+                        eod_prediction = "UP"
+                        eod_confidence = "HIGH"
+                        eod_reasoning.append(f"Long buildup in futures (OI↑ + Price↑)")
+                    
+                    elif oi_signal == "SHORT_BUILDUP":
+                        eod_prediction = "DOWN"
+                        eod_confidence = "HIGH"
+                        eod_reasoning.append(f"Short buildup in futures (OI↑ + Price↓)")
+                    
+                    elif oi_signal == "SHORT_COVERING":
+                        eod_prediction = "UP"
+                        eod_confidence = "HIGH"
+                        eod_reasoning.append(f"Short covering rally (OI↓ + Price↑)")
+                    
+                    elif oi_signal == "LONG_UNWINDING":
+                        eod_prediction = "DOWN"
+                        eod_confidence = "MEDIUM"
+                        eod_reasoning.append(f"Long unwinding (OI↓ + Price↓)")
+                
+                else:
+                    # For non-F&O stocks, use order book imbalance (less reliable)
+                    if buy_pressure > 0.65:
+                        eod_prediction = "UP"
+                        eod_confidence = "LOW"
+                        eod_reasoning.append(f"Strong buy orders pending ({buy_pressure*100:.0f}%)")
+                    elif sell_pressure > 0.65:
+                        eod_prediction = "DOWN"
+                        eod_confidence = "LOW"
+                        eod_reasoning.append(f"Strong sell orders pending ({sell_pressure*100:.0f}%)")
+                
+                # Additional: Price near day's low with time running out = potential squeeze
+                now = datetime.now()
+                if now.hour >= 14:  # After 2 PM
+                    if position_in_range < 0.3 and buy_pressure > 0.55:
+                        eod_reasoning.append("Near day low, late session - potential short squeeze")
+                        if eod_confidence == "LOW":
+                            eod_confidence = "MEDIUM"
+                    elif position_in_range > 0.7 and sell_pressure > 0.55:
+                        eod_reasoning.append("Near day high, late session - potential profit booking")
+                        if eod_confidence == "LOW":
+                            eod_confidence = "MEDIUM"
+                
+                # Trading signal
+                if eod_prediction == "UP" and eod_confidence in ["MEDIUM", "HIGH"]:
+                    trade_signal = "BUY_FOR_EOD"
+                    strategy = f"Buy for EOD close higher - {', '.join(eod_reasoning)}"
+                elif eod_prediction == "DOWN" and eod_confidence in ["MEDIUM", "HIGH"]:
+                    trade_signal = "SHORT_FOR_EOD"
+                    strategy = f"Short for EOD close lower - {', '.join(eod_reasoning)}"
+                else:
+                    trade_signal = "NO_SIGNAL"
+                    strategy = "No clear EOD edge from OI/order flow"
+                
+                analysis[symbol] = {
+                    "ltp": ltp,
+                    "change_from_open": round(change_from_open, 2),
+                    "volume": volume,
+                    "buy_pending_qty": buy_pending,
+                    "sell_pending_qty": sell_pending,
+                    "buy_pressure_pct": round(buy_pressure * 100, 1),
+                    "sell_pressure_pct": round(sell_pressure * 100, 1),
+                    "position_in_range": round(position_in_range * 100, 1),
+                    "has_futures_oi": oi_data.get('has_futures', False),
+                    "oi_signal": oi_data.get('oi_signal', 'N/A'),
+                    "eod_prediction": eod_prediction,
+                    "eod_confidence": eod_confidence,
+                    "eod_reasoning": eod_reasoning,
+                    "trade_signal": trade_signal,
+                    "strategy": strategy
+                }
+            
+            return analysis
+            
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def _get_futures_oi_quick(self, symbol: str) -> Dict:
+        """Quick futures OI check for a symbol"""
+        try:
+            if ":" in symbol:
+                _, stock = symbol.split(":")
+            else:
+                stock = symbol
+            
+            # Check if this is an F&O stock
+            fno_stocks = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
+                         "SBIN", "AXISBANK", "KOTAKBANK", "BAJFINANCE", "TATAMOTORS",
+                         "ITC", "TATASTEEL", "HINDUNILVR", "MARUTI", "TITAN",
+                         "LT", "SUNPHARMA", "BHARTIARTL", "ONGC", "COALINDIA",
+                         "TATAPOWER", "BANKBARODA", "PNB", "MCX"]
+            
+            if stock not in fno_stocks:
+                return {"has_futures": False}
+            
+            # Get current quote for price change
+            quote = self.kite.quote([symbol])
+            if symbol not in quote:
+                return {"has_futures": False}
+            
+            q = quote[symbol]
+            ltp = q.get('last_price', 0)
+            ohlc = q.get('ohlc', {})
+            prev_close = ohlc.get('close', ltp)
+            change_pct = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
+            
+            # Get instruments to find futures
+            instruments = self.kite.instruments("NFO")
+            
+            # Find current month futures
+            futures = [i for i in instruments if 
+                      i['name'] == stock and 
+                      i['instrument_type'] == 'FUT' and
+                      i['segment'] == 'NFO-FUT']
+            
+            if not futures:
+                return {"has_futures": False}
+            
+            # Sort by expiry, get nearest
+            futures.sort(key=lambda x: x['expiry'])
+            current_fut = futures[0]
+            
+            fut_symbol = f"NFO:{current_fut['tradingsymbol']}"
+            fut_quote = self.kite.quote([fut_symbol])
+            
+            if fut_symbol not in fut_quote:
+                return {"has_futures": False}
+            
+            fq = fut_quote[fut_symbol]
+            oi = fq.get('oi', 0)
+            oi_day_high = fq.get('oi_day_high', oi)
+            oi_day_low = fq.get('oi_day_low', oi)
+            
+            # OI change from day's low (intraday buildup)
+            oi_change_pct = ((oi - oi_day_low) / oi_day_low * 100) if oi_day_low else 0
+            
+            # Determine OI signal
+            if change_pct > 0.3 and oi_change_pct > 2:
+                oi_signal = "LONG_BUILDUP"
+            elif change_pct < -0.3 and oi_change_pct > 2:
+                oi_signal = "SHORT_BUILDUP"
+            elif change_pct < -0.3 and oi_change_pct < -2:
+                oi_signal = "LONG_UNWINDING"
+            elif change_pct > 0.3 and oi_change_pct < -2:
+                oi_signal = "SHORT_COVERING"
+            else:
+                oi_signal = "NEUTRAL"
+            
+            return {
+                "has_futures": True,
+                "futures_symbol": fut_symbol,
+                "oi": oi,
+                "oi_change_pct": round(oi_change_pct, 2),
+                "price_change_pct": round(change_pct, 2),
+                "oi_signal": oi_signal
+            }
+            
+        except Exception as e:
+            return {"has_futures": False, "error": str(e)}
+    
+    def get_oi_analysis(self, symbol: str) -> Dict:
+        """
+        Tool: Get Open Interest analysis for F&O stocks
+        
+        OI Analysis:
+        - Long Build-up: Price UP + OI UP = Strong Bullish
+        - Short Build-up: Price DOWN + OI UP = Strong Bearish
+        - Long Unwinding: Price DOWN + OI DOWN = Weak (longs exiting)
+        - Short Covering: Price UP + OI DOWN = Rally (shorts covering)
+        """
+        self._rate_limit()
+        
+        try:
+            # Get the underlying symbol without exchange
+            if ":" in symbol:
+                _, stock = symbol.split(":")
+            else:
+                stock = symbol
+            
+            # Get current quote
+            quote = self.kite.quote([symbol])
+            if symbol not in quote:
+                return {"error": f"Symbol not found: {symbol}"}
+            
+            q = quote[symbol]
+            ltp = q.get('last_price', 0)
+            ohlc = q.get('ohlc', {})
+            prev_close = ohlc.get('close', ltp)
+            change_pct = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
+            
+            # Try to get F&O instruments for this stock
+            # Find current month expiry futures
+            try:
+                instruments = self.kite.instruments("NFO")
+                
+                # Find futures for this stock
+                futures = [i for i in instruments if 
+                          i['name'] == stock and 
+                          i['instrument_type'] == 'FUT' and
+                          i['segment'] == 'NFO-FUT']
+                
+                if not futures:
+                    return {
+                        "symbol": symbol,
+                        "ltp": ltp,
+                        "change_pct": round(change_pct, 2),
+                        "oi_analysis": "N/A - Not an F&O stock",
+                        "has_fno": False
+                    }
+                
+                # Sort by expiry to get current month
+                futures.sort(key=lambda x: x['expiry'])
+                current_fut = futures[0] if futures else None
+                
+                if current_fut:
+                    fut_symbol = f"NFO:{current_fut['tradingsymbol']}"
+                    fut_quote = self.kite.quote([fut_symbol])
+                    
+                    if fut_symbol in fut_quote:
+                        fq = fut_quote[fut_symbol]
+                        oi = fq.get('oi', 0)
+                        oi_day_high = fq.get('oi_day_high', oi)
+                        oi_day_low = fq.get('oi_day_low', oi)
+                        
+                        # Calculate OI change (approximate)
+                        oi_change = oi - oi_day_low if oi_day_low else 0
+                        oi_change_pct = (oi_change / oi_day_low * 100) if oi_day_low else 0
+                        
+                        # Determine OI interpretation
+                        if change_pct > 0.5 and oi_change_pct > 1:
+                            oi_signal = "LONG_BUILDUP"
+                            interpretation = "🟢 New longs being created - BULLISH"
+                            trade_bias = "BUY"
+                        elif change_pct < -0.5 and oi_change_pct > 1:
+                            oi_signal = "SHORT_BUILDUP"
+                            interpretation = "🔴 New shorts being created - BEARISH"
+                            trade_bias = "SHORT"
+                        elif change_pct < -0.5 and oi_change_pct < -1:
+                            oi_signal = "LONG_UNWINDING"
+                            interpretation = "🟡 Longs exiting - Weak"
+                            trade_bias = "AVOID"
+                        elif change_pct > 0.5 and oi_change_pct < -1:
+                            oi_signal = "SHORT_COVERING"
+                            interpretation = "🟢 Shorts covering - Rally mode"
+                            trade_bias = "BUY"
+                        else:
+                            oi_signal = "NEUTRAL"
+                            interpretation = "⚪ No clear OI signal"
+                            trade_bias = "NEUTRAL"
+                        
+                        return {
+                            "symbol": symbol,
+                            "ltp": ltp,
+                            "change_pct": round(change_pct, 2),
+                            "has_fno": True,
+                            "futures_symbol": fut_symbol,
+                            "oi": oi,
+                            "oi_day_high": oi_day_high,
+                            "oi_day_low": oi_day_low,
+                            "oi_change": oi_change,
+                            "oi_change_pct": round(oi_change_pct, 2),
+                            "oi_signal": oi_signal,
+                            "interpretation": interpretation,
+                            "trade_bias": trade_bias
+                        }
+                
+            except Exception as e:
+                pass  # F&O data not available
+            
+            return {
+                "symbol": symbol,
+                "ltp": ltp,
+                "change_pct": round(change_pct, 2),
+                "oi_analysis": "Could not fetch OI data",
+                "has_fno": False
+            }
+            
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_market_data(self, symbols: List[str]) -> Dict[str, Dict]:
+        """
+        Tool: Get market data for symbols
+        Returns OHLCV + technical indicators
+        """
+        # Filter to approved universe
+        valid_symbols = [s for s in symbols if s in APPROVED_UNIVERSE]
+        if not valid_symbols:
+            return {"error": "No valid symbols in approved universe"}
+        
+        self._rate_limit()
+        
+        result = {}
+        
+        try:
+            # Get quotes
+            quotes = self.kite.quote(valid_symbols)
+            
+            for symbol in valid_symbols:
+                if symbol not in quotes:
+                    continue
+                
+                q = quotes[symbol]
+                ohlc = q.get('ohlc', {})
+                
+                # Check if data is stale
+                last_trade_time = q.get('last_trade_time')
+                is_stale = False
+                if last_trade_time:
+                    if isinstance(last_trade_time, str):
+                        last_trade_time = datetime.fromisoformat(last_trade_time)
+                    age = (datetime.now() - last_trade_time).seconds
+                    is_stale = age > HARD_RULES["STALE_DATA_SECONDS"]
+                
+                # Get historical data for indicators
+                indicators = self._calculate_indicators(symbol)
+                
+                data = MarketData(
+                    symbol=symbol,
+                    ltp=q.get('last_price', 0),
+                    open=ohlc.get('open', 0),
+                    high=ohlc.get('high', 0),
+                    low=ohlc.get('low', 0),
+                    close=ohlc.get('close', 0),
+                    volume=q.get('volume', 0),
+                    change_pct=q.get('change', 0),
+                    timestamp=str(datetime.now()),
+                    is_stale=is_stale,
+                    sma_20=indicators.get('sma_20', 0),
+                    sma_50=indicators.get('sma_50', 0),
+                    rsi_14=indicators.get('rsi_14', 50),
+                    atr_14=indicators.get('atr_14', 0)
+                )
+                
+                result[symbol] = asdict(data)
+            
+            return result
+            
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def _calculate_indicators(self, symbol: str) -> Dict:
+        """Calculate technical indicators for a symbol"""
+        self._rate_limit()
+        
+        try:
+            # Get instrument token
+            exchange, tradingsymbol = symbol.split(":")
+            instruments = self.kite.instruments(exchange)
+            token = None
+            for inst in instruments:
+                if inst['tradingsymbol'] == tradingsymbol:
+                    token = inst['instrument_token']
+                    break
+            
+            if not token:
+                return {}
+            
+            # Get historical data
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=60)
+            
+            data = self.kite.historical_data(
+                instrument_token=token,
+                from_date=from_date,
+                to_date=to_date,
+                interval="day"
+            )
+            
+            if not data:
+                return {}
+            
+            df = pd.DataFrame(data)
+            close = df['close']
+            high = df['high']
+            low = df['low']
+            
+            # SMA
+            sma_20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else close.mean()
+            sma_50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else close.mean()
+            
+            # RSI
+            delta = close.diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = (100 - (100 / (1 + rs))).iloc[-1] if len(close) >= 14 else 50
+            
+            # ATR
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else tr.mean()
+            
+            # Additional context for informed decisions
+            high_20d = high.tail(20).max()
+            low_20d = low.tail(20).min()
+            high_5d = high.tail(5).max()
+            low_5d = low.tail(5).min()
+            
+            # Previous day
+            prev_high = high.iloc[-2] if len(high) > 1 else high.iloc[-1]
+            prev_low = low.iloc[-2] if len(low) > 1 else low.iloc[-1]
+            prev_close = close.iloc[-2] if len(close) > 1 else close.iloc[-1]
+            
+            # Trend detection
+            current_price = close.iloc[-1]
+            trend = "BULLISH" if current_price > sma_20 > sma_50 else "BEARISH" if current_price < sma_20 < sma_50 else "SIDEWAYS"
+            
+            # Volume analysis
+            vol = df['volume']
+            avg_volume_20 = vol.tail(20).mean()
+            current_volume = vol.iloc[-1]
+            volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1
+            
+            # Support/Resistance (swing points)
+            resistance_1 = high_5d
+            resistance_2 = high_20d
+            support_1 = low_5d
+            support_2 = low_20d
+            
+            # ATR-based targets
+            atr_target = round(current_price + (atr * 1.5), 2)
+            atr_stoploss = round(current_price - (atr * 1.0), 2)
+            
+            return {
+                'sma_20': round(sma_20, 2),
+                'sma_50': round(sma_50, 2),
+                'rsi_14': round(rsi, 2),
+                'atr_14': round(atr, 2),
+                # New fields
+                'trend': trend,
+                'high_20d': round(high_20d, 2),
+                'low_20d': round(low_20d, 2),
+                'high_5d': round(high_5d, 2),
+                'low_5d': round(low_5d, 2),
+                'prev_high': round(prev_high, 2),
+                'prev_low': round(prev_low, 2),
+                'prev_close': round(prev_close, 2),
+                'resistance_1': round(resistance_1, 2),
+                'resistance_2': round(resistance_2, 2),
+                'support_1': round(support_1, 2),
+                'support_2': round(support_2, 2),
+                'atr_target': atr_target,
+                'atr_stoploss': atr_stoploss,
+                'volume_ratio': round(volume_ratio, 2),
+                'volume_signal': 'HIGH' if volume_ratio > 1.5 else 'LOW' if volume_ratio < 0.5 else 'NORMAL'
+            }
+            
+        except Exception as e:
+            return {}
+    
+    def calculate_position_size(
+        self, 
+        entry_price: float, 
+        stop_loss: float, 
+        capital: float,
+        lot_size: int = 1
+    ) -> Dict:
+        """
+        Tool: Calculate safe position size based on risk rules
+        """
+        risk_per_share = abs(entry_price - stop_loss)
+        
+        if risk_per_share == 0:
+            return {"error": "Stop loss equals entry price", "quantity": 0}
+        
+        # Max risk amount (0.5% of capital)
+        max_risk = capital * HARD_RULES["RISK_PER_TRADE"]
+        
+        # Calculate quantity
+        quantity = int(max_risk / risk_per_share)
+        
+        # Round to lot size
+        if lot_size > 1:
+            quantity = (quantity // lot_size) * lot_size
+        
+        actual_risk = risk_per_share * quantity
+        actual_risk_pct = actual_risk / capital * 100
+        
+        return {
+            "quantity": quantity,
+            "risk_per_share": round(risk_per_share, 2),
+            "max_risk_allowed": round(max_risk, 2),
+            "actual_risk": round(actual_risk, 2),
+            "actual_risk_pct": round(actual_risk_pct, 3),
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "position_value": round(entry_price * quantity, 2)
+        }
+    
+    def validate_trade(self, trade_plan: Dict) -> Dict:
+        """
+        Tool: Validate a trade plan against all hard rules
+        Returns pass/fail for each rule
+        """
+        checks = []
+        all_passed = True
+        
+        # Get current account state
+        account = self.get_account_state()
+        
+        # 1. Check if trading is allowed
+        if not account.get('can_trade', False):
+            checks.append(RiskCheck(
+                rule="TRADING_ALLOWED",
+                passed=False,
+                current_value=account.get('reason'),
+                limit="Must be able to trade",
+                message=f"Trading blocked: {account.get('reason')}"
+            ))
+            all_passed = False
+        else:
+            checks.append(RiskCheck(
+                rule="TRADING_ALLOWED",
+                passed=True,
+                current_value="OK",
+                limit="Must be able to trade",
+                message="Trading is allowed"
+            ))
+        
+        # 2. Check symbol is in approved universe
+        symbol = trade_plan.get('symbol', '')
+        in_universe = symbol in APPROVED_UNIVERSE
+        checks.append(RiskCheck(
+            rule="APPROVED_UNIVERSE",
+            passed=in_universe,
+            current_value=symbol,
+            limit=f"Must be in {len(APPROVED_UNIVERSE)} approved symbols",
+            message="Symbol approved" if in_universe else f"{symbol} not in approved universe"
+        ))
+        if not in_universe:
+            all_passed = False
+        
+        # 3. Check risk per trade
+        risk_pct = trade_plan.get('risk_pct', 1)
+        risk_ok = risk_pct <= HARD_RULES["RISK_PER_TRADE"] * 100
+        checks.append(RiskCheck(
+            rule="RISK_PER_TRADE",
+            passed=risk_ok,
+            current_value=f"{risk_pct:.3f}%",
+            limit=f"<= {HARD_RULES['RISK_PER_TRADE']*100}%",
+            message="Risk within limit" if risk_ok else "Risk exceeds limit"
+        ))
+        if not risk_ok:
+            all_passed = False
+        
+        # 4. Check max positions
+        current_positions = account.get('positions_count', 0)
+        positions_ok = current_positions < HARD_RULES["MAX_POSITIONS"]
+        checks.append(RiskCheck(
+            rule="MAX_POSITIONS",
+            passed=positions_ok,
+            current_value=current_positions,
+            limit=f"< {HARD_RULES['MAX_POSITIONS']}",
+            message="Position limit OK" if positions_ok else "Max positions reached"
+        ))
+        if not positions_ok:
+            all_passed = False
+        
+        # 5. Check stop loss exists and is in correct direction
+        has_sl = trade_plan.get('stop_loss', 0) > 0
+        entry_price = trade_plan.get('entry_price', 0)
+        stop_loss = trade_plan.get('stop_loss', 0)
+        side = trade_plan.get('side', 'BUY')
+        
+        sl_direction_ok = True
+        sl_message = "Stop loss set"
+        
+        if has_sl and entry_price > 0:
+            if side == 'BUY':
+                # For long: SL must be BELOW entry
+                if stop_loss >= entry_price:
+                    sl_direction_ok = False
+                    sl_message = f"BUY trade: SL (₹{stop_loss}) must be BELOW entry (₹{entry_price})"
+            elif side == 'SELL':
+                # For short: SL must be ABOVE entry
+                if stop_loss <= entry_price:
+                    sl_direction_ok = False
+                    sl_message = f"SELL trade: SL (₹{stop_loss}) must be ABOVE entry (₹{entry_price})"
+        
+        sl_valid = has_sl and sl_direction_ok
+        checks.append(RiskCheck(
+            rule="STOP_LOSS_REQUIRED",
+            passed=sl_valid,
+            current_value=f"SL: ₹{stop_loss}, Entry: ₹{entry_price}, Side: {side}",
+            limit="Must have correctly placed stop loss",
+            message=sl_message if sl_valid else sl_message
+        ))
+        if not sl_valid:
+            all_passed = False
+        
+        # 6. Check daily loss limit
+        daily_loss_pct = account.get('daily_loss_pct', 0)
+        daily_ok = daily_loss_pct < HARD_RULES["MAX_DAILY_LOSS"]
+        checks.append(RiskCheck(
+            rule="DAILY_LOSS_LIMIT",
+            passed=daily_ok,
+            current_value=f"{daily_loss_pct*100:.2f}%",
+            limit=f"< {HARD_RULES['MAX_DAILY_LOSS']*100}%",
+            message="Daily loss OK" if daily_ok else "Daily loss limit reached"
+        ))
+        if not daily_ok:
+            all_passed = False
+        
+        return {
+            "all_passed": all_passed,
+            "checks": [asdict(c) for c in checks],
+            "trade_approved": all_passed,
+            "message": "✅ All checks passed - trade can proceed" if all_passed else "❌ Trade blocked - rule violations detected"
+        }
+    
+    def place_order(self, order: Dict) -> Dict:
+        """
+        Tool: Place an order with Zerodha (or simulate in paper mode)
+        Only works if validate_trade passes and no duplicate exists
+        """
+        symbol = order.get('symbol', '')
+        
+        # CHECK FOR DUPLICATE TRADE
+        if self.is_symbol_in_active_trades(symbol):
+            existing = self.get_active_trade(symbol)
+            return {
+                "success": False,
+                "error": f"DUPLICATE TRADE BLOCKED: {symbol} already has an active position",
+                "existing_trade": {
+                    "symbol": existing['symbol'],
+                    "side": existing['side'],
+                    "entry": existing['avg_price'],
+                    "stop_loss": existing['stop_loss'],
+                    "target": existing.get('target'),
+                    "opened_at": existing.get('timestamp')
+                }
+            }
+        
+        # First validate
+        validation = self.validate_trade(order)
+        if not validation['all_passed']:
+            return {
+                "success": False,
+                "error": "Trade validation failed",
+                "validation": validation
+            }
+        
+        self._rate_limit()
+        
+        try:
+            # PAPER MODE: Simulate the order
+            if self.paper_mode:
+                import random
+                paper_order_id = f"PAPER_{random.randint(100000, 999999)}"
+                
+                # Add to paper positions
+                position = {
+                    'symbol': symbol,
+                    'quantity': order['quantity'],
+                    'avg_price': order['entry_price'],
+                    'side': order['side'],
+                    'stop_loss': order['stop_loss'],
+                    'target': order.get('target', order['entry_price'] * (1.02 if order['side'] == 'BUY' else 0.98)),
+                    'order_id': paper_order_id,
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': order.get('rationale', 'No rationale provided')
+                }
+                self.paper_positions.append(position)
+                
+                # SAVE TO FILE immediately
+                self._save_active_trades()
+                
+                # Update paper capital (reduce by position value)
+                position_value = order['quantity'] * order['entry_price']
+                
+                return {
+                    "success": True,
+                    "paper_trade": True,
+                    "order_id": paper_order_id,
+                    "sl_order_id": f"PAPER_SL_{random.randint(100000, 999999)}",
+                    "message": f"📝 PAPER ORDER: {order['side']} {order['quantity']} {symbol} @ ₹{order['entry_price']:.2f}",
+                    "position_value": position_value,
+                    "stop_loss": order['stop_loss'],
+                    "target": order.get('target'),
+                    "details": order
+                }
+            
+            # LIVE MODE: Place real order
+            exchange, tradingsymbol = symbol.split(":")
+            
+            # Place main order
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_BUY if order['side'] == 'BUY' else self.kite.TRANSACTION_TYPE_SELL,
+                quantity=order['quantity'],
+                product=self.kite.PRODUCT_MIS,  # Intraday
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                validity=self.kite.VALIDITY_DAY
+            )
+            
+            # Place SL order
+            sl_side = self.kite.TRANSACTION_TYPE_SELL if order['side'] == 'BUY' else self.kite.TRANSACTION_TYPE_BUY
+            sl_trigger = order['stop_loss'] * (0.999 if order['side'] == 'BUY' else 1.001)
+            
+            sl_order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=sl_side,
+                quantity=order['quantity'],
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_SLM,
+                trigger_price=sl_trigger,
+                validity=self.kite.VALIDITY_DAY
+            )
+            
+            return {
+                "success": True,
+                "order_id": order_id,
+                "sl_order_id": sl_order_id,
+                "message": f"Order placed: {order['side']} {order['quantity']} {symbol}",
+                "details": order
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    def get_portfolio_risk(self) -> Dict:
+        """
+        Tool: Get current portfolio risk exposure
+        """
+        account = self.get_account_state()
+        
+        total_exposure = 0
+        total_risk = 0
+        
+        for pos in account.get('open_positions', []):
+            qty = abs(pos['quantity'])
+            price = pos['ltp']
+            exposure = qty * price
+            total_exposure += exposure
+            # Assume 2% risk per position if SL unknown
+            total_risk += exposure * 0.02
+        
+        capital = account.get('total_equity', 0)
+        
+        return {
+            "total_equity": round(capital, 2),
+            "total_exposure": round(total_exposure, 2),
+            "exposure_pct": round(total_exposure / capital * 100, 2) if capital > 0 else 0,
+            "estimated_risk": round(total_risk, 2),
+            "risk_pct": round(total_risk / capital * 100, 2) if capital > 0 else 0,
+            "positions_count": len(account.get('open_positions', [])),
+            "max_positions": HARD_RULES["MAX_POSITIONS"],
+            "daily_pnl": round(account.get('realized_pnl', 0) + account.get('unrealized_pnl', 0), 2),
+            "daily_loss_limit_remaining": round(
+                (HARD_RULES["MAX_DAILY_LOSS"] * capital) - abs(account.get('daily_loss', 0)), 2
+            )
+        }
+    
+    def get_options_chain(self, symbol: str, bias: str = "neutral") -> Dict:
+        """
+        Tool: Get options chain for a stock with best option recommendations
+        
+        Args:
+            symbol: Stock symbol like 'NSE:RELIANCE'
+            bias: 'bullish', 'bearish', or 'neutral'
+        
+        Returns:
+            Options chain with ATM strikes and recommendations
+        """
+        self._rate_limit()
+        
+        try:
+            # Extract trading symbol
+            exchange, tradingsymbol = symbol.split(":")
+            
+            # Get spot price
+            quote = self.kite.quote([symbol])
+            spot_price = quote[symbol]['last_price']
+            
+            # Get all instruments
+            instruments = self.kite.instruments("NFO")
+            
+            # Filter options for this stock
+            stock_options = [i for i in instruments 
+                           if i['name'] == tradingsymbol 
+                           and i['instrument_type'] in ['CE', 'PE']]
+            
+            if not stock_options:
+                return {"error": f"No options found for {tradingsymbol}"}
+            
+            # Get nearest expiry
+            expiries = sorted(set([i['expiry'] for i in stock_options]))
+            nearest_expiry = expiries[0]
+            
+            # Filter to nearest expiry
+            options = [o for o in stock_options if o['expiry'] == nearest_expiry]
+            
+            # Find ATM strike
+            strikes = sorted(set([o['strike'] for o in options]))
+            atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+            atm_idx = strikes.index(atm_strike)
+            
+            # Get relevant strikes (ATM ± 2)
+            relevant_strikes = strikes[max(0, atm_idx-2):atm_idx+3]
+            
+            # Get tokens for relevant options
+            relevant_options = [o for o in options if o['strike'] in relevant_strikes]
+            tokens = [o['instrument_token'] for o in relevant_options]
+            
+            # Get quotes
+            quotes = self.kite.quote(tokens)
+            
+            # Build chain
+            chain = {}
+            for opt in relevant_options:
+                strike = opt['strike']
+                if strike not in chain:
+                    chain[strike] = {'CE': None, 'PE': None}
+                
+                token = opt['instrument_token']
+                q = quotes.get(str(token), quotes.get(token, {}))
+                
+                chain[strike][opt['instrument_type']] = {
+                    'symbol': f"NFO:{opt['tradingsymbol']}",
+                    'token': token,
+                    'ltp': q.get('last_price', 0),
+                    'bid': q.get('depth', {}).get('buy', [{}])[0].get('price', 0),
+                    'ask': q.get('depth', {}).get('sell', [{}])[0].get('price', 0),
+                    'oi': q.get('oi', 0),
+                    'volume': q.get('volume', 0),
+                    'lot_size': opt['lot_size']
+                }
+            
+            # Recommend best option based on bias
+            recommendation = None
+            if bias == "bullish":
+                ce = chain[atm_strike].get('CE')
+                if ce:
+                    recommendation = {
+                        "action": "BUY",
+                        "option_type": "CE",
+                        "strike": atm_strike,
+                        "symbol": ce['symbol'],
+                        "premium": ce['ltp'],
+                        "lot_size": ce['lot_size'],
+                        "cost_per_lot": ce['ltp'] * ce['lot_size'],
+                        "rationale": f"ATM Call for bullish view on {tradingsymbol}"
+                    }
+            elif bias == "bearish":
+                pe = chain[atm_strike].get('PE')
+                if pe:
+                    recommendation = {
+                        "action": "BUY",
+                        "option_type": "PE",
+                        "strike": atm_strike,
+                        "symbol": pe['symbol'],
+                        "premium": pe['ltp'],
+                        "lot_size": pe['lot_size'],
+                        "cost_per_lot": pe['ltp'] * pe['lot_size'],
+                        "rationale": f"ATM Put for bearish view on {tradingsymbol}"
+                    }
+            
+            return {
+                "symbol": symbol,
+                "spot_price": spot_price,
+                "expiry": str(nearest_expiry),
+                "atm_strike": atm_strike,
+                "chain": chain,
+                "recommendation": recommendation,
+                "fno_enabled": FNO_CONFIG.get('enabled', False)
+            }
+            
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def place_option_order(self, option_symbol: str, action: str, quantity: int, 
+                           premium: float, stop_loss_pct: float = 30) -> Dict:
+        """
+        Tool: Place an option order
+        
+        Args:
+            option_symbol: Full option symbol like 'NFO:RELIANCE25FEB2500CE'
+            action: 'BUY' only (no selling allowed)
+            quantity: Number of lots
+            premium: Expected premium per share
+            stop_loss_pct: Stop loss as % of premium (default 30%)
+        """
+        if action != "BUY":
+            return {"error": "Only BUY orders allowed for options"}
+        
+        self._rate_limit()
+        
+        try:
+            exchange, tradingsymbol = option_symbol.split(":")
+            
+            # Get lot size (estimate for paper mode)
+            lot_size = 1000  # Default lot size estimate
+            
+            if not self.paper_mode:
+                # Get actual lot size from instruments
+                instruments = self.kite.instruments("NFO")
+                for inst in instruments:
+                    if inst['tradingsymbol'] == tradingsymbol:
+                        lot_size = inst['lot_size']
+                        break
+            
+            total_qty = quantity * lot_size
+            
+            # PAPER MODE: Simulate the option order
+            if self.paper_mode:
+                import random
+                paper_order_id = f"PAPER_OPT_{random.randint(100000, 999999)}"
+                
+                position = {
+                    'symbol': option_symbol,
+                    'quantity': total_qty,
+                    'lots': quantity,
+                    'lot_size': lot_size,
+                    'avg_price': premium,
+                    'side': 'BUY',
+                    'stop_loss': premium * (1 - stop_loss_pct/100),
+                    'type': 'OPTION',
+                    'order_id': paper_order_id,
+                    'timestamp': datetime.now().isoformat()
+                }
+                self.paper_positions.append(position)
+                
+                cost = premium * total_qty
+                
+                return {
+                    "success": True,
+                    "paper_trade": True,
+                    "order_id": paper_order_id,
+                    "message": f"📝 PAPER OPTION: BUY {quantity} lots of {tradingsymbol} @ ₹{premium:.2f}",
+                    "details": {
+                        "symbol": option_symbol,
+                        "lots": quantity,
+                        "lot_size": lot_size,
+                        "total_qty": total_qty,
+                        "expected_premium": premium,
+                        "expected_cost": cost,
+                        "stop_loss_at": premium * (1 - stop_loss_pct/100)
+                    }
+                }
+            
+            # LIVE MODE: Place real order
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange="NFO",
+                tradingsymbol=tradingsymbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                quantity=total_qty,
+                product=self.kite.PRODUCT_MIS,  # Intraday
+                order_type=self.kite.ORDER_TYPE_MARKET
+            )
+            
+            return {
+                "success": True,
+                "order_id": order_id,
+                "message": f"Option order placed: BUY {quantity} lots of {tradingsymbol}",
+                "details": {
+                    "symbol": option_symbol,
+                    "lots": quantity,
+                    "lot_size": lot_size,
+                    "total_qty": total_qty,
+                    "expected_premium": premium,
+                    "expected_cost": premium * total_qty,
+                    "stop_loss_at": premium * (1 - stop_loss_pct/100)
+                }
+            }
+            
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+# Create singleton instance
+_tools = None
+
+def get_tools(paper_mode: bool = True, paper_capital: float = None) -> ZerodhaTools:
+    global _tools
+    if _tools is None:
+        _tools = ZerodhaTools(paper_mode=paper_mode, paper_capital=paper_capital)
+    return _tools
+
+def reset_tools():
+    """Reset the singleton to allow new configuration"""
+    global _tools
+    _tools = None
+
+
+if __name__ == "__main__":
+    # Test the tools
+    tools = get_tools()
+    
+    print("\n" + "="*60)
+    print("ZERODHA TOOLS TEST")
+    print("="*60)
+    
+    # Test account state
+    print("\n📊 Account State:")
+    account = tools.get_account_state()
+    if 'error' not in account:
+        print(f"   Available Margin: ₹{account['available_margin']:,.2f}")
+        print(f"   Open Positions: {account['positions_count']}")
+        print(f"   Daily P&L: ₹{account['realized_pnl'] + account['unrealized_pnl']:,.2f}")
+        print(f"   Can Trade: {account['can_trade']} ({account['reason']})")
+    else:
+        print(f"   Error: {account['error']}")
+    
+    # Test position sizing
+    print("\n📐 Position Size Calculation:")
+    sizing = tools.calculate_position_size(
+        entry_price=2500,
+        stop_loss=2450,
+        capital=200000,
+        lot_size=1
+    )
+    print(f"   Entry: ₹2500, SL: ₹2450")
+    print(f"   Quantity: {sizing['quantity']}")
+    print(f"   Risk: ₹{sizing['actual_risk']} ({sizing['actual_risk_pct']}%)")
+    
+    # Test trade validation
+    print("\n✅ Trade Validation:")
+    validation = tools.validate_trade({
+        'symbol': 'NSE:RELIANCE',
+        'side': 'BUY',
+        'entry_price': 2500,
+        'stop_loss': 2450,
+        'target': 2600,
+        'quantity': 20,
+        'risk_pct': 0.5
+    })
+    print(f"   All Passed: {validation['all_passed']}")
+    for check in validation['checks']:
+        emoji = "✅" if check['passed'] else "❌"
+        print(f"   {emoji} {check['rule']}: {check['message']}")

@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agentic Trading System</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --border: #30363d;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --accent-green: #3fb950;
+            --accent-red: #f85149;
+            --accent-yellow: #d29922;
+            --accent-blue: #58a6ff;
+            --accent-purple: #a371f7;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-badge {
+            font-size: 12px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: 500;
+        }
+        
+        .status-active { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); border: 1px solid var(--accent-green); }
+        .status-warning { background: rgba(210, 153, 34, 0.15); color: var(--accent-yellow); border: 1px solid var(--accent-yellow); }
+        .status-error { background: rgba(248, 81, 73, 0.15); color: var(--accent-red); border: 1px solid var(--accent-red); }
+        
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            gap: 20px;
+            padding: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+            height: calc(100vh - 80px);
+        }
+        
+        .main-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        
+        .card-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 16px;
+        }
+        
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            max-height: 500px;
+        }
+        
+        .message {
+            padding: 12px 16px;
+            border-radius: 12px;
+            max-width: 90%;
+        }
+        
+        .message.user {
+            background: var(--accent-blue);
+            color: white;
+            align-self: flex-end;
+        }
+        
+        .message.assistant {
+            background: var(--bg-tertiary);
+            align-self: flex-start;
+            white-space: pre-wrap;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        
+        .message.system {
+            background: rgba(163, 113, 247, 0.15);
+            color: var(--accent-purple);
+            align-self: center;
+            font-size: 12px;
+        }
+        
+        .chat-input-container {
+            display: flex;
+            gap: 12px;
+            padding: 16px;
+            border-top: 1px solid var(--border);
+        }
+        
+        .chat-input {
+            flex: 1;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: inherit;
+        }
+        
+        .chat-input:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+        
+        .btn {
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 500;
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary { background: var(--accent-blue); color: white; }
+        .btn-primary:hover { background: #4c9aed; }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .btn-success { background: var(--accent-green); color: white; }
+        .btn-danger { background: var(--accent-red); color: white; }
+        .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-primary); }
+        
+        .quick-actions {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        
+        .quick-btn {
+            padding: 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .quick-btn:hover {
+            background: var(--border);
+        }
+        
+        .side-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .metric {
+            margin-bottom: 12px;
+        }
+        
+        .metric-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        
+        .metric-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        
+        .metric-value.positive { color: var(--accent-green); }
+        .metric-value.negative { color: var(--accent-red); }
+        
+        .rule-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+        
+        .rule-name { color: var(--text-secondary); }
+        .rule-value { font-family: 'JetBrains Mono', monospace; }
+        
+        .pending-trade {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+        
+        .pending-trade-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        
+        .pending-trade-symbol {
+            font-weight: 600;
+        }
+        
+        .pending-trade-side.buy { color: var(--accent-green); }
+        .pending-trade-side.sell { color: var(--accent-red); }
+        
+        .pending-trade-details {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .pending-trade-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        
+        .pending-trade-actions .btn {
+            flex: 1;
+            padding: 8px;
+            font-size: 12px;
+        }
+        
+        .loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+        }
+        
+        .loading::before {
+            content: "";
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent-blue);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+        
+        .indicator-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .indicator-dot.green { background: var(--accent-green); }
+        .indicator-dot.red { background: var(--accent-red); }
+        .indicator-dot.yellow { background: var(--accent-yellow); }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>
+            🤖 Agentic Trading System
+            <span id="statusBadge" class="status-badge status-warning">Checking...</span>
+        </h1>
+        <div style="display: flex; gap: 12px; align-items: center;">
+            <span id="timeDisplay" style="font-size: 13px; color: var(--text-secondary);"></span>
+        </div>
+    </header>
+    
+    <div class="container">
+        <!-- Main Chat Panel -->
+        <div class="main-panel">
+            <div class="card chat-container">
+                <div class="card-title">💬 Agent Chat</div>
+                
+                <div class="quick-actions">
+                    <button class="quick-btn" onclick="sendQuickAction('analyze')">
+                        📊 Analyze Market
+                    </button>
+                    <button class="quick-btn" onclick="sendQuickAction('status')">
+                        📋 Check Status
+                    </button>
+                    <button class="quick-btn" onclick="sendQuickAction('risk')">
+                        ⚠️ Portfolio Risk
+                    </button>
+                    <button class="quick-btn" onclick="promptSymbol()">
+                        🎯 Plan Trade
+                    </button>
+                </div>
+                
+                <div class="chat-messages" id="chatMessages">
+                    <div class="message system">
+                        Agent ready. Ask me to analyze markets, create trade plans, or check risk status.
+                    </div>
+                </div>
+                
+                <div class="chat-input-container">
+                    <input type="text" class="chat-input" id="chatInput" 
+                           placeholder="Ask the agent anything..." 
+                           onkeypress="if(event.key==='Enter') sendMessage()">
+                    <button class="btn btn-primary" onclick="sendMessage()" id="sendBtn">Send</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Side Panel -->
+        <div class="side-panel">
+            <!-- System Status -->
+            <div class="card">
+                <div class="card-title">🔌 System Status</div>
+                <div class="indicator">
+                    <span id="openaiDot" class="indicator-dot red"></span>
+                    <span id="openaiStatus">OpenAI Not Configured</span>
+                </div>
+                <div class="indicator">
+                    <span id="zerodhaDot" class="indicator-dot red"></span>
+                    <span id="zerodhaStatus">Zerodha Disconnected</span>
+                </div>
+                <div class="indicator">
+                    <span id="tradingDot" class="indicator-dot red"></span>
+                    <span id="tradingStatus">Trading Disabled</span>
+                </div>
+            </div>
+            
+            <!-- Account Summary -->
+            <div class="card">
+                <div class="card-title">💰 Account</div>
+                <div class="metric">
+                    <div class="metric-label">Available Margin</div>
+                    <div id="availableMargin" class="metric-value">₹0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Daily P&L</div>
+                    <div id="dailyPnl" class="metric-value">₹0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Positions</div>
+                    <div id="positionsCount" class="metric-value">0 / 3</div>
+                </div>
+            </div>
+            
+            <!-- Hard Rules -->
+            <div class="card">
+                <div class="card-title">⚠️ Hard Rules</div>
+                <div class="rule-item">
+                    <span class="rule-name">Risk per trade</span>
+                    <span class="rule-value">≤ 0.5%</span>
+                </div>
+                <div class="rule-item">
+                    <span class="rule-name">Max daily loss</span>
+                    <span class="rule-value">≤ 1.5%</span>
+                </div>
+                <div class="rule-item">
+                    <span class="rule-name">Max positions</span>
+                    <span class="rule-value">3</span>
+                </div>
+                <div class="rule-item">
+                    <span class="rule-name">Stop-loss</span>
+                    <span class="rule-value">Required</span>
+                </div>
+            </div>
+            
+            <!-- Pending Trades -->
+            <div class="card">
+                <div class="card-title">📋 Pending Approvals</div>
+                <div id="pendingTrades">
+                    <div style="color: var(--text-secondary); font-size: 13px;">
+                        No pending trades
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Update time
+        function updateTime() {
+            document.getElementById('timeDisplay').textContent = 
+                new Date().toLocaleTimeString('en-IN', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+        }
+        setInterval(updateTime, 1000);
+        updateTime();
+        
+        // Fetch status
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                // Update badges
+                const badge = document.getElementById('statusBadge');
+                if (data.openai_configured && data.zerodha_connected) {
+                    badge.textContent = '✅ Ready';
+                    badge.className = 'status-badge status-active';
+                } else if (data.openai_configured || data.zerodha_connected) {
+                    badge.textContent = '⚠️ Partial';
+                    badge.className = 'status-badge status-warning';
+                } else {
+                    badge.textContent = '❌ Not Ready';
+                    badge.className = 'status-badge status-error';
+                }
+                
+                // Update indicators
+                updateIndicator('openai', data.openai_configured, 'OpenAI Connected', 'OpenAI Not Configured');
+                updateIndicator('zerodha', data.zerodha_connected, 'Zerodha Connected', 'Zerodha Disconnected');
+                updateIndicator('trading', data.account?.can_trade, 'Trading Enabled', data.account?.reason || 'Trading Disabled');
+                
+                // Update account
+                if (data.account) {
+                    document.getElementById('availableMargin').textContent = 
+                        `₹${(data.account.available_margin || 0).toLocaleString()}`;
+                    
+                    const pnl = (data.account.realized_pnl || 0) + (data.account.unrealized_pnl || 0);
+                    const pnlEl = document.getElementById('dailyPnl');
+                    pnlEl.textContent = `₹${pnl.toLocaleString()}`;
+                    pnlEl.className = `metric-value ${pnl >= 0 ? 'positive' : 'negative'}`;
+                    
+                    document.getElementById('positionsCount').textContent = 
+                        `${data.account.positions_count || 0} / 3`;
+                }
+            } catch (error) {
+                console.error('Status fetch error:', error);
+            }
+        }
+        
+        function updateIndicator(id, active, activeText, inactiveText) {
+            document.getElementById(`${id}Dot`).className = `indicator-dot ${active ? 'green' : 'red'}`;
+            document.getElementById(`${id}Status`).textContent = active ? activeText : inactiveText;
+        }
+        
+        // Chat functions
+        function addMessage(content, role) {
+            const messages = document.getElementById('chatMessages');
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+            div.textContent = content;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        async function sendMessage() {
+            const input = document.getElementById('chatInput');
+            const message = input.value.trim();
+            if (!message) return;
+            
+            input.value = '';
+            addMessage(message, 'user');
+            
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<span class="loading">Thinking</span>';
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message})
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    addMessage(`Error: ${data.error}`, 'system');
+                } else {
+                    addMessage(data.response, 'assistant');
+                    updatePendingTrades(data.pending_trades || []);
+                }
+            } catch (error) {
+                addMessage(`Error: ${error.message}`, 'system');
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Send';
+            }
+        }
+        
+        async function sendQuickAction(action) {
+            let message = '';
+            switch(action) {
+                case 'analyze':
+                    message = 'Analyze the top 5 stocks from the approved universe for trading opportunities. Focus on technical signals and risk/reward.';
+                    break;
+                case 'status':
+                    message = 'Get and summarize the current account state. Can I trade today? What is my risk exposure?';
+                    break;
+                case 'risk':
+                    message = 'Get the current portfolio risk exposure. How much of my daily loss limit have I used?';
+                    break;
+            }
+            
+            document.getElementById('chatInput').value = message;
+            sendMessage();
+        }
+        
+        function promptSymbol() {
+            const symbol = prompt('Enter symbol (e.g., RELIANCE, TCS):');
+            if (symbol) {
+                document.getElementById('chatInput').value = 
+                    `Create a trade plan for NSE:${symbol.toUpperCase()}. Analyze the technicals and give me entry, stop loss, and target with proper position sizing.`;
+                sendMessage();
+            }
+        }
+        
+        function updatePendingTrades(trades) {
+            const container = document.getElementById('pendingTrades');
+            
+            if (!trades || trades.length === 0) {
+                container.innerHTML = '<div style="color: var(--text-secondary); font-size: 13px;">No pending trades</div>';
+                return;
+            }
+            
+            container.innerHTML = trades.map((trade, i) => `
+                <div class="pending-trade">
+                    <div class="pending-trade-header">
+                        <span class="pending-trade-symbol">${trade.symbol}</span>
+                        <span class="pending-trade-side ${trade.side.toLowerCase()}">${trade.side}</span>
+                    </div>
+                    <div class="pending-trade-details">
+                        Qty: ${trade.quantity} | Entry: ₹${trade.entry_price}<br>
+                        SL: ₹${trade.stop_loss} | Target: ₹${trade.target}
+                    </div>
+                    <div class="pending-trade-actions">
+                        <button class="btn btn-success" onclick="approveTrade(${i})">✓ Approve</button>
+                        <button class="btn btn-danger" onclick="rejectTrade(${i})">✕ Reject</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        async function approveTrade(index) {
+            if (!confirm('Execute this trade?')) return;
+            
+            try {
+                const response = await fetch('/api/approve', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({index})
+                });
+                const data = await response.json();
+                addMessage(`Trade approved: ${data.result}`, 'system');
+                fetchPending();
+            } catch (error) {
+                addMessage(`Error: ${error.message}`, 'system');
+            }
+        }
+        
+        async function rejectTrade(index) {
+            try {
+                const response = await fetch('/api/reject', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({index})
+                });
+                const data = await response.json();
+                addMessage(`Trade rejected`, 'system');
+                fetchPending();
+            } catch (error) {
+                addMessage(`Error: ${error.message}`, 'system');
+            }
+        }
+        
+        async function fetchPending() {
+            try {
+                const response = await fetch('/api/pending');
+                const data = await response.json();
+                updatePendingTrades(data.pending_trades || []);
+            } catch (error) {
+                console.error('Pending fetch error:', error);
+            }
+        }
+        
+        // Initial fetch
+        fetchStatus();
+        fetchPending();
+        setInterval(fetchStatus, 10000);
+    </script>
+</body>
+</html>

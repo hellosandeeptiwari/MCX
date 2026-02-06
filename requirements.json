@@ -1,0 +1,13 @@
+{
+    "name": "mcx-sync-analyzer",
+    "version": "1.0.0",
+    "description": "MCX Base Metal Prices vs MCX Ltd Stock Sync Analyzer for Indian Options Traders",
+    "author": "Options Trader",
+    "dependencies": {
+        "yfinance": ">=0.2.0",
+        "pandas": ">=2.0.0",
+        "numpy": ">=1.24.0",
+        "matplotlib": ">=3.7.0",
+        "scipy": ">=1.10.0"
+    }
+}
