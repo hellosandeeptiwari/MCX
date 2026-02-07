@@ -1,0 +1,22 @@
+{
+  "date": "2026-02-07",
+  "last_updated": "2026-02-07T09:58:48.255375",
+  "stale_counters": {
+    "NSE:INFY": 1,
+    "NSE:TCS": 1,
+    "NSE:RELIANCE": 1,
+    "NSE:HDFC": 0
+  },
+  "halted_symbols": [],
+  "health_history": [
+    {
+      "timestamp": "2026-02-07T09:58:48.255375",
+      "symbol": "NSE:INFY",
+      "status": "STALE",
+      "can_trade": false,
+      "issues": [
+        "STALE_TICK: 3528s old (limit: 60s)"
+      ]
+    }
+  ]
+}

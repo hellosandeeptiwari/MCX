@@ -16,6 +16,13 @@ from config import (
     ZERODHA_API_KEY, ZERODHA_API_SECRET, 
     HARD_RULES, TRADING_HOURS, APPROVED_UNIVERSE, FNO_CONFIG
 )
+from execution_guard import get_execution_guard
+from idempotent_order_engine import get_idempotent_engine
+from correlation_guard import get_correlation_guard
+from regime_score import get_regime_scorer
+from position_reconciliation import get_position_reconciliation
+from data_health_gate import get_data_health_gate
+from options_trader import get_options_trader, OptionType, StrikeSelection, ExpirySelection, get_intraday_scorer, IntradaySignal
 
 
 @dataclass
@@ -71,6 +78,40 @@ class MarketData:
     atr_stoploss: float = 0
     volume_ratio: float = 1.0
     volume_signal: str = "NORMAL"
+    
+    # === REGIME DETECTION SIGNALS ===
+    # VWAP Analysis
+    vwap: float = 0                    # Volume Weighted Average Price
+    vwap_slope: str = "FLAT"           # RISING, FALLING, FLAT
+    price_vs_vwap: str = "AT_VWAP"     # ABOVE_VWAP, BELOW_VWAP, AT_VWAP
+    
+    # EMA Compression/Expansion
+    ema_9: float = 0
+    ema_21: float = 0
+    ema_spread: float = 0              # % difference between 9 and 21 EMA
+    ema_regime: str = "NEUTRAL"        # COMPRESSED, EXPANDING_BULL, EXPANDING_BEAR
+    
+    # Opening Range Breakout (ORB)
+    orb_high: float = 0                # First 15-min high
+    orb_low: float = 0                 # First 15-min low
+    orb_signal: str = "INSIDE_ORB"     # BREAKOUT_UP, BREAKOUT_DOWN, INSIDE_ORB
+    orb_strength: float = 0            # % move from ORB level
+    
+    # Volume Analysis
+    volume_5d_avg: float = 0           # 5-day average volume
+    volume_vs_avg: float = 1.0         # Today's volume / 5-day avg
+    volume_regime: str = "NORMAL"      # LOW, NORMAL, HIGH, EXPLOSIVE
+    
+    # === CHOP FILTER (Anti-Whipsaw) ===
+    chop_zone: bool = False            # True = NO TRADE zone (choppy)
+    chop_reason: str = ""              # Why it's choppy
+    atr_range_ratio: float = 1.0       # Current range / ATR (low = compressed)
+    orb_reentries: int = 0             # Count of ORB re-entries (chop signal)
+    
+    # === HIGHER TIMEFRAME ALIGNMENT ===
+    htf_trend: str = "NEUTRAL"         # BULLISH, BEARISH, NEUTRAL (based on longer EMA)
+    htf_ema_slope: str = "FLAT"        # RISING, FALLING, FLAT
+    htf_alignment: str = "NEUTRAL"     # ALIGNED, CONFLICTING, NEUTRAL
 
 
 @dataclass 
@@ -895,6 +936,25 @@ class ZerodhaTools:
                 # Get historical data for indicators
                 indicators = self._calculate_indicators(symbol)
                 
+                # === DATA HEALTH GATE: Add health check result ===
+                health_gate = get_data_health_gate()
+                health_result = health_gate.check_health(symbol, {
+                    'ltp': q.get('last_price', 0),
+                    'volume': q.get('volume', 0),
+                    'volume_ratio': indicators.get('volume_ratio', 1.0),
+                    'timestamp': str(datetime.now()),
+                    'last_trade_time': q.get('last_trade_time'),
+                    'vwap': indicators.get('vwap', 0),
+                    'ema_9': indicators.get('ema_9', 0),
+                    'ema_21': indicators.get('ema_21', 0),
+                    'sma_20': indicators.get('sma_20', 0),
+                    'atr_14': indicators.get('atr_14', 0),
+                    'rsi_14': indicators.get('rsi_14', 50)
+                })
+                
+                # Use health gate stale check instead of simple is_stale
+                is_stale = not health_result.can_trade or is_stale
+                
                 data = MarketData(
                     symbol=symbol,
                     ltp=q.get('last_price', 0),
@@ -909,7 +969,48 @@ class ZerodhaTools:
                     sma_20=indicators.get('sma_20', 0),
                     sma_50=indicators.get('sma_50', 0),
                     rsi_14=indicators.get('rsi_14', 50),
-                    atr_14=indicators.get('atr_14', 0)
+                    atr_14=indicators.get('atr_14', 0),
+                    # Enhanced context
+                    trend=indicators.get('trend', 'SIDEWAYS'),
+                    high_20d=indicators.get('high_20d', 0),
+                    low_20d=indicators.get('low_20d', 0),
+                    high_5d=indicators.get('high_5d', 0),
+                    low_5d=indicators.get('low_5d', 0),
+                    prev_high=indicators.get('prev_high', 0),
+                    prev_low=indicators.get('prev_low', 0),
+                    prev_close=indicators.get('prev_close', 0),
+                    resistance_1=indicators.get('resistance_1', 0),
+                    resistance_2=indicators.get('resistance_2', 0),
+                    support_1=indicators.get('support_1', 0),
+                    support_2=indicators.get('support_2', 0),
+                    atr_target=indicators.get('atr_target', 0),
+                    atr_stoploss=indicators.get('atr_stoploss', 0),
+                    volume_ratio=indicators.get('volume_ratio', 1.0),
+                    volume_signal=indicators.get('volume_signal', 'NORMAL'),
+                    # === REGIME DETECTION ===
+                    vwap=indicators.get('vwap', 0),
+                    vwap_slope=indicators.get('vwap_slope', 'FLAT'),
+                    price_vs_vwap=indicators.get('price_vs_vwap', 'AT_VWAP'),
+                    ema_9=indicators.get('ema_9', 0),
+                    ema_21=indicators.get('ema_21', 0),
+                    ema_spread=indicators.get('ema_spread', 0),
+                    ema_regime=indicators.get('ema_regime', 'NEUTRAL'),
+                    orb_high=indicators.get('orb_high', 0),
+                    orb_low=indicators.get('orb_low', 0),
+                    orb_signal=indicators.get('orb_signal', 'INSIDE_ORB'),
+                    orb_strength=indicators.get('orb_strength', 0),
+                    volume_5d_avg=indicators.get('volume_5d_avg', 0),
+                    volume_vs_avg=indicators.get('volume_vs_avg', 1.0),
+                    volume_regime=indicators.get('volume_regime', 'NORMAL'),
+                    # === CHOP FILTER ===
+                    chop_zone=indicators.get('chop_zone', False),
+                    chop_reason=indicators.get('chop_reason', ''),
+                    atr_range_ratio=indicators.get('atr_range_ratio', 1.0),
+                    orb_reentries=indicators.get('orb_reentries', 0),
+                    # === HTF ALIGNMENT ===
+                    htf_trend=indicators.get('htf_trend', 'NEUTRAL'),
+                    htf_ema_slope=indicators.get('htf_ema_slope', 'FLAT'),
+                    htf_alignment=indicators.get('htf_alignment', 'NEUTRAL')
                 )
                 
                 result[symbol] = asdict(data)
@@ -994,6 +1095,168 @@ class ZerodhaTools:
             current_volume = vol.iloc[-1]
             volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1
             
+            # === REGIME DETECTION CALCULATIONS ===
+            
+            # 1. EMA 9 and 21 for compression/expansion
+            ema_9_series = close.ewm(span=9, adjust=False).mean()
+            ema_21_series = close.ewm(span=21, adjust=False).mean()
+            ema_9 = ema_9_series.iloc[-1]
+            ema_21 = ema_21_series.iloc[-1]
+            ema_spread = abs(ema_9 - ema_21) / ema_21 * 100 if ema_21 > 0 else 0
+            
+            # EMA regime detection - TIME-QUALIFIED COMPRESSION
+            # Check if compression has persisted for 5+ candles
+            compression_threshold = 0.3  # % spread threshold
+            if len(ema_9_series) >= 5:
+                recent_spreads = abs(ema_9_series.iloc[-5:] - ema_21_series.iloc[-5:]) / ema_21_series.iloc[-5:] * 100
+                candles_compressed = (recent_spreads < compression_threshold).sum()
+                
+                if candles_compressed >= 5:
+                    ema_regime = "COMPRESSED"  # Squeeze for 5+ candles - valid breakout setup
+                elif ema_9 > ema_21:
+                    ema_regime = "EXPANDING_BULL"
+                else:
+                    ema_regime = "EXPANDING_BEAR"
+            else:
+                ema_regime = "NEUTRAL"
+            
+            # 2. VWAP calculation (for daily data, approximate)
+            typical_price = (high + low + close) / 3
+            cumulative_tpv = (typical_price * vol).cumsum()
+            cumulative_vol = vol.cumsum()
+            vwap_series = cumulative_tpv / cumulative_vol
+            vwap = vwap_series.iloc[-1] if len(vwap_series) > 0 else current_price
+            
+            # VWAP slope over 5 candles (not tick-to-tick to avoid chop)
+            if len(vwap_series) >= 5:
+                vwap_5_ago = vwap_series.iloc[-5]
+                vwap_now = vwap_series.iloc[-1]
+                vwap_change_pct = (vwap_now - vwap_5_ago) / vwap_5_ago * 100 if vwap_5_ago > 0 else 0
+                
+                if vwap_change_pct > 0.5:  # >0.5% rise over 5 candles
+                    vwap_slope = "RISING"
+                elif vwap_change_pct < -0.5:  # <-0.5% fall over 5 candles
+                    vwap_slope = "FALLING"
+                else:
+                    vwap_slope = "FLAT"
+            else:
+                vwap_slope = "FLAT"
+            
+            # Price vs VWAP
+            if current_price > vwap * 1.005:
+                price_vs_vwap = "ABOVE_VWAP"
+            elif current_price < vwap * 0.995:
+                price_vs_vwap = "BELOW_VWAP"
+            else:
+                price_vs_vwap = "AT_VWAP"
+            
+            # 3. Opening Range Breakout (using previous day high/low as proxy for ORB)
+            orb_high = prev_high
+            orb_low = prev_low
+            orb_range = orb_high - orb_low
+            
+            if current_price > orb_high:
+                orb_signal = "BREAKOUT_UP"
+                orb_strength = (current_price - orb_high) / orb_range * 100 if orb_range > 0 else 0
+            elif current_price < orb_low:
+                orb_signal = "BREAKOUT_DOWN"
+                orb_strength = (orb_low - current_price) / orb_range * 100 if orb_range > 0 else 0
+            else:
+                orb_signal = "INSIDE_ORB"
+                orb_strength = 0
+            
+            # 4. Volume relative to 5-day average
+            volume_5d_avg = vol.tail(5).mean() if len(vol) >= 5 else vol.mean()
+            volume_vs_avg = current_volume / volume_5d_avg if volume_5d_avg > 0 else 1.0
+            
+            if volume_vs_avg < 0.5:
+                volume_regime = "LOW"
+            elif volume_vs_avg < 1.2:
+                volume_regime = "NORMAL"
+            elif volume_vs_avg < 2.0:
+                volume_regime = "HIGH"
+            else:
+                volume_regime = "EXPLOSIVE"
+            
+            # === 5. CHOP FILTER (Anti-Whipsaw) ===
+            chop_zone = False
+            chop_reason = ""
+            
+            # Calculate ATR/Range ratio for last 5 candles
+            if len(df) >= 5:
+                recent_high = high.iloc[-5:].max()
+                recent_low = low.iloc[-5:].min()
+                recent_range = recent_high - recent_low
+                atr_range_ratio = recent_range / atr if atr > 0 else 1.0
+            else:
+                atr_range_ratio = 1.0
+            
+            # Count ORB re-entries (price crossing back into ORB multiple times)
+            orb_reentries = 0
+            if len(df) >= 10:
+                for i in range(-10, 0):
+                    price_i = close.iloc[i]
+                    price_prev = close.iloc[i-1] if i > -10 else close.iloc[i]
+                    # Check if crossed back into ORB from outside
+                    if orb_low <= price_i <= orb_high:
+                        if price_prev > orb_high or price_prev < orb_low:
+                            orb_reentries += 1
+            
+            # CHOP Zone detection (any of these = NO TRADE)
+            # 1. VWAP is flat AND volume is not high
+            if vwap_slope == "FLAT" and volume_regime in ["LOW", "NORMAL"]:
+                chop_zone = True
+                chop_reason = "VWAP_FLAT+LOW_VOL"
+            
+            # 2. Range too compressed (< 0.5x ATR over 5 candles)
+            elif atr_range_ratio < 0.5:
+                chop_zone = True
+                chop_reason = "COMPRESSED_RANGE"
+            
+            # 3. ORB containment with multiple re-entries (whipsaw)
+            elif orb_reentries >= 3 and volume_regime in ["LOW", "NORMAL"]:
+                chop_zone = True
+                chop_reason = "ORB_WHIPSAW"
+            
+            # === 6. HIGHER TIMEFRAME (HTF) ALIGNMENT ===
+            # Use 50-period EMA as HTF proxy (simulates longer timeframe trend)
+            htf_trend = "NEUTRAL"
+            htf_ema_slope = "FLAT"
+            htf_alignment = "NEUTRAL"
+            
+            if len(df) >= 50:
+                ema_50 = close.ewm(span=50, adjust=False).mean()
+                ema_50_now = ema_50.iloc[-1]
+                ema_50_10_ago = ema_50.iloc[-10] if len(ema_50) >= 10 else ema_50.iloc[0]
+                
+                # HTF trend based on price vs 50 EMA
+                if current_price > ema_50_now * 1.005:
+                    htf_trend = "BULLISH"
+                elif current_price < ema_50_now * 0.995:
+                    htf_trend = "BEARISH"
+                else:
+                    htf_trend = "NEUTRAL"
+                
+                # 50 EMA slope (over 10 periods)
+                ema_50_change = (ema_50_now - ema_50_10_ago) / ema_50_10_ago * 100 if ema_50_10_ago > 0 else 0
+                if ema_50_change > 0.5:
+                    htf_ema_slope = "RISING"
+                elif ema_50_change < -0.5:
+                    htf_ema_slope = "FALLING"
+                else:
+                    htf_ema_slope = "FLAT"
+                
+                # Alignment check - does intraday signal match HTF?
+                # Will be set by caller based on intended trade direction
+                if htf_trend == "BULLISH" and htf_ema_slope == "RISING":
+                    htf_alignment = "BULLISH_ALIGNED"
+                elif htf_trend == "BEARISH" and htf_ema_slope == "FALLING":
+                    htf_alignment = "BEARISH_ALIGNED"
+                elif htf_ema_slope == "FLAT":
+                    htf_alignment = "NEUTRAL"
+                else:
+                    htf_alignment = "MIXED"
+            
             # Support/Resistance (swing points)
             resistance_1 = high_5d
             resistance_2 = high_20d
@@ -1009,7 +1272,7 @@ class ZerodhaTools:
                 'sma_50': round(sma_50, 2),
                 'rsi_14': round(rsi, 2),
                 'atr_14': round(atr, 2),
-                # New fields
+                # Trend
                 'trend': trend,
                 'high_20d': round(high_20d, 2),
                 'low_20d': round(low_20d, 2),
@@ -1025,7 +1288,31 @@ class ZerodhaTools:
                 'atr_target': atr_target,
                 'atr_stoploss': atr_stoploss,
                 'volume_ratio': round(volume_ratio, 2),
-                'volume_signal': 'HIGH' if volume_ratio > 1.5 else 'LOW' if volume_ratio < 0.5 else 'NORMAL'
+                'volume_signal': 'HIGH' if volume_ratio > 1.5 else 'LOW' if volume_ratio < 0.5 else 'NORMAL',
+                # === NEW REGIME DETECTION FIELDS ===
+                'vwap': round(vwap, 2),
+                'vwap_slope': vwap_slope,
+                'price_vs_vwap': price_vs_vwap,
+                'ema_9': round(ema_9, 2),
+                'ema_21': round(ema_21, 2),
+                'ema_spread': round(ema_spread, 2),
+                'ema_regime': ema_regime,
+                'orb_high': round(orb_high, 2),
+                'orb_low': round(orb_low, 2),
+                'orb_signal': orb_signal,
+                'orb_strength': round(orb_strength, 2),
+                'volume_5d_avg': round(volume_5d_avg, 0),
+                'volume_vs_avg': round(volume_vs_avg, 2),
+                'volume_regime': volume_regime,
+                # === CHOP FILTER FIELDS ===
+                'chop_zone': chop_zone,
+                'chop_reason': chop_reason,
+                'atr_range_ratio': round(atr_range_ratio, 2),
+                'orb_reentries': orb_reentries,
+                # === HTF ALIGNMENT FIELDS ===
+                'htf_trend': htf_trend,
+                'htf_ema_slope': htf_ema_slope,
+                'htf_alignment': htf_alignment
             }
             
         except Exception as e:
@@ -1036,38 +1323,146 @@ class ZerodhaTools:
         entry_price: float, 
         stop_loss: float, 
         capital: float,
-        lot_size: int = 1
+        lot_size: int = 1,
+        atr: float = 0,
+        volume_regime: str = "NORMAL",
+        spread_bps: float = 0,
+        available_margin: float = 0
     ) -> Dict:
         """
-        Tool: Calculate safe position size based on risk rules
+        Tool: Calculate adaptive position size based on R-risk and volatility
+        
+        Key improvements:
+        1. R-based sizing: risk_amount = equity * risk_per_trade
+        2. Volatility adjustment: Reduce size in high vol
+        3. Spread penalty: Reduce size if spread is wide
+        4. Margin cap: Don't exceed available margin
+        5. Liquidity cap: Don't take too large a position
         """
         risk_per_share = abs(entry_price - stop_loss)
         
         if risk_per_share == 0:
-            return {"error": "Stop loss equals entry price", "quantity": 0}
+            return {
+                "error": "Stop loss equals entry price", 
+                "quantity": 0,
+                "reason": "Invalid stop loss"
+            }
         
-        # Max risk amount (0.5% of capital)
-        max_risk = capital * HARD_RULES["RISK_PER_TRADE"]
+        # === BASE R-RISK CALCULATION ===
+        # Risk 0.5-1% of capital per trade
+        base_risk_pct = HARD_RULES["RISK_PER_TRADE"]  # e.g., 0.005 = 0.5%
+        max_risk = capital * base_risk_pct
         
-        # Calculate quantity
-        quantity = int(max_risk / risk_per_share)
+        # Base quantity from R-risk
+        base_quantity = int(max_risk / risk_per_share)
         
-        # Round to lot size
+        # === VOLATILITY ADJUSTMENT ===
+        # High volatility = reduce position size for survivability
+        vol_multiplier = 1.0
+        vol_warning = ""
+        
+        if atr > 0 and entry_price > 0:
+            atr_pct = (atr / entry_price) * 100
+            
+            if atr_pct > 3.0:  # Very high volatility (>3% daily ATR)
+                vol_multiplier = 0.5
+                vol_warning = f"High vol ({atr_pct:.1f}% ATR) - size reduced 50%"
+            elif atr_pct > 2.0:  # High volatility
+                vol_multiplier = 0.7
+                vol_warning = f"Elevated vol ({atr_pct:.1f}% ATR) - size reduced 30%"
+            elif atr_pct > 1.5:  # Moderate volatility
+                vol_multiplier = 0.85
+                vol_warning = f"Moderate vol ({atr_pct:.1f}% ATR) - size reduced 15%"
+        
+        # === VOLUME REGIME ADJUSTMENT ===
+        # EXPLOSIVE = allow normal, HIGH = normal, NORMAL = reduce, LOW = block
+        regime_multiplier = 1.0
+        regime_warning = ""
+        
+        if volume_regime == "LOW":
+            return {
+                "error": "Volume too low for safe entry",
+                "quantity": 0,
+                "reason": "LOW volume regime - trading blocked"
+            }
+        elif volume_regime == "NORMAL":
+            regime_multiplier = 0.8
+            regime_warning = "Normal volume - conservative sizing"
+        elif volume_regime == "EXPLOSIVE":
+            regime_multiplier = 1.0  # Full size OK
+        
+        # === SPREAD PENALTY ===
+        # Wide spreads eat into profits - reduce size
+        spread_multiplier = 1.0
+        spread_warning = ""
+        
+        if spread_bps > 30:  # Wide spread
+            spread_multiplier = 0.7
+            spread_warning = f"Wide spread ({spread_bps:.0f} bps) - size reduced"
+        elif spread_bps > 20:
+            spread_multiplier = 0.85
+        
+        # === APPLY ALL ADJUSTMENTS ===
+        adjusted_quantity = int(base_quantity * vol_multiplier * regime_multiplier * spread_multiplier)
+        
+        # === CAP BY MARGIN ===
+        if available_margin > 0:
+            # Assume 5x leverage for F&O, 1x for equity
+            max_position_value = available_margin * 0.8  # Use only 80% of margin
+            max_qty_by_margin = int(max_position_value / entry_price)
+            
+            if adjusted_quantity > max_qty_by_margin:
+                adjusted_quantity = max_qty_by_margin
+        
+        # === CAP BY MAX POSITION SIZE ===
+        # Never risk more than 25% of capital in one position
+        max_position_pct = 0.25
+        max_position_value = capital * max_position_pct
+        max_qty_by_position = int(max_position_value / entry_price)
+        
+        if adjusted_quantity > max_qty_by_position:
+            adjusted_quantity = max_qty_by_position
+        
+        # === ROUND TO LOT SIZE ===
         if lot_size > 1:
-            quantity = (quantity // lot_size) * lot_size
+            adjusted_quantity = (adjusted_quantity // lot_size) * lot_size
         
-        actual_risk = risk_per_share * quantity
-        actual_risk_pct = actual_risk / capital * 100
+        # Minimum quantity check
+        if adjusted_quantity < 1:
+            adjusted_quantity = 1 if lot_size == 1 else lot_size
+        
+        # === FINAL CALCULATIONS ===
+        actual_risk = risk_per_share * adjusted_quantity
+        actual_risk_pct = (actual_risk / capital) * 100
+        position_value = entry_price * adjusted_quantity
+        position_pct = (position_value / capital) * 100
+        
+        # Collect warnings
+        warnings = []
+        if vol_warning:
+            warnings.append(vol_warning)
+        if regime_warning:
+            warnings.append(regime_warning)
+        if spread_warning:
+            warnings.append(spread_warning)
         
         return {
-            "quantity": quantity,
+            "quantity": adjusted_quantity,
             "risk_per_share": round(risk_per_share, 2),
             "max_risk_allowed": round(max_risk, 2),
             "actual_risk": round(actual_risk, 2),
             "actual_risk_pct": round(actual_risk_pct, 3),
             "entry_price": entry_price,
             "stop_loss": stop_loss,
-            "position_value": round(entry_price * quantity, 2)
+            "position_value": round(position_value, 2),
+            "position_pct": round(position_pct, 2),
+            # Adjustment factors
+            "base_quantity": base_quantity,
+            "vol_multiplier": vol_multiplier,
+            "regime_multiplier": regime_multiplier,
+            "spread_multiplier": spread_multiplier,
+            "warnings": warnings,
+            "sizing_method": "R-RISK_ADAPTIVE"
         }
     
     def validate_trade(self, trade_plan: Dict) -> Dict:
@@ -1194,11 +1589,81 @@ class ZerodhaTools:
     def place_order(self, order: Dict) -> Dict:
         """
         Tool: Place an order with Zerodha (or simulate in paper mode)
-        Only works if validate_trade passes and no duplicate exists
+        Only works if validate_trade passes, execution guard approves, and no duplicate exists
+        Uses idempotent order engine to prevent duplicate orders on reconnect/retry
         """
         symbol = order.get('symbol', '')
+        side = order.get('side', 'BUY')
+        quantity = order.get('quantity', 0)
+        strategy = order.get('strategy', 'MANUAL')
+        setup_id = order.get('setup_id', order.get('rationale', 'DEFAULT')[:20])
         
-        # CHECK FOR DUPLICATE TRADE
+        # === POSITION RECONCILIATION CHECK ===
+        recon = get_position_reconciliation(kite=self.kite, paper_mode=self.paper_mode)
+        recon_can_trade, recon_reason = recon.can_trade()
+        if not recon_can_trade:
+            return {
+                "success": False,
+                "error": f"RECONCILIATION BLOCK: {recon_reason}",
+                "state": recon.state.value,
+                "action": "Resolve mismatch before new trades"
+            }
+        
+        # === DATA HEALTH GATE CHECK ===
+        health_gate = get_data_health_gate()
+        try:
+            md = self.get_market_data([symbol])
+            if symbol in md and isinstance(md[symbol], dict):
+                health_ok, health_reason = health_gate.can_trade(symbol, md[symbol])
+                if not health_ok:
+                    return {
+                        "success": False,
+                        "error": f"DATA HEALTH BLOCK: {health_reason}",
+                        "stale_counter": health_gate.get_stale_counter(symbol),
+                        "action": "Wait for healthy data"
+                    }
+        except Exception as e:
+            print(f"   ⚠️ Data health check failed: {e}")
+        
+        # === IDEMPOTENT ORDER CHECK ===
+        idempotent_engine = get_idempotent_engine()
+        
+        # Create order intent
+        order_intent = idempotent_engine.create_intent(
+            symbol=symbol,
+            direction=side,
+            strategy=strategy,
+            setup_id=setup_id
+        )
+        
+        # Check if this order intent was already placed
+        try:
+            # Get broker orders for duplicate check
+            broker_open_orders = self.kite.orders() if not self.paper_mode else []
+            can_place, reason = idempotent_engine.can_place_order(
+                intent=order_intent,
+                broker_open_orders=broker_open_orders
+            )
+            
+            if not can_place:
+                return {
+                    "success": False,
+                    "error": f"IDEMPOTENT BLOCK: {reason}",
+                    "client_order_id": order_intent.generate_client_order_id(),
+                    "intent": {
+                        "symbol": symbol,
+                        "direction": side,
+                        "strategy": strategy,
+                        "setup_id": setup_id
+                    }
+                }
+        except Exception as e:
+            print(f"   ⚠️ Idempotency check failed: {e} - proceeding with caution")
+        
+        # Store intent for later recording
+        order['_order_intent'] = order_intent
+        
+        # CHECK FOR DUPLICATE TRADE (active position check)
         if self.is_symbol_in_active_trades(symbol):
             existing = self.get_active_trade(symbol)
             return {
@@ -1214,6 +1679,64 @@ class ZerodhaTools:
                 }
             }
         
+        # === CORRELATION & INDEX GUARD CHECK ===
+        correlation_guard = get_correlation_guard()
+        active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        
+        corr_check = correlation_guard.can_trade(
+            symbol=symbol,
+            active_positions=active_positions
+        )
+        
+        if not corr_check.can_trade:
+            return {
+                "success": False,
+                "error": f"CORRELATION BLOCK: {corr_check.reason}",
+                "beta_category": corr_check.beta_category,
+                "correlated_positions": corr_check.correlated_positions,
+                "warnings": corr_check.warnings
+            }
+        
+        # Log correlation warnings if any
+        if corr_check.warnings:
+            for w in corr_check.warnings:
+                print(f"   ⚠️ Correlation: {w}")
+        
+        # === REGIME SCORE CHECK ===
+        regime_scorer = get_regime_scorer()
+        
+        # Get market data for scoring
+        market_data = {}
+        try:
+            md = self.get_market_data([symbol])
+            if symbol in md and isinstance(md[symbol], dict):
+                market_data = md[symbol]
+        except:
+            pass
+        
+        # Calculate regime score
+        regime_result = regime_scorer.calculate_score(
+            symbol=symbol,
+            direction=side,
+            trade_type=strategy,
+            market_data=market_data
+        )
+        
+        if not regime_result.passes_threshold:
+            return {
+                "success": False,
+                "error": f"REGIME SCORE BLOCK: {regime_result.total_score}/{regime_result.threshold} - {regime_result.final_verdict}",
+                "score": regime_result.total_score,
+                "threshold": regime_result.threshold,
+                "confidence": regime_result.confidence,
+                "summary": regime_result.summary,
+                "breakdown": [{"name": c.name, "points": c.points, "reason": c.reason} for c in regime_result.components]
+            }
+        
+        print(f"   📊 Regime Score: {regime_result.total_score}/{regime_result.threshold} ({regime_result.confidence})")
+        order['_regime_score'] = regime_result.total_score
+        order['_regime_confidence'] = regime_result.confidence
+        
         # First validate
         validation = self.validate_trade(order)
         if not validation['all_passed']:
@@ -1222,6 +1745,101 @@ class ZerodhaTools:
                 "error": "Trade validation failed",
                 "validation": validation
             }
+        
+        # === EXECUTION GUARD: Check spread and get execution policy ===
+        execution_guard = get_execution_guard()
+        try:
+            quote = self.kite.quote([symbol])
+            ltp = quote[symbol]['last_price']
+            depth = quote[symbol].get('depth', {})
+            
+            # Get bid/ask from depth
+            buy_depth = depth.get('buy', [{}])
+            sell_depth = depth.get('sell', [{}])
+            
+            bid = buy_depth[0].get('price', ltp * 0.999) if buy_depth else ltp * 0.999
+            ask = sell_depth[0].get('price', ltp * 1.001) if sell_depth else ltp * 1.001
+            bid_qty = buy_depth[0].get('quantity', 0) if buy_depth else 0
+            ask_qty = sell_depth[0].get('quantity', 0) if sell_depth else 0
+            
+            # Get volume regime from market data
+            market_data = self.get_market_data([symbol])
+            volume_regime = market_data.get(symbol, {}).get('volume_regime', 'NORMAL')
+            
+            # Check execution policy
+            exec_policy = execution_guard.get_execution_policy(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                ltp=ltp,
+                bid=bid,
+                ask=ask,
+                bid_qty=bid_qty,
+                ask_qty=ask_qty,
+                volume_regime=volume_regime
+            )
+            
+            if not exec_policy.can_execute:
+                return {
+                    "success": False,
+                    "error": f"EXECUTION BLOCKED: {exec_policy.reason}",
+                    "execution_policy": {
+                        "order_type": exec_policy.order_type,
+                        "reason": exec_policy.reason,
+                        "warnings": exec_policy.warnings
+                    }
+                }
+            
+            # Log warnings if any
+            if exec_policy.warnings:
+                print(f"   ⚠️ Execution warnings: {', '.join(exec_policy.warnings)}")
+            
+            # Store expected entry price for slippage calculation
+            expected_entry = ask if side == 'BUY' else bid
+            order['expected_entry'] = expected_entry
+            order['volume_regime'] = volume_regime
+            order['execution_order_type'] = exec_policy.order_type
+            order['max_slippage_pct'] = exec_policy.max_slippage_pct
+            
+            # === ADAPTIVE POSITION SIZING: Recalculate quantity ===
+            # Get market data for ATR and spread
+            atr = market_data.get(symbol, {}).get('atr_14', 0)
+            spread_bps = ((ask - bid) / ((ask + bid) / 2)) * 10000 if ask > 0 and bid > 0 else 0
+            
+            entry_price = ltp
+            stop_loss = order.get('stop_loss', ltp * 0.99 if side == 'BUY' else ltp * 1.01)
+            
+            # Calculate adaptive position size
+            sizing = self.calculate_position_size(
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                capital=self.paper_capital if hasattr(self, 'paper_capital') else 100000,
+                lot_size=1,
+                atr=atr,
+                volume_regime=volume_regime,
+                spread_bps=spread_bps,
+                available_margin=0  # Will use default caps
+            )
+            
+            if 'error' in sizing:
+                return {
+                    "success": False,
+                    "error": f"SIZING BLOCKED: {sizing.get('reason', sizing.get('error'))}",
+                    "sizing": sizing
+                }
+            
+            # Override quantity with adaptive sizing
+            original_qty = order.get('quantity', 0)
+            order['quantity'] = sizing['quantity']
+            
+            if original_qty != sizing['quantity']:
+                print(f"   📊 Adaptive sizing: {original_qty} → {sizing['quantity']}")
+                if sizing.get('warnings'):
+                    for w in sizing['warnings']:
+                        print(f"      ⚠️ {w}")
+            
+        except Exception as e:
+            print(f"   ⚠️ Execution guard check failed: {e} - proceeding with defaults")
         
         self._rate_limit()
         
@@ -1260,18 +1878,42 @@ class ZerodhaTools:
                     'order_id': paper_order_id,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'OPEN',
-                    'rationale': order.get('rationale', 'No rationale provided')
+                    'rationale': order.get('rationale', 'No rationale provided'),
+                    'volume_regime': order.get('volume_regime', 'NORMAL'),
+                    'expected_entry': order.get('expected_entry', current_ltp)
                 }
                 self.paper_positions.append(position)
                 
                 # SAVE TO FILE immediately
                 self._save_active_trades()
                 
+                # Record slippage
+                expected_entry = order.get('expected_entry', current_ltp)
+                execution_guard.record_slippage(
+                    symbol=symbol,
+                    side=side,
+                    expected_price=expected_entry,
+                    actual_price=current_ltp,
+                    volume_regime=order.get('volume_regime', 'NORMAL'),
+                    order_type=order.get('execution_order_type', 'MARKET')
+                )
+                
                 # Update paper capital (reduce by position value)
                 position_value = order['quantity'] * current_ltp
                 
                 print(f"   ✅ {side} {order['quantity']} {symbol} @ ₹{current_ltp:.2f}")
                 print(f"      SL: ₹{stop_loss:.2f} | Target: ₹{target:.2f}")
+                
+                # === RECORD ORDER IN IDEMPOTENT ENGINE ===
+                order_intent = order.get('_order_intent')
+                if order_intent:
+                    idempotent_engine.record_order(
+                        intent=order_intent,
+                        broker_order_id=paper_order_id,
+                        quantity=order['quantity'],
+                        price=current_ltp,
+                        status="COMPLETE"
+                    )
                 
                 return {
                     "success": True,
@@ -1283,6 +1925,7 @@ class ZerodhaTools:
                     "entry_price": current_ltp,
                     "stop_loss": stop_loss,
                     "target": target,
+                    "client_order_id": order_intent.generate_client_order_id() if order_intent else None,
                     "details": order
                 }
             
@@ -1317,11 +1960,23 @@ class ZerodhaTools:
                 validity=self.kite.VALIDITY_DAY
             )
             
+            # === RECORD ORDER IN IDEMPOTENT ENGINE ===
+            order_intent = order.get('_order_intent')
+            if order_intent:
+                idempotent_engine.record_order(
+                    intent=order_intent,
+                    broker_order_id=str(order_id),
+                    quantity=order['quantity'],
+                    price=order.get('entry_price', 0),
+                    status="OPEN"
+                )
+            
             return {
                 "success": True,
                 "order_id": order_id,
                 "sl_order_id": sl_order_id,
                 "message": f"Order placed: {order['side']} {order['quantity']} {symbol}",
+                "client_order_id": order_intent.generate_client_order_id() if order_intent else None,
                 "details": order
             }
             
@@ -1331,6 +1986,220 @@ class ZerodhaTools:
                 "error": str(e)
             }
     
+    def place_option_order(self, underlying: str, direction: str, 
+                          option_type: str = None, 
+                          strike_selection: str = "ATM",
+                          expiry_selection: str = "CURRENT_WEEK",
+                          rationale: str = "",
+                          use_intraday_scoring: bool = True) -> Dict:
+        """
+        Tool: Place an option order instead of equity order
+        
+        INTRADAY SIGNALS ARE HIGHEST PRIORITY for decision making.
+        When use_intraday_scoring=True, the system analyzes:
+        - ORB breakout (25 points) - HIGHEST
+        - Volume regime (20 points) 
+        - VWAP position/trend (15 points)
+        - EMA regime (15 points)
+        - HTF alignment (10 points)
+        - RSI extremes (10 points)
+        - Price momentum (5 points)
+        
+        Args:
+            underlying: e.g., "NSE:RELIANCE"
+            direction: 'BUY' or 'SELL' signal on underlying
+            option_type: 'CE' or 'PE' (None = auto based on direction)
+            strike_selection: 'ATM', 'ITM_1', 'ITM_2', 'OTM_1', 'OTM_2'
+            expiry_selection: 'CURRENT_WEEK', 'NEXT_WEEK', 'CURRENT_MONTH'
+            rationale: Trade rationale
+            use_intraday_scoring: If True, uses intraday signals for decision (default: True)
+            
+        Returns:
+            Dict with order result including Greeks and intraday decision
+        """
+        from options_trader import get_intraday_scorer, IntradaySignal
+        
+        # Check if symbol is F&O eligible
+        options_trader = get_options_trader(
+            kite=self.kite, 
+            capital=getattr(self, 'paper_capital', 100000),
+            paper_mode=self.paper_mode
+        )
+        
+        if not options_trader.should_use_options(underlying):
+            return {
+                "success": False,
+                "error": f"{underlying} is not F&O eligible",
+                "action": "Use equity order instead"
+            }
+        
+        # === GET INTRADAY MARKET DATA ===
+        market_data = {}
+        if use_intraday_scoring:
+            try:
+                md = self.get_market_data([underlying])
+                if underlying in md and isinstance(md[underlying], dict):
+                    market_data = md[underlying]
+                    print(f"   📊 Using intraday signals for {underlying}")
+            except Exception as e:
+                print(f"   ⚠️ Could not get intraday data: {e}")
+        
+        # Parse enums
+        opt_type = None
+        if option_type:
+            opt_type = OptionType[option_type.upper()]
+        
+        strike_sel = StrikeSelection[strike_selection.upper()] if strike_selection != "AUTO" else None
+        expiry_sel = ExpirySelection[expiry_selection.upper()] if expiry_selection != "AUTO" else None
+        
+        # === CREATE OPTION ORDER WITH INTRADAY SCORING ===
+        plan = options_trader.create_option_order(
+            underlying=underlying,
+            direction=direction,
+            option_type=opt_type,
+            strike_selection=strike_sel,
+            expiry_selection=expiry_sel,
+            market_data=market_data if use_intraday_scoring else None
+        )
+        
+        if plan is None:
+            return {
+                "success": False,
+                "error": f"Could not create option order for {underlying}",
+                "reason": "No suitable strikes or chain unavailable"
+            }
+        
+        # Validate risk - max premium check
+        max_premium_per_trade = 15000  # ₹15K per option trade
+        if plan.total_premium > max_premium_per_trade:
+            return {
+                "success": False,
+                "error": f"Premium ₹{plan.total_premium:.0f} exceeds limit ₹{max_premium_per_trade}",
+                "action": "Reduce quantity or choose different strike"
+            }
+        
+        # Check total options exposure
+        portfolio_greeks = options_trader.get_portfolio_greeks()
+        max_total_exposure = 50000  # ₹50K total option exposure
+        current_exposure = sum(p.get('total_premium', 0) for p in options_trader.positions if p.get('status') == 'OPEN')
+        
+        if current_exposure + plan.total_premium > max_total_exposure:
+            return {
+                "success": False,
+                "error": f"Total option exposure would exceed ₹{max_total_exposure}",
+                "current_exposure": current_exposure,
+                "new_premium": plan.total_premium
+            }
+        
+        # Execute the order
+        result = options_trader.execute_option_order(plan)
+        
+        if result.get('success'):
+            print(f"   📊 OPTION ORDER: {plan.contract.symbol}")
+            print(f"      Premium: ₹{plan.total_premium:.0f} | Lots: {plan.quantity}")
+            print(f"      Greeks: {plan.greeks_summary}")
+            print(f"      Target: ₹{plan.target_premium:.2f} | SL: ₹{plan.stoploss_premium:.2f}")
+            
+            # Add to paper positions if paper mode
+            if self.paper_mode:
+                option_position = {
+                    'symbol': plan.contract.symbol,
+                    'underlying': plan.underlying,
+                    'quantity': plan.quantity * plan.contract.lot_size,
+                    'lots': plan.quantity,
+                    'avg_price': plan.contract.ltp,
+                    'side': direction,
+                    'option_type': plan.contract.option_type.value,
+                    'strike': plan.contract.strike,
+                    'expiry': plan.contract.expiry.isoformat() if plan.contract.expiry else None,
+                    'stop_loss': plan.stoploss_premium,
+                    'target': plan.target_premium,
+                    'order_id': result.get('order_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'is_option': True,
+                    'total_premium': plan.total_premium,
+                    'max_loss': plan.max_loss,
+                    'breakeven': plan.breakeven,
+                    'delta': plan.contract.delta,
+                    'theta': plan.contract.theta,
+                    'iv': plan.contract.iv,
+                    'rationale': rationale or plan.rationale
+                }
+                self.paper_positions.append(option_position)
+                self._save_active_trades()
+        
+        return result
+    
+    def get_option_greeks_update(self, symbol: str = None) -> Dict:
+        """
+        Tool: Get current Greeks for option positions
+        
+        Args:
+            symbol: Specific symbol or None for all
+            
+        Returns:
+            Dict with Greeks updates and exit signals
+        """
+        options_trader = get_options_trader(
+            kite=self.kite,
+            capital=getattr(self, 'paper_capital', 100000),
+            paper_mode=self.paper_mode
+        )
+        
+        if symbol:
+            # Check specific position
+            for pos in options_trader.positions:
+                if pos.get('symbol') == symbol and pos.get('status') == 'OPEN':
+                    exit_signal = options_trader.check_option_exit(symbol)
+                    return {
+                        "symbol": symbol,
+                        "position": pos,
+                        "exit_signal": exit_signal
+                    }
+            return {"error": f"No open option position for {symbol}"}
+        
+        # Get all Greeks
+        return {
+            "portfolio_greeks": options_trader.get_portfolio_greeks(),
+            "positions": [p for p in options_trader.positions if p.get('status') == 'OPEN']
+        }
+    
+    def check_option_exits(self) -> List[Dict]:
+        """
+        Tool: Check all option positions for exit signals
+        
+        Returns:
+            List of positions that need attention
+        """
+        options_trader = get_options_trader(
+            kite=self.kite,
+            capital=getattr(self, 'paper_capital', 100000),
+            paper_mode=self.paper_mode
+        )
+        
+        exit_signals = []
+        
+        for pos in options_trader.positions:
+            if pos.get('status') != 'OPEN':
+                continue
+            
+            symbol = pos.get('symbol')
+            signal = options_trader.check_option_exit(symbol)
+            
+            if signal and signal.get('should_exit'):
+                exit_signals.append({
+                    "symbol": symbol,
+                    "reason": signal.get('reason'),
+                    "exit_type": signal.get('exit_type'),
+                    "current_pnl": signal.get('current_pnl', 0),
+                    "days_to_expiry": signal.get('days_to_expiry', 0),
+                    "delta": pos.get('delta', 0),
+                    "theta": pos.get('theta', 0)
+                })
+        
+        return exit_signals
+
     def get_portfolio_risk(self) -> Dict:
         """
         Tool: Get current portfolio risk exposure
