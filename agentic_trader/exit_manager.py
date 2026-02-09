@@ -64,7 +64,7 @@ class ExitManager:
     
     Rules:
     - Hard SL: Structure-based (ORB opposite, swing low/high, VWAP)
-    - Time Stop: Exit if no +0.5R move in 10 candles
+    - Time Stop: Exit if no +0.5R move in 7 candles
     - Break-even: Move SL to entry after +0.8R
     - Session Cutoff: Exit all by 15:15
     - Trailing: After +1R, trail at 50% of max profit
@@ -73,7 +73,7 @@ class ExitManager:
     def __init__(self):
         # Configuration
         self.session_cutoff = time(15, 20)  # 3:20 PM
-        self.time_stop_candles = 10  # Exit if no progress in 10 candles
+        self.time_stop_candles = 7  # Exit if no progress in 7 candles
         self.time_stop_min_r = 0.5  # Must make at least 0.5R to stay
         self.breakeven_trigger_r = 0.8  # Move SL to entry at 0.8R
         self.trailing_start_r = 1.0  # Start trailing at 1R

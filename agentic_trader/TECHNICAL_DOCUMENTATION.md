@@ -146,7 +146,7 @@ OTM strikes are **NOT default** - require ALL of:
 
 #### Aggressive Sizing Requirements
 1.2x size requires **ALL** of:
-- Premium tier (≥ 80)
+- Premium tier (≥ 55)
 - Acceleration ≥ 8/10
 - Microstructure ≥ 12/15
 
@@ -191,7 +191,7 @@ class OptionMicrostructure:
 | Type | Trigger | Action |
 |------|---------|--------|
 | Hard Stop Loss | Structure-based (ORB, swing, VWAP) | Immediate exit |
-| Time Stop | No +0.5R in 10 candles | Exit position |
+| Time Stop | No +0.5R in 7 candles | Exit position |
 | Break-even | +0.8R achieved | Move SL to entry |
 | Session Cutoff | 15:20 IST | Exit all positions |
 | Trailing Stop | After +1R, trail at 50% | Lock in profits |
@@ -489,7 +489,7 @@ if orb_window_minutes <= TREND_WINDOW_MINUTES:  # 15 min
 - EMA expansion confirms trend acceleration
 
 ### 3. Quick Exits
-- Time stop if no progress in 10 candles
+- Time stop if no progress in 7 candles
 - Session cutoff at 15:20 (EOD exit at 15:15)
 - Break-even at +0.8R
 - Trailing after +1R
@@ -543,7 +543,7 @@ agentic_trader/
 4. TREND state gate (NEUTRAL blocks)
 5. Aggressive requires Accel + Micro dominance
 6. VWAP Position reduced + penalty for misalignment
-7. Simplified to 2 thresholds (65 standard, 80 premium)
+7. Simplified to 2 thresholds (65 standard, 80 premium) → later revised to 30/35/55 in v1.4
 
 ### v1.4 Scoring Fix + Bug Fixes (9 Feb 2026)
 

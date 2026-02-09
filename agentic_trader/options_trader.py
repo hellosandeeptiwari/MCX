@@ -557,7 +557,7 @@ class IntradayOptionScorer:
             reasons.append(f"💪 PREMIUM conviction - {self.AGGRESSIVE_SIZE_MAX}x size (accel {acceleration_score}/10, micro {microstructure_score:.0f}/15)")
         elif score >= self.PREMIUM_THRESHOLD:
             size_multiplier = 1.0
-            warnings.append(f"⚠️ Score >= 80 but accel ({acceleration_score}/10) or micro ({microstructure_score:.0f}/15) too low for sizing up")
+            warnings.append(f"⚠️ Score >= {self.PREMIUM_THRESHOLD} but accel ({acceleration_score}/10) or micro ({microstructure_score:.0f}/15) too low for sizing up")
         elif score >= self.STANDARD_THRESHOLD:
             size_multiplier = 1.0
         else:
@@ -619,9 +619,10 @@ class IntradayOptionScorer:
         - Standard/Premium = ATM or ITM only
         
         Tiers:
-        - < 65: ITM_1 (most conservative)
-        - 65-79: ATM (standard)
-        - 80+: ATM or ITM (premium but disciplined)
+        - < 30: BLOCKED (no trade)
+        - 30-34: ITM_1 (most conservative)
+        - 35-54: ATM (standard)
+        - 55+: ATM or ITM (premium but disciplined)
         - OTM: Special case only
         """
         # === OTM SPECIAL CASE (NOT DEFAULT) ===
