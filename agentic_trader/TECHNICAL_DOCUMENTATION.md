@@ -127,12 +127,16 @@ Force immediate downgrade if:
 | HTF Alignment | 5 | Higher timeframe |
 | RSI Penalty | -3 | Overextension only |
 
-#### Trade Tiers (Simplified 2-Tier System)
+#### Trade Tiers (3-Tier System)
 | Score | Tier | Strike | Size |
 |-------|------|--------|------|
-| < 65 | BLOCK | - | No trade |
-| 65-79 | Standard | ATM/ITM | 1.0x |
-| ≥ 80 | Premium | ATM/ITM | Up to 1.2x |
+| < 30 | BLOCK | - | No trade |
+| 30-34 | Standard | ATM/ITM | 1.0x |
+| 35-54 | Standard+ | ATM/ITM | 1.0x |
+| ≥ 55 | Premium | ATM/ITM | Up to 1.2x |
+
+#### Caller Direction Bonus
+When GPT agent's direction aligns with intraday signals (VWAP, volume, EMA), up to +5 bonus points are added to the score.
 
 #### OTM Strike Requirements (Special Case)
 OTM strikes are **NOT default** - require ALL of:
@@ -189,7 +193,7 @@ class OptionMicrostructure:
 | Hard Stop Loss | Structure-based (ORB, swing, VWAP) | Immediate exit |
 | Time Stop | No +0.5R in 10 candles | Exit position |
 | Break-even | +0.8R achieved | Move SL to entry |
-| Session Cutoff | 15:15 IST | Exit all positions |
+| Session Cutoff | 15:20 IST | Exit all positions |
 | Trailing Stop | After +1R, trail at 50% | Lock in profits |
 | Target Hit | 2R or 3R target | Take profit |
 
@@ -228,21 +232,28 @@ R = (Entry - Stop Loss)
 #### System States
 ```
 ACTIVE        - Normal trading
-COOLDOWN      - 15 min pause after loss
+COOLDOWN      - 10 min pause after loss
 HALT_TRADING  - Stopped for the day
 CIRCUIT_BREAK - Emergency stop (data/order issues)
 ```
+
+> **Critical Fix (v1.4):** `is_trading_allowed()` now clears expired cooldowns.
+> Previously, cooldown expiry was only checked in `can_trade_general()` which was
+> never reached because `is_trading_allowed()` returned False first, permanently
+> halting the bot after any single loss.
 
 #### Risk Limits
 | Limit | Default Value |
 |-------|---------------|
 | Max Daily Loss | 2% of capital |
-| Max Consecutive Losses | 2 |
-| Max Trades Per Day | 5 |
+| Max Consecutive Losses | 3 |
+| Max Trades Per Day | 8 |
 | Max Symbol Exposure | 2 same sector |
-| Cooldown Duration | 15 minutes |
+| Cooldown Duration | 10 minutes |
 | Max Position Size | 25% of capital |
 | Max Total Exposure | 80% of capital |
+| Max Premium Per Trade | ₹35,000 |
+| Max Total Option Exposure | ₹80,000 |
 
 ### 2. Correlation Guard (`correlation_guard.py`)
 **Purpose:** Prevent hidden overexposure from correlated positions
@@ -333,10 +344,14 @@ INIT       - Startup sync in progress
 ### 3. Hard Gates (Options Trading)
 | Gate | Condition for BLOCK |
 |------|---------------------|
-| Trend State | NEUTRAL (must be BULLISH/BEARISH/STRONG) |
-| Score | < 65 |
+| Score | < 30 (BLOCK threshold) |
 | Direction | Cannot determine |
-| Microstructure | Spread too wide, OI too low, etc. |
+| Microstructure | Spread > 2%, OI < 500, depth < 25 |
+| Duplicate | Already holding option on same underlying |
+| Premium | Single trade > ₹35K or total exposure > ₹80K |
+
+> **Note:** NEUTRAL trend no longer fully blocks — it applies a -5 point penalty
+> instead of -10, allowing strong intraday signals to compensate.
 
 ---
 
@@ -358,7 +373,7 @@ HARD_RULES = {
 ```python
 TRADING_HOURS = {
     "start": "09:20",      # 5 mins after market open
-    "end": "15:15",        # 15 mins before close
+    "end": "15:20",        # 10 mins before close
     "no_new_after": "14:30"  # No new trades after 2:30 PM
 }
 ```
@@ -461,11 +476,12 @@ if orb_window_minutes <= TREND_WINDOW_MINUTES:  # 15 min
 
 ## Key Design Decisions
 
-### 1. Safety Over Returns
-- Score ≥ 65 to trade (was 60)
-- Max size 1.2x (was 1.5x)
-- NEUTRAL state blocks trading
+### 1. Balanced Risk & Opportunity
+- Score ≥ 30 to trade (BLOCK), ≥ 35 Standard+, ≥ 55 Premium
+- Max size 1.2x (Premium tier only)
+- NEUTRAL trend applies -5 penalty (not full block)
 - OTM strikes require special conditions
+- Duplicate underlying check prevents double exposure
 
 ### 2. Institutional Signals First
 - VWAP Slope (25 pts) > all other indicators
@@ -474,7 +490,7 @@ if orb_window_minutes <= TREND_WINDOW_MINUTES:  # 15 min
 
 ### 3. Quick Exits
 - Time stop if no progress in 10 candles
-- Session cutoff at 15:15
+- Session cutoff at 15:20 (EOD exit at 15:15)
 - Break-even at +0.8R
 - Trailing after +1R
 
@@ -518,6 +534,7 @@ agentic_trader/
 | 1.1 | - | Added Microstructure (15 pts) |
 | 1.2 | - | Replaced RSI with Acceleration |
 | 1.3 | Feb 2026 | Risk of ruin fixes (7 changes) |
+| 1.4 | 9 Feb 2026 | Scoring fix + bug fixes + ROI optimization |
 
 ### v1.3 Risk of Ruin Fixes
 1. OTM + 1.5x → OTM special case + max 1.2x
@@ -528,7 +545,53 @@ agentic_trader/
 6. VWAP Position reduced + penalty for misalignment
 7. Simplified to 2 thresholds (65 standard, 80 premium)
 
+### v1.4 Scoring Fix + Bug Fixes (9 Feb 2026)
+
+**Problem:** Bot was not taking any trades. Investigation of the 19-gate pipeline
+revealed the IntradayOptionScorer thresholds were mathematically unreachable when
+trend=NEUTRAL (-10 penalty) + missing microstructure data. Best realistic score was ~31
+but BLOCK_THRESHOLD was 45.
+
+**Scoring Changes (options_trader.py):**
+1. BLOCK_THRESHOLD: 45 → **30**
+2. STANDARD_THRESHOLD: 45 → **35**
+3. PREMIUM_THRESHOLD: 65 → **55**
+4. NEUTRAL trend penalty: -10 → **-5**
+5. No-trend-data penalty: -10 → **-5**
+6. Added `caller_direction` parameter with +5 alignment bonus
+7. Fallback direction from caller when signals ambiguous
+
+**Critical Bug Fixes:**
+8. **Cooldown expiry not clearing** (`risk_governor.py`): `is_trading_allowed()` checked
+   `system_state == ACTIVE` but never cleared expired cooldowns. Only `can_trade_general()`
+   did, which was unreachable. Bot permanently halted after any single loss.
+9. **Option side='SELL' for PE buys** (`zerodha_tools.py`): Options stored with the market
+   direction as `side` instead of always `'BUY'`. Caused wrong P&L formula (SHORT instead
+   of LONG) and premature TARGET_HIT exits.
+10. **Duplicate option positions** (`zerodha_tools.py`): No check for existing option on
+    same underlying. GPT retried different strikes + retry mechanism created duplicates.
+    Added underlying duplicate check.
+11. **Default capital** (`autonomous_trader.py`): argparse default was ₹10,000 instead of
+    ₹200,000.
+
+**Configuration Changes:**
+12. Cooldown: 15 → **10 minutes**
+13. Max trades per day: 5 → **8**
+14. Max consecutive losses: 2 → **3**
+15. Per-trade premium cap: ₹25K → **₹35K**
+16. Total option exposure: ₹75K → **₹80K**
+17. Market close: 15:15 → **15:20** (EOD exit at 15:15)
+18. F&O opportunity filter broadened (VWAP_TREND + MOMENTUM setups)
+
+**Day 1 Results (Paper Trading):**
+- Capital: ₹200,000
+- Trades: 6 (5W / 1L)
+- Day P&L: **+₹2,867 (+1.43%)**
+- Winners: SBIN equity (+₹240), SBIN CE (+₹2,100), TATASTEEL PE (+₹550),
+  INFY PE (+₹20), JINDALSTEL PE (+₹469)
+- Loser: UNIONBANK equity (-₹512)
+
 ---
 
 *TITAN Autonomous Trading System - Technical Documentation*
-*Generated: February 2026*
+*Updated: 9 February 2026*

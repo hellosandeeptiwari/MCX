@@ -47,7 +47,7 @@ class CorrelationIndexGuard:
         
         self.beta_mapping = {
             # HIGH BETA (>1.2) - Very correlated to index
-            "NSE:TATAMOTORS": "HIGH_BETA",
+            "NSE:BHARTIARTL": "HIGH_BETA",
             "NSE:BAJFINANCE": "HIGH_BETA",
             "NSE:BAJAJFINSV": "HIGH_BETA",
             "NSE:ADANIENT": "HIGH_BETA",
@@ -60,6 +60,12 @@ class CorrelationIndexGuard:
             "NSE:HINDALCO": "HIGH_BETA",
             "NSE:JSWSTEEL": "HIGH_BETA",
             "NSE:COALINDIA": "HIGH_BETA",
+            "NSE:VEDL": "HIGH_BETA",
+            "NSE:JINDALSTEL": "HIGH_BETA",
+            "NSE:NMDC": "HIGH_BETA",
+            "NSE:NATIONALUM": "HIGH_BETA",
+            "NSE:SAIL": "HIGH_BETA",
+            "NSE:HINDCOPPER": "HIGH_BETA",
             "NSE:ONGC": "HIGH_BETA",
             "NSE:BPCL": "HIGH_BETA",
             "NSE:M&M": "HIGH_BETA",
@@ -108,8 +114,9 @@ class CorrelationIndexGuard:
         self.sector_groups = {
             "BANKING": ["NSE:HDFCBANK", "NSE:ICICIBANK", "NSE:AXISBANK", "NSE:KOTAKBANK", "NSE:SBIN", "NSE:INDUSINDBK"],
             "IT": ["NSE:INFY", "NSE:TCS", "NSE:WIPRO", "NSE:HCLTECH", "NSE:TECHM", "NSE:LTIM"],
-            "AUTO": ["NSE:TATAMOTORS", "NSE:M&M", "NSE:MARUTI", "NSE:BAJAJ-AUTO", "NSE:HEROMOTOCO", "NSE:EICHERMOT"],
-            "METAL": ["NSE:TATASTEEL", "NSE:HINDALCO", "NSE:JSWSTEEL", "NSE:COALINDIA"],
+            "AUTO": ["NSE:M&M", "NSE:MARUTI", "NSE:BAJAJ-AUTO", "NSE:HEROMOTOCO", "NSE:EICHERMOT"],
+            "TELECOM": ["NSE:BHARTIARTL"],
+            "METAL": ["NSE:TATASTEEL", "NSE:HINDALCO", "NSE:JSWSTEEL", "NSE:COALINDIA", "NSE:VEDL", "NSE:JINDALSTEL", "NSE:NMDC", "NSE:NATIONALUM", "NSE:SAIL", "NSE:HINDCOPPER"],
             "PHARMA": ["NSE:SUNPHARMA", "NSE:DRREDDY", "NSE:CIPLA", "NSE:APOLLOHOSP", "NSE:DIVISLAB"],
             "OIL_GAS": ["NSE:RELIANCE", "NSE:ONGC", "NSE:BPCL"],
             "NBFC": ["NSE:BAJFINANCE", "NSE:BAJAJFINSV"],

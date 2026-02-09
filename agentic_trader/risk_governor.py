@@ -30,11 +30,11 @@ class SystemState(Enum):
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_daily_loss_pct: float = 2.0      # Max 2% daily loss
-    max_consecutive_losses: int = 2       # Max 2 losses in a row
-    max_trades_per_day: int = 5           # Max 5 trades
+    max_daily_loss_pct: float = 3.0      # Max 3% daily loss (aligned with config)
+    max_consecutive_losses: int = 3       # Max 3 losses in a row
+    max_trades_per_day: int = 8           # Max 8 trades (52-symbol universe)
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
-    cooldown_minutes: int = 15            # 15 min cooldown after loss
+    cooldown_minutes: int = 10            # 10 min cooldown after loss (was 15, skipping 3 scan cycles was too aggressive)
     max_position_pct: float = 25.0        # Max 25% of capital in one position
     max_total_exposure_pct: float = 80.0  # Max 80% of capital deployed
 
@@ -89,7 +89,7 @@ class RiskGovernor:
         self.state_file = "risk_state.json"
         self.trade_date = datetime.now().date()
         
-        # Sector/correlation mapping
+        # Sector/correlation mapping - MUST cover ALL APPROVED_UNIVERSE symbols
         self.sector_map = {
             # IT
             "NSE:INFY": "IT", "NSE:TCS": "IT", "NSE:WIPRO": "IT", 
@@ -97,18 +97,44 @@ class RiskGovernor:
             # Banking
             "NSE:HDFCBANK": "BANK", "NSE:ICICIBANK": "BANK", "NSE:AXISBANK": "BANK",
             "NSE:KOTAKBANK": "BANK", "NSE:SBIN": "BANK", "NSE:INDUSINDBK": "BANK",
+            "NSE:UNIONBANK": "BANK", "NSE:BANKBARODA": "BANK", "NSE:PNB": "BANK",
+            # Telecom
+            "NSE:BHARTIARTL": "TELECOM", "NSE:IDEA": "TELECOM",
             # Auto
-            "NSE:TATAMOTORS": "AUTO", "NSE:M&M": "AUTO", "NSE:MARUTI": "AUTO",
-            "NSE:BAJAJ-AUTO": "AUTO", "NSE:HEROMOTOCO": "AUTO",
+            "NSE:M&M": "AUTO", "NSE:MARUTI": "AUTO",
+            "NSE:BAJAJ-AUTO": "AUTO", "NSE:HEROMOTOCO": "AUTO", "NSE:EICHERMOT": "AUTO",
             # Pharma
             "NSE:SUNPHARMA": "PHARMA", "NSE:DRREDDY": "PHARMA", "NSE:CIPLA": "PHARMA",
             # Metal
             "NSE:TATASTEEL": "METAL", "NSE:HINDALCO": "METAL", "NSE:JSWSTEEL": "METAL",
+            "NSE:VEDL": "METAL", "NSE:JINDALSTEL": "METAL", "NSE:NMDC": "METAL",
+            "NSE:NATIONALUM": "METAL", "NSE:SAIL": "METAL", "NSE:HINDCOPPER": "METAL",
             # Oil & Gas
             "NSE:RELIANCE": "OIL", "NSE:ONGC": "OIL", "NSE:BPCL": "OIL",
-            # Others
+            # Consumer
             "NSE:ASIANPAINT": "CONSUMER", "NSE:TITAN": "CONSUMER",
+            "NSE:ITC": "CONSUMER", "NSE:HINDUNILVR": "CONSUMER",
+            "NSE:ETERNAL": "CONSUMER",
+            # NBFC
             "NSE:BAJFINANCE": "NBFC", "NSE:BAJAJFINSV": "NBFC",
+            # Power / Infra
+            "NSE:NHPC": "POWER", "NSE:POWERGRID": "POWER", "NSE:NTPC": "POWER",
+            "NSE:ADANIPOWER": "POWER", "NSE:TATAPOWER": "POWER",
+            # Misc cash
+            "NSE:MCX": "EXCHANGE", "NSE:IRFC": "FINANCE",
+            "NSE:YESBANK": "BANK", "NSE:CANBK": "BANK",
+            # ETFs (separate sector to allow multiple)
+            "NSE:NIFTYBEES": "ETF", "NSE:BANKBEES": "ETF", "NSE:GOLDBEES": "ETF",
+            "NSE:SILVERBEES": "ETF", "NSE:ITBEES": "ETF", "NSE:JUNIORBEES": "ETF",
+            "NSE:CPSEETF": "ETF", "NSE:PSUBNKBEES": "ETF", "NSE:NEXT50": "ETF",
+            "NSE:PHARMABEES": "ETF", "NSE:INFRABEES": "ETF",
+        }
+        
+        # Sector limits (how many positions allowed per sector)
+        self.sector_limits = {
+            "BANK": 3, "IT": 2, "METAL": 3, "ETF": 4,
+            "OIL": 2, "PHARMA": 2, "AUTO": 2, "CONSUMER": 2,
+            "TELECOM": 2, "NBFC": 2, "POWER": 2, "OTHER": 2,
         }
         
         self._load_state()
@@ -147,6 +173,50 @@ class RiskGovernor:
         self.current_capital = new_capital
         self.state.daily_pnl = new_capital - self.starting_capital
         self.state.daily_pnl_pct = (self.state.daily_pnl / self.starting_capital) * 100
+    
+    def can_trade_general(self, active_positions: List[Dict]) -> 'TradePermission':
+        """
+        Lightweight pre-scan check: can the system trade AT ALL?
+        Checks system state, cooldown, daily loss, consecutive losses, trade count.
+        Does NOT check sector/symbol exposure (that's done per-candidate).
+        """
+        self._check_new_day()
+        
+        if self.state.system_state == SystemState.HALT_TRADING.value:
+            return TradePermission(allowed=False, reason=f"Trading halted: {self.state.halt_reason}", warnings=[])
+        
+        if self.state.system_state == SystemState.CIRCUIT_BREAK.value:
+            return TradePermission(allowed=False, reason=f"Circuit breaker active: {self.state.halt_reason}", warnings=[])
+        
+        if self.state.system_state == SystemState.COOLDOWN.value:
+            if self.state.cooldown_until:
+                cooldown_end = datetime.fromisoformat(self.state.cooldown_until)
+                if datetime.now() < cooldown_end:
+                    mins_left = (cooldown_end - datetime.now()).seconds // 60
+                    return TradePermission(allowed=False, reason=f"Cooldown active: {mins_left} minutes remaining", warnings=[])
+                else:
+                    self.state.system_state = SystemState.ACTIVE.value
+                    self._save_state()
+        
+        if self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct:
+            return TradePermission(allowed=False, reason=f"Max daily loss exceeded: {self.state.daily_pnl_pct:.2f}%", warnings=[])
+        
+        if self.state.consecutive_losses >= self.limits.max_consecutive_losses:
+            return TradePermission(allowed=False, reason=f"Max consecutive losses: {self.state.consecutive_losses}", warnings=[])
+        
+        if self.state.trades_today >= self.limits.max_trades_per_day:
+            return TradePermission(allowed=False, reason=f"Max trades per day reached: {self.state.trades_today}", warnings=[])
+        
+        # Total exposure check
+        total_exposure = sum(p.get('avg_price', 0) * p.get('quantity', 0) for p in active_positions)
+        total_exposure_pct = (total_exposure / self.current_capital) * 100
+        if total_exposure_pct > self.limits.max_total_exposure_pct:
+            return TradePermission(allowed=False, reason=f"Max total exposure: {total_exposure_pct:.1f}%", warnings=[])
+        
+        warnings = []
+        if self.state.trades_today == self.limits.max_trades_per_day - 1:
+            warnings.append("Last trade allowed today")
+        return TradePermission(allowed=True, reason="", warnings=warnings, suggested_size_multiplier=1.0)
     
     def can_trade(
         self, 
@@ -227,16 +297,28 @@ class RiskGovernor:
             )
         
         # 6. Check symbol/sector exposure
-        sector = self.sector_map.get(symbol, "OTHER")
+        # For NFO symbols, map via underlying (e.g. NFO:SBIN26FEB1140CE → NSE:SBIN)
+        def _get_sector(sym):
+            if sym.startswith('NFO:'):
+                # Extract underlying from NFO trading symbol
+                ts = sym.replace('NFO:', '')
+                for base in self.sector_map:
+                    base_name = base.replace('NSE:', '')
+                    if ts.startswith(base_name):
+                        return self.sector_map[base]
+            return self.sector_map.get(sym, 'OTHER')
+        
+        sector = _get_sector(symbol)
         sector_positions = sum(
             1 for p in active_positions 
-            if self.sector_map.get(p.get('symbol', ''), 'OTHER') == sector
+            if _get_sector(p.get('symbol', '')) == sector
         )
         
-        if sector_positions >= self.limits.max_symbol_exposure:
+        max_in_sector = self.sector_limits.get(sector, self.limits.max_symbol_exposure)
+        if sector_positions >= max_in_sector:
             return TradePermission(
                 allowed=False,
-                reason=f"Max exposure in {sector} sector: {sector_positions} positions",
+                reason=f"Max exposure in {sector} sector: {sector_positions}/{max_in_sector} positions",
                 warnings=[f"Too many {sector} positions"]
             )
         
@@ -420,6 +502,15 @@ class RiskGovernor:
     def is_trading_allowed(self) -> bool:
         """Quick check if trading is allowed"""
         self._check_new_day()
+        # Also clear expired cooldowns
+        if self.state.system_state == SystemState.COOLDOWN.value:
+            if self.state.cooldown_until:
+                cooldown_end = datetime.fromisoformat(self.state.cooldown_until)
+                if datetime.now() >= cooldown_end:
+                    self.state.system_state = SystemState.ACTIVE.value
+                    self.state.cooldown_until = ""
+                    self._save_state()
+                    print("✅ Cooldown expired - trading resumed")
         return self.state.system_state == SystemState.ACTIVE.value
 
 

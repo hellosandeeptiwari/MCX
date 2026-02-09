@@ -1,0 +1,22 @@
+{
+  "date": "2026-02-09",
+  "placed_order_ids": [
+    "SBIN_20260209_MAN_B_E1E8DBFC"
+  ],
+  "order_records": {
+    "SBIN_20260209_MAN_B_E1E8DBFC": {
+      "client_order_id": "SBIN_20260209_MAN_B_E1E8DBFC",
+      "broker_order_id": "PAPER_412390",
+      "symbol": "NSE:SBIN",
+      "direction": "BUY",
+      "strategy": "MANUAL",
+      "setup_id": "DEFAULT",
+      "quantity": 44,
+      "price": 1127.2,
+      "status": "COMPLETE",
+      "created_at": "2026-02-09T09:39:40.244585",
+      "updated_at": "2026-02-09T09:39:40.244585",
+      "raw_intent": "NSE:SBIN|2026-02-09|MANUAL|BUY|DEFAULT|0"
+    }
+  }
+}

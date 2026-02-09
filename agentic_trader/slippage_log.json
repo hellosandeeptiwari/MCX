@@ -1,0 +1,14 @@
+[
+  {
+    "symbol": "NSE:UNIONBANK",
+    "side": "BUY",
+    "expected_price": 181.94,
+    "actual_price": 181.99,
+    "slippage_abs": 0.05000000000001137,
+    "slippage_pct": 0.027481587336490802,
+    "slippage_bps": 2.7481587336490803,
+    "volume_regime": "NORMAL",
+    "timestamp": "2026-02-09T10:37:18.441784",
+    "order_type": "LIMIT"
+  }
+]

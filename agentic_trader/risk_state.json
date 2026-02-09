@@ -1,0 +1,17 @@
+{
+  "system_state": "ACTIVE",
+  "daily_pnl": 240.01999999999475,
+  "daily_pnl_pct": 0.12000999999999737,
+  "trades_today": 2,
+  "wins_today": 1,
+  "losses_today": 1,
+  "consecutive_losses": 0,
+  "last_trade_time": "2026-02-09T14:48:26.787113",
+  "last_loss_time": "2026-02-09T13:59:06.278641",
+  "cooldown_until": "",
+  "halt_reason": "",
+  "positions_by_sector": {},
+  "order_rejections": 0,
+  "data_stale_count": 0,
+  "date": "2026-02-09"
+}

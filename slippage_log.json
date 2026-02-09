@@ -1,0 +1,14 @@
+[
+  {
+    "symbol": "NSE:SBIN",
+    "side": "BUY",
+    "expected_price": 1127.7,
+    "actual_price": 1127.2,
+    "slippage_abs": -0.5,
+    "slippage_pct": -0.04433803316484881,
+    "slippage_bps": -4.433803316484881,
+    "volume_regime": "NORMAL",
+    "timestamp": "2026-02-09T09:39:40.244585",
+    "order_type": "LIMIT"
+  }
+]

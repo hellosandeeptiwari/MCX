@@ -134,17 +134,16 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "place_option_order",
-            "description": "Place a BUY order for an option. Only BUY is allowed (no option selling).",
+            "description": "Place an F&O option order with automatic strike selection and IntradayOptionScorer validation. Use this for F&O-eligible stocks instead of place_order(). The system auto-selects CE for BUY direction and PE for SELL direction.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "option_symbol": {"type": "string", "description": "Full option symbol like 'NFO:RELIANCE25FEB2500CE'"},
-                    "action": {"type": "string", "enum": ["BUY"], "description": "Only BUY allowed"},
-                    "quantity": {"type": "integer", "description": "Number of lots"},
-                    "premium": {"type": "number", "description": "Expected premium per share"},
-                    "stop_loss_pct": {"type": "number", "description": "Stop loss as % of premium (default 30)"}
+                    "underlying": {"type": "string", "description": "Underlying stock symbol like 'NSE:RELIANCE'"},
+                    "direction": {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY = bullish (auto CE), SELL = bearish (auto PE)"},
+                    "strike_selection": {"type": "string", "enum": ["ATM", "ITM_1", "ITM_2", "OTM_1", "OTM_2"], "description": "Strike selection. ATM recommended for most trades."},
+                    "rationale": {"type": "string", "description": "Trade rationale (e.g., 'ORB breakout + high volume')"}
                 },
-                "required": ["option_symbol", "action", "quantity", "premium"]
+                "required": ["underlying", "direction"]
             }
         }
     },
@@ -286,11 +285,11 @@ If auto_execute is False, you must output trade plans for user approval instead 
                     self.trade_plans.append(arguments)
                 else:
                     result = self.tools.place_option_order(
-                        option_symbol=arguments["option_symbol"],
-                        action=arguments["action"],
-                        quantity=arguments["quantity"],
-                        premium=arguments["premium"],
-                        stop_loss_pct=arguments.get("stop_loss_pct", 30)
+                        underlying=arguments["underlying"],
+                        direction=arguments["direction"],
+                        strike_selection=arguments.get("strike_selection", "ATM"),
+                        rationale=arguments.get("rationale", ""),
+                        use_intraday_scoring=True
                     )
             elif tool_name == "place_order":
                 if not self.auto_execute:
@@ -337,12 +336,13 @@ If auto_execute is False, you must output trade plans for user approval instead 
         while iteration < max_iterations:
             iteration += 1
             
-            # Call OpenAI
+            # Call OpenAI with sufficient output tokens
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 messages=self.conversation,
                 tools=TOOL_DEFINITIONS,
-                tool_choice="auto"
+                tool_choice="auto",
+                max_tokens=4096
             )
             
             message = response.choices[0].message
@@ -368,9 +368,22 @@ If auto_execute is False, you must output trade plans for user approval instead 
             
             self.conversation.append(assistant_msg)
             
-            # If no tool calls, we're done
+            # If no tool calls, check if response was truncated
             if not message.tool_calls:
-                return message.content or "No response generated."
+                # Check if response was cut off mid-sentence (truncated)
+                finish_reason = response.choices[0].finish_reason
+                content = message.content or ""
+                
+                if finish_reason == "length" and iteration < max_iterations:
+                    # Response was truncated - ask GPT to continue with tool calls
+                    print("⚠️ GPT response truncated - requesting continuation...")
+                    self.conversation.append({
+                        "role": "user",
+                        "content": "Your response was cut off. Do NOT repeat the analysis. Just call place_order() for any remaining trades you identified. One place_order() call per trade."
+                    })
+                    continue  # Loop back to call GPT again
+                
+                return content or "No response generated."
             
             # Execute tool calls
             for tool_call in message.tool_calls:

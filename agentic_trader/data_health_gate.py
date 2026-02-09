@@ -88,6 +88,13 @@ class DataHealthGate:
                     if data.get('date') == str(datetime.now().date()):
                         self.stale_counters = data.get('stale_counters', {})
                         self.halted_symbols = data.get('halted_symbols', [])
+                        # Clean symbols no longer in universe
+                        try:
+                            from config import APPROVED_UNIVERSE
+                            self.halted_symbols = [s for s in self.halted_symbols if s in APPROVED_UNIVERSE]
+                            self.stale_counters = {k: v for k, v in self.stale_counters.items() if k in APPROVED_UNIVERSE}
+                        except ImportError:
+                            pass
         except Exception as e:
             print(f"⚠️ Error loading health state: {e}")
     

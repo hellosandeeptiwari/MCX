@@ -71,16 +71,16 @@ class RegimeScorer:
     def __init__(self):
         # Score thresholds by trade type
         self.thresholds = {
-            TradeType.ORB_BREAKOUT.value: 70,
-            TradeType.VWAP_TREND.value: 60,
-            TradeType.EMA_SQUEEZE.value: 65,
-            TradeType.MEAN_REVERSION.value: 65,
-            TradeType.EOD_PLAY.value: 55,
-            TradeType.MOMENTUM.value: 60,
+            TradeType.ORB_BREAKOUT.value: 55,
+            TradeType.VWAP_TREND.value: 45,
+            TradeType.EMA_SQUEEZE.value: 50,
+            TradeType.MEAN_REVERSION.value: 50,
+            TradeType.EOD_PLAY.value: 40,
+            TradeType.MOMENTUM.value: 45,
         }
         
         # Default threshold for unknown trade types
-        self.default_threshold = 60
+        self.default_threshold = 45
         
         # === TREND FOLLOWING INTEGRATION ===
         # Uses hysteresis-aware TrendFollowingEngine for intraday equity

@@ -12,7 +12,7 @@ Comprehensive options trading capabilities including:
 import json
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict, field
 from enum import Enum
@@ -167,10 +167,10 @@ class IntradayOptionScorer:
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
     # === TRADE THRESHOLDS (Simplified to 2 tiers) ===
-    BLOCK_THRESHOLD = 65         # < 65 = BLOCK (no trade)
-    STANDARD_THRESHOLD = 65      # 65-79 = Standard (ATM/ITM, 1x size)
-    PREMIUM_THRESHOLD = 80       # >= 80 = Premium (ATM/ITM, up to 1.2x)
-    CHOP_PENALTY = 30            # Deduct if in CHOP zone
+    BLOCK_THRESHOLD = 30         # < 30 = BLOCK (no trade) [lowered: NEUTRAL trend + no ORB made 45 impossible]
+    STANDARD_THRESHOLD = 35      # 35-54 = Standard (ATM/ITM, 1x size)
+    PREMIUM_THRESHOLD = 55       # >= 55 = Premium (ATM/ITM, up to 1.2x)
+    CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
     # === AGGRESSIVE SIZING REQUIREMENTS (Risk of ruin protection) ===
     # OTM + larger size = blows up even good systems
@@ -202,19 +202,21 @@ class IntradayOptionScorer:
     
     def score_intraday_signal(self, signal: IntradaySignal, 
                               market_data: Dict = None,
-                              option_data: OptionMicrostructure = None) -> IntradayOptionDecision:
+                              option_data: OptionMicrostructure = None,
+                              caller_direction: str = None) -> IntradayOptionDecision:
         """
         Score intraday signals and recommend option parameters
         
         HARD GATES:
-        1. TREND STATE must be BULLISH/BEARISH/STRONG (NEUTRAL = block)
+        1. Score >= BLOCK_THRESHOLD (30) required
         2. Microstructure gates (spread, OI, volume, depth)
-        3. Score >= 65 required
+        3. Must have a clear direction
         
         Args:
             signal: IntradaySignal with underlying price action
             market_data: Dict with candle/indicator data for trend analysis
             option_data: OptionMicrostructure with bid/ask/depth/OI
+            caller_direction: Direction hint from GPT agent ('BUY' or 'SELL')
         """
         score = 0
         reasons = []
@@ -248,10 +250,12 @@ class IntradayOptionScorer:
                 trend_score = normalized_trend
                 trend_state_str = trend_decision.trend_state.value
                 
-                # === HARD GATE: Options only in TREND states ===
+                # === NEUTRAL TREND: Score penalty instead of hard block ===
+                # TrendFollowing data is often incomplete (ADX, ORB hold not flowing)
+                # Strong intraday signals (ORB breakout, volume surge) should still trade
                 if trend_decision.trend_state == TrendState.NEUTRAL:
-                    trend_state_block = True
-                    warnings.append("🚫 BLOCKED: NEUTRAL trend - options require directional conviction")
+                    score -= 5
+                    warnings.append("⚠️ NEUTRAL trend penalty (-5) - need strong intraday signals")
                 elif trend_decision.trend_state == TrendState.STRONG_BULLISH:
                     bullish_points += trend_score
                     trend_direction = "BUY"
@@ -277,9 +281,9 @@ class IntradayOptionScorer:
             except Exception as e:
                 warnings.append(f"⚠️ Trend analysis error: {str(e)[:30]}")
         else:
-            # No trend data = treat as NEUTRAL = block
-            trend_state_block = True
-            warnings.append("⚠️ No trend data available - blocking options")
+            # No trend data = penalty instead of block
+            score -= 5
+            warnings.append("⚠️ No trend data available - penalty applied (-5)")
         
         # === 1. OPTIONS MICROSTRUCTURE GATE (15 points) ===
         microstructure_score, microstructure_block, microstructure_block_reason = self._score_microstructure(option_data, signal, reasons, warnings)
@@ -490,12 +494,41 @@ class IntradayOptionScorer:
             score -= self.CHOP_PENALTY
             warnings.append(f"⛔ CHOP ZONE - deducted {self.CHOP_PENALTY} points")
         
+        # === CALLER DIRECTION ALIGNMENT BONUS (5 pts max) ===
+        # When GPT agent has a clear direction and underlying signals partially support it,
+        # award a bonus. This helps bridge the gap when trend_following returns NEUTRAL.
+        if caller_direction and caller_direction in ('BUY', 'SELL'):
+            alignment_pts = 0
+            if caller_direction == 'BUY':
+                if signal.vwap_position == 'ABOVE_VWAP':
+                    alignment_pts += 2
+                if signal.volume_regime in ('HIGH', 'EXPLOSIVE'):
+                    alignment_pts += 2
+                if signal.ema_regime in ('EXPANDING', 'COMPRESSED'):
+                    alignment_pts += 1
+            elif caller_direction == 'SELL':
+                if signal.vwap_position == 'BELOW_VWAP':
+                    alignment_pts += 2
+                if signal.volume_regime in ('HIGH', 'EXPLOSIVE'):
+                    alignment_pts += 2
+                if signal.ema_regime in ('EXPANDING', 'COMPRESSED'):
+                    alignment_pts += 1
+            if alignment_pts > 0:
+                score += alignment_pts
+                reasons.append(f"🤖 Agent direction aligned with signals (+{alignment_pts})")
+                # Also help set direction when trend is NEUTRAL
+                if direction == 'HOLD':
+                    direction = caller_direction
+        
         # === DETERMINE DIRECTION ===
         if direction == "HOLD":
             if bullish_points > bearish_points + 10:
                 direction = "BUY"
             elif bearish_points > bullish_points + 10:
                 direction = "SELL"
+            elif caller_direction and caller_direction in ('BUY', 'SELL'):
+                # Fallback: use GPT direction if points are close
+                direction = caller_direction
         
         # === DETERMINE STRIKE SELECTION (with OTM safety rules) ===
         strike_selection = self._recommend_strike(
@@ -534,12 +567,7 @@ class IntradayOptionScorer:
         # === ALL HARD GATES ===
         should_trade = True
         
-        # Gate 1: TREND STATE must be directional
-        if trend_state_block:
-            should_trade = False
-            # Warning already added above
-        
-        # Gate 2: Score must be >= BLOCK_THRESHOLD (65)
+        # Gate 1: Score must be >= BLOCK_THRESHOLD
         if score < self.BLOCK_THRESHOLD:
             should_trade = False
             warnings.append(f"🚫 BLOCKED: Score {score:.0f} < {self.BLOCK_THRESHOLD} minimum")
@@ -1033,21 +1061,21 @@ class OptionOrderPlan:
 
 # F&O Lot Sizes (as of 2026 - may need updates)
 FNO_LOT_SIZES = {
-    "RELIANCE": 250,
-    "TCS": 150,
+    "RELIANCE": 500,
+    "TCS": 175,
     "HDFCBANK": 550,
-    "INFY": 300,
+    "INFY": 400,
     "ICICIBANK": 700,
-    "SBIN": 1500,
-    "AXISBANK": 600,
-    "KOTAKBANK": 400,
-    "BAJFINANCE": 125,
-    "TATAMOTORS": 1425,
-    "MCX": 200,
-    "LT": 150,
-    "MARUTI": 100,
-    "TITAN": 375,
-    "SUNPHARMA": 700,
+    "SBIN": 750,
+    "AXISBANK": 625,
+    "KOTAKBANK": 2000,
+    "BAJFINANCE": 750,
+    "ETERNAL": 2425,
+    "MCX": 625,
+    "LT": 175,
+    "MARUTI": 50,
+    "TITAN": 175,
+    "SUNPHARMA": 350,
     "BHARTIARTL": 475,
     "ADANIENT": 250,
     "ADANIPORTS": 1250,
@@ -1055,32 +1083,37 @@ FNO_LOT_SIZES = {
     "ASIANPAINT": 300,
     "BPCL": 1800,
     "CIPLA": 650,
-    "COALINDIA": 2100,
+    "COALINDIA": 1350,
     "DIVISLAB": 100,
     "DRREDDY": 125,
     "EICHERMOT": 175,
     "GRASIM": 475,
     "HCLTECH": 350,
-    "HDFC": 300,
     "HEROMOTOCO": 150,
-    "HINDALCO": 1075,
+    "HINDALCO": 700,
     "HINDUNILVR": 300,
     "INDUSINDBK": 450,
     "ITC": 1600,
+    "TATAPOWER": 1450,
     "JSWSTEEL": 675,
     "M&M": 350,
     "NESTLEIND": 25,
-    "NTPC": 2700,
-    "ONGC": 3850,
+    "NTPC": 1500,
+    "ONGC": 2250,
     "POWERGRID": 2700,
     "SBILIFE": 750,
     "SHREECEM": 25,
-    "TATACONSUM": 450,
-    "TATASTEEL": 550,
+    "TATACONSUM": 550,
+    "TATASTEEL": 5500,
     "TECHM": 600,
     "ULTRACEMCO": 100,
     "UPL": 1300,
-    "WIPRO": 1500,
+    "WIPRO": 3000,
+    "VEDL": 1150,
+    "JINDALSTEL": 625,
+    "NATIONALUM": 3750,
+    "NMDC": 6750,
+    "SAIL": 4700,
     "NIFTY": 50,
     "BANKNIFTY": 15,
     "FINNIFTY": 40,
@@ -1201,23 +1234,29 @@ class BlackScholes:
         
         sigma = 0.3  # Initial guess
         
-        for _ in range(max_iterations):
-            if option_type == OptionType.CE:
-                price = BlackScholes.call_price(S, K, T, r, sigma)
-            else:
-                price = BlackScholes.put_price(S, K, T, r, sigma)
-            
-            vega = BlackScholes.vega(S, K, T, r, sigma) * 100  # Actual vega
-            
-            if vega == 0:
-                break
-            
-            diff = market_price - price
-            if abs(diff) < precision:
-                break
-            
-            sigma = sigma + diff / vega
-            sigma = max(0.01, min(5.0, sigma))  # Keep sigma reasonable
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for _ in range(max_iterations):
+                if option_type == OptionType.CE:
+                    price = BlackScholes.call_price(S, K, T, r, sigma)
+                else:
+                    price = BlackScholes.put_price(S, K, T, r, sigma)
+                
+                vega = BlackScholes.vega(S, K, T, r, sigma) * 100  # Actual vega
+                
+                if vega == 0 or not math.isfinite(vega):
+                    break
+                
+                diff = market_price - price
+                if abs(diff) < precision:
+                    break
+                
+                sigma = sigma + diff / vega
+                if not math.isfinite(sigma):
+                    sigma = 0.3
+                    break
+                sigma = max(0.01, min(5.0, sigma))  # Keep sigma reasonable
         
         return sigma
 
@@ -1273,24 +1312,31 @@ class OptionChainFetcher:
         
         today = datetime.now().date()
         
+        # Helper: expiry may be datetime.date or datetime.datetime
+        def exp_date(exp):
+            return exp if isinstance(exp, date) and not isinstance(exp, datetime) else exp.date() if hasattr(exp, 'date') else exp
+        
         if selection == ExpirySelection.CURRENT_WEEK:
             # Get expiry in current week (Thursday)
             for exp in expiries:
-                if exp.date() >= today and (exp.date() - today).days <= 7:
+                ed = exp_date(exp)
+                if ed >= today and (ed - today).days <= 7:
                     return exp
             return expiries[0] if expiries else None
         
         elif selection == ExpirySelection.NEXT_WEEK:
             # Skip current week, get next
             for exp in expiries:
-                if exp.date() >= today and (exp.date() - today).days > 7:
+                ed = exp_date(exp)
+                if ed >= today and (ed - today).days > 7:
                     return exp
             return expiries[-1] if len(expiries) > 1 else expiries[0]
         
         elif selection == ExpirySelection.CURRENT_MONTH:
             # Get monthly expiry (last Thursday of month)
             for exp in expiries:
-                if exp.date() >= today and exp.day >= 23:
+                ed = exp_date(exp)
+                if ed >= today and ed.day >= 23:
                     return exp
             return expiries[0] if expiries else None
         
@@ -1298,7 +1344,8 @@ class OptionChainFetcher:
             # Get next month's expiry
             current_month = today.month
             for exp in expiries:
-                if exp.date() >= today and exp.month > current_month:
+                ed = exp_date(exp)
+                if ed >= today and ed.month > current_month:
                     return exp
             return expiries[-1] if expiries else None
         
@@ -1323,7 +1370,8 @@ class OptionChainFetcher:
         symbol = underlying.replace("NSE:", "")
         
         # Check cache
-        cache_key = f"{symbol}_{expiry.date() if expiry else 'nearest'}"
+        expiry_key = expiry if isinstance(expiry, date) and not isinstance(expiry, datetime) else (expiry.date() if expiry else 'nearest')
+        cache_key = f"{symbol}_{expiry_key}"
         if cache_key in self.cache:
             last = self.last_fetch.get(cache_key, datetime.min)
             if (datetime.now() - last).seconds < self.CACHE_TTL_SECONDS:
@@ -1385,7 +1433,8 @@ class OptionChainFetcher:
                         ask = depth.get('sell', [{}])[0].get('price', ltp * 1.05) if depth.get('sell') else ltp * 1.05
                         
                         # Calculate time to expiry
-                        T = max(0, (expiry - datetime.now()).days / 365)
+                        expiry_dt = datetime.combine(expiry, datetime.min.time()) if isinstance(expiry, date) and not isinstance(expiry, datetime) else expiry
+                        T = max(0.001, (expiry_dt - datetime.now()).total_seconds() / (365 * 86400))
                         
                         # Calculate IV
                         iv = BlackScholes.implied_volatility(
@@ -1611,8 +1660,9 @@ class OptionsTrader:
         self.chain_fetcher = OptionChainFetcher(kite)
         self.position_sizer = OptionsPositionSizer(capital)
         
-        # Active option positions
+        # Active option positions - load from active_trades.json if available
         self.positions: List[Dict] = []
+        self._load_option_positions()
         
         # Configuration
         self.config = {
@@ -1624,7 +1674,45 @@ class OptionsTrader:
             'min_volume': 100,              # Minimum volume
         }
         
-        print("📊 Options Trader: INITIALIZED")
+        if self.positions:
+            print(f"📊 Options Trader: INITIALIZED ({len(self.positions)} option positions loaded)")
+        else:
+            print("📊 Options Trader: INITIALIZED")
+    
+    def _load_option_positions(self):
+        """Load option positions from active_trades.json"""
+        try:
+            trades_file = os.path.join(os.path.dirname(__file__), 'active_trades.json')
+            if os.path.exists(trades_file):
+                with open(trades_file, 'r') as f:
+                    data = json.load(f)
+                    if data.get('date') == str(datetime.now().date()):
+                        for trade in data.get('active_trades', []):
+                            if trade.get('is_option') and trade.get('status', 'OPEN') == 'OPEN':
+                                # Reconstruct option position from paper trade data
+                                self.positions.append({
+                                    'order_id': trade.get('order_id', ''),
+                                    'symbol': trade['symbol'],
+                                    'underlying': trade.get('underlying', ''),
+                                    'direction': trade.get('side', 'BUY'),
+                                    'option_type': trade.get('option_type', 'CE'),
+                                    'strike': trade.get('strike', 0),
+                                    'expiry': trade.get('expiry', ''),
+                                    'quantity': trade.get('lots', 1),
+                                    'lot_size': trade.get('lot_size', 1),
+                                    'entry_premium': trade.get('avg_price', 0),
+                                    'total_premium': trade.get('total_premium', 0),
+                                    'target_premium': trade.get('target', 0),
+                                    'stoploss_premium': trade.get('stop_loss', 0),
+                                    'breakeven': trade.get('breakeven', 0),
+                                    'greeks': trade.get('greeks', {
+                                        'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'iv': 0
+                                    }),
+                                    'status': 'OPEN',
+                                    'timestamp': trade.get('timestamp', '')
+                                })
+        except Exception as e:
+            print(f"⚠️ Error loading option positions: {e}")
     
     def should_use_options(self, underlying: str) -> bool:
         """
@@ -1660,19 +1748,64 @@ class OptionsTrader:
         intraday_signal = IntradaySignal(
             symbol=underlying,
             orb_signal=market_data.get('orb_signal', 'INSIDE_ORB'),
-            vwap_position=market_data.get('vwap_position', 'AT_VWAP'),
-            vwap_trend=market_data.get('vwap_trend', 'FLAT'),
+            vwap_position=market_data.get('price_vs_vwap', market_data.get('vwap_position', 'AT_VWAP')),
+            vwap_trend=market_data.get('vwap_slope', market_data.get('vwap_trend', 'FLAT')),
             ema_regime=market_data.get('ema_regime', 'NORMAL'),
             volume_regime=market_data.get('volume_regime', 'NORMAL'),
             rsi=market_data.get('rsi_14', 50.0),
             price_momentum=market_data.get('momentum_15m', 0.0),
             htf_alignment=market_data.get('htf_alignment', 'NEUTRAL'),
-            chop_zone=market_data.get('chop_zone', False)
+            chop_zone=market_data.get('chop_zone', False),
+            follow_through_candles=market_data.get('follow_through_candles', 0),
+            range_expansion_ratio=market_data.get('range_expansion_ratio', 0.0),
+            vwap_slope_steepening=market_data.get('vwap_slope_steepening', False)
         )
         
-        # === SCORE INTRADAY + TREND FOLLOWING SIGNALS ===
+        # === PRE-FETCH OPTION CHAIN FOR MICROSTRUCTURE DATA ===
+        # Fetch chain BEFORE scoring so we can pass microstructure to scorer
+        # This unlocks 15 points that were previously always 0
+        micro_data = None
+        try:
+            pre_expiry_sel = force_expiry or ExpirySelection.CURRENT_WEEK
+            pre_expiry = self.chain_fetcher.get_nearest_expiry(underlying, pre_expiry_sel)
+            if pre_expiry:
+                pre_chain = self.chain_fetcher.fetch_option_chain(underlying, pre_expiry)
+                if pre_chain and pre_chain.contracts:
+                    # Find ATM strike for the expected option type
+                    atm_strike = pre_chain.get_atm_strike(pre_expiry)
+                    expected_type = OptionType.CE if direction == 'BUY' else OptionType.PE
+                    atm_contract = pre_chain.get_contract(atm_strike, expected_type, pre_expiry)
+                    
+                    if atm_contract:
+                        # Fetch fresh depth from Kite for this specific contract
+                        depth_data = None
+                        try:
+                            if self.chain_fetcher.kite:
+                                q = self.chain_fetcher.kite.quote([atm_contract.symbol])
+                                if atm_contract.symbol in q:
+                                    depth_data = q[atm_contract.symbol].get('depth', {})
+                        except Exception:
+                            pass  # Use contract data without depth
+                        
+                        # Build microstructure from contract + depth
+                        contract_dict = {
+                            'bid': atm_contract.bid,
+                            'ask': atm_contract.ask,
+                            'ltp': atm_contract.ltp,
+                            'oi': atm_contract.oi,
+                            'volume': atm_contract.volume,
+                        }
+                        micro_data = build_microstructure_from_contract(
+                            contract=contract_dict,
+                            depth=depth_data
+                        )
+                        print(f"   📊 Microstructure: spread={micro_data.spread_pct:.2f}%, OI={micro_data.open_interest:,}, vol={micro_data.option_volume:,}")
+        except Exception as e:
+            print(f"   ⚠️ Microstructure pre-fetch failed: {e}")
+        
+        # === SCORE INTRADAY + TREND FOLLOWING SIGNALS (now WITH microstructure!) ===
         scorer = get_intraday_scorer()
-        decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data)
+        decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, option_data=micro_data, caller_direction=direction)
         
         print(f"\n📊 INTRADAY + TREND OPTION DECISION for {underlying}:")
         print(f"   Score: {decision.confidence_score:.0f}/100")
@@ -1699,52 +1832,67 @@ class OptionsTrader:
         
         print(f"   Strike: {strike_sel.value} | Expiry: {expiry_sel.value} | Type: {opt_type.value}")
         
-        # === GET OPTION CHAIN ===
-        expiry = self.chain_fetcher.get_nearest_expiry(underlying, expiry_sel)
-        chain = self.chain_fetcher.fetch_option_chain(underlying, expiry)
-        
-        if chain is None or not chain.contracts:
-            print(f"⚠️ No option chain available for {underlying}")
-            return None
-        
-        # Select strike
-        contract = self.chain_fetcher.select_strike(chain, opt_type, strike_sel, expiry)
-        
-        if contract is None:
-            print(f"⚠️ No suitable strike found for {underlying}")
-            return None
-        
-        # === CALCULATE POSITION SIZE (apply intraday multiplier) ===
-        sizing = self.position_sizer.calculate_position(contract, final_direction, self.capital)
-        
-        # Apply intraday conviction multiplier
-        adjusted_lots = max(1, int(sizing['lots'] * decision.position_size_multiplier))
-        adjusted_premium = adjusted_lots * sizing['premium_per_lot']
-        
-        # Cap at max allowed
-        if adjusted_premium > self.capital * 0.15:  # Max 15% of capital
-            adjusted_lots = max(1, int((self.capital * 0.15) / sizing['premium_per_lot']))
+        try:
+            # === GET OPTION CHAIN ===
+            expiry = self.chain_fetcher.get_nearest_expiry(underlying, expiry_sel)
+            if expiry is None:
+                print(f"   ⚠️ No expiry found for {underlying}")
+                return None
+            print(f"   📅 Expiry: {expiry}")
+            
+            chain = self.chain_fetcher.fetch_option_chain(underlying, expiry)
+            
+            if chain is None or not chain.contracts:
+                print(f"   ⚠️ No option chain available for {underlying} (chain={'None' if chain is None else f'{len(chain.contracts)} contracts'})")
+                return None
+            
+            print(f"   📊 Chain: {len(chain.contracts)} contracts, spot=₹{chain.spot_price:.2f}")
+            
+            # Select strike
+            contract = self.chain_fetcher.select_strike(chain, opt_type, strike_sel, expiry)
+            
+            if contract is None:
+                print(f"   ⚠️ No suitable strike found for {underlying}")
+                return None
+            
+            print(f"   🎯 Selected: {contract.symbol} @ ₹{contract.ltp:.2f}")
+            
+            # === CALCULATE POSITION SIZE (apply intraday multiplier) ===
+            sizing = self.position_sizer.calculate_position(contract, final_direction, self.capital)
+            
+            # Apply intraday conviction multiplier
+            adjusted_lots = max(1, int(sizing['lots'] * decision.position_size_multiplier))
             adjusted_premium = adjusted_lots * sizing['premium_per_lot']
-        
-        # === CREATE ORDER PLAN ===
-        plan = OptionOrderPlan(
-            underlying=underlying,
-            direction=final_direction,
-            contract=contract,
-            quantity=adjusted_lots,
-            premium_per_lot=sizing['premium_per_lot'],
-            total_premium=adjusted_premium,
-            max_loss=adjusted_premium,  # Max loss = premium for long options
-            breakeven=sizing['breakeven'],
-            target_premium=sizing['target_premium'],
-            stoploss_premium=sizing['stoploss_premium'],
-            rationale=f"{final_direction} {underlying} | {' | '.join(decision.reasons[:3])} | SCORE:{decision.confidence_score:.0f}",
-            greeks_summary=f"Δ:{contract.delta:.2f} Γ:{contract.gamma:.4f} Θ:{contract.theta:.2f} V:{contract.vega:.2f} IV:{contract.iv*100:.1f}%"
-        )
-        
-        print(f"   ✅ Plan: {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}")
-        
-        return (plan, decision)
+            
+            # Cap at max allowed
+            if adjusted_premium > self.capital * 0.15:  # Max 15% of capital
+                adjusted_lots = max(1, int((self.capital * 0.15) / sizing['premium_per_lot']))
+                adjusted_premium = adjusted_lots * sizing['premium_per_lot']
+            
+            # === CREATE ORDER PLAN ===
+            plan = OptionOrderPlan(
+                underlying=underlying,
+                direction=final_direction,
+                contract=contract,
+                quantity=adjusted_lots,
+                premium_per_lot=sizing['premium_per_lot'],
+                total_premium=adjusted_premium,
+                max_loss=adjusted_premium,  # Max loss = premium for long options
+                breakeven=sizing['breakeven'],
+                target_premium=sizing['target_premium'],
+                stoploss_premium=sizing['stoploss_premium'],
+                rationale=f"{final_direction} {underlying} | {' | '.join(decision.reasons[:3])} | SCORE:{decision.confidence_score:.0f}",
+                greeks_summary=f"Δ:{contract.delta:.2f} Γ:{contract.gamma:.4f} Θ:{contract.theta:.2f} V:{contract.vega:.2f} IV:{contract.iv*100:.1f}%"
+            )
+            
+            print(f"   ✅ Plan: {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}")
+            
+            return (plan, decision)
+        except Exception as e:
+            import traceback
+            print(f"   ❌ ERROR in option order creation: {e}")
+            traceback.print_exc()
+            return None
     
     def create_option_order(self, underlying: str, direction: str,
                            option_type: OptionType = None,
@@ -1780,11 +1928,8 @@ class OptionsTrader:
             )
             if result:
                 return result[0]  # Return just the plan
-            # If intraday scoring rejects, still allow manual override below
-            if strike_selection and expiry_selection:
-                print(f"   ⚠️ Intraday rejected but force params provided - proceeding")
-            else:
-                return None  # No forced params, respect intraday decision
+            # Intraday scoring rejected - respect the decision
+            return None
         
         # === FALLBACK: BASIC LOGIC (no intraday data) ===
         # Auto-select option type based on direction

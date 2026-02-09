@@ -14,6 +14,7 @@ from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import json
+import os
 
 
 @dataclass
@@ -71,7 +72,7 @@ class ExitManager:
     
     def __init__(self):
         # Configuration
-        self.session_cutoff = time(15, 15)  # 3:15 PM
+        self.session_cutoff = time(15, 20)  # 3:20 PM
         self.time_stop_candles = 10  # Exit if no progress in 10 candles
         self.time_stop_min_r = 0.5  # Must make at least 0.5R to stay
         self.breakeven_trigger_r = 0.8  # Move SL to entry at 0.8R
@@ -80,6 +81,36 @@ class ExitManager:
         
         # Track trades
         self.trade_states: Dict[str, TradeState] = {}
+        
+        # State persistence path
+        self._state_file = os.path.join(os.path.dirname(__file__), 'exit_manager_state.json')
+        self._load_persisted_state()
+    
+    def _load_persisted_state(self):
+        """Restore trade states from disk (crash recovery)"""
+        try:
+            if os.path.exists(self._state_file):
+                with open(self._state_file, 'r') as f:
+                    data = json.load(f)
+                for sym, state_dict in data.items():
+                    self.trade_states[sym] = TradeState.from_dict(state_dict)
+                if self.trade_states:
+                    print(f"📊 Exit Manager: Restored {len(self.trade_states)} trade states from disk")
+        except Exception as e:
+            print(f"⚠️ Exit Manager: Could not restore state: {e}")
+    
+    def _persist_state(self):
+        """Save trade states to disk for crash recovery"""
+        try:
+            data = {}
+            for sym, state in self.trade_states.items():
+                d = state.to_dict()
+                d['entry_time'] = state.entry_time.isoformat()
+                data[sym] = d
+            with open(self._state_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ Exit Manager: Could not persist state: {e}")
     
     def register_trade(
         self, 
@@ -108,6 +139,7 @@ class ExitManager:
             trailing_active=False
         )
         self.trade_states[symbol] = state
+        self._persist_state()
         print(f"📊 Exit Manager: Registered {symbol} {side} @ {entry_price}")
         return state
     
@@ -256,6 +288,7 @@ class ExitManager:
         if r_multiple >= self.breakeven_trigger_r:
             state.current_sl = state.entry_price
             state.breakeven_applied = True
+            self._persist_state()
             print(f"🔒 {state.symbol}: Break-even applied (SL moved to {state.entry_price})")
     
     def _apply_trailing_stop(self, state: TradeState, current_price: float, r_multiple: float):
@@ -275,6 +308,7 @@ class ExitManager:
                 old_sl = state.current_sl
                 state.current_sl = round(new_sl, 2)
                 state.trailing_active = True
+                self._persist_state()
                 print(f"📈 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
         else:  # SELL
             # Trail at 50% of max profit from entry
@@ -286,12 +320,14 @@ class ExitManager:
                 old_sl = state.current_sl
                 state.current_sl = round(new_sl, 2)
                 state.trailing_active = True
+                self._persist_state()
                 print(f"📉 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
     
     def remove_trade(self, symbol: str):
         """Remove a trade from tracking (after exit) and reset hysteresis"""
         if symbol in self.trade_states:
             del self.trade_states[symbol]
+            self._persist_state()
             print(f"📊 Exit Manager: Removed {symbol} from tracking")
             
             # === RESET HYSTERESIS FOR TREND FOLLOWING + REGIME SCORER ===

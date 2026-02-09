@@ -20,7 +20,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS
+from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG
 from llm_agent import TradingAgent
 from zerodha_tools import get_tools, reset_tools
 from exit_manager import get_exit_manager, calculate_structure_sl
@@ -115,6 +115,9 @@ class AutonomousTrader:
         # Start reconciliation loop
         self.position_recon.start()
         
+        # Sync exit manager with existing positions (crash recovery)
+        self._sync_exit_manager_with_positions()
+        
         print("\n  ✅ Bot initialized!")
         print("  🟢 Auto-execution: ON")
         print("  ⚡ Real-time monitoring: ENABLED (every 3 sec)")
@@ -143,6 +146,71 @@ class AutonomousTrader:
             self.orb_trades_today[symbol] = {"UP": False, "DOWN": False}
         return not self.orb_trades_today[symbol].get(direction, False)
     
+    def _sync_exit_manager_with_positions(self):
+        """
+        Sync exit manager with paper_positions on startup.
+        If exit_manager_state.json is missing/empty but we have active positions,
+        re-register them so exit logic (breakeven, trailing SL, time stop) works.
+        """
+        active = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        active_symbols = {t.get('symbol', '') for t in active}
+        
+        # Clean ghost positions from exit manager (in state file but not in paper_positions)
+        ghost_symbols = [sym for sym in list(self.exit_manager.trade_states.keys()) if sym not in active_symbols]
+        for sym in ghost_symbols:
+            self.exit_manager.remove_trade(sym)
+            print(f"🧹 Exit Manager: Removed ghost position {sym} (not in active trades)")
+        
+        if not active:
+            return
+        
+        already_tracked = set(self.exit_manager.trade_states.keys())
+        registered = 0
+        
+        for trade in active:
+            symbol = trade.get('symbol', '')
+            if symbol in already_tracked:
+                # Estimate candle count from entry time if still 0
+                state = self.exit_manager.trade_states[symbol]
+                if state.candles_since_entry == 0 and state.entry_time:
+                    elapsed_min = (datetime.now() - state.entry_time).total_seconds() / 60
+                    estimated_candles = max(0, int(elapsed_min / 5))  # 5-min candles
+                    state.candles_since_entry = estimated_candles
+                continue  # Already restored from state file
+            
+            entry = trade.get('avg_price', trade.get('entry_price', 0))
+            sl = trade.get('stop_loss', 0)
+            target = trade.get('target', 0)
+            qty = trade.get('quantity', 0)
+            side = trade.get('side', 'BUY')
+            
+            if entry > 0 and sl > 0 and target > 0:
+                self.exit_manager.register_trade(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry,
+                    stop_loss=sl,
+                    target=target,
+                    quantity=qty
+                )
+                # Estimate candles from trade entry timestamp
+                ts = trade.get('timestamp', '')
+                if ts:
+                    try:
+                        entry_time = datetime.fromisoformat(ts)
+                        elapsed_min = (datetime.now() - entry_time).total_seconds() / 60
+                        estimated_candles = max(0, int(elapsed_min / 5))
+                        state = self.exit_manager.trade_states.get(symbol)
+                        if state:
+                            state.candles_since_entry = estimated_candles
+                            state.entry_time = entry_time
+                    except:
+                        pass
+                registered += 1
+        
+        if registered:
+            print(f"📊 Exit Manager: Synced {registered} existing positions for exit management")
+    
     def _mark_orb_trade_taken(self, symbol: str, direction: str):
         """Mark ORB direction as used for symbol today"""
         self._reset_orb_tracker_if_new_day()
@@ -170,20 +238,28 @@ class AutonomousTrader:
     
     def _realtime_monitor_loop(self):
         """Continuous loop that checks positions every few seconds"""
+        candle_timer = 0  # Track time for candle increment
         while self.monitor_running:
             try:
                 if self.is_trading_hours():
                     self._check_positions_realtime()
                     self._check_eod_exit()  # Check if need to exit before close
+                    
+                    # Increment candle counter every ~5 minutes (300s / monitor_interval)
+                    candle_timer += self.monitor_interval
+                    if candle_timer >= 300:  # 5 minutes = 1 candle
+                        candle_timer = 0
+                        for state in self.exit_manager.get_all_states():
+                            self.exit_manager.increment_candles(state.symbol)
             except Exception as e:
                 print(f"⚠️ Monitor error: {e}")
             
             time.sleep(self.monitor_interval)
     
     def _check_eod_exit(self):
-        """Exit all positions before market close (3:15 PM)"""
+        """Exit all positions before market close (3:20 PM)"""
         now = datetime.now().time()
-        eod_exit_time = datetime.strptime("15:10", "%H:%M").time()  # Exit 5 mins before
+        eod_exit_time = datetime.strptime("15:15", "%H:%M").time()  # Exit 5 mins before 3:20
         
         if now >= eod_exit_time:
             active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
@@ -231,13 +307,26 @@ class AutonomousTrader:
         equity_trades = [t for t in active_trades if not t.get('is_option', False)]
         option_trades = [t for t in active_trades if t.get('is_option', False)]
         
-        # Get current prices for equity positions
-        if equity_trades:
-            symbols = [t['symbol'] for t in equity_trades]
+        # Get current prices for ALL positions (equity + options)
+        all_symbols = [t['symbol'] for t in active_trades]
+        if all_symbols:
             try:
-                quotes = self.tools.kite.quote(symbols)
+                quotes = self.tools.kite.quote(all_symbols)
             except Exception as e:
+                # If mixed exchange query fails, try separately
                 quotes = {}
+                if equity_trades:
+                    try:
+                        eq_syms = [t['symbol'] for t in equity_trades]
+                        quotes.update(self.tools.kite.quote(eq_syms))
+                    except:
+                        pass
+                if option_trades:
+                    try:
+                        opt_syms = [t['symbol'] for t in option_trades]
+                        quotes.update(self.tools.kite.quote(opt_syms))
+                    except:
+                        pass
         else:
             quotes = {}
         
@@ -286,8 +375,8 @@ class AutonomousTrader:
                     print(f"   ⚠️ Option exit check error: {e}")
         
         # === EXIT MANAGER INTEGRATION ===
-        # Check all trades via exit manager
-        price_dict = {t['symbol']: quotes.get(t['symbol'], {}).get('last_price', 0) for t in equity_trades}
+        # Check all trades via exit manager (equity AND options)
+        price_dict = {t['symbol']: quotes.get(t['symbol'], {}).get('last_price', 0) for t in active_trades}
         exit_signals = self.exit_manager.check_all_exits(price_dict)
         
         # Process exit signals first (highest priority)
@@ -458,6 +547,7 @@ class AutonomousTrader:
         
         print(f"\n🔍 {datetime.now().strftime('%H:%M:%S')} - Scanning market...")
         print(self.risk_governor.get_status())
+        self._rejected_this_cycle = set()  # Reset rejected symbols for new scan
         
         # CHECK AND UPDATE EXISTING TRADES (target/stoploss hits)
         trade_updates = self.tools.check_and_update_trades()
@@ -501,11 +591,15 @@ class AutonomousTrader:
                     line = f"""
 {symbol}:
   Price: ₹{data['ltp']:.2f} | Change: {data.get('change_pct', 0):.2f}% | Trend: {data.get('trend', 'N/A')}
-  RSI: {data.get('rsi_14', 50):.0f} | Volume: {data.get('volume_signal', 'N/A')}
-  Order Flow: {order_flow} | Buy%: {buy_ratio}% | EOD Prediction: {eod_pred}
-  SMA20: ₹{data.get('sma_20', 0):.2f} | SMA50: ₹{data.get('sma_50', 0):.2f}
+  RSI: {data.get('rsi_14', 50):.0f} | ATR: ₹{data.get('atr_14', 0):.2f}
+  VWAP: ₹{data.get('vwap', 0):.2f} ({data.get('price_vs_vwap', 'N/A')}) Slope: {data.get('vwap_slope', 'FLAT')}
+  EMA9: ₹{data.get('ema_9', 0):.2f} | EMA21: ₹{data.get('ema_21', 0):.2f} | Regime: {data.get('ema_regime', 'N/A')}
+  ORB: H=₹{data.get('orb_high', 0):.2f} L=₹{data.get('orb_low', 0):.2f} → {data.get('orb_signal', 'N/A')} (Str:{data.get('orb_strength', 0):.1f}%)
+  Volume: {data.get('volume_regime', 'N/A')} ({data.get('volume_vs_avg', 1.0):.1f}x avg) | Order Flow: {order_flow} | Buy%: {buy_ratio}%
+  HTF: {data.get('htf_trend', 'N/A')} ({data.get('htf_alignment', 'N/A')}) | Chop: {'⚠️YES' if data.get('chop_zone', False) else 'NO'}
   Support: ₹{data.get('support_1', 0):.2f} / ₹{data.get('support_2', 0):.2f}
-  Resistance: ₹{data.get('resistance_1', 0):.2f} / ₹{data.get('resistance_2', 0):.2f}"""
+  Resistance: ₹{data.get('resistance_1', 0):.2f} / ₹{data.get('resistance_2', 0):.2f}
+  EOD Prediction: {eod_pred}"""
                     data_summary.append(line)
             
             # Sort by absolute change to show active stocks first
@@ -631,7 +725,8 @@ class AutonomousTrader:
                     
                     # Include CHOP and HTF status in scan output
                     htf_icon = "🐂" if htf_trend == "BULLISH" else "🐻" if htf_trend == "BEARISH" else "➖"
-                    quick_scan.append(f"{symbol}: {chg:+.2f}% RSI:{rsi:.0f} {trend} ORB:{orb_signal} Vol:{volume_regime} HTF:{htf_icon} {setup}")
+                    fno_tag = "[F&O]" if symbol in FNO_CONFIG.get('prefer_options_for', []) else ""
+                    quick_scan.append(f"{symbol}{fno_tag}: {chg:+.2f}% RSI:{rsi:.0f} {trend} ORB:{orb_signal} Vol:{volume_regime} HTF:{htf_icon} {setup}")
             
             # Print regime signals
             if regime_signals:
@@ -654,9 +749,7 @@ class AutonomousTrader:
             
             # Check trade permission before prompting agent
             active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
-            can_trade_check = self.risk_governor.can_trade(
-                symbol="NSE:DUMMY",  # Just checking general permission
-                position_value=10000,
+            can_trade_check = self.risk_governor.can_trade_general(
                 active_positions=active_positions
             )
             
@@ -686,95 +779,139 @@ class AutonomousTrader:
             else:
                 print(f"🛡️ DATA HEALTH: ✅ All symbols healthy")
             
+            # Build F&O opportunity list
+            fno_prefer = FNO_CONFIG.get('prefer_options_for', [])
+            fno_opportunities = []
+            for symbol, data in sorted_data:
+                if isinstance(data, dict) and 'ltp' in data and symbol in fno_prefer:
+                    if self.tools.is_symbol_in_active_trades(symbol):
+                        continue
+                    if data.get('chop_zone', False):
+                        continue
+                    setup_type = None
+                    direction = None
+                    orb_sig = data.get('orb_signal', 'INSIDE_ORB')
+                    vol_reg = data.get('volume_regime', 'NORMAL')
+                    ema_reg = data.get('ema_regime', 'NEUTRAL')
+                    htf_a = data.get('htf_alignment', 'NEUTRAL')
+                    rsi = data.get('rsi_14', 50)
+                    pvw = data.get('price_vs_vwap', 'AT_VWAP')
+                    vs = data.get('vwap_slope', 'FLAT')
+                    
+                    if orb_sig == "BREAKOUT_UP" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                        setup_type = "ORB_BREAKOUT"
+                        direction = "BUY"
+                    elif orb_sig == "BREAKOUT_DOWN" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                        setup_type = "ORB_BREAKOUT"
+                        direction = "SELL"
+                    elif pvw == "ABOVE_VWAP" and vs == "RISING" and ema_reg in ["EXPANDING_BULL", "EXPANDING", "COMPRESSED"]:
+                        setup_type = "VWAP_TREND"
+                        direction = "BUY"
+                    elif pvw == "BELOW_VWAP" and vs == "FALLING" and ema_reg in ["EXPANDING_BEAR", "EXPANDING", "COMPRESSED"]:
+                        setup_type = "VWAP_TREND"
+                        direction = "SELL"
+                    elif pvw == "ABOVE_VWAP" and vs == "RISING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                        setup_type = "MOMENTUM"
+                        direction = "BUY"
+                    elif pvw == "BELOW_VWAP" and vs == "FALLING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                        setup_type = "MOMENTUM"
+                        direction = "SELL"
+                    elif ema_reg == "COMPRESSED" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                        setup_type = "EMA_SQUEEZE"
+                        direction = "BUY" if data.get('change_pct', 0) > 0 else "SELL"
+                    elif rsi < 30 and htf_a != "BEARISH_ALIGNED":
+                        setup_type = "RSI_REVERSAL"
+                        direction = "BUY"
+                    elif rsi > 70 and htf_a != "BULLISH_ALIGNED":
+                        setup_type = "RSI_REVERSAL"
+                        direction = "SELL"
+                    
+                    if setup_type and direction:
+                        opt_type = "CE" if direction == "BUY" else "PE"
+                        fno_opportunities.append(
+                            f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]"
+                        )
+            
+            # Select top detailed stocks for GPT (most active + those with setups)
+            top_detail_symbols = [s for s, _ in sorted_data[:10] if isinstance(market_data.get(s), dict) and 'ltp' in market_data.get(s, {})]
+            detailed_data = [line for line in data_summary if any(sym in line for sym in top_detail_symbols)]
+            
             # Ask agent to analyze market with FULL CONTEXT
-            prompt = f"""EXECUTE TRADES NOW using place_order tool - DO NOT just describe trades!
+            prompt = f"""EXECUTE TRADES NOW - DO NOT just describe trades!
 
-MARKET SCAN ({len(quick_scan)} stocks):
-{chr(10).join(quick_scan[:20])}
+=== ⚡F&O OPTIONS FIRST (HIGHEST PRIORITY) ===
+For stocks marked [F&O], use place_option_order() instead of place_order().
+F&O stocks: {', '.join(fno_prefer)}
 
-REGIME SIGNALS (HIGHEST PRIORITY):
+F&O READY SIGNALS:
+{chr(10).join(fno_opportunities) if fno_opportunities else 'No F&O setups right now - check CASH stocks below'}
+
+=== MARKET SCAN ({len(quick_scan)} stocks) ===
+{chr(10).join(quick_scan[:25])}
+
+=== DETAILED TECHNICALS (Top Movers) ===
+{chr(10).join(detailed_data[:10])}
+
+=== REGIME SIGNALS (HIGH PRIORITY) ===
 {chr(10).join(regime_signals) if regime_signals else 'No strong regime signals'}
 
-EOD PREDICTIONS:
+=== EOD PREDICTIONS ===
 {chr(10).join(eod_opportunities) if eod_opportunities else 'No EOD signals'}
 
-ALREADY HOLDING (SKIP):
-{', '.join(active_symbols) if active_symbols else 'None'}
+ALREADY HOLDING (SKIP): {', '.join(active_symbols) if active_symbols else 'None'}
 
 === CORRELATION EXPOSURE ===
 {corr_exposure}
 
 === SYSTEM HEALTH ===
 Reconciliation: {recon_state} {'(CAN TRADE)' if recon_can_trade else '(BLOCKED: ' + recon_reason + ')'}
-Data Health: {len(halted_symbols)} halted symbols
-{f'Halted: {", ".join(halted_symbols[:5])}' if halted_symbols else 'All symbols healthy'}
+Data Health: {len(halted_symbols)} halted | {'Halted: ' + ', '.join(halted_symbols[:5]) if halted_symbols else 'All healthy'}
 
-=== ACCOUNT & RISK STATUS ===
-Capital: Rs{self.capital:,.0f}
-Daily P&L: Rs{risk_status.daily_pnl:+,.0f} ({risk_status.daily_pnl_pct:+.2f}%)
-Trades Today: {risk_status.trades_today}/{self.risk_governor.limits.max_trades_per_day} (Remaining: {trades_remaining})
-Win/Loss: {risk_status.wins_today}/{risk_status.losses_today}
-Consecutive Losses: {risk_status.consecutive_losses}/{self.risk_governor.limits.max_consecutive_losses}
-Risk per Trade: Rs{self.capital * 0.005:,.0f} (0.5%)
+=== ACCOUNT ===
+Capital: Rs{self.capital:,.0f} | Daily P&L: Rs{risk_status.daily_pnl:+,.0f} ({risk_status.daily_pnl_pct:+.2f}%)
+Trades: {risk_status.trades_today}/{self.risk_governor.limits.max_trades_per_day} (Remaining: {trades_remaining})
+W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_status.consecutive_losses}/{self.risk_governor.limits.max_consecutive_losses}
 
-=== REGIME SCORE THRESHOLDS ===
-- ORB_BREAKOUT: need 70+ score to trade
-- VWAP_TREND: need 60+ score to trade
-- EMA_SQUEEZE: need 65+ score to trade
-- MEAN_REVERSION: need 65+ score to trade
-
-=== TRADING PRIORITY (highest to lowest) ===
-
-1. ORB BREAKOUT (Opening Range Breakout):
-   - BREAKOUT_UP + HIGH/EXPLOSIVE volume + EMA expanding = BUY
-   - BREAKOUT_DOWN + HIGH/EXPLOSIVE volume + EMA expanding = SELL
-   - Most reliable intraday signal
-
-2. EMA SQUEEZE + VOLUME:
-   - EMA COMPRESSED (9 and 21 EMA tight) + EXPLOSIVE volume = breakout imminent
-   - Wait for direction, then enter with tight SL
-
-3. VWAP TREND TRADES:
-   - Price ABOVE_VWAP + VWAP RISING + RSI<60 = BUY
-   - Price BELOW_VWAP + VWAP FALLING + RSI>40 = SELL
-
-4. RSI EXTREMES:
-   - RSI < 30 = Oversold BUY
-   - RSI > 70 = Overbought SELL
-
-5. EOD PLAYS (after 11 AM):
-   - OI signals + volume confirmation = quick scalp
-
-RISK RULES:
-- Stop Loss: 1% from entry
-- Target: 1.5% from entry
-- Max 2-3 trades at a time
-
-=== OPTIONS TRADING (F&O STOCKS) ===
-For F&O eligible stocks (RELIANCE, TCS, INFY, HDFCBANK, etc.), you can use options:
-- place_option_order(underlying="NSE:RELIANCE", direction="BUY", strike_selection="ATM")
-- Options auto-select CE for BUY signals, PE for SELL signals
-- Strike selections: ATM, ITM_1, ITM_2, OTM_1, OTM_2
-- Options have fixed lot sizes (RELIANCE=250, TCS=150, etc.)
-- Max premium per trade: Rs15,000 | Max total exposure: Rs50,000
-
-WHEN TO USE OPTIONS:
-- High conviction directional views → ATM or ITM_1
-- Strong breakouts with volume → OTM_1 for leverage
-- Volatile markets → Options limit downside to premium paid
-
-YOU MUST CALL place_order() tool NOW with strategy and setup_id for order tracking!
-Example:
-place_order(symbol="NSE:INFY", side="BUY", quantity=100, stop_loss=1490, target=1550, strategy="ORB", setup_id="BREAKOUT_UP")
-
-OPTION EXAMPLE:
-place_option_order(underlying="NSE:RELIANCE", direction="BUY", strike_selection="ATM", rationale="Strong ORB breakout")
-
-STRATEGY VALUES: ORB, VWAP, EMA_SQUEEZE, RSI, EOD, VOLUME
-SETUP_ID VALUES: BREAKOUT_UP, BREAKOUT_DOWN, VWAP_TREND, OVERSOLD, OVERBOUGHT, SQUEEZE_BREAK"""
+=== EXECUTION RULES ===
+1. F&O stocks → ALWAYS use place_option_order(underlying, direction, strike_selection="ATM")
+2. Cash stocks → use place_order(symbol, side, quantity, stop_loss, target, strategy, setup_id)
+3. Stop Loss: 1% from entry | Target: 1.5% from entry | Max 3 trades at a time
+4. Call tools IMMEDIATELY. Do not describe trades without placing them.
+5. Strategy: ORB, VWAP, EMA_SQUEEZE, RSI, EOD | Setup: BREAKOUT_UP, BREAKOUT_DOWN, VWAP_TREND, OVERSOLD, OVERBOUGHT"""
 
             response = self.agent.run(prompt)
-            print(f"\n📊 Agent response:\n{response[:500]}...")
+            print(f"\n📊 Agent response:\n{response[:300]}...")
+            
+            # === AUTO-RETRY: Detect trades mentioned but not placed ===
+            # Collect scorer rejections from the tools layer
+            if not hasattr(self, '_rejected_this_cycle'):
+                self._rejected_this_cycle = set()
+            if hasattr(self.tools, '_scorer_rejected_symbols'):
+                self._rejected_this_cycle.update(self.tools._scorer_rejected_symbols)
+                if self.tools._scorer_rejected_symbols:
+                    print(f"   🚫 Scorer rejected (won't retry): {self.tools._scorer_rejected_symbols}")
+                    self.tools._scorer_rejected_symbols.clear()
+            
+            if response and not self.agent.get_pending_approvals():
+                # Check if response mentions trade symbols but no orders were placed
+                import re
+                mentioned_symbols = re.findall(r'NSE:([A-Z]+)', response)
+                active_symbols_set = {t['symbol'].replace('NSE:', '') for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN'}
+                unplaced = [s for s in set(mentioned_symbols) 
+                           if s not in active_symbols_set 
+                           and f'NSE:{s}' in [sym for sym in APPROVED_UNIVERSE]
+                           and s not in self._rejected_this_cycle]
+                
+                if unplaced and len(unplaced) <= 3:
+                    print(f"\n🔄 Detected {len(unplaced)} unplaced trades in response: {unplaced}")
+                    fno_prefer_set = {s.replace('NSE:', '') for s in FNO_CONFIG.get('prefer_options_for', [])}
+                    for sym in unplaced[:2]:  # Max 2 retries
+                        if sym in fno_prefer_set:
+                            retry_prompt = f"You mentioned NSE:{sym} as a trade but did NOT call place_option_order(). NSE:{sym} is F&O eligible. Call place_option_order(underlying=\"NSE:{sym}\", direction=<BUY or SELL based on your analysis>, strike_selection=\"ATM\") NOW. Do not explain - just call the tool."
+                        else:
+                            retry_prompt = f"You mentioned NSE:{sym} as a trade but did NOT call place_order(). Call place_order() for NSE:{sym} NOW with the entry, stop_loss, and target you identified. Do not explain - just call the tool."
+                        retry_response = self.agent.run(retry_prompt)
+                        print(f"   🔄 Retry for {sym}: {retry_response[:150]}...")
             
             # Check if agent created any trades
             pending = self.agent.get_pending_approvals()
@@ -935,7 +1072,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Autonomous Trading Bot')
-    parser.add_argument('--capital', type=float, default=10000, help='Starting capital')
+    parser.add_argument('--capital', type=float, default=200000, help='Starting capital')
     parser.add_argument('--live', action='store_true', help='Enable live trading (default: paper)')
     parser.add_argument('--interval', type=int, default=5, help='Scan interval in minutes')
     

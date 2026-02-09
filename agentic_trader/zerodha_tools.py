@@ -163,6 +163,7 @@ class ZerodhaTools:
         self.paper_positions = []
         self.paper_orders = []
         self.paper_pnl = 0
+        self._scorer_rejected_symbols = set()  # Track scorer rejections for retry filtering
         
         # Load saved token
         self._load_token()
@@ -706,10 +707,12 @@ class ZerodhaTools:
             
             # Check if this is an F&O stock
             fno_stocks = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
-                         "SBIN", "AXISBANK", "KOTAKBANK", "BAJFINANCE", "TATAMOTORS",
+                         "SBIN", "AXISBANK", "KOTAKBANK", "BAJFINANCE", "BHARTIARTL",
                          "ITC", "TATASTEEL", "HINDUNILVR", "MARUTI", "TITAN",
-                         "LT", "SUNPHARMA", "BHARTIARTL", "ONGC", "COALINDIA",
-                         "TATAPOWER", "BANKBARODA", "PNB", "MCX"]
+                         "LT", "SUNPHARMA", "ETERNAL", "ONGC", "COALINDIA",
+                         "TATAPOWER", "BANKBARODA", "PNB", "MCX",
+                         "HINDALCO", "JSWSTEEL", "VEDL", "JINDALSTEL", "NMDC",
+                         "NATIONALUM", "SAIL"]
             
             if stock not in fno_stocks:
                 return {"has_futures": False}
@@ -1021,13 +1024,20 @@ class ZerodhaTools:
             return {"error": str(e)}
     
     def _calculate_indicators(self, symbol: str) -> Dict:
-        """Calculate technical indicators for a symbol"""
+        """Calculate technical indicators for a symbol using BOTH daily and intraday data"""
         self._rate_limit()
         
         try:
             # Get instrument token
             exchange, tradingsymbol = symbol.split(":")
-            instruments = self.kite.instruments(exchange)
+            
+            # Cache instruments list to avoid repeated API calls
+            if not hasattr(self, '_instrument_cache'):
+                self._instrument_cache = {}
+            if exchange not in self._instrument_cache:
+                self._instrument_cache[exchange] = self.kite.instruments(exchange)
+            
+            instruments = self._instrument_cache[exchange]
             token = None
             for inst in instruments:
                 if inst['tradingsymbol'] == tradingsymbol:
@@ -1037,7 +1047,7 @@ class ZerodhaTools:
             if not token:
                 return {}
             
-            # Get historical data
+            # Get DAILY historical data (for trend, SMA, RSI, ATR)
             to_date = datetime.now()
             from_date = to_date - timedelta(days=60)
             
@@ -1050,6 +1060,22 @@ class ZerodhaTools:
             
             if not data:
                 return {}
+            
+            # === FETCH INTRADAY 5-MINUTE DATA for proper VWAP & ORB ===
+            intraday_df = None
+            try:
+                self._rate_limit()
+                today = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
+                intraday_data = self.kite.historical_data(
+                    instrument_token=token,
+                    from_date=today,
+                    to_date=datetime.now(),
+                    interval="5minute"
+                )
+                if intraday_data and len(intraday_data) >= 2:
+                    intraday_df = pd.DataFrame(intraday_data)
+            except Exception:
+                pass  # Fall back to daily-based calculations
             
             df = pd.DataFrame(data)
             close = df['close']
@@ -1098,61 +1124,107 @@ class ZerodhaTools:
             # === REGIME DETECTION CALCULATIONS ===
             
             # 1. EMA 9 and 21 for compression/expansion
-            ema_9_series = close.ewm(span=9, adjust=False).mean()
-            ema_21_series = close.ewm(span=21, adjust=False).mean()
-            ema_9 = ema_9_series.iloc[-1]
-            ema_21 = ema_21_series.iloc[-1]
-            ema_spread = abs(ema_9 - ema_21) / ema_21 * 100 if ema_21 > 0 else 0
-            
-            # EMA regime detection - TIME-QUALIFIED COMPRESSION
-            # Check if compression has persisted for 5+ candles
-            compression_threshold = 0.3  # % spread threshold
-            if len(ema_9_series) >= 5:
+            # Use INTRADAY 5-min candle EMAs if available for better regime detection
+            if intraday_df is not None and len(intraday_df) >= 21:
+                i_close = intraday_df['close']
+                ema_9_series = i_close.ewm(span=9, adjust=False).mean()
+                ema_21_series = i_close.ewm(span=21, adjust=False).mean()
+                ema_9 = ema_9_series.iloc[-1]
+                ema_21 = ema_21_series.iloc[-1]
+                ema_spread = abs(ema_9 - ema_21) / ema_21 * 100 if ema_21 > 0 else 0
+                
+                compression_threshold = 0.15  # Tighter threshold for 5-min candles
                 recent_spreads = abs(ema_9_series.iloc[-5:] - ema_21_series.iloc[-5:]) / ema_21_series.iloc[-5:] * 100
                 candles_compressed = (recent_spreads < compression_threshold).sum()
                 
                 if candles_compressed >= 5:
-                    ema_regime = "COMPRESSED"  # Squeeze for 5+ candles - valid breakout setup
+                    ema_regime = "COMPRESSED"
                 elif ema_9 > ema_21:
                     ema_regime = "EXPANDING_BULL"
                 else:
                     ema_regime = "EXPANDING_BEAR"
             else:
-                ema_regime = "NEUTRAL"
-            
-            # 2. VWAP calculation (for daily data, approximate)
-            typical_price = (high + low + close) / 3
-            cumulative_tpv = (typical_price * vol).cumsum()
-            cumulative_vol = vol.cumsum()
-            vwap_series = cumulative_tpv / cumulative_vol
-            vwap = vwap_series.iloc[-1] if len(vwap_series) > 0 else current_price
-            
-            # VWAP slope over 5 candles (not tick-to-tick to avoid chop)
-            if len(vwap_series) >= 5:
-                vwap_5_ago = vwap_series.iloc[-5]
-                vwap_now = vwap_series.iloc[-1]
-                vwap_change_pct = (vwap_now - vwap_5_ago) / vwap_5_ago * 100 if vwap_5_ago > 0 else 0
+                # Fallback: daily EMAs
+                ema_9_series = close.ewm(span=9, adjust=False).mean()
+                ema_21_series = close.ewm(span=21, adjust=False).mean()
+                ema_9 = ema_9_series.iloc[-1]
+                ema_21 = ema_21_series.iloc[-1]
+                ema_spread = abs(ema_9 - ema_21) / ema_21 * 100 if ema_21 > 0 else 0
                 
-                if vwap_change_pct > 0.5:  # >0.5% rise over 5 candles
-                    vwap_slope = "RISING"
-                elif vwap_change_pct < -0.5:  # <-0.5% fall over 5 candles
-                    vwap_slope = "FALLING"
+                compression_threshold = 0.3  # % spread threshold for daily
+                if len(ema_9_series) >= 5:
+                    recent_spreads = abs(ema_9_series.iloc[-5:] - ema_21_series.iloc[-5:]) / ema_21_series.iloc[-5:] * 100
+                    candles_compressed = (recent_spreads < compression_threshold).sum()
+                    
+                    if candles_compressed >= 5:
+                        ema_regime = "COMPRESSED"
+                    elif ema_9 > ema_21:
+                        ema_regime = "EXPANDING_BULL"
+                    else:
+                        ema_regime = "EXPANDING_BEAR"
+                else:
+                    ema_regime = "NEUTRAL"
+            
+            # 2. VWAP calculation - USE INTRADAY DATA if available
+            if intraday_df is not None and len(intraday_df) >= 2:
+                # REAL intraday VWAP from today's 5-min candles
+                itp = (intraday_df['high'] + intraday_df['low'] + intraday_df['close']) / 3
+                ivol = intraday_df['volume']
+                i_cum_tpv = (itp * ivol).cumsum()
+                i_cum_vol = ivol.cumsum()
+                vwap_series = i_cum_tpv / i_cum_vol
+                vwap_series = vwap_series.replace([float('inf'), float('-inf')], current_price).fillna(current_price)
+                vwap = vwap_series.iloc[-1]
+                
+                # VWAP slope over last 6 candles (30 min)
+                if len(vwap_series) >= 6:
+                    vwap_6_ago = vwap_series.iloc[-6]
+                    vwap_now = vwap_series.iloc[-1]
+                    vwap_change_pct = (vwap_now - vwap_6_ago) / vwap_6_ago * 100 if vwap_6_ago > 0 else 0
+                    
+                    if vwap_change_pct > 0.15:
+                        vwap_slope = "RISING"
+                    elif vwap_change_pct < -0.15:
+                        vwap_slope = "FALLING"
+                    else:
+                        vwap_slope = "FLAT"
                 else:
                     vwap_slope = "FLAT"
             else:
-                vwap_slope = "FLAT"
+                # Fallback: daily VWAP (less accurate for intraday)
+                typical_price = (high + low + close) / 3
+                cumulative_tpv = (typical_price * vol).cumsum()
+                cumulative_vol = vol.cumsum()
+                vwap_series_daily = cumulative_tpv / cumulative_vol
+                vwap = vwap_series_daily.iloc[-1] if len(vwap_series_daily) > 0 else current_price
+                
+                if len(vwap_series_daily) >= 5:
+                    vwap_5_ago = vwap_series_daily.iloc[-5]
+                    vwap_now = vwap_series_daily.iloc[-1]
+                    vwap_change_pct = (vwap_now - vwap_5_ago) / vwap_5_ago * 100 if vwap_5_ago > 0 else 0
+                    vwap_slope = "RISING" if vwap_change_pct > 0.5 else "FALLING" if vwap_change_pct < -0.5 else "FLAT"
+                else:
+                    vwap_slope = "FLAT"
             
             # Price vs VWAP
-            if current_price > vwap * 1.005:
+            if current_price > vwap * 1.003:
                 price_vs_vwap = "ABOVE_VWAP"
-            elif current_price < vwap * 0.995:
+            elif current_price < vwap * 0.997:
                 price_vs_vwap = "BELOW_VWAP"
             else:
                 price_vs_vwap = "AT_VWAP"
             
-            # 3. Opening Range Breakout (using previous day high/low as proxy for ORB)
-            orb_high = prev_high
-            orb_low = prev_low
+            # 3. Opening Range Breakout - USE INTRADAY DATA if available
+            if intraday_df is not None and len(intraday_df) >= 3:
+                # TRUE ORB: First 15 minutes (3 x 5-min candles)
+                orb_candles = intraday_df.head(3)
+                orb_high = orb_candles['high'].max()
+                orb_low = orb_candles['low'].min()
+            else:
+                # Fallback: previous day high/low
+                orb_high = prev_high
+                orb_low = prev_low
+            
             orb_range = orb_high - orb_low
             
             if current_price > orb_high:
@@ -1202,19 +1274,19 @@ class ZerodhaTools:
                         if price_prev > orb_high or price_prev < orb_low:
                             orb_reentries += 1
             
-            # CHOP Zone detection (any of these = NO TRADE)
-            # 1. VWAP is flat AND volume is not high
-            if vwap_slope == "FLAT" and volume_regime in ["LOW", "NORMAL"]:
+            # CHOP Zone detection (tightened: only trigger on clear chop)
+            # 1. VWAP is flat AND volume is LOW (not NORMAL - intraday vol is biased low)
+            if vwap_slope == "FLAT" and volume_regime == "LOW":
                 chop_zone = True
                 chop_reason = "VWAP_FLAT+LOW_VOL"
             
-            # 2. Range too compressed (< 0.5x ATR over 5 candles)
-            elif atr_range_ratio < 0.5:
+            # 2. Range too compressed (< 0.4x ATR over 5 candles) 
+            elif atr_range_ratio < 0.4:
                 chop_zone = True
                 chop_reason = "COMPRESSED_RANGE"
             
-            # 3. ORB containment with multiple re-entries (whipsaw)
-            elif orb_reentries >= 3 and volume_regime in ["LOW", "NORMAL"]:
+            # 3. ORB containment with many re-entries (whipsaw)
+            elif orb_reentries >= 4 and volume_regime == "LOW":
                 chop_zone = True
                 chop_reason = "ORB_WHIPSAW"
             
@@ -1267,6 +1339,48 @@ class ZerodhaTools:
             atr_target = round(current_price + (atr * 1.5), 2)
             atr_stoploss = round(current_price - (atr * 1.0), 2)
             
+            # === ACCELERATION / FOLLOW-THROUGH METRICS (for IntradayOptionScorer) ===
+            follow_through_candles = 0
+            range_expansion_ratio = 0.0
+            vwap_slope_steepening = False
+            
+            if intraday_df is not None and len(intraday_df) >= 6:
+                idf = intraday_df
+                # Follow-through: count consecutive candles in breakout direction after ORB
+                if orb_signal == "BREAKOUT_UP":
+                    # Count candles with close > previous close after ORB breakout
+                    post_orb = idf.iloc[3:]  # Skip first 3 candles (ORB period)
+                    for i in range(len(post_orb)):
+                        if post_orb.iloc[i]['close'] > post_orb.iloc[i]['open']:
+                            follow_through_candles += 1
+                        else:
+                            break
+                elif orb_signal == "BREAKOUT_DOWN":
+                    post_orb = idf.iloc[3:]
+                    for i in range(len(post_orb)):
+                        if post_orb.iloc[i]['close'] < post_orb.iloc[i]['open']:
+                            follow_through_candles += 1
+                        else:
+                            break
+                
+                # Range expansion: last candle body / ATR
+                last_candle = idf.iloc[-1]
+                candle_body = abs(last_candle['close'] - last_candle['open'])
+                range_expansion_ratio = candle_body / atr if atr > 0 else 0.0
+                
+                # VWAP slope steepening: compare recent VWAP slope vs earlier
+                if len(idf) >= 10:
+                    idf_c = idf['close']
+                    idf_v = idf['volume']
+                    # Approximate VWAP slope from last 5 vs prior 5 candles
+                    mid1 = idf_c.iloc[-10:-5].mean()
+                    mid2 = idf_c.iloc[-5:].mean()
+                    vol1 = idf_v.iloc[-10:-5].mean()
+                    vol2 = idf_v.iloc[-5:].mean()
+                    # Steepening = price moving faster with volume
+                    if vol2 > vol1 * 1.2 and abs(mid2 - mid1) > atr * 0.3:
+                        vwap_slope_steepening = True
+            
             return {
                 'sma_20': round(sma_20, 2),
                 'sma_50': round(sma_50, 2),
@@ -1312,7 +1426,11 @@ class ZerodhaTools:
                 # === HTF ALIGNMENT FIELDS ===
                 'htf_trend': htf_trend,
                 'htf_ema_slope': htf_ema_slope,
-                'htf_alignment': htf_alignment
+                'htf_alignment': htf_alignment,
+                # === ACCELERATION FIELDS ===
+                'follow_through_candles': follow_through_candles,
+                'range_expansion_ratio': round(range_expansion_ratio, 2),
+                'vwap_slope_steepening': vwap_slope_steepening
             }
             
         except Exception as e:
@@ -2033,6 +2151,15 @@ class ZerodhaTools:
                 "action": "Use equity order instead"
             }
         
+        # === CHECK FOR DUPLICATE OPTION ON SAME UNDERLYING ===
+        for pos in self.paper_positions:
+            if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_option') and pos.get('underlying') == underlying:
+                return {
+                    "success": False,
+                    "error": f"DUPLICATE BLOCKED: Already have option position on {underlying} ({pos['symbol']})",
+                    "action": "Skip - already holding option on this underlying"
+                }
+        
         # === GET INTRADAY MARKET DATA ===
         market_data = {}
         if use_intraday_scoring:
@@ -2063,14 +2190,17 @@ class ZerodhaTools:
         )
         
         if plan is None:
+            # Track rejection so autonomous_trader won't retry this symbol
+            self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
             return {
                 "success": False,
-                "error": f"Could not create option order for {underlying}",
-                "reason": "No suitable strikes or chain unavailable"
+                "error": f"Intraday scorer REJECTED {underlying} - score below threshold. Do NOT retry this symbol.",
+                "reason": "Intraday signals insufficient for options entry. Wait for stronger setup.",
+                "action": "SKIP - look for other opportunities"
             }
         
         # Validate risk - max premium check
-        max_premium_per_trade = 15000  # ₹15K per option trade
+        max_premium_per_trade = 35000  # ₹35K per option trade (allows TATASTEEL 5500 lot)
         if plan.total_premium > max_premium_per_trade:
             return {
                 "success": False,
@@ -2079,8 +2209,7 @@ class ZerodhaTools:
             }
         
         # Check total options exposure
-        portfolio_greeks = options_trader.get_portfolio_greeks()
-        max_total_exposure = 50000  # ₹50K total option exposure
+        max_total_exposure = 80000  # ₹80K total option exposure
         current_exposure = sum(p.get('total_premium', 0) for p in options_trader.positions if p.get('status') == 'OPEN')
         
         if current_exposure + plan.total_premium > max_total_exposure:
@@ -2102,13 +2231,17 @@ class ZerodhaTools:
             
             # Add to paper positions if paper mode
             if self.paper_mode:
+                # Options are always BOUGHT (BUY CE for bullish, BUY PE for bearish)
+                # The direction (BUY/SELL) indicates the market view, not the option transaction
+                option_side = 'BUY'  # We always buy options (debit), never write/sell them
                 option_position = {
                     'symbol': plan.contract.symbol,
                     'underlying': plan.underlying,
                     'quantity': plan.quantity * plan.contract.lot_size,
                     'lots': plan.quantity,
                     'avg_price': plan.contract.ltp,
-                    'side': direction,
+                    'side': option_side,
+                    'direction': direction,  # Original market view (BUY=bullish, SELL=bearish)
                     'option_type': plan.contract.option_type.value,
                     'strike': plan.contract.strike,
                     'expiry': plan.contract.expiry.isoformat() if plan.contract.expiry else None,
@@ -2151,17 +2284,15 @@ class ZerodhaTools:
             # Check specific position
             for pos in options_trader.positions:
                 if pos.get('symbol') == symbol and pos.get('status') == 'OPEN':
-                    exit_signal = options_trader.check_option_exit(symbol)
                     return {
                         "symbol": symbol,
-                        "position": pos,
-                        "exit_signal": exit_signal
+                        "position": pos
                     }
             return {"error": f"No open option position for {symbol}"}
         
         # Get all Greeks
         return {
-            "portfolio_greeks": options_trader.get_portfolio_greeks(),
+            "portfolio_greeks": options_trader.get_greeks_summary(),
             "positions": [p for p in options_trader.positions if p.get('status') == 'OPEN']
         }
     
@@ -2178,24 +2309,18 @@ class ZerodhaTools:
             paper_mode=self.paper_mode
         )
         
-        exit_signals = []
+        # Use the existing check_option_exits method that checks all positions
+        all_exits = options_trader.check_option_exits()
         
-        for pos in options_trader.positions:
-            if pos.get('status') != 'OPEN':
-                continue
-            
-            symbol = pos.get('symbol')
-            signal = options_trader.check_option_exit(symbol)
-            
-            if signal and signal.get('should_exit'):
+        exit_signals = []
+        for signal in all_exits:
+            if signal.get('signal') in ('TARGET_HIT', 'STOPLOSS_HIT', 'THETA_DECAY_WARNING'):
                 exit_signals.append({
-                    "symbol": symbol,
-                    "reason": signal.get('reason'),
-                    "exit_type": signal.get('exit_type'),
-                    "current_pnl": signal.get('current_pnl', 0),
-                    "days_to_expiry": signal.get('days_to_expiry', 0),
-                    "delta": pos.get('delta', 0),
-                    "theta": pos.get('theta', 0)
+                    "symbol": signal['symbol'],
+                    "reason": signal['signal'],
+                    "exit_type": signal['signal'],
+                    "current_pnl": signal.get('pnl_value', 0),
+                    "should_exit": signal['signal'] in ('TARGET_HIT', 'STOPLOSS_HIT')
                 })
         
         return exit_signals
@@ -2350,10 +2475,11 @@ class ZerodhaTools:
         except Exception as e:
             return {"error": str(e)}
     
-    def place_option_order(self, option_symbol: str, action: str, quantity: int, 
+    def _place_option_order_legacy(self, option_symbol: str, action: str, quantity: int, 
                            premium: float, stop_loss_pct: float = 30) -> Dict:
         """
-        Tool: Place an option order
+        LEGACY: Place an option order by specific symbol (used internally)
+        For GPT tool calls, use place_option_order(underlying, direction) instead.
         
         Args:
             option_symbol: Full option symbol like 'NFO:RELIANCE25FEB2500CE'

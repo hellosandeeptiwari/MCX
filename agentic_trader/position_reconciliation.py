@@ -172,6 +172,13 @@ class PositionReconciliation:
         
         with self._lock:
             try:
+                # In paper mode, local state IS the truth — no broker to compare against
+                if self.paper_mode:
+                    self._load_local_state()
+                    self.state = ReconciliationState.SYNCED
+                    print(f"✅ Startup sync complete (paper mode) - {len(self.local_positions)} local positions")
+                    return
+                
                 # Get broker truth
                 self._fetch_broker_state()
                 
