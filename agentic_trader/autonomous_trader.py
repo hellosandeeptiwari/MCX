@@ -83,6 +83,15 @@ class AutonomousTrader:
         self.agent = TradingAgent(auto_execute=True, paper_mode=paper_mode, paper_capital=capital)
         self.tools = get_tools(paper_mode=paper_mode, paper_capital=capital)
         
+        # === RESTORE daily P&L from persisted realized P&L ===
+        # On restart, zerodha_tools loads paper_pnl from active_trades.json.
+        # Sync self.daily_pnl and self.capital so the display is correct.
+        persisted_pnl = getattr(self.tools, 'paper_pnl', 0) or 0
+        if persisted_pnl != 0:
+            self.daily_pnl = persisted_pnl
+            self.capital = capital + persisted_pnl
+            print(f"  📊 Restored daily P&L: ₹{persisted_pnl:+,.0f} | Capital: ₹{self.capital:,.0f}")
+        
         # Real-time monitoring
         self.monitor_running = False
         self.monitor_thread = None
@@ -318,6 +327,9 @@ class AutonomousTrader:
         if not active_trades:
             return
         
+        # === SYNC: Register any new trades the agent placed since last check ===
+        self._sync_exit_manager_with_positions()
+        
         # Separate equity and option positions
         equity_trades = [t for t in active_trades if not t.get('is_option', False)]
         option_trades = [t for t in active_trades if t.get('is_option', False)]
@@ -416,6 +428,50 @@ class AutonomousTrader:
                     qty = trade['quantity']
                     side = trade['side']
                     
+                    # === PARTIAL PROFIT EXIT ===
+                    if signal.exit_type == "PARTIAL_PROFIT" and signal.partial_pct > 0:
+                        # Get lot size to ensure we exit in whole lots
+                        lot_size = trade.get('quantity', qty) // max(1, trade.get('lots', 1))  # shares per lot
+                        total_lots = qty // lot_size if lot_size > 0 else 1
+                        exit_lots = total_lots // 2  # Exit half the lots
+                        exit_qty = exit_lots * lot_size
+                        
+                        if exit_qty <= 0 or exit_lots < 1:
+                            continue
+                        # Calculate P&L on partial quantity only
+                        if side == 'BUY':
+                            partial_pnl = (ltp - entry) * exit_qty
+                        else:
+                            partial_pnl = (entry - ltp) * exit_qty
+                        
+                        remaining_qty = qty - exit_qty
+                        pnl_pct = partial_pnl / (entry * exit_qty) * 100
+                        
+                        print(f"\n💰 PARTIAL_PROFIT! {symbol}")
+                        print(f"   Reason: {signal.reason}")
+                        print(f"   Booked {exit_qty}/{qty} @ ₹{ltp:.2f}")
+                        print(f"   Partial P&L: ₹{partial_pnl:+,.2f} ({pnl_pct:+.2f}%)")
+                        print(f"   Remaining: {remaining_qty} qty, SL moved to entry ₹{entry:.2f}")
+                        
+                        # Update trade quantity to remaining
+                        self.tools.partial_exit_trade(symbol, exit_qty, ltp, partial_pnl)
+                        self.daily_pnl += partial_pnl
+                        self.capital += partial_pnl
+                        
+                        # Update exit manager state with reduced quantity
+                        em_state = self.exit_manager.get_trade_state(symbol)
+                        if em_state:
+                            em_state.quantity = remaining_qty
+                            self.exit_manager._persist_state()
+                        
+                        # Record partial win with risk governor
+                        open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+                        unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
+                        self.risk_governor.record_trade_result(symbol + "_PARTIAL", partial_pnl, True, unrealized_pnl=unrealized)
+                        self.risk_governor.update_capital(self.capital)
+                        continue
+                    
+                    # === FULL EXIT ===
                     if side == 'BUY':
                         pnl = (ltp - entry) * qty
                     else:
@@ -430,7 +486,9 @@ class AutonomousTrader:
                         'TARGET_HIT': '🎯',
                         'SESSION_CUTOFF': '⏰',
                         'TIME_STOP': '⏱️',
-                        'TRAILING_SL': '📈'
+                        'TRAILING_SL': '📈',
+                        'PARTIAL_PROFIT': '💰',
+                        'OPTION_SPEED_GATE': '🚀'
                     }.get(signal.exit_type, '🚪')
                     
                     print(f"\n{emoji} {signal.exit_type}! {symbol}")
@@ -970,7 +1028,19 @@ W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_
                 # Check if response mentions trade symbols but no orders were placed
                 import re
                 mentioned_symbols = re.findall(r'NSE:([A-Z]+)', response)
-                active_symbols_set = {t['symbol'].replace('NSE:', '') for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN'}
+                # Build active set from BOTH equity symbols (NSE:X) AND option underlying (NSE:X)
+                active_symbols_set = set()
+                for t in self.tools.paper_positions:
+                    if t.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    sym = t.get('symbol', '')
+                    # Equity: NSE:INFY → INFY
+                    if sym.startswith('NSE:'):
+                        active_symbols_set.add(sym.replace('NSE:', ''))
+                    # Options: NFO:ICICIBANK26FEB1410CE → check underlying field
+                    underlying = t.get('underlying', '')
+                    if underlying:
+                        active_symbols_set.add(underlying.replace('NSE:', ''))
                 unplaced = [s for s in set(mentioned_symbols) 
                            if s not in active_symbols_set 
                            and f'NSE:{s}' in [sym for sym in APPROVED_UNIVERSE]

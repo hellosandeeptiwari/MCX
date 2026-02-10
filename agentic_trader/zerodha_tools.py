@@ -264,11 +264,44 @@ class ZerodhaTools:
                     # Save to history and remove from active
                     if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
                                   'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
-                                  'SESSION_CUTOFF', 'GREEKS_EXIT']:
+                                  'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT']:
                         self._save_to_history(trade, status, pnl or 0)
-                        self.paper_positions.pop(i)
+                        if status != 'PARTIAL_PROFIT':
+                            self.paper_positions.pop(i)
                     
                     self._save_active_trades()
+                    return True
+        return False
+    
+    def partial_exit_trade(self, symbol: str, exit_qty: int, exit_price: float, partial_pnl: float):
+        """Partially exit a trade — reduce quantity and record partial P&L"""
+        with self._positions_lock:
+            for trade in self.paper_positions:
+                if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                    original_qty = trade['quantity']
+                    remaining_qty = original_qty - exit_qty
+                    
+                    # Save partial exit to history
+                    partial_record = dict(trade)
+                    partial_record['quantity'] = exit_qty
+                    partial_record['exit_price'] = exit_price
+                    partial_record['exit_time'] = datetime.now().isoformat()
+                    partial_record['pnl'] = partial_pnl
+                    partial_record['status'] = 'PARTIAL_PROFIT'
+                    partial_record['partial_exit'] = True
+                    partial_record['original_qty'] = original_qty
+                    partial_record['remaining_qty'] = remaining_qty
+                    self._save_to_history(partial_record, 'PARTIAL_PROFIT', partial_pnl)
+                    
+                    # Update the live position with reduced qty
+                    trade['quantity'] = remaining_qty
+                    trade['total_premium'] = remaining_qty * trade['avg_price']
+                    
+                    # Track realized P&L
+                    self.paper_pnl += partial_pnl
+                    self._save_active_trades()
+                    
+                    print(f"   📊 Partial exit saved: {exit_qty} exited, {remaining_qty} remaining")
                     return True
         return False
     

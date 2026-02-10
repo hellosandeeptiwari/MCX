@@ -34,10 +34,11 @@ class ExitSignal:
     """Exit signal with reason and urgency"""
     symbol: str
     should_exit: bool
-    exit_type: str  # SL_HIT, TIME_STOP, SESSION_CUTOFF, TARGET_HIT, TRAILING_SL
+    exit_type: str  # SL_HIT, TIME_STOP, SESSION_CUTOFF, TARGET_HIT, TRAILING_SL, PARTIAL_PROFIT
     exit_price: float
     reason: str
     urgency: str  # IMMEDIATE, NORMAL, LOW
+    partial_pct: float = 0.0  # 0 = full exit, 0.5 = exit 50% of qty
 
 
 @dataclass
@@ -61,6 +62,7 @@ class TradeState:
     trailing_active: bool = False
     is_option: bool = False          # True for option positions
     max_premium_gain_pct: float = 0  # Max % gain on premium since entry
+    partial_booked: bool = False     # True after 50% profit booking at +15%
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -69,6 +71,8 @@ class TradeState:
     def from_dict(cls, data: Dict) -> 'TradeState':
         if isinstance(data.get('entry_time'), str):
             data['entry_time'] = datetime.fromisoformat(data['entry_time'])
+        # Backward compat: add fields that may not exist in old state files
+        data.setdefault('partial_booked', False)
         return cls(**data)
 
 
@@ -90,13 +94,17 @@ class ExitManager:
         self.time_stop_candles = 7  # Exit if no progress in 7 candles
         self.time_stop_min_r = 0.5  # Must make at least 0.5R to stay
         self.breakeven_trigger_r = 0.8  # Move SL to entry at 0.8R
-        self.trailing_start_r = 1.0  # Start trailing at 1R
-        self.trailing_pct = 0.5  # Trail at 50% of max profit
+        self.trailing_start_r = 0.5  # Start trailing at 0.5R (was 1.0R)
+        self.trailing_pct = 0.6  # Trail retaining 60% of max profit (was 50%)
+        
+        # Scaled profit booking (options only)
+        self.partial_profit_pct = 15.0       # Book 50% at +15% premium gain
+        self.partial_exit_fraction = 0.5     # Exit 50% of position
         
         # Early speed gate (options only)
-        self.option_speed_gate_candles = 4   # Check after 4 candles (20 min)
-        self.option_speed_gate_pct = 12.0    # Need +12% premium gain
-        self.option_speed_gate_max_r = 0.3   # Only exit if R < 0.3 too
+        self.option_speed_gate_candles = 6   # Check after 6 candles (30 min) — was 4
+        self.option_speed_gate_pct = 5.0     # Need +5% premium gain — was 12%
+        self.option_speed_gate_max_r = 0.15  # OR need +0.15R — was 0.3 (AND logic)
         
         # Track trades
         self.trade_states: Dict[str, TradeState] = {}
@@ -212,6 +220,11 @@ class ExitManager:
         if exit_signal:
             return exit_signal
         
+        # 3.5 PARTIAL PROFIT BOOKING (options only, before trailing/breakeven)
+        exit_signal = self._check_partial_profit(state, current_price)
+        if exit_signal:
+            return exit_signal
+        
         # 4. BREAK-EVEN RULE (modify SL, don't exit)
         self._apply_breakeven(state, r_multiple)
         
@@ -300,13 +313,84 @@ class ExitManager:
                 )
         return None
     
+    def _check_partial_profit(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
+        """Book 50% of position when premium gain hits +15%.
+        
+        Only for option positions with >= 2 lots. Fires once (partial_booked flag).
+        For 1-lot positions: can't split, so applies aggressive breakeven + tight trail.
+        After partial booking, also moves SL to entry (breakeven on remaining).
+        """
+        if not state.is_option:
+            return None
+        if state.partial_booked:
+            return None
+        
+        if state.entry_price <= 0:
+            return None
+        
+        premium_pct = (current_price - state.entry_price) / state.entry_price * 100
+        
+        if state.side == "BUY" and premium_pct >= self.partial_profit_pct:
+            # Check if we have enough lots to split
+            lot_size = self._get_lot_size_for_symbol(state.symbol)
+            total_lots = state.quantity // lot_size if lot_size > 0 else 1
+            
+            if total_lots >= 2:
+                # === MULTI-LOT: Partial exit 50% ===
+                state.partial_booked = True
+                state.current_sl = state.entry_price
+                state.breakeven_applied = True
+                self._persist_state()
+                exit_lots = total_lots // 2
+                print(f"💰 {state.symbol}: PARTIAL PROFIT — booking {exit_lots} of {total_lots} lots at +{premium_pct:.1f}% | SL→entry on remainder")
+                
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="PARTIAL_PROFIT",
+                    exit_price=current_price,
+                    reason=f"Partial profit: +{premium_pct:.1f}% premium gain, booking {exit_lots}/{total_lots} lots",
+                    urgency="NORMAL",
+                    partial_pct=self.partial_exit_fraction,
+                )
+            else:
+                # === SINGLE LOT: Can't split, protect with tight trail ===
+                state.partial_booked = True  # Don't re-check
+                state.current_sl = state.entry_price  # Breakeven
+                state.breakeven_applied = True
+                state.trailing_active = True
+                # Tight trail: retain 70% of current profit
+                profit = current_price - state.entry_price
+                tight_sl = current_price - profit * 0.30  # Keep 70%
+                if tight_sl > state.current_sl:
+                    state.current_sl = round(tight_sl, 2)
+                self._persist_state()
+                print(f"🔒 {state.symbol}: +{premium_pct:.1f}% gain (1 lot) — can't split, tight trail SL→₹{state.current_sl:.2f} (lock 70%)")
+                return None  # No exit signal, just tightened SL
+        
+        return None
+    
+    def _get_lot_size_for_symbol(self, symbol: str) -> int:
+        """Get lot size for a symbol from FNO_LOT_SIZES"""
+        try:
+            from options_trader import FNO_LOT_SIZES
+            # symbol like NFO:TATASTEEL26FEB207CE — extract underlying
+            clean = symbol.replace('NFO:', '')
+            for name, size in FNO_LOT_SIZES.items():
+                if clean.startswith(name):
+                    return size
+        except ImportError:
+            pass
+        return 1  # Fallback
+    
     def _check_option_speed_gate(self, state: TradeState, r_multiple: float) -> Optional[ExitSignal]:
         """Early exit for options that aren't moving fast enough.
         
         Options are theta-bleeding instruments. If the premium hasn't gained
-        +12% within 4 candles (20 min), and R-multiple is also < +0.3R,
+        +5% within 6 candles (30 min), AND R-multiple is also < +0.15R,
         the trade thesis is failing — exit before theta eats the position.
         
+        Uses OR-pass logic: survives if EITHER premium% OR R-multiple is good enough.
         Only applies to option positions (is_option=True).
         Logs every evaluation (EXIT and PASS) for evidence-based tuning.
         """
@@ -315,8 +399,10 @@ class ExitManager:
         
         if state.candles_since_entry >= self.option_speed_gate_candles:
             t_minutes = state.candles_since_entry * 5
-            should_exit = (state.max_premium_gain_pct < self.option_speed_gate_pct 
-                          and state.max_favorable_move < self.option_speed_gate_max_r)
+            # OR-pass: trade survives if EITHER condition is met
+            premium_ok = state.max_premium_gain_pct >= self.option_speed_gate_pct
+            r_ok = state.max_favorable_move >= self.option_speed_gate_max_r
+            should_exit = not premium_ok and not r_ok  # Only exit if BOTH fail
             
             # Structured log for every evaluation at the gate candle
             log_entry = json.dumps({
@@ -371,14 +457,14 @@ class ExitManager:
             print(f"🔒 {state.symbol}: Break-even applied (SL moved to {state.entry_price})")
     
     def _apply_trailing_stop(self, state: TradeState, current_price: float, r_multiple: float):
-        """Apply trailing stop after +1R"""
+        """Apply trailing stop after +0.5R, retaining 60% of max profit"""
         if r_multiple < self.trailing_start_r:
             return
         
         risk = abs(state.entry_price - state.initial_sl)
         
         if state.side == "BUY":
-            # Trail at 50% of max profit from entry
+            # Trail retaining 60% of max profit from entry
             profit = state.highest_price - state.entry_price
             trail_distance = profit * (1 - self.trailing_pct)
             new_sl = state.highest_price - trail_distance
@@ -390,7 +476,7 @@ class ExitManager:
                 self._persist_state()
                 print(f"📈 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
         else:  # SELL
-            # Trail at 50% of max profit from entry
+            # Trail retaining 60% of max profit from entry
             profit = state.entry_price - state.lowest_price
             trail_distance = profit * (1 - self.trailing_pct)
             new_sl = state.lowest_price + trail_distance

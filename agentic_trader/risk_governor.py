@@ -32,7 +32,7 @@ class RiskLimits:
     """Risk limit configuration"""
     max_daily_loss_pct: float = 6.0      # Max 6% daily loss
     max_consecutive_losses: int = 4       # Max 4 losses in a row
-    max_trades_per_day: int = 8           # Max 8 trades (52-symbol universe)
+    max_trades_per_day: int = 20          # Max 20 trades per day
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
     cooldown_minutes: int = 10            # 10 min cooldown after loss (was 15, skipping 3 scan cycles was too aggressive)
     max_position_pct: float = 25.0        # Max 25% of capital in one position
@@ -139,6 +139,7 @@ class RiskGovernor:
         
         self._load_state()
         self._check_new_day()
+        self._reconcile_pnl_from_history()
     
     def _load_state(self):
         """Load state from file"""
@@ -151,6 +152,38 @@ class RiskGovernor:
                         self.state = RiskState(**{k: v for k, v in data.items() if k != 'date'})
             except Exception as e:
                 print(f"⚠️ Error loading risk state: {e}")
+    
+    def _reconcile_pnl_from_history(self):
+        """Reconcile daily_pnl from trade_history.json (source of truth).
+        
+        Prevents drift caused by restarts or manual edits.
+        trade_history.json is written by zerodha_tools on every trade close.
+        """
+        history_file = os.path.join(os.path.dirname(__file__), 'trade_history.json')
+        if not os.path.exists(history_file):
+            return
+        try:
+            with open(history_file, 'r') as f:
+                history = json.load(f)
+            today_str = str(datetime.now().date())
+            today_pnl = sum(
+                t.get('pnl', 0) for t in history
+                if today_str in t.get('closed_at', '')
+            )
+            today_trades = [
+                t for t in history
+                if today_str in t.get('closed_at', '')
+            ]
+            if today_trades:
+                old_pnl = self.state.daily_pnl
+                if abs(old_pnl - today_pnl) > 1.0:  # Only fix if meaningful drift
+                    self.state.daily_pnl = today_pnl
+                    self.state.daily_pnl_pct = (today_pnl / self.starting_capital) * 100
+                    self.current_capital = self.starting_capital + today_pnl
+                    self._save_state()
+                    print(f"📊 Risk Governor: Reconciled daily P&L from trade history: ₹{old_pnl:+,.0f} → ₹{today_pnl:+,.0f}")
+        except Exception as e:
+            print(f"⚠️ Risk Governor: P&L reconciliation failed: {e}")
     
     def _save_state(self):
         """Save state to file"""
@@ -169,10 +202,12 @@ class RiskGovernor:
             self._save_state()
     
     def update_capital(self, new_capital: float):
-        """Update current capital (call after each trade)"""
+        """Update current capital tracking (does NOT overwrite daily_pnl).
+        
+        daily_pnl is maintained by record_trade_result() and reconciled
+        from trade_history.json on startup. We only track current_capital here.
+        """
         self.current_capital = new_capital
-        self.state.daily_pnl = new_capital - self.starting_capital
-        self.state.daily_pnl_pct = (self.state.daily_pnl / self.starting_capital) * 100
     
     def _calc_unrealized_pnl(self, active_positions: List[Dict]) -> float:
         """Calculate total unrealized P&L from open positions"""
