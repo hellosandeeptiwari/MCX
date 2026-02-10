@@ -1,34 +1,38 @@
 {
-  "NFO:SBIN26FEB1140CE": {
-    "symbol": "NFO:SBIN26FEB1140CE",
+  "NFO:BANDHANBNK26FEB167.5CE": {
+    "symbol": "NFO:BANDHANBNK26FEB167.5CE",
     "side": "BUY",
-    "entry_price": 20,
-    "entry_time": "2026-02-09T13:40:28.581170",
-    "initial_sl": 14.0,
-    "current_sl": 14.0,
-    "target": 30.0,
-    "quantity": 750,
-    "highest_price": 21.95,
+    "entry_price": 3.81,
+    "entry_time": "2026-02-10T12:25:33.324649",
+    "initial_sl": 2.667,
+    "current_sl": 2.667,
+    "target": 5.715,
+    "quantity": 3600,
+    "highest_price": 4.22,
     "lowest_price": Infinity,
-    "candles_since_entry": 2,
-    "max_favorable_move": 0.3249999999999999,
+    "candles_since_entry": 5,
+    "max_favorable_move": 0.3587051618547678,
     "breakeven_applied": false,
-    "trailing_active": false
+    "trailing_active": false,
+    "is_option": true,
+    "max_premium_gain_pct": 10.761154855643037
   },
-  "NFO:TATASTEEL26FEB202PE": {
-    "symbol": "NFO:TATASTEEL26FEB202PE",
+  "NFO:TATASTEEL26FEB207CE": {
+    "symbol": "NFO:TATASTEEL26FEB207CE",
     "side": "BUY",
-    "entry_price": 4.5,
-    "entry_time": "2026-02-09T14:50:08.652165",
-    "initial_sl": 3.15,
-    "current_sl": 3.15,
-    "target": 6.75,
+    "entry_price": 4.91,
+    "entry_time": "2026-02-10T12:30:36.150534",
+    "initial_sl": 3.437,
+    "current_sl": 3.437,
+    "target": 7.365,
     "quantity": 5500,
-    "highest_price": 4.5,
+    "highest_price": 5.61,
     "lowest_price": Infinity,
-    "candles_since_entry": 0,
-    "max_favorable_move": 0,
+    "candles_since_entry": 4,
+    "max_favorable_move": 0.4752206381534284,
     "breakeven_applied": false,
-    "trailing_active": false
+    "trailing_active": false,
+    "is_option": true,
+    "max_premium_gain_pct": 14.256619144602855
   }
 }

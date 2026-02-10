@@ -33,51 +33,56 @@ ZERODHA_API_SECRET = os.environ.get("ZERODHA_API_SECRET", "")
 
 # ========== HARD RULES (NEVER VIOLATE) ==========
 HARD_RULES = {
-    "RISK_PER_TRADE": 0.025,        # 2.5% max risk per trade (₹2500 on 1L)
-    "MAX_DAILY_LOSS": 0.03,         # 3% max daily loss (₹6000 on 2L)
-    "MAX_POSITIONS": 10,            # Max simultaneous positions
+    "RISK_PER_TRADE": 0.025,        # 2.5% max risk per trade
+    "MAX_DAILY_LOSS": 0.03,         # 3% max daily loss
+    "MAX_POSITIONS": 5,             # Max simultaneous positions (prompt says 3 as soft guide)
     "STALE_DATA_SECONDS": 60,       # Data older than this is stale
     "API_RATE_LIMIT_MS": 500,       # Min ms between API calls
-    "CAPITAL": 100000,              # Starting capital ₹1,00,000
+    "CAPITAL": 200000,              # Starting capital ₹2,00,000
 }
 
 # Trading Hours
 TRADING_HOURS = {
     "start": "09:20",  # 5 mins after open
     "end": "15:20",    # 10 mins before close
-    "no_new_after": "14:30"  # No new trades after this
+    "no_new_after": "15:15"  # No new trades after this
 }
 
-# Approved Universe (stocks affordable with ₹50K + F&O + ETFs)
-APPROVED_UNIVERSE = [
-    # Cash Stocks (low-price, liquid)
-    "NSE:IDEA", "NSE:SUZLON", "NSE:YESBANK", "NSE:PNB", "NSE:IRFC",
-    "NSE:NHPC", "NSE:SAIL", "NSE:BANKBARODA", "NSE:UNIONBANK", "NSE:NATIONALUM",
-    "NSE:HINDCOPPER", "NSE:GMRAIRPORT", "NSE:IRCTC", "NSE:ETERNAL", "NSE:PAYTM",
-    # ETFs (intraday buy/sell - highly liquid, low spread)
-    "NSE:NIFTYBEES", "NSE:BANKBEES", "NSE:GOLDBEES", "NSE:SILVERBEES",
-    "NSE:ITBEES", "NSE:JUNIORBEES", "NSE:CPSEETF", "NSE:PSUBNKBEES",
-    "NSE:NEXT50", "NSE:PHARMABEES", "NSE:INFRABEES",
-    # Medium price stocks
-    "NSE:TATASTEEL", "NSE:TATAPOWER", "NSE:ITC", "NSE:ONGC", "NSE:COALINDIA",
-    # F&O Stocks (for options trading based on stock signals)
-    "NSE:RELIANCE", "NSE:TCS", "NSE:HDFCBANK", "NSE:INFY", "NSE:ICICIBANK",
-    "NSE:SBIN", "NSE:AXISBANK", "NSE:KOTAKBANK", "NSE:BAJFINANCE", "NSE:BHARTIARTL",
-    "NSE:MCX", "NSE:LT", "NSE:MARUTI", "NSE:TITAN", "NSE:SUNPHARMA",
-    # Metal & Mining F&O (high-beta, commodity-linked)
-    "NSE:HINDALCO", "NSE:JSWSTEEL", "NSE:VEDL", "NSE:JINDALSTEL", "NSE:NMDC",
+# === TIERED UNIVERSE (Options-First Strategy) ===
+# Tier-1: Always scan, always eligible for options. Tightest spreads, best trending.
+TIER_1_OPTIONS = [
+    # Banks (trend intraday, tightest option spreads, institutional flow)
+    "NSE:SBIN", "NSE:HDFCBANK", "NSE:ICICIBANK", "NSE:AXISBANK", "NSE:KOTAKBANK",
+    # High-beta financials (trend hard, liquid options)
+    "NSE:BAJFINANCE",
+    # Large-cap liquid (tight spreads, deep OI)
+    "NSE:RELIANCE", "NSE:BHARTIARTL",
+    # IT (high liquidity, 0.27% spread - cheapest to trade)
+    "NSE:INFY", "NSE:TCS",
 ]
+
+# Tier-2: Scanned every cycle but only trade options when trend_score >= 60
+# (i.e., must be BULLISH/BEARISH, not NEUTRAL). Higher beta = higher reward but wider spreads.
+TIER_2_OPTIONS = [
+    # Metals (high-beta, commodity-linked, wider spreads ~1%)
+    "NSE:TATASTEEL", "NSE:JSWSTEEL", "NSE:JINDALSTEL", "NSE:HINDALCO",
+    # Infrastructure / diversified (decent option chains)
+    "NSE:LT", "NSE:MARUTI", "NSE:TITAN", "NSE:SUNPHARMA",
+]
+
+TIER_2_MIN_TREND_SCORE = 60  # Tier-2 stocks need BULLISH/BEARISH trend to trade
+
+# Combined universe for scanning (Tier-1 + Tier-2 only, no cash-only/ETFs)
+APPROVED_UNIVERSE = TIER_1_OPTIONS + TIER_2_OPTIONS
 
 # F&O Configuration
 FNO_CONFIG = {
     "enabled": True,
-    "prefer_options_for": ["NSE:RELIANCE", "NSE:TCS", "NSE:HDFCBANK", "NSE:INFY", "NSE:ICICIBANK", 
-                           "NSE:SBIN", "NSE:AXISBANK", "NSE:BAJFINANCE", "NSE:BHARTIARTL", "NSE:MCX",
-                           "NSE:HINDALCO", "NSE:JSWSTEEL", "NSE:VEDL", "NSE:JINDALSTEL", "NSE:TATASTEEL"],
+    "prefer_options_for": TIER_1_OPTIONS + TIER_2_OPTIONS,  # All stocks are options-eligible
     "option_type_on_bullish": "CE",  # Buy Call on bullish signal
     "option_type_on_bearish": "PE",  # Buy Put on bearish signal
     "strike_selection": "ATM",       # ATM, ITM, OTM
-    "max_option_premium": 5000,      # Max premium per lot
+    "max_option_premium": 100000,    # Max premium per lot (₹1 lakh)
 }
 
 # Agent System Prompt
@@ -117,7 +122,7 @@ F&O OPTIONS (PRIMARY for F&O-eligible stocks):
 - BUY direction → auto CE (call), SELL direction → auto PE (put)
 - strike_selection: ATM (default), ITM_1 (conservative), OTM_1 (aggressive)
 - System scores the trade with IntradayOptionScorer (100pts) before executing
-- Max ₹15,000 per option trade | Max ₹50,000 total exposure
+- Max ₹1,00,000 per option trade | Max ₹2,00,000 total exposure
 
 CASH STOCKS (for non-F&O only):
 - Use place_order() with stop_loss and target
@@ -126,7 +131,7 @@ CASH STOCKS (for non-F&O only):
 RISK RULES (NON-NEGOTIABLE):
 - Stop Loss = 1% from entry (below support for longs, above resistance for shorts)
 - Target = 1.5% minimum (risk:reward ≥ 1:1.5)
-- Max 3 simultaneous positions
+- Max 5 simultaneous positions (aim for 3)
 - If 2 consecutive losses → reduce size, if 3 → stop trading
 
 WHAT YOU NEVER DO:

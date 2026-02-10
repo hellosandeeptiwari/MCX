@@ -30,8 +30,8 @@ class SystemState(Enum):
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_daily_loss_pct: float = 3.0      # Max 3% daily loss (aligned with config)
-    max_consecutive_losses: int = 3       # Max 3 losses in a row
+    max_daily_loss_pct: float = 6.0      # Max 6% daily loss
+    max_consecutive_losses: int = 4       # Max 4 losses in a row
     max_trades_per_day: int = 8           # Max 8 trades (52-symbol universe)
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
     cooldown_minutes: int = 10            # 10 min cooldown after loss (was 15, skipping 3 scan cycles was too aggressive)
@@ -174,6 +174,27 @@ class RiskGovernor:
         self.state.daily_pnl = new_capital - self.starting_capital
         self.state.daily_pnl_pct = (self.state.daily_pnl / self.starting_capital) * 100
     
+    def _calc_unrealized_pnl(self, active_positions: List[Dict]) -> float:
+        """Calculate total unrealized P&L from open positions"""
+        unrealized = 0.0
+        for pos in active_positions:
+            if pos.get('status', 'OPEN') != 'OPEN':
+                continue
+            pnl = pos.get('pnl', 0)
+            if pnl:
+                unrealized += pnl
+                continue
+            # Fallback: compute from avg_price and ltp
+            qty = pos.get('quantity', 0)
+            entry = pos.get('avg_price', 0)
+            ltp = pos.get('ltp', entry)
+            side = pos.get('side', 'BUY')
+            if side == 'BUY':
+                unrealized += (ltp - entry) * qty
+            else:
+                unrealized += (entry - ltp) * qty
+        return unrealized
+    
     def can_trade_general(self, active_positions: List[Dict]) -> 'TradePermission':
         """
         Lightweight pre-scan check: can the system trade AT ALL?
@@ -198,8 +219,13 @@ class RiskGovernor:
                     self.state.system_state = SystemState.ACTIVE.value
                     self._save_state()
         
-        if self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct:
-            return TradePermission(allowed=False, reason=f"Max daily loss exceeded: {self.state.daily_pnl_pct:.2f}%", warnings=[])
+        # Daily loss check using NET P&L (realized + unrealized)
+        unrealized_pnl = self._calc_unrealized_pnl(active_positions)
+        net_pnl = self.state.daily_pnl + unrealized_pnl
+        net_pnl_pct = (net_pnl / self.starting_capital) * 100
+        
+        if net_pnl_pct <= -self.limits.max_daily_loss_pct:
+            return TradePermission(allowed=False, reason=f"Max daily loss exceeded: net {net_pnl_pct:.2f}% (realized {self.state.daily_pnl_pct:.2f}% + unrealized ₹{unrealized_pnl:+,.0f})", warnings=[])
         
         if self.state.consecutive_losses >= self.limits.max_consecutive_losses:
             return TradePermission(allowed=False, reason=f"Max consecutive losses: {self.state.consecutive_losses}", warnings=[])
@@ -216,6 +242,8 @@ class RiskGovernor:
         warnings = []
         if self.state.trades_today == self.limits.max_trades_per_day - 1:
             warnings.append("Last trade allowed today")
+        if self.state.daily_pnl_pct <= -(self.limits.max_daily_loss_pct * 0.5) and unrealized_pnl > 0:
+            warnings.append(f"⚠️ Realized P&L stressed ({self.state.daily_pnl_pct:.1f}%), open winners keeping net OK ({net_pnl_pct:.1f}%)")
         return TradePermission(allowed=True, reason="", warnings=warnings, suggested_size_multiplier=1.0)
     
     def can_trade(
@@ -364,15 +392,17 @@ class RiskGovernor:
         self, 
         symbol: str, 
         pnl: float, 
-        was_win: bool
+        was_win: bool,
+        unrealized_pnl: float = 0.0
     ):
         """
         Record result of a completed trade
         
         Args:
             symbol: Symbol traded
-            pnl: Profit/loss amount
+            pnl: Profit/loss amount (realized)
             was_win: True if profitable
+            unrealized_pnl: Current unrealized P&L from open positions
         """
         self._check_new_day()
         
@@ -397,9 +427,15 @@ class RiskGovernor:
         
         self._save_state()
         
-        # Check if we should halt
-        if self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct:
-            self._halt_trading(f"Max daily loss: {self.state.daily_pnl_pct:.2f}%")
+        # Check if we should halt using NET P&L (realized + unrealized)
+        # This prevents halting when open winners offset a closed loser
+        net_pnl = self.state.daily_pnl + unrealized_pnl
+        net_pnl_pct = (net_pnl / self.starting_capital) * 100
+        
+        if net_pnl_pct <= -self.limits.max_daily_loss_pct:
+            self._halt_trading(f"Max daily loss: {net_pnl_pct:.2f}% (realized: {self.state.daily_pnl_pct:.2f}% + unrealized: ₹{unrealized_pnl:+,.0f})")
+        elif self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct and unrealized_pnl > 0:
+            print(f"⚠️ Realized P&L {self.state.daily_pnl_pct:.2f}% exceeds limit, but open winners offset (net: {net_pnl_pct:.2f}%) — continuing")
         
         if self.state.consecutive_losses >= self.limits.max_consecutive_losses:
             self._halt_trading(f"Max consecutive losses: {self.state.consecutive_losses}")

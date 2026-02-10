@@ -18,11 +18,15 @@ import schedule
 import sys
 import os
 
+# Ensure CWD is the script's directory so relative file paths (risk_state.json, active_trades.json) resolve correctly
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG
+from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS
 from llm_agent import TradingAgent
 from zerodha_tools import get_tools, reset_tools
+from market_scanner import get_market_scanner
+from options_trader import update_fno_lot_sizes
 from exit_manager import get_exit_manager, calculate_structure_sl
 from execution_guard import get_execution_guard
 from risk_governor import get_risk_governor, SystemState
@@ -63,7 +67,8 @@ class AutonomousTrader:
         print(f"  Risk per trade: {HARD_RULES['RISK_PER_TRADE']*100}%")
         print(f"  Max daily loss: {HARD_RULES['MAX_DAILY_LOSS']*100}%")
         print(f"  Max positions: {HARD_RULES['MAX_POSITIONS']}")
-        print(f"\n  Universe: {len(APPROVED_UNIVERSE)} stocks")
+        print(f"\n  Universe: {len(APPROVED_UNIVERSE)} stocks ({len(TIER_1_OPTIONS)} Tier-1 + {len(TIER_2_OPTIONS)} Tier-2)")
+        print(f"  Scanner: ALL F&O stocks (~200) scanned each cycle for wild-card movers")
         
         if not paper_mode:
             print("\n  ⚠️  LIVE MODE - Real orders will be placed!")
@@ -111,6 +116,16 @@ class AutonomousTrader:
         
         # Data Health Gate for data quality validation
         self.data_health_gate = get_data_health_gate()
+        
+        # Market Scanner for dynamic F&O stock discovery
+        self.market_scanner = get_market_scanner(kite=self.tools.kite)
+        self._wildcard_symbols = []  # Wild-card symbols from last scan
+        
+        # Pre-populate lot sizes from Kite API at startup
+        try:
+            update_fno_lot_sizes(self.market_scanner.get_lot_map())
+        except Exception as e:
+            print(f"⚠️ Dynamic lot size fetch failed at startup (will retry on scan): {e}")
         
         # Start reconciliation loop
         self.position_recon.start()
@@ -367,8 +382,10 @@ class AutonomousTrader:
                         self.daily_pnl += pnl
                         self.capital += pnl
                         
-                        # Record with Risk Governor
-                        self.risk_governor.record_trade_result(symbol, pnl, pnl > 0)
+                        # Record with Risk Governor (include unrealized P&L from open positions)
+                        open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
+                        unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
+                        self.risk_governor.record_trade_result(symbol, pnl, pnl > 0, unrealized_pnl=unrealized)
                         self.risk_governor.update_capital(self.capital)
             except Exception as e:
                 if show_status:
@@ -376,7 +393,12 @@ class AutonomousTrader:
         
         # === EXIT MANAGER INTEGRATION ===
         # Check all trades via exit manager (equity AND options)
-        price_dict = {t['symbol']: quotes.get(t['symbol'], {}).get('last_price', 0) for t in active_trades}
+        # Filter out zero-price entries (quote failures) to prevent phantom SL triggers
+        price_dict = {}
+        for t in active_trades:
+            ltp_val = quotes.get(t['symbol'], {}).get('last_price', 0)
+            if ltp_val and ltp_val > 0:
+                price_dict[t['symbol']] = ltp_val
         exit_signals = self.exit_manager.check_all_exits(price_dict)
         
         # Process exit signals first (highest priority)
@@ -386,6 +408,10 @@ class AutonomousTrader:
                 if trade:
                     symbol = signal.symbol
                     ltp = price_dict.get(symbol, 0) or signal.exit_price
+                    # Guard: never exit at price 0 (quote failure)
+                    if ltp <= 0:
+                        print(f"   ⚠️ Skipping {symbol} exit — LTP is 0 (quote failure)")
+                        continue
                     entry = trade['avg_price']
                     qty = trade['quantity']
                     side = trade['side']
@@ -416,8 +442,10 @@ class AutonomousTrader:
                     self.daily_pnl += pnl
                     self.capital += pnl
                     
-                    # Record with Risk Governor
-                    self.risk_governor.record_trade_result(symbol, pnl, was_win)
+                    # Record with Risk Governor (include unrealized P&L from open positions)
+                    open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
+                    unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
+                    self.risk_governor.record_trade_result(symbol, pnl, was_win, unrealized_pnl=unrealized)
                     self.risk_governor.update_capital(self.capital)
                     
                     # Record slippage if we have expected price
@@ -572,11 +600,30 @@ class AutonomousTrader:
         self.reset_agent()
         
         try:
-            # Get fresh market data for ALL stocks (not just first 10)
-            market_data = self.tools.get_market_data(APPROVED_UNIVERSE)
+            # === MARKET SCANNER: Discover movers outside fixed universe ===
+            try:
+                scan_result = self.market_scanner.scan(existing_universe=APPROVED_UNIVERSE)
+                print(self.market_scanner.format_scan_summary(scan_result))
+                # Collect wild-card symbols to merge into data pipeline
+                self._wildcard_symbols = [f"NSE:{w.symbol}" for w in scan_result.wildcards]
+                # === DYNAMIC LOT SIZES: ensure every F&O stock has correct lot size ===
+                update_fno_lot_sizes(self.market_scanner.get_lot_map())
+            except Exception as e:
+                print(f"⚠️ Scanner error (non-fatal): {e}")
+                scan_result = None
+                self._wildcard_symbols = []
+            
+            # Merge wild-cards into scan universe for this cycle
+            scan_universe = list(APPROVED_UNIVERSE)
+            for ws in self._wildcard_symbols:
+                if ws not in scan_universe:
+                    scan_universe.append(ws)
+            
+            # Get fresh market data for fixed universe + wild-cards
+            market_data = self.tools.get_market_data(scan_universe)
             
             # Get volume analysis for EOD predictions
-            volume_analysis = self.tools.get_volume_analysis(APPROVED_UNIVERSE)
+            volume_analysis = self.tools.get_volume_analysis(scan_universe)
             
             # Format ENHANCED data for prompt
             data_summary = []
@@ -781,13 +828,29 @@ class AutonomousTrader:
             
             # Build F&O opportunity list
             fno_prefer = FNO_CONFIG.get('prefer_options_for', [])
+            # Wild-card symbols are F&O-eligible (they came from NFO instruments list)
+            fno_prefer_set = set(fno_prefer) | set(self._wildcard_symbols)
             fno_opportunities = []
             for symbol, data in sorted_data:
-                if isinstance(data, dict) and 'ltp' in data and symbol in fno_prefer:
+                if isinstance(data, dict) and 'ltp' in data and symbol in fno_prefer_set:
                     if self.tools.is_symbol_in_active_trades(symbol):
                         continue
                     if data.get('chop_zone', False):
                         continue
+                    
+                    # Tier-2 / wild-card gate: only trade when stock shows clear directional trend
+                    is_tier2 = symbol in TIER_2_OPTIONS
+                    is_wildcard = symbol in self._wildcard_symbols
+                    if is_tier2 or is_wildcard:
+                        trend_state = data.get('trend', 'SIDEWAYS')
+                        orb = data.get('orb_signal', 'INSIDE_ORB')
+                        vol = data.get('volume_regime', 'NORMAL')
+                        # Tier-2 requires: clear trend OR ORB breakout with volume
+                        tier2_trending = trend_state in ('BULLISH', 'STRONG_BULLISH', 'BEARISH', 'STRONG_BEARISH')
+                        tier2_orb = orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') and vol in ('HIGH', 'EXPLOSIVE')
+                        if not (tier2_trending or tier2_orb):
+                            continue  # Skip Tier-2 stocks without clear trend/breakout
+                    
                     setup_type = None
                     direction = None
                     orb_sig = data.get('orb_signal', 'INSIDE_ORB')
@@ -836,6 +899,14 @@ class AutonomousTrader:
             top_detail_symbols = [s for s, _ in sorted_data[:10] if isinstance(market_data.get(s), dict) and 'ltp' in market_data.get(s, {})]
             detailed_data = [line for line in data_summary if any(sym in line for sym in top_detail_symbols)]
             
+            # Build scanner wild-card summary for GPT
+            wildcard_info = ""
+            if scan_result and scan_result.wildcards:
+                wc_lines = []
+                for w in scan_result.wildcards:
+                    wc_lines.append(f"  ⭐ {w.nse_symbol}: {w.change_pct:+.2f}% ₹{w.ltp:.2f} [{w.category}] — OUTSIDE fixed universe, use place_option_order()")
+                wildcard_info = "\n".join(wc_lines)
+            
             # Ask agent to analyze market with FULL CONTEXT
             prompt = f"""EXECUTE TRADES NOW - DO NOT just describe trades!
 
@@ -845,6 +916,9 @@ F&O stocks: {', '.join(fno_prefer)}
 
 F&O READY SIGNALS:
 {chr(10).join(fno_opportunities) if fno_opportunities else 'No F&O setups right now - check CASH stocks below'}
+
+=== 📡 MARKET SCANNER WILD-CARDS ===
+{wildcard_info if wildcard_info else 'No wild-card movers outside fixed universe this cycle'}
 
 === MARKET SCAN ({len(quick_scan)} stocks) ===
 {chr(10).join(quick_scan[:25])}

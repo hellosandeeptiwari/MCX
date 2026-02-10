@@ -92,9 +92,6 @@ class ExecutionGuard:
         # Limit order timeout
         self.limit_timeout_seconds = 30
         
-        # Min depth for market orders (quantity at best bid/ask)
-        self.min_depth_qty = 100
-        
         # Slippage log
         self.slippage_log: list[SlippageRecord] = []
         self.slippage_log_file = "slippage_log.json"

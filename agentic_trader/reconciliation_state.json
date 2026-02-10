@@ -1,19 +1,10 @@
 {
-  "date": "2026-02-09",
-  "last_updated": "2026-02-09T15:19:55.966199",
+  "date": "2026-02-10",
+  "last_updated": "2026-02-10T13:24:36.258876",
   "state": "SYNCED",
   "frozen": false,
   "mismatch_count": 0,
   "consecutive_mismatches": 0,
   "mismatch_history": [],
-  "recovery_actions": [
-    {
-      "timestamp": "2026-02-09T10:16:53.200529",
-      "action": "STARTUP: Found 1 orphan local positions - likely filled at broker"
-    },
-    {
-      "timestamp": "2026-02-09T10:16:53.200529",
-      "action": "RECOVERY MODE: Startup sync mismatch"
-    }
-  ]
+  "recovery_actions": []
 }

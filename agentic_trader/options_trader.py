@@ -18,7 +18,10 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 import numpy as np
 from scipy.stats import norm
+from config import HARD_RULES
 
+# Persistent log file — always in agentic_trader/ regardless of CWD
+TRADE_DECISIONS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trade_decisions.log')
 
 # ============================================================
 # INTRADAY OPTION DECISION SCORER
@@ -146,18 +149,36 @@ class IntradayOptionScorer:
         'rsi_penalty': -3,       # Overextension penalty only (no points)
     }
     
-    # === MICROSTRUCTURE THRESHOLDS (Tightened by instrument type) ===
-    SPREAD_TIGHT_PCT = 0.3       # < 0.3% spread = excellent
-    SPREAD_OK_PCT = 0.5          # < 0.5% spread = acceptable
-    SPREAD_WIDE_PCT = 1.0        # > 1% spread = bad
-    SPREAD_BLOCK_PCT = 2.0       # > 2% spread = HARD BLOCK (indices)
+    # === SMART SPREAD EVALUATOR (Tick-based + Impact Cost) ===
+    # Old % method was broken: ₹0.10 on ₹10 option = 1% ("wide") but it's just 2 ticks!
+    # New approach: measure in TICKS (market quality) + IMPACT COST (P&L drag)
+    TICK_SIZE = 0.05             # NSE option tick size
     
-    # Absolute spread thresholds (because cheap premiums distort %)
-    SPREAD_BLOCK_ABS_INDEX = 3.0    # ₹3 max for index options
-    SPREAD_BLOCK_ABS_STOCK = 5.0    # ₹5 max for stock options
+    # Tick-based thresholds (by premium bucket)
+    # Cheap options (<₹20): 2-tick spread is normal & excellent
+    # Mid options (₹20-75): slightly more room
+    # Expensive options (>₹75): should be very tight in tick terms
+    SPREAD_TICKS_EXCELLENT = 2   # 1-2 ticks = ₹0.10 max → +6 pts
+    SPREAD_TICKS_GOOD = 4        # 3-4 ticks = ₹0.20 max → +4 pts
+    
+    # Premium-adaptive max ticks before BLOCK (dual-gate with impact)
+    SPREAD_MAX_TICKS_CHEAP = 6   # <₹20 premium: max 6 ticks (₹0.30)
+    SPREAD_MAX_TICKS_MID = 8     # ₹20-75 premium: max 8 ticks (₹0.40)
+    SPREAD_MAX_TICKS_EXPENSIVE = 12  # >₹75 premium: max 12 ticks (₹0.60)
+    
+    # Impact cost: round-trip spread / expected profit
+    # If target = 50%, expected profit = premium * 0.50
+    # Round-trip cost = spread * 2 (pay on entry + exit)
+    SPREAD_IMPACT_EXCELLENT = 0.05  # <5% of expected profit → +6 pts
+    SPREAD_IMPACT_GOOD = 0.10       # <10% → +4 pts
+    SPREAD_IMPACT_BLOCK = 0.20      # >20% of expected profit → BLOCK
+    
+    # Hard absolute backstop (catches truly broken quotes)
+    SPREAD_BLOCK_ABS_INDEX = 2.0    # ₹2 max for index options
+    SPREAD_BLOCK_ABS_STOCK = 3.0    # ₹3 max for stock options
     
     # Depth and volume thresholds (OI alone is not enough)
-    MIN_DEPTH_QTY = 50           # Min quantity at best bid/ask
+    MIN_DEPTH_LOTS = 2           # Min lots at best bid/ask (Kite returns shares, we normalize)
     MIN_OI = 500                 # Minimum OI for liquidity
     MIN_OPTION_VOLUME = 100      # ⭐ NEW: Min today's option volume
     MIN_OI_VOLUME_RATIO = 0.5    # OI should be at least 0.5x volume
@@ -167,8 +188,8 @@ class IntradayOptionScorer:
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
     # === TRADE THRESHOLDS (Simplified to 2 tiers) ===
-    BLOCK_THRESHOLD = 30         # < 30 = BLOCK (no trade) [lowered: NEUTRAL trend + no ORB made 45 impossible]
-    STANDARD_THRESHOLD = 35      # 35-54 = Standard (ATM/ITM, 1x size)
+    BLOCK_THRESHOLD = 45         # < 45 = BLOCK (requires at least one directional signal)
+    STANDARD_THRESHOLD = 50      # 50-64 = Standard (ATM/ITM, 1x size)
     PREMIUM_THRESHOLD = 55       # >= 55 = Premium (ATM/ITM, up to 1.2x)
     CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
@@ -180,7 +201,7 @@ class IntradayOptionScorer:
     
     # === OTM STRIKE REQUIREMENTS (Special case, not default) ===
     OTM_REQUIRES_EXPLOSIVE_VOL = True   # Must have EXPLOSIVE volume
-    OTM_REQUIRES_TIGHT_SPREAD = 0.3     # Spread must be < 0.3%
+    OTM_REQUIRES_TIGHT_TICKS = 2       # OTM requires ≤2 tick spread (₹0.10)
     OTM_REQUIRES_ACCEL_MIN = 8          # Acceleration >= 8/10
     
     # TrendFollowing window (for anti-double-counting)
@@ -301,15 +322,34 @@ class IntradayOptionScorer:
         else:
             cap_reason = ""
         
+        # === ORB STALENESS DECAY ===
+        # orb_strength = how far price moved from ORB range (in % of ORB range)
+        # >100% = price moved more than 1x the ORB range = stale breakout
+        # Decay: 0-50%=full, 50-100%=75%, 100-200%=50%, >200%=25%
+        orb_strength = 0
+        if market_data:
+            orb_strength = abs(market_data.get('orb_strength', 0))
+        if orb_strength > 200:
+            orb_decay = 0.25
+            cap_reason += f" [STALE: {orb_strength:.0f}% from ORB, 25% credit]"
+        elif orb_strength > 100:
+            orb_decay = 0.50
+            cap_reason += f" [aging: {orb_strength:.0f}% from ORB, 50% credit]"
+        elif orb_strength > 50:
+            orb_decay = 0.75
+            cap_reason += f" [aging: {orb_strength:.0f}% from ORB, 75% credit]"
+        else:
+            orb_decay = 1.0
+        
         if signal.orb_signal == "BREAKOUT_UP":
-            orb_points = orb_max_points
+            orb_points = int(orb_max_points * orb_decay)
             score += orb_points
             bullish_points += orb_points
             reasons.append(f"🚀 ORB BREAKOUT UP (+{orb_points}){cap_reason}")
             if direction == "HOLD":
                 direction = "BUY"
         elif signal.orb_signal == "BREAKOUT_DOWN":
-            orb_points = orb_max_points
+            orb_points = int(orb_max_points * orb_decay)
             score += orb_points
             bearish_points += orb_points
             reasons.append(f"📉 ORB BREAKOUT DOWN (+{orb_points}){cap_reason}")
@@ -489,6 +529,97 @@ class IntradayOptionScorer:
             warnings.append(f"⚠️ RSI high ({signal.rsi:.0f}) - caution on longs (-1)")
         # Note: RSI 30-70 = no impact (neutral)
         
+        # === 8. MOMENTUM EXHAUSTION FILTER (graduated, overridable) ===
+        # Prevents chasing moves that have already exhausted their run.
+        # Checks BOTH gap (from prev close) AND intraday move (from today's open).
+        # A stock up +6% intraday is almost as dangerous as a 6% gap.
+        exhaustion_score = 0
+        if market_data:
+            gap_pct = abs(market_data.get('change_pct', 0))   # % from prev close
+            ltp = market_data.get('ltp', 0)
+            day_high = market_data.get('high', 0)
+            day_low = market_data.get('low', 0)
+            day_open = market_data.get('open', ltp)
+            vwap = market_data.get('vwap', 0)
+            day_range = day_high - day_low if day_high > day_low else 0.01
+
+            # --- NEW: Calculate intraday move from open ---
+            intraday_move_pct = abs((ltp - day_open) / day_open * 100) if day_open > 0 and ltp > 0 else 0
+            # Total exhaustion signal = max of gap and intraday move
+            # (captures both gap plays AND intraday runners)
+            total_move_pct = max(gap_pct, intraday_move_pct)
+
+            # --- A. Gap penalty (% from previous close) ---
+            if gap_pct >= 7:
+                exhaustion_score -= 18
+                warnings.append(f"🔥 EXHAUSTION: Massive gap {gap_pct:.1f}% from prev close (-18)")
+            elif gap_pct >= 5:
+                exhaustion_score -= 10
+                warnings.append(f"⚠️ EXHAUSTION: Large gap {gap_pct:.1f}% from prev close (-10)")
+            elif gap_pct >= 3:
+                exhaustion_score -= 5
+                warnings.append(f"⚠️ EXHAUSTION: Gap {gap_pct:.1f}% from prev close (-5)")
+
+            # --- B. INTRADAY MOVE PENALTY (% from today's open) ---
+            # This is the NEW check that catches stocks like ETERNAL (+6% from open)
+            # Only apply if gap penalty didn't already cover it (avoid double-counting)
+            if intraday_move_pct > gap_pct:
+                # Intraday move is larger than the gap → the move happened today
+                if intraday_move_pct >= 6:
+                    exhaustion_score -= 15
+                    warnings.append(f"🔥 CHASING: {intraday_move_pct:.1f}% intraday move from open — late entry (-15)")
+                elif intraday_move_pct >= 4:
+                    exhaustion_score -= 10
+                    warnings.append(f"⚠️ CHASING: {intraday_move_pct:.1f}% intraday move from open — extended (-10)")
+                elif intraday_move_pct >= 2:
+                    exhaustion_score -= 5
+                    warnings.append(f"⚠️ CHASING: {intraday_move_pct:.1f}% intraday move from open (-5)")
+
+            # --- C. Retracement check (holding at highs = strong, retraced = weak) ---
+            if total_move_pct >= 2 and ltp > 0 and day_high > 0:
+                is_bullish_move = (ltp > day_open) if day_open > 0 else (market_data.get('change_pct', 0) > 0)
+                if is_bullish_move:
+                    pct_from_high = ((day_high - ltp) / day_high * 100) if day_high else 0
+                    if pct_from_high <= 0.5:
+                        # AT day highs — still has momentum, partial override
+                        exhaustion_score += 5
+                        reasons.append(f"🚀 MOMENTUM HOLDING: LTP within {pct_from_high:.1f}% of day-high (+5)")
+                    elif (day_high - ltp) / day_range > 0.5:
+                        exhaustion_score -= 8
+                        retrace_pct = (day_high - ltp) / day_range * 100
+                        warnings.append(f"📉 EXHAUSTION: Retraced {retrace_pct:.0f}% of day range (-8)")
+                else:
+                    pct_from_low = ((ltp - day_low) / day_low * 100) if day_low else 0
+                    if pct_from_low <= 0.5:
+                        exhaustion_score += 5
+                        reasons.append(f"📉 MOMENTUM HOLDING: LTP within {pct_from_low:.1f}% of day-low (+5)")
+                    elif (ltp - day_low) / day_range > 0.5:
+                        exhaustion_score -= 8
+                        retrace_pct = (ltp - day_low) / day_range * 100
+                        warnings.append(f"🚀 EXHAUSTION: Bounced {retrace_pct:.0f}% of day range (-8)")
+
+            # --- D. Volume confirmation (only helps reduce penalty, not eliminate) ---
+            if total_move_pct >= 3:
+                vol_regime = market_data.get('volume_regime', 'NORMAL')
+                if vol_regime == 'EXPLOSIVE':
+                    exhaustion_score += 5
+                    reasons.append("💥 EXHAUSTION OVERRIDE: Explosive volume confirms move (+5)")
+                elif vol_regime == 'LOW':
+                    exhaustion_score -= 3
+                    warnings.append("⚠️ EXHAUSTION: Move on LOW volume (-3)")
+
+            # --- E. VWAP arbiter (below VWAP on move-up = move failing) ---
+            if total_move_pct >= 2 and vwap > 0 and ltp > 0:
+                is_bullish = ltp > day_open if day_open > 0 else market_data.get('change_pct', 0) > 0
+                if is_bullish and ltp < vwap:
+                    exhaustion_score -= 10
+                    warnings.append(f"🚫 EXHAUSTION: Moved up BUT below VWAP ₹{vwap:.0f} (-10)")
+                elif not is_bullish and ltp > vwap:
+                    exhaustion_score -= 10
+                    warnings.append(f"🚫 EXHAUSTION: Moved down BUT above VWAP ₹{vwap:.0f} (-10)")
+
+            score += exhaustion_score
+
         # === CHOP ZONE PENALTY ===
         if signal.chop_zone:
             score -= self.CHOP_PENALTY
@@ -572,6 +703,13 @@ class IntradayOptionScorer:
             should_trade = False
             warnings.append(f"🚫 BLOCKED: Score {score:.0f} < {self.BLOCK_THRESHOLD} minimum")
         
+        # Gate 2: Must have at least one meaningful directional signal
+        # Prevents trades that pass only on volume + microstructure noise
+        directional_strength = max(bullish_points, bearish_points)
+        if directional_strength < 10:
+            should_trade = False
+            warnings.append(f"🚫 BLOCKED: No directional conviction (best: {directional_strength:.0f}pts, need ≥10)")
+        
         # Gate 3: Must have direction
         if direction == "HOLD":
             should_trade = False
@@ -634,8 +772,12 @@ class IntradayOptionScorer:
             if self.OTM_REQUIRES_EXPLOSIVE_VOL and signal.volume_regime != "EXPLOSIVE":
                 otm_allowed = False
             
-            # Must have tight spread
-            if option_data and option_data.spread_pct > self.OTM_REQUIRES_TIGHT_SPREAD:
+            # Must have tight spread (tick-based)
+            if option_data and option_data.bid > 0 and option_data.ask > 0:
+                otm_spread_ticks = round((option_data.ask - option_data.bid) / self.TICK_SIZE)
+                if otm_spread_ticks > self.OTM_REQUIRES_TIGHT_TICKS:
+                    otm_allowed = False
+            else:
                 otm_allowed = False
             
             # Must have high acceleration
@@ -679,8 +821,8 @@ class IntradayOptionScorer:
             (score, is_blocked, block_reason)
         """
         if option_data is None:
-            warnings.append("⚠️ No microstructure data - unable to assess tradability")
-            return (0.0, False, "")
+            warnings.append("🚫 No microstructure data - BLOCKED (cannot assess spread/depth)")
+            return (0.0, True, "No microstructure data available - chain fetch may have failed")
         
         score = 0.0
         block = False
@@ -692,57 +834,89 @@ class IntradayOptionScorer:
         is_index = any(idx in symbol_upper for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
         spread_block_abs = self.SPREAD_BLOCK_ABS_INDEX if is_index else self.SPREAD_BLOCK_ABS_STOCK
         
-        # === 1. SPREAD % (6 points max) ===
-        # This is the most important - wide spread = instant loss
+        # === 1. SMART SPREAD (6 points max) ===
+        # Uses TICKS (market quality) + IMPACT COST (P&L drag) instead of raw %
         spread_pct = option_data.spread_pct
         
-        # ⭐ NEW: Absolute spread check (₹3 for index, ₹5 for stock)
-        # Even if % is OK, absolute spread can still eat into profits
-        bid = option_data.bid_qty  # Using for calculation
-        ask = option_data.ask_qty
-        # We need to calculate absolute spread from the data if available
-        # For now, use the % check and add absolute when price is available
+        bid_price = option_data.bid
+        ask_price = option_data.ask
+        spread_abs = (ask_price - bid_price) if (bid_price > 0 and ask_price > 0) else 0
+        mid_price = (bid_price + ask_price) / 2 if (bid_price > 0 and ask_price > 0) else 0
         
-        if spread_pct <= self.SPREAD_TIGHT_PCT:
-            # Excellent spread < 0.3%
-            score += 6
-            reasons.append(f"💰 Tight spread {spread_pct:.2f}% (+6)")
-        elif spread_pct <= self.SPREAD_OK_PCT:
-            # Acceptable spread 0.3-0.5%
-            score += 4
-            reasons.append(f"💵 Good spread {spread_pct:.2f}% (+4)")
-        elif spread_pct <= self.SPREAD_WIDE_PCT:
-            # Wide but tradable 0.5-1%
-            score += 2
-            warnings.append(f"⚠️ Wide spread {spread_pct:.2f}% (+2)")
-        elif spread_pct <= self.SPREAD_BLOCK_PCT:
-            # Very wide 1-2% - penalty
-            score += 0
-            warnings.append(f"⛔ Very wide spread {spread_pct:.2f}% (0pts)")
-        else:
-            # BLOCK > 2% spread
+        # --- Layer 1: Hard absolute backstop (catches broken quotes) ---
+        if spread_abs > 0 and spread_abs > spread_block_abs:
             block = True
-            block_reason = f"Spread {spread_pct:.2f}% > {self.SPREAD_BLOCK_PCT}%"
+            block_reason = f"Absolute spread ₹{spread_abs:.2f} > ₹{spread_block_abs:.1f} max"
             warnings.append(f"🚫 BLOCKED: {block_reason}")
+        elif mid_price <= 0:
+            block = True
+            block_reason = "No valid bid/ask prices"
+            warnings.append(f"🚫 BLOCKED: {block_reason}")
+        else:
+            # --- Layer 2: Tick-based quality ---
+            spread_ticks = round(spread_abs / self.TICK_SIZE) if spread_abs > 0 else 0
+            
+            # --- Layer 3: Impact cost (round-trip spread / expected profit) ---
+            # We pay the spread TWICE: once buying at ask, once selling at bid
+            expected_profit = mid_price * 0.50  # 50% target = standard
+            impact_cost = (spread_abs * 2) / expected_profit if expected_profit > 0 else 1.0
+            
+            # --- Layer 4: Premium-adaptive max ticks ---
+            if mid_price < 20:
+                max_ticks = self.SPREAD_MAX_TICKS_CHEAP      # 6 ticks
+            elif mid_price < 75:
+                max_ticks = self.SPREAD_MAX_TICKS_MID         # 8 ticks
+            else:
+                max_ticks = self.SPREAD_MAX_TICKS_EXPENSIVE   # 12 ticks
+            
+            # --- Scoring: best of tick-quality OR impact-quality ---
+            tick_excellent = spread_ticks <= self.SPREAD_TICKS_EXCELLENT  # ≤2 ticks
+            tick_good = spread_ticks <= self.SPREAD_TICKS_GOOD           # ≤4 ticks
+            impact_excellent = impact_cost <= self.SPREAD_IMPACT_EXCELLENT  # <5%
+            impact_good = impact_cost <= self.SPREAD_IMPACT_GOOD           # <10%
+            
+            if tick_excellent or impact_excellent:
+                # Either market is super tight OR impact is negligible
+                score += 6
+                reasons.append(f"💰 Excellent spread: {spread_ticks} ticks (₹{spread_abs:.2f}), impact {impact_cost*100:.1f}% (+6)")
+            elif tick_good or impact_good:
+                # Good market quality OR acceptable impact
+                score += 4
+                reasons.append(f"💵 Good spread: {spread_ticks} ticks (₹{spread_abs:.2f}), impact {impact_cost*100:.1f}% (+4)")
+            elif spread_ticks <= max_ticks or impact_cost <= self.SPREAD_IMPACT_BLOCK:
+                # At least ONE gate passes — acceptable but no points
+                score += 2
+                warnings.append(f"⚠️ Wide spread: {spread_ticks} ticks (₹{spread_abs:.2f}), impact {impact_cost*100:.1f}% (+2)")
+            else:
+                # BOTH tick AND impact fail → BLOCK
+                block = True
+                block_reason = f"Spread {spread_ticks} ticks (₹{spread_abs:.2f}), impact {impact_cost*100:.1f}% > {self.SPREAD_IMPACT_BLOCK*100:.0f}%"
+                warnings.append(f"🚫 BLOCKED: {block_reason}")
         
         # === 2. TOP-OF-BOOK DEPTH (3 points max) ===
-        # Thin depth = slippage risk
-        min_depth = min(option_data.bid_qty, option_data.ask_qty)
-        if min_depth >= self.MIN_DEPTH_QTY * 2:
-            # Excellent depth
+        # Kite returns depth quantities in shares — normalize to lots
+        min_depth_shares = min(option_data.bid_qty, option_data.ask_qty)
+        
+        # Get lot size for this symbol (strip NSE:/NFO: prefix)
+        underlying_clean = symbol_upper.replace('NSE:', '').replace('NFO:', '').split()[0]
+        lot_size = FNO_LOT_SIZES.get(underlying_clean, 1)
+        min_depth_lots = min_depth_shares / lot_size if lot_size > 0 else min_depth_shares
+        
+        if min_depth_lots >= self.MIN_DEPTH_LOTS * 2:
+            # Excellent depth (4+ lots)
             score += 3
-            reasons.append(f"📊 Good depth {min_depth}+ lots (+3)")
-        elif min_depth >= self.MIN_DEPTH_QTY:
-            # Acceptable depth
+            reasons.append(f"📊 Good depth {min_depth_lots:.1f} lots ({min_depth_shares} shares) (+3)")
+        elif min_depth_lots >= self.MIN_DEPTH_LOTS:
+            # Acceptable depth (2+ lots)
             score += 2
-            reasons.append(f"📊 OK depth {min_depth} lots (+2)")
-        elif min_depth >= self.MIN_DEPTH_QTY / 2:
-            # Thin depth
+            reasons.append(f"📊 OK depth {min_depth_lots:.1f} lots ({min_depth_shares} shares) (+2)")
+        elif min_depth_lots >= self.MIN_DEPTH_LOTS / 2:
+            # Thin depth (1+ lot)
             score += 1
-            warnings.append(f"⚠️ Thin depth {min_depth} lots (+1)")
+            warnings.append(f"⚠️ Thin depth {min_depth_lots:.1f} lots ({min_depth_shares} shares) (+1)")
         else:
             # Very thin - don't block but 0 points
-            warnings.append(f"⛔ Very thin depth {min_depth} lots (0pts)")
+            warnings.append(f"⛔ Very thin depth {min_depth_lots:.1f} lots ({min_depth_shares} shares) (0pts)")
         
         # === 3. OI / VOLUME FILTER (4 points max) ===
         # Illiquid strikes = hard to exit
@@ -1115,10 +1289,45 @@ FNO_LOT_SIZES = {
     "NATIONALUM": 3750,
     "NMDC": 6750,
     "SAIL": 4700,
-    "NIFTY": 50,
-    "BANKNIFTY": 15,
-    "FINNIFTY": 40,
+    "NIFTY": 65,
+    "BANKNIFTY": 30,
+    "FINNIFTY": 60,
+    "MIDCPNIFTY": 120,
+    # Wild-card scanner stocks (added 10 Feb 2026)
+    "BSE": 375,
+    "BANDHANBNK": 3600,
+    "SWIGGY": 1300,
+    "MOTHERSON": 6150,
+    "GAIL": 3150,
+    "JIOFIN": 2350,
+    "KALYANKJIL": 1175,
+    "PGEL": 950,
+    "AMBER": 100,
+    "CDSL": 475,
+    "IOC": 4875,
 }
+
+
+def update_fno_lot_sizes(lot_map: Dict[str, int]) -> int:
+    """
+    Dynamically update FNO_LOT_SIZES from Kite API lot data.
+    Called after market_scanner fetches NFO instruments so every
+    wild-card stock automatically gets the correct lot size.
+    
+    Args:
+        lot_map: {symbol: lot_size} dict from scanner
+    Returns:
+        Number of NEW symbols added
+    """
+    added = 0
+    for symbol, lot_size in lot_map.items():
+        if lot_size and lot_size > 0:
+            if symbol not in FNO_LOT_SIZES:
+                added += 1
+            FNO_LOT_SIZES[symbol] = lot_size
+    if added:
+        print(f"📦 Dynamic lot sizes: {added} new symbols added → total {len(FNO_LOT_SIZES)} F&O stocks")
+    return added
 
 
 class BlackScholes:
@@ -1556,13 +1765,13 @@ class OptionsPositionSizer:
         self.capital = capital
         
         # Risk limits
-        self.max_premium_per_trade = 0.05   # Max 5% of capital per option premium
-        self.max_premium_per_day = 0.15     # Max 15% of capital in option premiums per day
+        self.max_premium_per_trade = 0.50   # Max 50% of capital per option premium (₹1L on ₹2L capital)
+        self.max_premium_per_day = 1.00     # Max 100% of capital in option premiums per day
         self.max_lots_per_trade = 10        # Maximum lots per single trade
         self.max_total_premium = 0          # Tracking
         
         # Risk per trade (as % of capital)
-        self.risk_per_trade = 0.02  # 2% of capital at risk
+        self.risk_per_trade = HARD_RULES.get("RISK_PER_TRADE", 0.025)  # Aligned with config (2.5%)
     
     def calculate_position(self, contract: OptionContract, 
                           signal_direction: str,
@@ -1585,8 +1794,17 @@ class OptionsPositionSizer:
         
         premium_per_lot = contract.ltp * contract.lot_size
         
-        # Method 1: Premium-based sizing (max 5% of capital)
+        # === CAPITAL GUARD: Block if single lot exceeds max premium ===
         max_premium = capital * self.max_premium_per_trade
+        if premium_per_lot > max_premium:
+            return {
+                'quantity': 0,
+                'premium_per_lot': premium_per_lot,
+                'error': f'Single lot premium ₹{premium_per_lot:,.0f} exceeds {self.max_premium_per_trade*100:.0f}% of capital (₹{max_premium:,.0f})',
+                'blocked': True
+            }
+        
+        # Method 1: Premium-based sizing (max 5% of capital)
         lots_by_premium = max(1, int(max_premium / premium_per_lot))
         
         # Method 2: Risk-based sizing (max loss = 2% of capital)
@@ -1808,18 +2026,40 @@ class OptionsTrader:
         scorer = get_intraday_scorer()
         decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, option_data=micro_data, caller_direction=direction)
         
-        print(f"\n📊 INTRADAY + TREND OPTION DECISION for {underlying}:")
-        print(f"   Score: {decision.confidence_score:.0f}/100")
-        print(f"   Direction: {decision.recommended_direction}")
-        print(f"   Should Trade: {decision.should_trade}")
-        for reason in decision.reasons[:5]:
-            print(f"   {reason}")
-        for warning in decision.warnings[:3]:
-            print(f"   {warning}")
+        # === PERSISTENT DECISION LOG (never lost to terminal buffer) ===
+        from datetime import datetime as _dt
+        log_lines = []
+        log_lines.append(f"\n{'='*70}")
+        log_lines.append(f"📊 INTRADAY + TREND OPTION DECISION for {underlying}")
+        log_lines.append(f"   Time: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log_lines.append(f"   Score: {decision.confidence_score:.0f}/100")
+        log_lines.append(f"   Direction: {decision.recommended_direction}")
+        log_lines.append(f"   Should Trade: {decision.should_trade}")
+        for reason in decision.reasons:
+            log_lines.append(f"   {reason}")
+        for warning in decision.warnings:
+            log_lines.append(f"   {warning}")
+        
+        # Print to terminal (may scroll away)
+        for line in log_lines:
+            print(line)
+        
+        # Write to persistent log file (always survives)
+        try:
+            with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                f.write('\n'.join(log_lines) + '\n')
+        except Exception:
+            pass  # Never crash on logging failure
         
         # === CHECK IF SHOULD TRADE ===
         if not decision.should_trade:
-            print(f"   ❌ INTRADAY SCORE TOO LOW - SKIP OPTION TRADE")
+            reject_msg = f"   ❌ REJECTED: {underlying} score {decision.confidence_score:.0f} — SKIP"
+            print(reject_msg)
+            try:
+                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                    f.write(reject_msg + '\n')
+            except Exception:
+                pass
             return None
         
         # === USE INTRADAY DECISION FOR PARAMETERS ===
@@ -1887,6 +2127,16 @@ class OptionsTrader:
             )
             
             print(f"   ✅ Plan: {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}")
+            
+            # Log executed order to persistent file
+            try:
+                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                    f.write(f"   ✅ EXECUTED: {contract.symbol} | {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}\n")
+                    f.write(f"      Greeks: {plan.greeks_summary}\n")
+                    f.write(f"      Target: ₹{plan.target_premium:.2f} | SL: ₹{plan.stoploss_premium:.2f}\n")
+                    f.write(f"{'='*70}\n")
+            except Exception:
+                pass
             
             return (plan, decision)
         except Exception as e:

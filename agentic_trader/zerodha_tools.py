@@ -5,6 +5,7 @@ Provides structured tools that the LLM agent can call
 
 import json
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
@@ -151,7 +152,7 @@ class ZerodhaTools:
     TRADE_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'trade_history.json')
     
     def __init__(self, paper_mode: bool = True, paper_capital: float = None):
-        self.kite = KiteConnect(api_key=ZERODHA_API_KEY)
+        self.kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
         self.access_token = None
         self.start_of_day_equity = None
         self.last_api_call = 0
@@ -163,6 +164,7 @@ class ZerodhaTools:
         self.paper_positions = []
         self.paper_orders = []
         self.paper_pnl = 0
+        self._positions_lock = threading.RLock()  # Thread safety for paper_positions (reentrant)
         self._scorer_rejected_symbols = set()  # Track scorer rejections for retry filtering
         
         # Load saved token
@@ -197,7 +199,7 @@ class ZerodhaTools:
             self.paper_pnl = 0
     
     def _save_active_trades(self):
-        """Save active trades to JSON file"""
+        """Save active trades to JSON file (caller must hold _positions_lock)"""
         try:
             data = {
                 'date': str(datetime.now().date()),
@@ -248,107 +250,114 @@ class ZerodhaTools:
     
     def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None):
         """Update trade status and move to history if closed"""
-        for i, trade in enumerate(self.paper_positions):
-            if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
-                trade['status'] = status
-                trade['exit_price'] = exit_price
-                trade['exit_time'] = datetime.now().isoformat()
-                
-                if pnl is not None:
-                    trade['pnl'] = pnl
-                    self.paper_pnl += pnl
-                
-                # Save to history and remove from active
-                if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT']:
-                    self._save_to_history(trade, status, pnl or 0)
-                    self.paper_positions.pop(i)
-                
-                self._save_active_trades()
-                return True
+        with self._positions_lock:
+            for i, trade in enumerate(self.paper_positions):
+                if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                    trade['status'] = status
+                    trade['exit_price'] = exit_price
+                    trade['exit_time'] = datetime.now().isoformat()
+                    
+                    if pnl is not None:
+                        trade['pnl'] = pnl
+                        self.paper_pnl += pnl
+                    
+                    # Save to history and remove from active
+                    if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
+                                  'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
+                                  'SESSION_CUTOFF', 'GREEKS_EXIT']:
+                        self._save_to_history(trade, status, pnl or 0)
+                        self.paper_positions.pop(i)
+                    
+                    self._save_active_trades()
+                    return True
         return False
     
     def check_and_update_trades(self) -> List[Dict]:
         """Check all active trades for target/stoploss hits and update"""
         updates = []
         
-        if not self.paper_positions:
-            return updates
+        with self._positions_lock:
+            if not self.paper_positions:
+                return updates
+            
+            # Get current prices for all active symbols
+            symbols = [t['symbol'] for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
         
-        # Get current prices for all active symbols
-        symbols = [t['symbol'] for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
         if not symbols:
             return updates
         
         try:
             quotes = self.kite.quote(symbols)
             
-            for trade in self.paper_positions[:]:  # Copy list to avoid modification during iteration
-                if trade.get('status', 'OPEN') != 'OPEN':
-                    continue
-                
-                symbol = trade['symbol']
-                if symbol not in quotes:
-                    continue
-                
-                ltp = quotes[symbol]['last_price']
-                entry = trade['avg_price']
-                sl = trade['stop_loss']
-                target = trade.get('target', entry * 1.02)
-                qty = trade['quantity']
-                side = trade['side']
-                
-                # Calculate P&L
-                if side == 'BUY':
-                    pnl = (ltp - entry) * qty
-                    # Check target hit (price went above target)
-                    if ltp >= target:
-                        self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
-                        updates.append({
-                            'symbol': symbol, 
-                            'result': 'TARGET_HIT', 
-                            'pnl': pnl,
-                            'entry': entry,
-                            'exit': ltp
-                        })
-                    # Check stoploss hit (price went below SL)
-                    elif ltp <= sl:
-                        self.update_trade_status(symbol, 'STOPLOSS_HIT', ltp, pnl)
-                        updates.append({
-                            'symbol': symbol, 
-                            'result': 'STOPLOSS_HIT', 
-                            'pnl': pnl,
-                            'entry': entry,
-                            'exit': ltp
-                        })
-                else:  # SHORT
-                    pnl = (entry - ltp) * qty
-                    # Check target hit (price went below target for shorts)
-                    if ltp <= target:
-                        self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
-                        updates.append({
-                            'symbol': symbol, 
-                            'result': 'TARGET_HIT', 
-                            'pnl': pnl,
-                            'entry': entry,
-                            'exit': ltp
-                        })
-                    # Check stoploss hit (price went above SL for shorts)
-                    elif ltp >= sl:
-                        self.update_trade_status(symbol, 'STOPLOSS_HIT', ltp, pnl)
-                        updates.append({
-                            'symbol': symbol, 
-                            'result': 'STOPLOSS_HIT', 
-                            'pnl': pnl,
-                            'entry': entry,
-                            'exit': ltp
-                        })
+            with self._positions_lock:
+                for trade in self.paper_positions[:]:  # Copy list to avoid modification during iteration
+                    if trade.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    
+                    symbol = trade['symbol']
+                    if symbol not in quotes:
+                        continue
+                    
+                    ltp = quotes[symbol]['last_price']
+                    entry = trade['avg_price']
+                    sl = trade['stop_loss']
+                    target = trade.get('target', entry * 1.02)
+                    qty = trade['quantity']
+                    side = trade['side']
+                    
+                    # Calculate P&L
+                    if side == 'BUY':
+                        pnl = (ltp - entry) * qty
+                        # Check target hit (price went above target)
+                        if ltp >= target:
+                            self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
+                            updates.append({
+                                'symbol': symbol, 
+                                'result': 'TARGET_HIT', 
+                                'pnl': pnl,
+                                'entry': entry,
+                                'exit': ltp
+                            })
+                        # Check stoploss hit (price went below SL)
+                        elif ltp <= sl:
+                            self.update_trade_status(symbol, 'STOPLOSS_HIT', ltp, pnl)
+                            updates.append({
+                                'symbol': symbol, 
+                                'result': 'STOPLOSS_HIT', 
+                                'pnl': pnl,
+                                'entry': entry,
+                                'exit': ltp
+                            })
+                    else:  # SHORT
+                        pnl = (entry - ltp) * qty
+                        # Check target hit (price went below target for shorts)
+                        if ltp <= target:
+                            self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
+                            updates.append({
+                                'symbol': symbol, 
+                                'result': 'TARGET_HIT', 
+                                'pnl': pnl,
+                                'entry': entry,
+                                'exit': ltp
+                            })
+                        # Check stoploss hit (price went above SL for shorts)
+                        elif ltp >= sl:
+                            self.update_trade_status(symbol, 'STOPLOSS_HIT', ltp, pnl)
+                            updates.append({
+                                'symbol': symbol, 
+                                'result': 'STOPLOSS_HIT', 
+                                'pnl': pnl,
+                                'entry': entry,
+                                'exit': ltp
+                            })
         except Exception as e:
             print(f"⚠️ Error checking trades: {e}")
         
         return updates
     
     def _load_token(self):
-        """Load access token from file"""
+        """Load access token from file or environment variable"""
+        # 1. Try token file (date-checked)
         try:
             token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
             with open(token_path, 'r') as f:
@@ -357,10 +366,35 @@ class ZerodhaTools:
             if data.get('date') == str(datetime.now().date()):
                 self.access_token = data['access_token']
                 self.kite.set_access_token(self.access_token)
+                print(f"🔑 Loaded today's access token from file")
                 return True
+            else:
+                print(f"⚠️ Token file is stale (date: {data.get('date')}, today: {datetime.now().date()})")
         except:
             pass
-        return False
+        
+        # 2. Try ZERODHA_ACCESS_TOKEN from .env (user manually updated)
+        env_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "")
+        if env_token:
+            self.access_token = env_token
+            self.kite.set_access_token(self.access_token)
+            # Test if token is valid
+            try:
+                self.kite.profile()
+                print(f"🔑 Using access token from .env (ZERODHA_ACCESS_TOKEN)")
+                # Save to file for consistency
+                token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
+                with open(token_path, 'w') as f:
+                    json.dump({'access_token': env_token, 'date': str(datetime.now().date())}, f)
+                return True
+            except Exception:
+                print(f"⚠️ .env access token is invalid/expired")
+                self.access_token = None
+        
+        # 3. No valid token — prompt for authentication
+        print(f"\n⚠️ No valid Kite access token found for today.")
+        print(f"   Starting interactive authentication...\n")
+        return self.authenticate()
     
     def authenticate(self):
         """Authenticate with Zerodha - run once daily"""
@@ -907,10 +941,10 @@ class ZerodhaTools:
         Tool: Get market data for symbols
         Returns OHLCV + technical indicators
         """
-        # Filter to approved universe
-        valid_symbols = [s for s in symbols if s in APPROVED_UNIVERSE]
+        # Filter to approved universe + any extra symbols passed by caller (wild-cards)
+        valid_symbols = [s for s in symbols if s in APPROVED_UNIVERSE or s.startswith("NSE:")]
         if not valid_symbols:
-            return {"error": "No valid symbols in approved universe"}
+            return {"error": "No valid symbols"}
         
         self._rate_limit()
         
@@ -1957,7 +1991,11 @@ class ZerodhaTools:
                         print(f"      ⚠️ {w}")
             
         except Exception as e:
-            print(f"   ⚠️ Execution guard check failed: {e} - proceeding with defaults")
+            return {
+                "success": False,
+                "error": f"EXECUTION GUARD FAILED: {e} - order blocked for safety",
+                "action": "Execution guard could not validate spread/sizing. Retry next cycle."
+            }
         
         self._rate_limit()
         
@@ -1985,7 +2023,7 @@ class ZerodhaTools:
                     stop_loss = current_ltp * 1.01  # 1% above
                     target = current_ltp * 0.985    # 1.5% below
                 
-                # Add to paper positions
+                # Add to paper positions (thread-safe)
                 position = {
                     'symbol': symbol,
                     'quantity': order['quantity'],
@@ -2000,10 +2038,9 @@ class ZerodhaTools:
                     'volume_regime': order.get('volume_regime', 'NORMAL'),
                     'expected_entry': order.get('expected_entry', current_ltp)
                 }
-                self.paper_positions.append(position)
-                
-                # SAVE TO FILE immediately
-                self._save_active_trades()
+                with self._positions_lock:
+                    self.paper_positions.append(position)
+                    self._save_active_trades()
                 
                 # Record slippage
                 expected_entry = order.get('expected_entry', current_ltp)
@@ -2151,6 +2188,70 @@ class ZerodhaTools:
                 "action": "Use equity order instead"
             }
         
+        # === SHARED SAFETY GATES (same as place_order) ===
+        # 1. Trading hours check
+        from config import TRADING_HOURS
+        now = datetime.now()
+        no_new_after = datetime.strptime(TRADING_HOURS['no_new_after'], '%H:%M').time()
+        market_start = datetime.strptime(TRADING_HOURS['start'], '%H:%M').time()
+        if now.time() < market_start or now.time() > no_new_after:
+            return {
+                "success": False,
+                "error": f"TRADING HOURS BLOCK: Current time {now.strftime('%H:%M')} outside {TRADING_HOURS['start']}-{TRADING_HOURS['no_new_after']}",
+                "action": "Wait for trading hours"
+            }
+        
+        # 2. Risk governor check (daily loss, consecutive losses, cooldown)
+        from risk_governor import get_risk_governor
+        risk_gov = get_risk_governor()
+        active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        trade_perm = risk_gov.can_trade_general(active_positions=active_positions)
+        if not trade_perm.allowed:
+            return {
+                "success": False,
+                "error": f"RISK GOVERNOR BLOCK: {trade_perm.reason}",
+                "action": "Risk limit reached - no new trades"
+            }
+        
+        # 3. Position reconciliation check
+        recon = get_position_reconciliation(kite=self.kite, paper_mode=self.paper_mode)
+        recon_can_trade, recon_reason = recon.can_trade()
+        if not recon_can_trade:
+            return {
+                "success": False,
+                "error": f"RECONCILIATION BLOCK: {recon_reason}",
+                "action": "Resolve mismatch before new trades"
+            }
+        
+        # 4. Data health gate check
+        health_gate = get_data_health_gate()
+        try:
+            md_health = self.get_market_data([underlying])
+            if underlying in md_health and isinstance(md_health[underlying], dict):
+                health_ok, health_reason = health_gate.can_trade(underlying, md_health[underlying])
+                if not health_ok:
+                    return {
+                        "success": False,
+                        "error": f"DATA HEALTH BLOCK: {health_reason}",
+                        "action": "Wait for healthy data"
+                    }
+        except Exception as e:
+            print(f"   ⚠️ Data health check failed for option: {e}")
+        
+        # 5. Correlation guard check
+        correlation_guard = get_correlation_guard()
+        active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        corr_check = correlation_guard.can_trade(
+            symbol=underlying,
+            active_positions=active_positions
+        )
+        if not corr_check.can_trade:
+            return {
+                "success": False,
+                "error": f"CORRELATION BLOCK: {corr_check.reason}",
+                "action": "Too many correlated positions"
+            }
+        
         # === CHECK FOR DUPLICATE OPTION ON SAME UNDERLYING ===
         for pos in self.paper_positions:
             if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_option') and pos.get('underlying') == underlying:
@@ -2200,7 +2301,7 @@ class ZerodhaTools:
             }
         
         # Validate risk - max premium check
-        max_premium_per_trade = 35000  # ₹35K per option trade (allows TATASTEEL 5500 lot)
+        max_premium_per_trade = 100000  # ₹1 lakh per option trade
         if plan.total_premium > max_premium_per_trade:
             return {
                 "success": False,
@@ -2209,7 +2310,7 @@ class ZerodhaTools:
             }
         
         # Check total options exposure
-        max_total_exposure = 80000  # ₹80K total option exposure
+        max_total_exposure = 200000  # ₹2 lakh total option exposure (full capital)
         current_exposure = sum(p.get('total_premium', 0) for p in options_trader.positions if p.get('status') == 'OPEN')
         
         if current_exposure + plan.total_premium > max_total_exposure:
@@ -2259,8 +2360,9 @@ class ZerodhaTools:
                     'iv': plan.contract.iv,
                     'rationale': rationale or plan.rationale
                 }
-                self.paper_positions.append(option_position)
-                self._save_active_trades()
+                with self._positions_lock:
+                    self.paper_positions.append(option_position)
+                    self._save_active_trades()
         
         return result
     

@@ -276,6 +276,27 @@ If auto_execute is False, you must output trade plans for user approval instead 
                     bias=arguments.get("bias", "neutral")
                 )
             elif tool_name == "place_option_order":
+                # === ARGUMENT VALIDATION ===
+                underlying = arguments.get("underlying", "")
+                direction = arguments.get("direction", "")
+                
+                # Validate underlying format
+                if not underlying or not isinstance(underlying, str):
+                    return json.dumps({"success": False, "error": "VALIDATION: 'underlying' is required and must be a string"})
+                if not underlying.startswith("NSE:"):
+                    underlying = f"NSE:{underlying}"
+                    arguments["underlying"] = underlying
+                
+                # Validate direction
+                if direction not in ("BUY", "SELL"):
+                    return json.dumps({"success": False, "error": f"VALIDATION: 'direction' must be 'BUY' or 'SELL', got '{direction}'"})
+                
+                # Validate strike_selection
+                valid_strikes = {"ATM", "OTM1", "OTM2", "ITM1", "ITM2"}
+                strike_sel = arguments.get("strike_selection", "ATM")
+                if strike_sel not in valid_strikes:
+                    arguments["strike_selection"] = "ATM"
+                
                 if not self.auto_execute:
                     result = {
                         "success": False,
@@ -292,6 +313,32 @@ If auto_execute is False, you must output trade plans for user approval instead 
                         use_intraday_scoring=True
                     )
             elif tool_name == "place_order":
+                # === ARGUMENT VALIDATION ===
+                order_args = arguments if isinstance(arguments, dict) else {}
+                symbol = order_args.get("symbol", "")
+                qty = order_args.get("quantity", 0)
+                side = order_args.get("side", "")
+                
+                # Validate symbol format
+                if not symbol or not isinstance(symbol, str):
+                    return json.dumps({"success": False, "error": "VALIDATION: 'symbol' is required"})
+                if not symbol.startswith("NSE:") and not symbol.startswith("NFO:"):
+                    symbol = f"NSE:{symbol}"
+                    order_args["symbol"] = symbol
+                
+                # Validate quantity is positive integer
+                try:
+                    qty = int(qty)
+                    if qty <= 0 or qty > 50000:
+                        return json.dumps({"success": False, "error": f"VALIDATION: 'quantity' must be 1-50000, got {qty}"})
+                    order_args["quantity"] = qty
+                except (ValueError, TypeError):
+                    return json.dumps({"success": False, "error": f"VALIDATION: 'quantity' must be an integer, got '{qty}'"})
+                
+                # Validate side
+                if side not in ("BUY", "SELL"):
+                    return json.dumps({"success": False, "error": f"VALIDATION: 'side' must be 'BUY' or 'SELL', got '{side}'"})
+                
                 if not self.auto_execute:
                     result = {
                         "success": False,

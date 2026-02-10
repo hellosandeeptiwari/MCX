@@ -15,6 +15,18 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import json
 import os
+import logging
+
+# Structured logger for speed gate evaluations
+_speed_gate_logger = logging.getLogger('speed_gate')
+if not _speed_gate_logger.handlers:
+    _sg_handler = logging.FileHandler(
+        os.path.join(os.path.dirname(__file__), 'speed_gate_log.jsonl'), mode='a'
+    )
+    _sg_handler.setFormatter(logging.Formatter('%(message)s'))
+    _speed_gate_logger.addHandler(_sg_handler)
+    _speed_gate_logger.setLevel(logging.INFO)
+    _speed_gate_logger.propagate = False
 
 
 @dataclass
@@ -47,6 +59,8 @@ class TradeState:
     max_favorable_move: float = 0  # Greatest R multiple achieved
     breakeven_applied: bool = False
     trailing_active: bool = False
+    is_option: bool = False          # True for option positions
+    max_premium_gain_pct: float = 0  # Max % gain on premium since entry
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -72,12 +86,17 @@ class ExitManager:
     
     def __init__(self):
         # Configuration
-        self.session_cutoff = time(15, 20)  # 3:20 PM
+        self.session_cutoff = time(15, 15)  # 3:15 PM — aligned with TRADING_HOURS['no_new_after'] and EOD exit
         self.time_stop_candles = 7  # Exit if no progress in 7 candles
         self.time_stop_min_r = 0.5  # Must make at least 0.5R to stay
         self.breakeven_trigger_r = 0.8  # Move SL to entry at 0.8R
         self.trailing_start_r = 1.0  # Start trailing at 1R
         self.trailing_pct = 0.5  # Trail at 50% of max profit
+        
+        # Early speed gate (options only)
+        self.option_speed_gate_candles = 4   # Check after 4 candles (20 min)
+        self.option_speed_gate_pct = 12.0    # Need +12% premium gain
+        self.option_speed_gate_max_r = 0.3   # Only exit if R < 0.3 too
         
         # Track trades
         self.trade_states: Dict[str, TradeState] = {}
@@ -136,7 +155,9 @@ class ExitManager:
             candles_since_entry=0,
             max_favorable_move=0,
             breakeven_applied=False,
-            trailing_active=False
+            trailing_active=False,
+            is_option='NFO' in symbol or 'CE' in symbol[-5:] or 'PE' in symbol[-5:],
+            max_premium_gain_pct=0,
         )
         self.trade_states[symbol] = state
         self._persist_state()
@@ -169,6 +190,11 @@ class ExitManager:
         
         state.max_favorable_move = max(state.max_favorable_move, r_multiple)
         
+        # Track premium % gain for options
+        if state.is_option and state.entry_price > 0:
+            premium_pct = (current_price - state.entry_price) / state.entry_price * 100
+            state.max_premium_gain_pct = max(state.max_premium_gain_pct, premium_pct)
+        
         # Check all exit conditions in priority order
         
         # 1. HARD STOP LOSS CHECK (IMMEDIATE)
@@ -192,7 +218,12 @@ class ExitManager:
         # 5. TRAILING STOP (modify SL, don't exit)
         self._apply_trailing_stop(state, current_price, r_multiple)
         
-        # 6. TIME STOP CHECK (after updates)
+        # 6. OPTION SPEED GATE (options only, before general time stop)
+        exit_signal = self._check_option_speed_gate(state, r_multiple)
+        if exit_signal:
+            return exit_signal
+        
+        # 7. TIME STOP CHECK (after updates)
         exit_signal = self._check_time_stop(state, r_multiple)
         if exit_signal:
             return exit_signal
@@ -206,6 +237,9 @@ class ExitManager:
     
     def _check_hard_sl(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
         """Check if hard stop loss is hit"""
+        # Guard: skip SL check if price is 0 or negative (data gap / quote failure)
+        if current_price <= 0:
+            return None
         if state.side == "BUY":
             if current_price <= state.current_sl:
                 return ExitSignal(
@@ -262,6 +296,51 @@ class ExitManager:
                     exit_type="TARGET_HIT",
                     exit_price=current_price,
                     reason=f"Target hit at {current_price} (Target: {state.target})",
+                    urgency="NORMAL"
+                )
+        return None
+    
+    def _check_option_speed_gate(self, state: TradeState, r_multiple: float) -> Optional[ExitSignal]:
+        """Early exit for options that aren't moving fast enough.
+        
+        Options are theta-bleeding instruments. If the premium hasn't gained
+        +12% within 4 candles (20 min), and R-multiple is also < +0.3R,
+        the trade thesis is failing — exit before theta eats the position.
+        
+        Only applies to option positions (is_option=True).
+        Logs every evaluation (EXIT and PASS) for evidence-based tuning.
+        """
+        if not state.is_option:
+            return None
+        
+        if state.candles_since_entry >= self.option_speed_gate_candles:
+            t_minutes = state.candles_since_entry * 5
+            should_exit = (state.max_premium_gain_pct < self.option_speed_gate_pct 
+                          and state.max_favorable_move < self.option_speed_gate_max_r)
+            
+            # Structured log for every evaluation at the gate candle
+            log_entry = json.dumps({
+                "ts": datetime.now().isoformat(),
+                "symbol": state.symbol,
+                "candles": state.candles_since_entry,
+                "t_minutes": t_minutes,
+                "ltp_entry": round(state.entry_price, 2),
+                "max_premium_pct": round(state.max_premium_gain_pct, 2),
+                "r_progress": round(state.max_favorable_move, 3),
+                "r_current": round(r_multiple, 3),
+                "reason": "OPTION_SPEED_GATE_EXIT" if should_exit else "OPTION_SPEED_GATE_PASS",
+            })
+            _speed_gate_logger.info(log_entry)
+            
+            if should_exit:
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="OPTION_SPEED_GATE",
+                    exit_price=0,  # Will use current market price
+                    reason=f"Option speed gate: {state.candles_since_entry} candles ({t_minutes}min), "
+                           f"max premium +{state.max_premium_gain_pct:.1f}% (need +{self.option_speed_gate_pct}%), "
+                           f"max R: {state.max_favorable_move:.2f} (need +{self.option_speed_gate_max_r}R)",
                     urgency="NORMAL"
                 )
         return None
