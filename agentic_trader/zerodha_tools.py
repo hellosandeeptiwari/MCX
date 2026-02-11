@@ -90,7 +90,7 @@ class MarketData:
     ema_9: float = 0
     ema_21: float = 0
     ema_spread: float = 0              # % difference between 9 and 21 EMA
-    ema_regime: str = "NEUTRAL"        # COMPRESSED, EXPANDING_BULL, EXPANDING_BEAR
+    ema_regime: str = "NORMAL"         # COMPRESSED, EXPANDING, NORMAL
     
     # Opening Range Breakout (ORB)
     orb_high: float = 0                # First 15-min high
@@ -113,6 +113,21 @@ class MarketData:
     htf_trend: str = "NEUTRAL"         # BULLISH, BEARISH, NEUTRAL (based on longer EMA)
     htf_ema_slope: str = "FLAT"        # RISING, FALLING, FLAT
     htf_alignment: str = "NEUTRAL"     # ALIGNED, CONFLICTING, NEUTRAL
+
+    # === TREND ENGINE FIELDS (must flow through to TrendFollowing) ===
+    vwap_change_pct: float = 0.0       # Numeric VWAP change % (precise, not lossy string)
+    orb_hold_candles: int = 0          # Post-ORB candles holding breakout level
+    adx: float = 20.0                  # ADX-14 trend strength (>25 = strong)
+
+    # === ACCELERATION FIELDS (must flow through to IntradayOptionScorer) ===
+    follow_through_candles: int = 0    # Confirming candles post-breakout
+    range_expansion_ratio: float = 0.0 # Last candle body / 5-min ATR
+    vwap_slope_steepening: bool = False # Price acceleration with rising volume
+
+    # === PULLBACK / VWAP DISTANCE FIELDS (for TrendFollowing pullback scorer) ===
+    vwap_distance_pct: float = 0.0     # ((ltp - vwap) / vwap) * 100 — signed
+    pullback_depth_pct: float = 0.0    # Most recent pullback depth % from swing high/low
+    pullback_candles: int = 0          # Candles in last pullback
 
 
 @dataclass 
@@ -213,8 +228,8 @@ class ZerodhaTools:
         except Exception as e:
             print(f"⚠️ Error saving trades: {e}")
     
-    def _save_to_history(self, trade: Dict, result: str, pnl: float):
-        """Save completed trade to history file"""
+    def _save_to_history(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
+        """Save completed trade to history file with full exit context"""
         try:
             history = []
             if os.path.exists(self.TRADE_HISTORY_FILE):
@@ -227,12 +242,71 @@ class ZerodhaTools:
                 'pnl': pnl,
                 'closed_at': datetime.now().isoformat()
             }
+            
+            # Attach exit context if provided (candles_held, R-multiple, etc.)
+            if exit_detail:
+                trade_record['exit_detail'] = exit_detail
+            
             history.append(trade_record)
             
             with open(self.TRADE_HISTORY_FILE, 'w') as f:
                 json.dump(history, f, indent=2)
+            
+            # === ALSO WRITE TO STRUCTURED EXIT LOG ===
+            self._log_exit_event(trade_record, result, pnl, exit_detail)
+            
         except Exception as e:
             print(f"⚠️ Error saving to history: {e}")
+    
+    def _log_exit_event(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
+        """Write structured exit event to trade_decisions.log for post-trade review"""
+        try:
+            from options_trader import TRADE_DECISIONS_LOG
+            symbol = trade.get('symbol', '?')
+            underlying = trade.get('underlying', symbol)
+            entry = trade.get('avg_price', 0)
+            exit_price = trade.get('exit_price', 0)
+            qty = trade.get('quantity', 0)
+            side = trade.get('side', '?')
+            entry_score = trade.get('entry_score', 0)
+            score_tier = trade.get('score_tier', '?')
+            trade_id = trade.get('trade_id', '?')
+            strategy = trade.get('strategy_type', trade.get('spread_type', 'NAKED_OPTION'))
+            entry_time = trade.get('timestamp', '?')
+            
+            # Exit detail fields
+            candles_held = (exit_detail or {}).get('candles_held', '?')
+            r_multiple = (exit_detail or {}).get('r_multiple_achieved', '?')
+            max_favorable = (exit_detail or {}).get('max_favorable_excursion', '?')
+            exit_reason = (exit_detail or {}).get('exit_reason', result)
+            
+            # Calculate hold duration
+            hold_mins = '?'
+            try:
+                if entry_time and entry_time != '?':
+                    from datetime import datetime as dt
+                    entry_dt = dt.fromisoformat(entry_time)
+                    hold_mins = int((datetime.now() - entry_dt).total_seconds() / 60)
+            except Exception:
+                pass
+            
+            pnl_pct = (pnl / (entry * qty) * 100) if entry > 0 and qty > 0 else 0
+            
+            emoji = '🎯' if pnl > 0 else '❌'
+            
+            with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'─'*70}\n")
+                f.write(f"{emoji} EXIT: {underlying} ({symbol}) | {result}\n")
+                f.write(f"   Trade ID: {trade_id}\n")
+                f.write(f"   Entry: ₹{entry:.2f} → Exit: ₹{exit_price:.2f} | {side} {qty} qty\n")
+                f.write(f"   P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)\n")
+                f.write(f"   Hold: {hold_mins} min | Candles: {candles_held} | R-Multiple: {r_multiple}\n")
+                f.write(f"   Max Favorable: {max_favorable} | Exit Reason: {exit_reason}\n")
+                f.write(f"   Entry Score: {entry_score} | Tier: {score_tier} | Strategy: {strategy}\n")
+                f.write(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"{'─'*70}\n")
+        except Exception:
+            pass  # Never crash on logging
     
     def is_symbol_in_active_trades(self, symbol: str) -> bool:
         """Check if symbol already has an active trade"""
@@ -248,8 +322,13 @@ class ZerodhaTools:
                 return trade
         return None
     
-    def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None):
-        """Update trade status and move to history if closed"""
+    def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None, exit_detail: Dict = None):
+        """Update trade status and move to history if closed.
+        
+        Args:
+            exit_detail: Optional dict with exit context from ExitManager:
+                candles_held, r_multiple_achieved, max_favorable_excursion, exit_reason
+        """
         with self._positions_lock:
             for i, trade in enumerate(self.paper_positions):
                 if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
@@ -265,7 +344,7 @@ class ZerodhaTools:
                     if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
                                   'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
                                   'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT']:
-                        self._save_to_history(trade, status, pnl or 0)
+                        self._save_to_history(trade, status, pnl or 0, exit_detail=exit_detail)
                         if status != 'PARTIAL_PROFIT':
                             self.paper_positions.pop(i)
                     
@@ -1006,6 +1085,11 @@ class ZerodhaTools:
                 # Get historical data for indicators
                 indicators = self._calculate_indicators(symbol)
                 
+                # Skip symbol entirely if indicator calculation failed
+                if not indicators:
+                    print(f"   ⚠️ Skipping {symbol} — indicator calculation failed")
+                    continue
+                
                 # === DATA HEALTH GATE: Add health check result ===
                 health_gate = get_data_health_gate()
                 health_result = health_gate.check_health(symbol, {
@@ -1064,7 +1148,7 @@ class ZerodhaTools:
                     ema_9=indicators.get('ema_9', 0),
                     ema_21=indicators.get('ema_21', 0),
                     ema_spread=indicators.get('ema_spread', 0),
-                    ema_regime=indicators.get('ema_regime', 'NEUTRAL'),
+                    ema_regime=indicators.get('ema_regime', 'NORMAL'),
                     orb_high=indicators.get('orb_high', 0),
                     orb_low=indicators.get('orb_low', 0),
                     orb_signal=indicators.get('orb_signal', 'INSIDE_ORB'),
@@ -1080,7 +1164,19 @@ class ZerodhaTools:
                     # === HTF ALIGNMENT ===
                     htf_trend=indicators.get('htf_trend', 'NEUTRAL'),
                     htf_ema_slope=indicators.get('htf_ema_slope', 'FLAT'),
-                    htf_alignment=indicators.get('htf_alignment', 'NEUTRAL')
+                    htf_alignment=indicators.get('htf_alignment', 'NEUTRAL'),
+                    # === TREND ENGINE FIELDS ===
+                    vwap_change_pct=indicators.get('vwap_change_pct', 0.0),
+                    orb_hold_candles=indicators.get('orb_hold_candles', 0),
+                    adx=indicators.get('adx', 20.0),
+                    # === ACCELERATION FIELDS ===
+                    follow_through_candles=indicators.get('follow_through_candles', 0),
+                    range_expansion_ratio=indicators.get('range_expansion_ratio', 0.0),
+                    vwap_slope_steepening=indicators.get('vwap_slope_steepening', False),
+                    # === PULLBACK / VWAP DISTANCE ===
+                    vwap_distance_pct=indicators.get('vwap_distance_pct', 0.0),
+                    pullback_depth_pct=indicators.get('pullback_depth_pct', 0.0),
+                    pullback_candles=indicators.get('pullback_candles', 0)
                 )
                 
                 result[symbol] = asdict(data)
@@ -1118,12 +1214,24 @@ class ZerodhaTools:
             to_date = datetime.now()
             from_date = to_date - timedelta(days=60)
             
-            data = self.kite.historical_data(
-                instrument_token=token,
-                from_date=from_date,
-                to_date=to_date,
-                interval="day"
-            )
+            data = None
+            for attempt in range(3):
+                try:
+                    self._rate_limit()
+                    data = self.kite.historical_data(
+                        instrument_token=token,
+                        from_date=from_date,
+                        to_date=to_date,
+                        interval="day"
+                    )
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        wait = (attempt + 1) * 2  # 2s, 4s
+                        print(f"   ⏳ {symbol} daily data retry {attempt+1}/2 (waiting {wait}s)")
+                        time.sleep(wait)
+                    else:
+                        raise
             
             if not data:
                 return {}
@@ -1131,14 +1239,25 @@ class ZerodhaTools:
             # === FETCH INTRADAY 5-MINUTE DATA for proper VWAP & ORB ===
             intraday_df = None
             try:
-                self._rate_limit()
                 today = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
-                intraday_data = self.kite.historical_data(
-                    instrument_token=token,
-                    from_date=today,
-                    to_date=datetime.now(),
-                    interval="5minute"
-                )
+                intraday_data = None
+                for attempt in range(3):
+                    try:
+                        self._rate_limit()
+                        intraday_data = self.kite.historical_data(
+                            instrument_token=token,
+                            from_date=today,
+                            to_date=datetime.now(),
+                            interval="5minute"
+                        )
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            wait = (attempt + 1) * 2
+                            print(f"   ⏳ {symbol} intraday data retry {attempt+1}/2 (waiting {wait}s)")
+                            time.sleep(wait)
+                        else:
+                            raise
                 if intraday_data and len(intraday_data) >= 2:
                     intraday_df = pd.DataFrame(intraday_data)
             except Exception:
@@ -1167,6 +1286,22 @@ class ZerodhaTools:
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             atr = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else tr.mean()
             
+            # ADX (Average Directional Index) - trend strength
+            adx = 20.0  # Default
+            if len(df) >= 28:
+                plus_dm = high.diff()
+                minus_dm = -low.diff()
+                plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+                minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+                atr_smooth = tr.rolling(14).mean()
+                plus_di = 100 * (plus_dm.rolling(14).mean() / atr_smooth)
+                minus_di = 100 * (minus_dm.rolling(14).mean() / atr_smooth)
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+                dx = dx.replace([float('inf'), float('-inf')], 0).fillna(0)
+                adx_series = dx.rolling(14).mean()
+                if len(adx_series.dropna()) > 0:
+                    adx = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 20.0
+            
             # Additional context for informed decisions
             high_20d = high.tail(20).max()
             low_20d = low.tail(20).min()
@@ -1182,10 +1317,25 @@ class ZerodhaTools:
             current_price = close.iloc[-1]
             trend = "BULLISH" if current_price > sma_20 > sma_50 else "BEARISH" if current_price < sma_20 < sma_50 else "SIDEWAYS"
             
-            # Volume analysis
+            # Volume analysis (TIME-NORMALIZED for intraday partial-day bias)
             vol = df['volume']
-            avg_volume_20 = vol.tail(20).mean()
-            current_volume = vol.iloc[-1]
+            raw_today_volume = vol.iloc[-1]
+            
+            # Time-normalize today's volume to full-day equivalent
+            _now = datetime.now()
+            _market_open = _now.replace(hour=9, minute=15, second=0, microsecond=0)
+            _full_day_min = 375.0  # 9:15 to 15:30
+            _elapsed_min = max((_now - _market_open).total_seconds() / 60.0, 1.0)
+            if _elapsed_min < _full_day_min:
+                # Cap multiplier at 12.5x (= 30-min minimum extrapolation)
+                # Prevents absurd projections in first few minutes
+                _proj_mult = min(_full_day_min / _elapsed_min, 12.5)
+                current_volume = raw_today_volume * _proj_mult
+            else:
+                current_volume = raw_today_volume  # After market close, no projection
+            
+            # Exclude today from averages (today is partial / projected)
+            avg_volume_20 = vol.iloc[-21:-1].mean() if len(vol) >= 21 else vol.iloc[:-1].mean() if len(vol) >= 2 else vol.mean()
             volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1
             
             # === REGIME DETECTION CALCULATIONS ===
@@ -1200,16 +1350,16 @@ class ZerodhaTools:
                 ema_21 = ema_21_series.iloc[-1]
                 ema_spread = abs(ema_9 - ema_21) / ema_21 * 100 if ema_21 > 0 else 0
                 
-                compression_threshold = 0.15  # Tighter threshold for 5-min candles
+                compression_threshold = 0.04  # 5-min EMAs: ≤0.04% spread = truly compressed
                 recent_spreads = abs(ema_9_series.iloc[-5:] - ema_21_series.iloc[-5:]) / ema_21_series.iloc[-5:] * 100
                 candles_compressed = (recent_spreads < compression_threshold).sum()
                 
-                if candles_compressed >= 5:
+                if candles_compressed >= 4:
                     ema_regime = "COMPRESSED"
-                elif ema_9 > ema_21:
-                    ema_regime = "EXPANDING_BULL"
+                elif ema_spread >= 0.08:  # Meaningful divergence on 5-min
+                    ema_regime = "EXPANDING"
                 else:
-                    ema_regime = "EXPANDING_BEAR"
+                    ema_regime = "NORMAL"
             else:
                 # Fallback: daily EMAs
                 ema_9_series = close.ewm(span=9, adjust=False).mean()
@@ -1223,14 +1373,14 @@ class ZerodhaTools:
                     recent_spreads = abs(ema_9_series.iloc[-5:] - ema_21_series.iloc[-5:]) / ema_21_series.iloc[-5:] * 100
                     candles_compressed = (recent_spreads < compression_threshold).sum()
                     
-                    if candles_compressed >= 5:
+                    if candles_compressed >= 4:
                         ema_regime = "COMPRESSED"
-                    elif ema_9 > ema_21:
-                        ema_regime = "EXPANDING_BULL"
+                    elif ema_spread >= 0.5:  # Meaningful divergence on daily
+                        ema_regime = "EXPANDING"
                     else:
-                        ema_regime = "EXPANDING_BEAR"
+                        ema_regime = "NORMAL"
                 else:
-                    ema_regime = "NEUTRAL"
+                    ema_regime = "NORMAL"
             
             # 2. VWAP calculation - USE INTRADAY DATA if available
             if intraday_df is not None and len(intraday_df) >= 2:
@@ -1257,6 +1407,7 @@ class ZerodhaTools:
                         vwap_slope = "FLAT"
                 else:
                     vwap_slope = "FLAT"
+                    vwap_change_pct = 0.0
             else:
                 # Fallback: daily VWAP (less accurate for intraday)
                 typical_price = (high + low + close) / 3
@@ -1272,6 +1423,7 @@ class ZerodhaTools:
                     vwap_slope = "RISING" if vwap_change_pct > 0.5 else "FALLING" if vwap_change_pct < -0.5 else "FLAT"
                 else:
                     vwap_slope = "FLAT"
+                    vwap_change_pct = 0.0
             
             # Price vs VWAP
             if current_price > vwap * 1.003:
@@ -1304,8 +1456,18 @@ class ZerodhaTools:
                 orb_signal = "INSIDE_ORB"
                 orb_strength = 0
             
-            # 4. Volume relative to 5-day average
-            volume_5d_avg = vol.tail(5).mean() if len(vol) >= 5 else vol.mean()
+            # ORB hold: count 5-min candles that held the breakout level
+            orb_hold_candles = 0
+            if intraday_df is not None and len(intraday_df) > 3 and orb_signal != "INSIDE_ORB":
+                post_orb_candles = intraday_df.iloc[3:]
+                if orb_signal == "BREAKOUT_UP":
+                    orb_hold_candles = int((post_orb_candles['low'] >= orb_high * 0.998).sum())
+                elif orb_signal == "BREAKOUT_DOWN":
+                    orb_hold_candles = int((post_orb_candles['high'] <= orb_low * 1.002).sum())
+            
+            # 4. Volume relative to 5-day average (TIME-NORMALIZED)
+            # Exclude today from avg (today is partial), use projected volume for comparison
+            volume_5d_avg = vol.iloc[-6:-1].mean() if len(vol) >= 6 else vol.iloc[:-1].mean() if len(vol) >= 2 else vol.mean()
             volume_vs_avg = current_volume / volume_5d_avg if volume_5d_avg > 0 else 1.0
             
             if volume_vs_avg < 0.5:
@@ -1410,43 +1572,130 @@ class ZerodhaTools:
             follow_through_candles = 0
             range_expansion_ratio = 0.0
             vwap_slope_steepening = False
+            intraday_atr = atr / 8.66  # Default: daily ATR / sqrt(75 candles/day)
             
             if intraday_df is not None and len(intraday_df) >= 6:
                 idf = intraday_df
-                # Follow-through: count consecutive candles in breakout direction after ORB
-                if orb_signal == "BREAKOUT_UP":
-                    # Count candles with close > previous close after ORB breakout
-                    post_orb = idf.iloc[3:]  # Skip first 3 candles (ORB period)
-                    for i in range(len(post_orb)):
-                        if post_orb.iloc[i]['close'] > post_orb.iloc[i]['open']:
-                            follow_through_candles += 1
-                        else:
-                            break
-                elif orb_signal == "BREAKOUT_DOWN":
-                    post_orb = idf.iloc[3:]
-                    for i in range(len(post_orb)):
-                        if post_orb.iloc[i]['close'] < post_orb.iloc[i]['open']:
-                            follow_through_candles += 1
-                        else:
-                            break
                 
-                # Range expansion: last candle body / ATR
+                # Calculate 5-min ATR from available intraday candles
+                idf_tr = pd.concat([
+                    idf['high'] - idf['low'],
+                    abs(idf['high'] - idf['close'].shift(1)),
+                    abs(idf['low'] - idf['close'].shift(1))
+                ], axis=1).max(axis=1)
+                
+                if len(idf) >= 14:
+                    _iatr = idf_tr.rolling(14).mean().iloc[-1]
+                else:
+                    # Fewer than 14 candles: use mean of available TRs (better than daily/15)
+                    _iatr = idf_tr.iloc[1:].mean()  # Skip first (no shift value)
+                if not pd.isna(_iatr) and _iatr > 0:
+                    intraday_atr = _iatr
+                
+                # Follow-through: count confirming candles post-ORB (doji-tolerant)
+                if orb_signal in ("BREAKOUT_UP", "BREAKOUT_DOWN"):
+                    post_orb = idf.iloc[3:]  # Skip ORB period
+                    confirming = 0
+                    non_confirming = 0
+                    for i in range(len(post_orb)):
+                        c = post_orb.iloc[i]
+                        body = c['close'] - c['open']
+                        candle_range = c['high'] - c['low']
+                        is_confirming = (body > 0) if orb_signal == "BREAKOUT_UP" else (body < 0)
+                        is_doji = abs(body) < candle_range * 0.15 if candle_range > 0 else True
+                        
+                        if is_confirming:
+                            confirming += 1
+                        elif is_doji:
+                            pass  # Dojis don't break follow-through
+                        else:
+                            non_confirming += 1
+                            if non_confirming > 1:  # Tolerate 1 counter candle
+                                break
+                    follow_through_candles = confirming
+                
+                # Range expansion: last candle body / 5-min ATR (proper scale)
                 last_candle = idf.iloc[-1]
                 candle_body = abs(last_candle['close'] - last_candle['open'])
-                range_expansion_ratio = candle_body / atr if atr > 0 else 0.0
+                range_expansion_ratio = candle_body / intraday_atr if intraday_atr > 0 else 0.0
                 
-                # VWAP slope steepening: compare recent VWAP slope vs earlier
+                # VWAP slope steepening: price acceleration with rising volume
                 if len(idf) >= 10:
                     idf_c = idf['close']
                     idf_v = idf['volume']
-                    # Approximate VWAP slope from last 5 vs prior 5 candles
                     mid1 = idf_c.iloc[-10:-5].mean()
                     mid2 = idf_c.iloc[-5:].mean()
                     vol1 = idf_v.iloc[-10:-5].mean()
                     vol2 = idf_v.iloc[-5:].mean()
-                    # Steepening = price moving faster with volume
-                    if vol2 > vol1 * 1.2 and abs(mid2 - mid1) > atr * 0.3:
+                    # Threshold: 2x 5-min ATR movement with volume acceleration
+                    move_threshold = intraday_atr * 2.0
+                    if vol2 > vol1 * 1.15 and abs(mid2 - mid1) > move_threshold:
                         vwap_slope_steepening = True
+            
+            # === VWAP DISTANCE (signed % from VWAP) ===
+            vwap_distance_pct = ((current_price - vwap) / vwap * 100) if vwap > 0 else 0.0
+            
+            # === PULLBACK DETECTION (from intraday candles) ===
+            pullback_depth_pct = 0.0
+            pullback_candles = 0
+            if intraday_df is not None and len(intraday_df) >= 6 and orb_signal != "INSIDE_ORB":
+                idf_close = intraday_df['close'].values
+                idf_high = intraday_df['high'].values
+                idf_low = intraday_df['low'].values
+                n = len(idf_close)
+                
+                if orb_signal == "BREAKOUT_UP":
+                    # Find the highest high after ORB, then measure pullback from there
+                    post_orb_highs = idf_high[3:]  # skip first 3 ORB candles
+                    if len(post_orb_highs) > 0:
+                        swing_high_idx = int(post_orb_highs.argmax())  # relative to post_orb
+                        swing_high = float(post_orb_highs[swing_high_idx])
+                        # Measure pullback from swing high to current low
+                        if swing_high > 0 and swing_high_idx < len(post_orb_highs) - 1:
+                            # There are candles after the swing high — measure pullback
+                            after_swing = idf_low[3 + swing_high_idx + 1:]
+                            if len(after_swing) > 0:
+                                lowest_after = float(after_swing.min())
+                                pullback_depth_pct = (swing_high - lowest_after) / swing_high * 100
+                                # Count candles pulling back (close < prev close)
+                                pb_candles = 0
+                                closes_after = idf_close[3 + swing_high_idx + 1:]
+                                for k in range(len(closes_after)):
+                                    prev_c = idf_close[3 + swing_high_idx + k] if k == 0 else closes_after[k - 1]
+                                    if closes_after[k] < prev_c:
+                                        pb_candles += 1
+                                    else:
+                                        break  # pullback ended
+                                pullback_candles = pb_candles
+                
+                elif orb_signal == "BREAKOUT_DOWN":
+                    # Find the lowest low after ORB, then measure pullback from there
+                    post_orb_lows = idf_low[3:]
+                    if len(post_orb_lows) > 0:
+                        swing_low_idx = int(post_orb_lows.argmin())
+                        swing_low = float(post_orb_lows[swing_low_idx])
+                        if swing_low > 0 and swing_low_idx < len(post_orb_lows) - 1:
+                            after_swing = idf_high[3 + swing_low_idx + 1:]
+                            if len(after_swing) > 0:
+                                highest_after = float(after_swing.max())
+                                pullback_depth_pct = (highest_after - swing_low) / swing_low * 100
+                                pb_candles = 0
+                                closes_after = idf_close[3 + swing_low_idx + 1:]
+                                for k in range(len(closes_after)):
+                                    prev_c = idf_close[3 + swing_low_idx + k] if k == 0 else closes_after[k - 1]
+                                    if closes_after[k] > prev_c:
+                                        pb_candles += 1
+                                    else:
+                                        break
+                                pullback_candles = pb_candles
+            
+            # === MOMENTUM 15m: price change over last 3 candles (15 min on 5-min timeframe) ===
+            momentum_15m = 0.0
+            if intraday_df is not None and len(intraday_df) >= 4:
+                close_now = float(intraday_df['close'].iloc[-1])
+                close_3ago = float(intraday_df['close'].iloc[-4])  # 3 candles back = 15 min
+                if close_3ago > 0:
+                    momentum_15m = ((close_now - close_3ago) / close_3ago) * 100
             
             return {
                 'sma_20': round(sma_20, 2),
@@ -1494,13 +1743,26 @@ class ZerodhaTools:
                 'htf_trend': htf_trend,
                 'htf_ema_slope': htf_ema_slope,
                 'htf_alignment': htf_alignment,
+                # === TREND SIGNAL FIELDS (for TrendFollowing engine) ===
+                'vwap_change_pct': round(vwap_change_pct, 4),
+                'orb_hold_candles': orb_hold_candles,
+                'adx': round(adx, 1),
                 # === ACCELERATION FIELDS ===
                 'follow_through_candles': follow_through_candles,
                 'range_expansion_ratio': round(range_expansion_ratio, 2),
-                'vwap_slope_steepening': vwap_slope_steepening
+                'vwap_slope_steepening': vwap_slope_steepening,
+                # === PULLBACK / VWAP DISTANCE ===
+                'vwap_distance_pct': round(vwap_distance_pct, 3),
+                'pullback_depth_pct': round(pullback_depth_pct, 3),
+                'pullback_candles': pullback_candles,
+                # === MOMENTUM ===
+                'momentum_15m': round(momentum_15m, 4),
             }
             
         except Exception as e:
+            import traceback
+            print(f"\n⚠️ INDICATOR CALCULATION FAILED for {symbol}: {e}")
+            traceback.print_exc()
             return {}
     
     def calculate_position_size(
@@ -1998,7 +2260,7 @@ class ZerodhaTools:
             sizing = self.calculate_position_size(
                 entry_price=entry_price,
                 stop_loss=stop_loss,
-                capital=self.paper_capital if hasattr(self, 'paper_capital') else 100000,
+                capital=(self.paper_capital + getattr(self, 'paper_pnl', 0)) if hasattr(self, 'paper_capital') else 100000,
                 lot_size=1,
                 atr=atr,
                 volume_regime=volume_regime,
@@ -2045,16 +2307,14 @@ class ZerodhaTools:
                 except:
                     current_ltp = order.get('entry_price', 0)
                 
-                # Calculate proper SL and target based on ACTUAL entry
+                # Use order's computed SL/target (from ATR/regime/trend), fallback to 1%/1.5% only if missing
                 side = order['side']
                 if side == 'BUY':
-                    # For BUY: SL below entry, target above
-                    stop_loss = current_ltp * 0.99  # 1% below
-                    target = current_ltp * 1.015     # 1.5% above
+                    stop_loss = order.get('stop_loss') or (current_ltp * 0.99)
+                    target = order.get('target') or (current_ltp * 1.015)
                 else:
-                    # For SELL/SHORT: SL above entry, target below
-                    stop_loss = current_ltp * 1.01  # 1% above
-                    target = current_ltp * 0.985    # 1.5% below
+                    stop_loss = order.get('stop_loss') or (current_ltp * 1.01)
+                    target = order.get('target') or (current_ltp * 0.985)
                 
                 # Add to paper positions (thread-safe)
                 position = {
@@ -2302,13 +2562,73 @@ class ZerodhaTools:
                 if underlying in md and isinstance(md[underlying], dict):
                     market_data = md[underlying]
                     print(f"   📊 Using intraday signals for {underlying}")
+                else:
+                    print(f"   ⚠️ No indicator data for {underlying} — rejecting option order")
+                    self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+                    return {
+                        "success": False,
+                        "error": f"Indicator data unavailable for {underlying}. Cannot score option trade without market signals.",
+                        "reason": "Data health gate: indicators failed or timed out.",
+                        "action": "SKIP - do NOT retry this symbol this cycle"
+                    }
             except Exception as e:
                 print(f"   ⚠️ Could not get intraday data: {e}")
+                self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+                return {
+                    "success": False,
+                    "error": f"Failed to fetch market data for {underlying}: {e}",
+                    "reason": "Data fetch error.",
+                    "action": "SKIP - do NOT retry this symbol this cycle"
+                }
         
         # Parse enums
         opt_type = None
         if option_type:
             opt_type = OptionType[option_type.upper()]
+        
+        # === AUTO-TRY CREDIT SPREAD FIRST (code-level enforcement) ===
+        from config import CREDIT_SPREAD_CONFIG
+        if CREDIT_SPREAD_CONFIG.get('enabled', False) and CREDIT_SPREAD_CONFIG.get('primary_strategy', False):
+            try:
+                print(f"   🔄 Auto-trying credit spread FIRST for {underlying} ({direction})...")
+                spread_result = self.place_credit_spread(
+                    underlying=underlying,
+                    direction=direction,
+                    rationale=rationale or "Auto-routed from option order",
+                    pre_fetched_market_data=market_data if market_data else None
+                )
+                if spread_result.get('success'):
+                    print(f"   ✅ Credit spread placed instead of naked buy!")
+                    spread_result['auto_routed'] = True
+                    spread_result['original_tool'] = 'place_option_order'
+                    return spread_result
+                else:
+                    fallback_reason = spread_result.get('error', 'Unknown')
+                    print(f"   🔄 Credit spread not viable for {underlying}, checking debit spread fallback...")
+            except Exception as e:
+                print(f"   ⚠️ Credit spread attempt failed ({e}), checking debit spread fallback...")
+        
+        # === AUTO-TRY DEBIT SPREAD SECOND (before naked buy) ===
+        from config import DEBIT_SPREAD_CONFIG
+        if DEBIT_SPREAD_CONFIG.get('enabled', False):
+            try:
+                debit_result = self.place_debit_spread(
+                    underlying=underlying,
+                    direction=direction,
+                    rationale=rationale or "Auto-routed: credit spread failed, trying debit spread",
+                    pre_fetched_market_data=market_data if market_data else None
+                )
+                if debit_result.get('success'):
+                    print(f"   ✅ Debit spread placed instead of naked buy!")
+                    debit_result['auto_routed'] = True
+                    debit_result['original_tool'] = 'place_option_order'
+                    debit_result['fallback_from'] = 'credit_spread'
+                    return debit_result
+                else:
+                    debit_reason = debit_result.get('error', 'Unknown')
+                    print(f"   🔄 Debit spread not viable ({debit_reason}), falling back to naked buy...")
+            except Exception as e:
+                print(f"   ⚠️ Debit spread attempt failed ({e}), falling back to naked buy...")
         
         strike_sel = StrikeSelection[strike_selection.upper()] if strike_selection != "AUTO" else None
         expiry_sel = ExpirySelection[expiry_selection.upper()] if expiry_selection != "AUTO" else None
@@ -2334,7 +2654,7 @@ class ZerodhaTools:
             }
         
         # Validate risk - max premium check
-        max_premium_per_trade = 100000  # ₹1 lakh per option trade
+        max_premium_per_trade = 150000  # ₹1.5 lakh per option trade
         if plan.total_premium > max_premium_per_trade:
             return {
                 "success": False,
@@ -2343,7 +2663,7 @@ class ZerodhaTools:
             }
         
         # Check total options exposure
-        max_total_exposure = 200000  # ₹2 lakh total option exposure (full capital)
+        max_total_exposure = 500000  # ₹5 lakh total option exposure (full capital)
         current_exposure = sum(p.get('total_premium', 0) for p in options_trader.positions if p.get('status') == 'OPEN')
         
         if current_exposure + plan.total_premium > max_total_exposure:
@@ -2375,7 +2695,7 @@ class ZerodhaTools:
                     'lots': plan.quantity,
                     'avg_price': plan.contract.ltp,
                     'side': option_side,
-                    'direction': direction,  # Original market view (BUY=bullish, SELL=bearish)
+                    'direction': plan.direction,  # Final direction from scorer (may differ from LLM's original)
                     'option_type': plan.contract.option_type.value,
                     'strike': plan.contract.strike,
                     'expiry': plan.contract.expiry.isoformat() if plan.contract.expiry else None,
@@ -2391,10 +2711,368 @@ class ZerodhaTools:
                     'delta': plan.contract.delta,
                     'theta': plan.contract.theta,
                     'iv': plan.contract.iv,
-                    'rationale': rationale or plan.rationale
+                    'rationale': rationale or plan.rationale,
+                    # === ENTRY METADATA (for post-trade review) ===
+                    'entry_metadata': getattr(plan, 'entry_metadata', {}),
+                    'trade_id': getattr(plan, 'entry_metadata', {}).get('trade_id', ''),
+                    'entry_score': getattr(plan, 'entry_metadata', {}).get('entry_score', 0),
+                    'score_tier': getattr(plan, 'entry_metadata', {}).get('score_tier', 'unknown'),
+                    'strategy_type': getattr(plan, 'entry_metadata', {}).get('strategy_type', 'NAKED_OPTION'),
                 }
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
+                    self._save_active_trades()
+        
+        return result
+    
+    def place_credit_spread(self, underlying: str, direction: str,
+                            spread_width: int = None,
+                            rationale: str = "",
+                            pre_fetched_market_data: dict = None) -> Dict:
+        """
+        Tool: Place a credit spread (SELL option + BUY hedge) — theta-positive strategy
+        
+        Credit spreads SELL an option to collect premium and BUY a further OTM option
+        as a hedge. Theta (time decay) works IN OUR FAVOR.
+        
+        BULLISH view → Bull Put Spread: SELL OTM PE + BUY further OTM PE
+        BEARISH view → Bear Call Spread: SELL OTM CE + BUY further OTM CE
+        
+        Args:
+            underlying: e.g., "NSE:RELIANCE"
+            direction: 'BUY' (bullish → bull put spread) or 'SELL' (bearish → bear call spread)
+            spread_width: Strikes apart for hedge (default: 2 from config)
+            rationale: Trade rationale
+            
+        Returns:
+            Dict with spread execution result, credit received, max risk
+        """
+        from options_trader import get_options_trader, CreditSpreadPlan
+        
+        # === SAFETY GATES (same as place_option_order) ===
+        # 1. Trading hours
+        from config import TRADING_HOURS, CREDIT_SPREAD_CONFIG
+        now = datetime.now()
+        no_new_after = datetime.strptime(TRADING_HOURS['no_new_after'], '%H:%M').time()
+        market_start = datetime.strptime(TRADING_HOURS['start'], '%H:%M').time()
+        if now.time() < market_start or now.time() > no_new_after:
+            return {"success": False, "error": f"Outside trading hours {TRADING_HOURS['start']}-{TRADING_HOURS['no_new_after']}"}
+        
+        # 2. Risk governor
+        from risk_governor import get_risk_governor
+        risk_gov = get_risk_governor()
+        active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        trade_perm = risk_gov.can_trade_general(active_positions=active_positions)
+        if not trade_perm.allowed:
+            return {"success": False, "error": f"RISK GOVERNOR: {trade_perm.reason}"}
+        
+        # 3. Position reconciliation check
+        recon = get_position_reconciliation(kite=self.kite, paper_mode=self.paper_mode)
+        recon_can_trade, recon_reason = recon.can_trade()
+        if not recon_can_trade:
+            return {"success": False, "error": f"RECONCILIATION BLOCK: {recon_reason}"}
+        
+        # 4. Correlation guard check
+        correlation_guard = get_correlation_guard()
+        corr_check = correlation_guard.can_trade(
+            symbol=underlying,
+            active_positions=active_positions
+        )
+        if not corr_check.can_trade:
+            return {"success": False, "error": f"CORRELATION BLOCK: {corr_check.reason}"}
+        
+        # 5. Check for duplicate spreads on same underlying
+        for pos in self.paper_positions:
+            if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_credit_spread') and pos.get('underlying') == underlying:
+                return {"success": False, "error": f"Already have credit spread on {underlying}"}
+            if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_option') and pos.get('underlying') == underlying:
+                return {"success": False, "error": f"Already have option position on {underlying}"}
+        
+        # 6. Get market data for scoring (use pre-fetched if available)
+        market_data = {}
+        if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3:
+            market_data = pre_fetched_market_data
+            print(f"   📊 Using pre-fetched market data for {underlying} (saved API call)")
+        else:
+            try:
+                md = self.get_market_data([underlying])
+                if underlying in md and isinstance(md[underlying], dict):
+                    market_data = md[underlying]
+                else:
+                    self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+                    return {"success": False, "error": f"No indicator data for {underlying}"}
+            except Exception as e:
+                self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+                return {"success": False, "error": f"Market data fetch failed: {e}"}
+        
+        # 7. Data health gate check
+        health_gate = get_data_health_gate()
+        try:
+            health_ok, health_reason = health_gate.can_trade(underlying, market_data)
+            if not health_ok:
+                return {"success": False, "error": f"DATA HEALTH BLOCK: {health_reason}"}
+        except Exception as e:
+            print(f"   ⚠️ Data health check failed for spread: {e}")
+        
+        # === CREATE CREDIT SPREAD PLAN ===
+        options_trader = get_options_trader(
+            kite=self.kite,
+            capital=getattr(self, 'paper_capital', 500000),
+            paper_mode=self.paper_mode
+        )
+        
+        plan = options_trader.create_credit_spread(
+            underlying=underlying,
+            direction=direction,
+            market_data=market_data,
+            spread_width_strikes=spread_width
+        )
+        
+        if plan is None:
+            # Check if we should fall back to naked buy
+            if CREDIT_SPREAD_CONFIG.get('fallback_to_buy', True):
+                print(f"   🔄 Credit spread not viable for {underlying}, checking naked buy fallback...")
+                # Only fallback if score is high enough
+                buy_threshold = CREDIT_SPREAD_CONFIG.get('buy_only_score_threshold', 70)
+                # Try regular option order (it has its own scoring)
+                return {
+                    "success": False,
+                    "error": f"Credit spread not viable for {underlying}",
+                    "fallback": "place_option_order",
+                    "action": f"Try place_option_order() if score >= {buy_threshold}"
+                }
+            
+            self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+            return {"success": False, "error": f"Credit spread rejected for {underlying}"}
+        
+        # === EXECUTE THE SPREAD ===
+        result = options_trader.execute_credit_spread(plan)
+        
+        if result.get('success'):
+            print(f"   ✅ CREDIT SPREAD PLACED: {plan.spread_type}")
+            print(f"      SELL: {plan.sold_contract.symbol} @ ₹{plan.sold_contract.ltp:.2f}")
+            print(f"      BUY:  {plan.hedge_contract.symbol} @ ₹{plan.hedge_contract.ltp:.2f}")
+            print(f"      Credit: ₹{plan.net_credit_total:,.0f} | Max Risk: ₹{plan.max_risk:,.0f}")
+            print(f"      NetΘ: {plan.net_theta:+.2f}/day | DTE: {plan.dte}")
+            
+            # Add to paper positions
+            if self.paper_mode:
+                spread_position = {
+                    'symbol': f"{plan.sold_contract.symbol}|{plan.hedge_contract.symbol}",
+                    'underlying': plan.underlying,
+                    'is_credit_spread': True,
+                    'spread_type': plan.spread_type,
+                    'direction': plan.direction,
+                    'sold_symbol': plan.sold_contract.symbol,
+                    'sold_strike': plan.sold_contract.strike,
+                    'sold_premium': plan.sold_contract.ltp,
+                    'hedge_symbol': plan.hedge_contract.symbol,
+                    'hedge_strike': plan.hedge_contract.strike,
+                    'hedge_premium': plan.hedge_contract.ltp,
+                    'quantity': plan.quantity * plan.lot_size,
+                    'lots': plan.quantity,
+                    'lot_size': plan.lot_size,
+                    'avg_price': plan.net_credit,  # Credit received per share
+                    'side': 'SELL',  # Net seller
+                    'net_credit': plan.net_credit,
+                    'net_credit_total': plan.net_credit_total,
+                    'max_risk': plan.max_risk,
+                    'spread_width': plan.spread_width,
+                    'stop_loss': plan.stop_loss_debit,
+                    'target': plan.target_credit,
+                    'breakeven': plan.breakeven,
+                    'net_delta': plan.net_delta,
+                    'net_theta': plan.net_theta,
+                    'net_vega': plan.net_vega,
+                    'credit_pct': plan.credit_pct,
+                    'dte': plan.dte,
+                    'is_option': True,
+                    'order_id': result.get('spread_id', result.get('sold_order_id')),
+                    'spread_id': result.get('spread_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': rationale or plan.rationale,
+                    'total_premium': 0,  # Net credit strategy - no premium paid
+                }
+                with self._positions_lock:
+                    self.paper_positions.append(spread_position)
+                    self._save_active_trades()
+        
+        return result
+    
+    def place_debit_spread(self, underlying: str, direction: str,
+                           spread_width: int = None,
+                           rationale: str = "",
+                           pre_fetched_market_data: dict = None) -> Dict:
+        """
+        Tool: Place an intraday debit spread on a momentum mover.
+        
+        BUY near-ATM option + SELL further OTM option in direction of move.
+        Profits from strong continuation. Cheaper than naked buy, defined risk.
+        
+        BULLISH → Bull Call Spread: BUY ATM CE + SELL OTM CE
+        BEARISH → Bear Put Spread: BUY ATM PE + SELL OTM PE
+        
+        Smart candle gates filter: FT≥2, ADX≥28, ORB<120%, RangeExp<0.50.
+        Tiered sizing: premium (score≥70) gets 3+ lots, standard gets 2+.
+        R:R = 2.67:1 (SL 30%, Target 80%).
+        
+        Args:
+            underlying: e.g., "NSE:EICHERMOT"
+            direction: 'BUY' (bullish) or 'SELL' (bearish)
+            spread_width: Strikes apart for sell leg (default: 3 from config)
+            rationale: Trade rationale
+        """
+        from options_trader import get_options_trader, DebitSpreadPlan
+        from config import TRADING_HOURS, DEBIT_SPREAD_CONFIG
+        
+        if not DEBIT_SPREAD_CONFIG.get('enabled', False):
+            return {"success": False, "error": "Debit spreads disabled in config"}
+        
+        # === SAFETY GATES ===
+        # 1. Trading hours + debit spread time cutoff
+        now = datetime.now()
+        no_new_after = datetime.strptime(TRADING_HOURS['no_new_after'], '%H:%M').time()
+        market_start = datetime.strptime(TRADING_HOURS['start'], '%H:%M').time()
+        debit_cutoff = datetime.strptime(DEBIT_SPREAD_CONFIG.get('no_entry_after', '14:00'), '%H:%M').time()
+        
+        if now.time() < market_start or now.time() > no_new_after:
+            return {"success": False, "error": f"Outside trading hours"}
+        if now.time() > debit_cutoff:
+            return {"success": False, "error": f"Past debit spread cutoff ({DEBIT_SPREAD_CONFIG['no_entry_after']}) — not enough time"}
+        
+        # 2. Risk governor
+        from risk_governor import get_risk_governor
+        risk_gov = get_risk_governor()
+        active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        trade_perm = risk_gov.can_trade_general(active_positions=active_positions)
+        if not trade_perm.allowed:
+            return {"success": False, "error": f"RISK GOVERNOR: {trade_perm.reason}"}
+        
+        # 3. Position reconciliation
+        recon = get_position_reconciliation(kite=self.kite, paper_mode=self.paper_mode)
+        recon_can_trade, recon_reason = recon.can_trade()
+        if not recon_can_trade:
+            return {"success": False, "error": f"RECONCILIATION BLOCK: {recon_reason}"}
+        
+        # 4. Correlation guard
+        correlation_guard = get_correlation_guard()
+        corr_check = correlation_guard.can_trade(
+            symbol=underlying,
+            active_positions=active_positions
+        )
+        if not corr_check.can_trade:
+            return {"success": False, "error": f"CORRELATION BLOCK: {corr_check.reason}"}
+        
+        # 5. Check for duplicate on same underlying
+        for pos in self.paper_positions:
+            if pos.get('status', 'OPEN') == 'OPEN' and pos.get('underlying') == underlying:
+                return {"success": False, "error": f"Already have position on {underlying}"}
+        
+        # 6. Get market data
+        market_data = {}
+        if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3:
+            market_data = pre_fetched_market_data
+            print(f"   📊 Using pre-fetched market data for {underlying} (saved API call)")
+        else:
+            try:
+                md = self.get_market_data([underlying])
+                if underlying in md and isinstance(md[underlying], dict):
+                    market_data = md[underlying]
+                else:
+                    return {"success": False, "error": f"No indicator data for {underlying}"}
+            except Exception as e:
+                return {"success": False, "error": f"Market data fetch failed: {e}"}
+        
+        # 7. Data health gate
+        health_gate = get_data_health_gate()
+        try:
+            health_ok, health_reason = health_gate.can_trade(underlying, market_data)
+            if not health_ok:
+                return {"success": False, "error": f"DATA HEALTH BLOCK: {health_reason}"}
+        except Exception as e:
+            print(f"   ⚠️ Data health check failed for debit spread: {e}")
+        
+        # === CREATE DEBIT SPREAD PLAN ===
+        options_trader = get_options_trader(
+            kite=self.kite,
+            capital=getattr(self, 'paper_capital', 500000),
+            paper_mode=self.paper_mode
+        )
+        
+        plan = options_trader.create_debit_spread(
+            underlying=underlying,
+            direction=direction,
+            market_data=market_data,
+            spread_width_strikes=spread_width
+        )
+        
+        if plan is None:
+            return {"success": False, "error": f"Debit spread not viable for {underlying} (check move%, score, liquidity)"}
+        
+        # === EXECUTE ===
+        result = options_trader.execute_debit_spread(plan)
+        
+        if result.get('success'):
+            print(f"   ✅ DEBIT SPREAD PLACED: {plan.spread_type}")
+            print(f"      BUY:  {plan.buy_contract.symbol} @ ₹{plan.buy_contract.ltp:.2f}")
+            print(f"      SELL: {plan.sell_contract.symbol} @ ₹{plan.sell_contract.ltp:.2f}")
+            print(f"      Debit: ₹{plan.net_debit_total:,.0f} | Max Profit: ₹{plan.max_profit:,.0f}")
+            print(f"      NetΔ: {plan.net_delta:+.2f} | Move: {plan.move_pct:+.1f}% | DTE: {plan.dte}")
+            
+            if self.paper_mode:
+                debit_position = {
+                    'symbol': f"{plan.buy_contract.symbol}|{plan.sell_contract.symbol}",
+                    'underlying': plan.underlying,
+                    'is_debit_spread': True,
+                    'is_credit_spread': False,
+                    'spread_type': plan.spread_type,
+                    'direction': plan.direction,
+                    'buy_symbol': plan.buy_contract.symbol,
+                    'buy_strike': plan.buy_contract.strike,
+                    'buy_premium': plan.buy_contract.ltp,
+                    'sell_symbol': plan.sell_contract.symbol,
+                    'sell_strike': plan.sell_contract.strike,
+                    'sell_premium': plan.sell_contract.ltp,
+                    'quantity': plan.quantity * plan.lot_size,
+                    'lots': plan.quantity,
+                    'lot_size': plan.lot_size,
+                    'avg_price': plan.net_debit,  # Debit paid per share
+                    'side': 'BUY',  # Net buyer
+                    'net_debit': plan.net_debit,
+                    'net_debit_total': plan.net_debit_total,
+                    'max_profit': plan.max_profit,
+                    'max_loss': plan.max_loss,
+                    'spread_width': plan.spread_width,
+                    'stop_loss': plan.stop_loss_value,
+                    'target': plan.target_value,
+                    'breakeven': plan.breakeven,
+                    'net_delta': plan.net_delta,
+                    'net_theta': plan.net_theta,
+                    'net_vega': plan.net_vega,
+                    'move_pct': plan.move_pct,
+                    'dte': plan.dte,
+                    'is_option': True,
+                    'order_id': result.get('spread_id', result.get('buy_order_id')),
+                    'spread_id': result.get('spread_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': rationale or plan.rationale,
+                    'total_premium': plan.net_debit_total,
+                    # === ENTRY METADATA for debit spreads ===
+                    'strategy_type': 'DEBIT_SPREAD',
+                    'trade_id': f"DS_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'entry_score': getattr(plan, '_score', 0),
+                    'score_tier': 'premium' if getattr(plan, '_score', 0) >= 70 else 'standard',
+                    'entry_metadata': {
+                        'strategy_type': 'DEBIT_SPREAD',
+                        'proactive': 'proactive' in (rationale or '').lower(),
+                        'move_pct': plan.move_pct,
+                        'dte': plan.dte,
+                    },
+                }
+                with self._positions_lock:
+                    self.paper_positions.append(debit_position)
                     self._save_active_trades()
         
         return result
@@ -2443,6 +3121,33 @@ class ZerodhaTools:
             capital=getattr(self, 'paper_capital', 100000),
             paper_mode=self.paper_mode
         )
+        
+        # Sync: Feed option positions from paper_positions into options_trader
+        # so check_option_exits sees all positions (not just ones placed via OptionsTrader)
+        with self._positions_lock:
+            option_positions = [p for p in self.paper_positions 
+                                if p.get('is_option', False) and p.get('status', 'OPEN') == 'OPEN']
+        
+        # Build positions list that check_option_exits expects
+        for pos in option_positions:
+            # Check if already tracked in options_trader.positions
+            already_tracked = any(
+                op.get('symbol') == pos.get('symbol') and op.get('status') == 'OPEN'
+                for op in options_trader.positions
+            )
+            if not already_tracked:
+                # Add to options_trader.positions with expected fields
+                options_trader.positions.append({
+                    'symbol': pos['symbol'],
+                    'entry_premium': pos.get('avg_price', 0),
+                    'target_premium': pos.get('target', pos.get('avg_price', 0) * 1.5),
+                    'stoploss_premium': pos.get('stop_loss', pos.get('avg_price', 0) * 0.7),
+                    'quantity': pos.get('lots', pos.get('quantity', 1)),
+                    'lot_size': pos.get('lot_size', 1),
+                    'greeks': pos.get('greeks', {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'iv': 0}),
+                    'status': 'OPEN',
+                    'timestamp': pos.get('timestamp', '')
+                })
         
         # Use the existing check_option_exits method that checks all positions
         all_exits = options_trader.check_option_exits()
@@ -2661,7 +3366,9 @@ class ZerodhaTools:
                     'order_id': paper_order_id,
                     'timestamp': datetime.now().isoformat()
                 }
-                self.paper_positions.append(position)
+                with self._positions_lock:
+                    self.paper_positions.append(position)
+                    self._save_active_trades()
                 
                 cost = premium * total_qty
                 

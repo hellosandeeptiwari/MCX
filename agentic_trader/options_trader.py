@@ -57,7 +57,7 @@ class IntradaySignal:
     orb_signal: str = "INSIDE_ORB"     # BREAKOUT_UP, BREAKOUT_DOWN, INSIDE_ORB
     vwap_position: str = "AT_VWAP"     # ABOVE_VWAP, BELOW_VWAP, AT_VWAP
     vwap_trend: str = "FLAT"           # RISING, FALLING, FLAT
-    ema_regime: str = "NORMAL"         # EXPANDING, CONTRACTING, COMPRESSED, NORMAL
+    ema_regime: str = "NORMAL"         # EXPANDING, COMPRESSED, NORMAL
     volume_regime: str = "NORMAL"      # EXPLOSIVE, HIGH, NORMAL, LOW
     rsi: float = 50.0                  # Kept only for overextension penalty
     price_momentum: float = 0.0        # % change in last 15min
@@ -146,7 +146,7 @@ class IntradayOptionScorer:
         'ema_regime': 10,        # IMPORTANT - Trend structure
         'acceleration': 10,      # Follow-through + range expansion
         'htf_alignment': 5,      # COMPLEMENTARY - Higher timeframe
-        'rsi_penalty': -3,       # Overextension penalty only (no points)
+        'rsi_penalty': -2,       # Overextension penalty only (RSI <20 or >80)
     }
     
     # === SMART SPREAD EVALUATOR (Tick-based + Impact Cost) ===
@@ -188,14 +188,14 @@ class IntradayOptionScorer:
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
     # === TRADE THRESHOLDS (Simplified to 2 tiers) ===
-    BLOCK_THRESHOLD = 45         # < 45 = BLOCK (requires at least one directional signal)
-    STANDARD_THRESHOLD = 50      # 50-64 = Standard (ATM/ITM, 1x size)
-    PREMIUM_THRESHOLD = 55       # >= 55 = Premium (ATM/ITM, up to 1.2x)
+    BLOCK_THRESHOLD = 60         # < 60 = BLOCK — raised from 55 for quality
+    STANDARD_THRESHOLD = 65      # 65-69 = Standard (ATM/ITM, 1x size)
+    PREMIUM_THRESHOLD = 70       # >= 70 = Premium (ATM/ITM, up to 1.5x)
     CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
     # === AGGRESSIVE SIZING REQUIREMENTS (Risk of ruin protection) ===
     # OTM + larger size = blows up even good systems
-    AGGRESSIVE_SIZE_MAX = 1.2           # Max 1.2x (not 1.5x!)
+    AGGRESSIVE_SIZE_MAX = 1.5           # Max 1.5x for premium tier
     AGGRESSIVE_ACCEL_MIN = 8            # Acceleration >= 8/10 required
     AGGRESSIVE_MICRO_MIN = 12           # Microstructure >= 12/15 required
     
@@ -207,8 +207,26 @@ class IntradayOptionScorer:
     # TrendFollowing window (for anti-double-counting)
     TREND_WINDOW_MINUTES = 15           # TrendFollowing uses 15min ORB/Volume
     
+    # === CANDLE-DATA-DERIVED GATES (from Feb 11 analysis) ===
+    # Winners had follow_through=4.1, losers=0.4 → follow-through is the #1 edge
+    # Winners had ADX=37.1, losers=30.8 → stronger trends win
+    # Winners had ORB strength=29.9, losers=142.2 → low ORB strength = early entry = WIN
+    # Winners had range_expansion=0.18, losers=0.37 → enter BEFORE the move, not after
+    FOLLOW_THROUGH_MIN_PREMIUM = 2      # Premium tier: need ≥2 follow-through candles
+    FOLLOW_THROUGH_MIN_STANDARD = 1     # Standard tier: need ≥1 follow-through candle
+    ADX_MIN_PREMIUM = 30                # Premium tier: ADX ≥ 30 (trend strength)
+    ADX_MIN_STANDARD = 25               # Standard tier: ADX ≥ 25
+    ORB_STRENGTH_OVEREXTENDED = 100     # ORB strength > 100 = already moved too far
+    RANGE_EXPANSION_OVEREXTENDED = 0.60 # Range > 0.6 ATR already = late entry
+    
+    # Re-entry prevention: don't trade same underlying if it already lost today
+    MAX_LOSSES_SAME_SYMBOL = 1          # Max 1 loss per symbol per day, then skip
+    
     def __init__(self):
         self.last_decisions: Dict[str, IntradayOptionDecision] = {}
+        # Track per-symbol losses today (prevents re-entering SBIN 4x etc.)
+        self.symbol_losses_today: Dict[str, int] = {}  # symbol -> loss count
+        self.symbol_trades_today: Dict[str, int] = {}  # symbol -> total trade count
         # Import trend engine for integration
         try:
             from trend_following import get_trend_engine, build_trend_signal_from_market_data, TrendState
@@ -343,6 +361,11 @@ class IntradayOptionScorer:
         
         if signal.orb_signal == "BREAKOUT_UP":
             orb_points = int(orb_max_points * orb_decay)
+            # ORB hold check — need at least 2 candles holding above ORB to confirm
+            orb_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
+            if orb_hold < 2:
+                orb_points = max(2, orb_points // 2)  # Halve points for unconfirmed breakout
+                cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 2]"
             score += orb_points
             bullish_points += orb_points
             reasons.append(f"🚀 ORB BREAKOUT UP (+{orb_points}){cap_reason}")
@@ -350,6 +373,11 @@ class IntradayOptionScorer:
                 direction = "BUY"
         elif signal.orb_signal == "BREAKOUT_DOWN":
             orb_points = int(orb_max_points * orb_decay)
+            # ORB hold check — need at least 2 candles holding below ORB to confirm
+            orb_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
+            if orb_hold < 2:
+                orb_points = max(2, orb_points // 2)
+                cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 2]"
             score += orb_points
             bearish_points += orb_points
             reasons.append(f"📉 ORB BREAKOUT DOWN (+{orb_points}){cap_reason}")
@@ -393,14 +421,14 @@ class IntradayOptionScorer:
         if trend_direction == "BUY":
             # For BUY, we want ABOVE_VWAP or AT_VWAP
             if signal.vwap_position == "ABOVE_VWAP" and signal.vwap_trend == "RISING":
-                score += 8
-                bullish_points += 8
-                reasons.append("📈 VWAP aligned: Above rising (+8)")
+                score += 10
+                bullish_points += 10
+                reasons.append("📈 VWAP aligned: Above rising (+10)")
                 vwap_aligned = True
             elif signal.vwap_position == "ABOVE_VWAP":
-                score += 6
-                bullish_points += 6
-                reasons.append("📈 VWAP aligned: Above (+6)")
+                score += 7
+                bullish_points += 7
+                reasons.append("📈 VWAP aligned: Above (+7)")
                 vwap_aligned = True
             elif signal.vwap_position == "AT_VWAP":
                 score += 3
@@ -413,14 +441,14 @@ class IntradayOptionScorer:
         elif trend_direction == "SELL":
             # For SELL, we want BELOW_VWAP or AT_VWAP
             if signal.vwap_position == "BELOW_VWAP" and signal.vwap_trend == "FALLING":
-                score += 8
-                bearish_points += 8
-                reasons.append("📉 VWAP aligned: Below falling (+8)")
+                score += 10
+                bearish_points += 10
+                reasons.append("📉 VWAP aligned: Below falling (+10)")
                 vwap_aligned = True
             elif signal.vwap_position == "BELOW_VWAP":
-                score += 6
-                bearish_points += 6
-                reasons.append("📉 VWAP aligned: Below (+6)")
+                score += 7
+                bearish_points += 7
+                reasons.append("📉 VWAP aligned: Below (+7)")
                 vwap_aligned = True
             elif signal.vwap_position == "AT_VWAP":
                 score += 3
@@ -448,9 +476,6 @@ class IntradayOptionScorer:
         elif signal.ema_regime == "COMPRESSED":
             score += 8
             reasons.append("⚡ EMA COMPRESSED - breakout imminent (+8)")
-        elif signal.ema_regime == "CONTRACTING":
-            score += 4
-            warnings.append("⚠️ EMA contracting - trend weakening (+4)")
         else:
             score += 3
             reasons.append("EMA normal (+3)")
@@ -566,12 +591,15 @@ class IntradayOptionScorer:
             if intraday_move_pct > gap_pct:
                 # Intraday move is larger than the gap → the move happened today
                 if intraday_move_pct >= 6:
-                    exhaustion_score -= 15
-                    warnings.append(f"🔥 CHASING: {intraday_move_pct:.1f}% intraday move from open — late entry (-15)")
+                    exhaustion_score -= 25
+                    warnings.append(f"🔥 CHASING: {intraday_move_pct:.1f}% intraday move from open — DANGEROUS late entry (-25)")
                 elif intraday_move_pct >= 4:
-                    exhaustion_score -= 10
-                    warnings.append(f"⚠️ CHASING: {intraday_move_pct:.1f}% intraday move from open — extended (-10)")
-                elif intraday_move_pct >= 2:
+                    exhaustion_score -= 18
+                    warnings.append(f"⚠️ CHASING: {intraday_move_pct:.1f}% intraday move from open — extended (-18)")
+                elif intraday_move_pct >= 2.5:
+                    exhaustion_score -= 12
+                    warnings.append(f"⚠️ CHASING: {intraday_move_pct:.1f}% intraday move from open (-12)")
+                elif intraday_move_pct >= 1.5:
                     exhaustion_score -= 5
                     warnings.append(f"⚠️ CHASING: {intraday_move_pct:.1f}% intraday move from open (-5)")
 
@@ -632,19 +660,20 @@ class IntradayOptionScorer:
             alignment_pts = 0
             if caller_direction == 'BUY':
                 if signal.vwap_position == 'ABOVE_VWAP':
-                    alignment_pts += 2
+                    alignment_pts += 1
                 if signal.volume_regime in ('HIGH', 'EXPLOSIVE'):
-                    alignment_pts += 2
-                if signal.ema_regime in ('EXPANDING', 'COMPRESSED'):
+                    alignment_pts += 1
+                if signal.ema_regime in ('EXPANDING',):
                     alignment_pts += 1
             elif caller_direction == 'SELL':
                 if signal.vwap_position == 'BELOW_VWAP':
-                    alignment_pts += 2
+                    alignment_pts += 1
                 if signal.volume_regime in ('HIGH', 'EXPLOSIVE'):
-                    alignment_pts += 2
+                    alignment_pts += 1
                 if signal.ema_regime in ('EXPANDING', 'COMPRESSED'):
                     alignment_pts += 1
             if alignment_pts > 0:
+                alignment_pts = min(alignment_pts, 3)  # Cap at +3, was +5 — GPT direction shouldn't override technicals
                 score += alignment_pts
                 reasons.append(f"🤖 Agent direction aligned with signals (+{alignment_pts})")
                 # Also help set direction when trend is NEUTRAL
@@ -658,8 +687,13 @@ class IntradayOptionScorer:
             elif bearish_points > bullish_points + 10:
                 direction = "SELL"
             elif caller_direction and caller_direction in ('BUY', 'SELL'):
-                # Fallback: use GPT direction if points are close
-                direction = caller_direction
+                # Only use GPT fallback if directional points margin is small (< 5)
+                # AND at least one directional signal exists
+                if max(bullish_points, bearish_points) >= 10:
+                    direction = caller_direction
+                else:
+                    # Not enough signals to even use GPT direction
+                    direction = "HOLD"
         
         # === DETERMINE STRIKE SELECTION (with OTM safety rules) ===
         strike_selection = self._recommend_strike(
@@ -706,9 +740,9 @@ class IntradayOptionScorer:
         # Gate 2: Must have at least one meaningful directional signal
         # Prevents trades that pass only on volume + microstructure noise
         directional_strength = max(bullish_points, bearish_points)
-        if directional_strength < 10:
+        if directional_strength < 15:
             should_trade = False
-            warnings.append(f"🚫 BLOCKED: No directional conviction (best: {directional_strength:.0f}pts, need ≥10)")
+            warnings.append(f"🚫 BLOCKED: No directional conviction (best: {directional_strength:.0f}pts, need ≥15)")
         
         # Gate 3: Must have direction
         if direction == "HOLD":
@@ -719,6 +753,126 @@ class IntradayOptionScorer:
         if microstructure_block:
             should_trade = False
             warnings.append(f"🚫 BLOCKED by microstructure: {microstructure_block_reason}")
+        
+        # Gate 5: VWAP HARD GATE — direction MUST align with VWAP position
+        # BUY direction requires price ABOVE or AT VWAP (not below)
+        # SELL direction requires price BELOW or AT VWAP (not above)
+        # This prevents the #1 cause of wrong direction: buying into weakness
+        if should_trade and direction == "BUY" and signal.vwap_position == "BELOW_VWAP":
+            # Exception: if trend is STRONG_BULLISH, allow (pullback entry)
+            if trend_state_str not in ('STRONG_BULLISH',):
+                should_trade = False
+                warnings.append(f"🚫 BLOCKED: BUY direction but price BELOW VWAP — buying into weakness")
+        if should_trade and direction == "SELL" and signal.vwap_position == "ABOVE_VWAP":
+            if trend_state_str not in ('STRONG_BEARISH',):
+                should_trade = False
+                warnings.append(f"🚫 BLOCKED: SELL direction but price ABOVE VWAP — selling into strength")
+        
+        # Gate 6: COUNTER-TREND BLOCK — agent direction vs trend must not conflict
+        # If trend says BEARISH/STRONG_BEARISH, don't let agent buy CE
+        if should_trade and direction == "BUY" and trend_state_str in ('BEARISH', 'STRONG_BEARISH'):
+            should_trade = False
+            warnings.append(f"🚫 BLOCKED: BUY conflicts with {trend_state_str} trend — counter-trend")
+        if should_trade and direction == "SELL" and trend_state_str in ('BULLISH', 'STRONG_BULLISH'):
+            should_trade = False
+            warnings.append(f"🚫 BLOCKED: SELL conflicts with {trend_state_str} trend — counter-trend")
+        
+        # Gate 7: DAY RANGE POSITION — don't buy near day-high or sell near day-low
+        # (buying at the top / selling at the bottom = guaranteed loss)
+        if should_trade and market_data:
+            ltp = market_data.get('ltp', 0)
+            day_high = market_data.get('high', 0)
+            day_low = market_data.get('low', 0)
+            day_range = day_high - day_low if day_high > day_low else 0.01
+            if day_range > 0.01 and ltp > 0:
+                position_in_range = (ltp - day_low) / day_range  # 0=at low, 1=at high
+                if direction == "BUY" and position_in_range > 0.90:
+                    score -= 10
+                    warnings.append(f"⚠️ TOPPING: LTP at {position_in_range*100:.0f}% of day range — buying near top (-10)")
+                    if position_in_range > 0.95:
+                        should_trade = False
+                        warnings.append(f"🚫 BLOCKED: Buying at {position_in_range*100:.0f}% of day range = buying the exact top")
+                elif direction == "SELL" and position_in_range < 0.10:
+                    score -= 10
+                    warnings.append(f"⚠️ BOTTOMING: LTP at {position_in_range*100:.0f}% of day range — selling near bottom (-10)")
+                    if position_in_range < 0.05:
+                        should_trade = False
+                        warnings.append(f"🚫 BLOCKED: Selling at {position_in_range*100:.0f}% of day range = selling the exact bottom")
+        
+        # ===================================================================
+        # CANDLE-DATA-DERIVED SMART GATES (from Feb 11 backtesting analysis)
+        # These are the REAL edge — derived from actual win/loss candle data
+        # Winners: FT=4.1, ADX=37, ORB_str=30, range_exp=0.18
+        # Losers:  FT=0.4, ADX=31, ORB_str=142, range_exp=0.37
+        # ===================================================================
+        
+        # Determine the intended tier for gate thresholds
+        if score >= self.PREMIUM_THRESHOLD:
+            intended_tier = "premium"
+        elif score >= self.STANDARD_THRESHOLD:
+            intended_tier = "standard"
+        else:
+            intended_tier = "base"
+        
+        # Gate 8: FOLLOW-THROUGH GATE — the #1 predictor (winners 4.1x vs losers 0.4x)
+        # Trades with 0 follow-through candles are essentially coinflips
+        ft_candles = signal.follow_through_candles
+        if should_trade and intended_tier == "premium":
+            if ft_candles < self.FOLLOW_THROUGH_MIN_PREMIUM:
+                score -= 8
+                warnings.append(f"⚠️ LOW FOLLOW-THROUGH: {ft_candles} candles < {self.FOLLOW_THROUGH_MIN_PREMIUM} required for premium (-8)")
+                if ft_candles == 0:
+                    # Premium with zero follow-through = don't do it
+                    should_trade = False
+                    warnings.append(f"🚫 BLOCKED: Premium tier with ZERO follow-through = blind entry")
+        elif should_trade and intended_tier == "standard":
+            if ft_candles < self.FOLLOW_THROUGH_MIN_STANDARD:
+                score -= 5
+                warnings.append(f"⚠️ NO FOLLOW-THROUGH: {ft_candles} candles — no confirmation after breakout (-5)")
+        
+        # Gate 9: ADX TREND STRENGTH — winners had ADX 37+, losers had 31
+        # ADX < 25 = no trend = directionless chop
+        adx = market_data.get('adx', 0) if market_data else 0
+        if should_trade and adx > 0:
+            if intended_tier == "premium" and adx < self.ADX_MIN_PREMIUM:
+                score -= 5
+                warnings.append(f"⚠️ WEAK TREND: ADX {adx:.0f} < {self.ADX_MIN_PREMIUM} for premium tier (-5)")
+            elif intended_tier == "standard" and adx < self.ADX_MIN_STANDARD:
+                score -= 3
+                warnings.append(f"⚠️ WEAK TREND: ADX {adx:.0f} < {self.ADX_MIN_STANDARD} for standard tier (-3)")
+            elif adx >= 40:
+                # Strong trend bonus
+                score += 3
+                reasons.append(f"💪 Strong ADX {adx:.0f} — clear trend (+3)")
+        
+        # Gate 10: ORB STRENGTH OVEREXTENSION — winners entered at ORB_str 30, losers at 142
+        # High ORB strength = price already moved far from ORB range = chasing the move
+        orb_str = market_data.get('orb_strength', 0) if market_data else 0
+        if should_trade and orb_str > self.ORB_STRENGTH_OVEREXTENDED:
+            score -= 8
+            warnings.append(f"⚠️ ORB OVEREXTENDED: Strength {orb_str:.0f}% > {self.ORB_STRENGTH_OVEREXTENDED}% — price too far from ORB range (-8)")
+            if orb_str > 200:
+                size_multiplier = min(size_multiplier, 0.75)
+                warnings.append(f"⚠️ ORB EXHAUSTED: {orb_str:.0f}% — capping size at 0.75x")
+        
+        # Gate 11: RANGE EXPANSION OVEREXTENSION — winners 0.18, losers 0.37
+        # If range has already expanded > 0.6x ATR, the move has happened
+        range_exp = signal.range_expansion_ratio
+        if should_trade and range_exp > self.RANGE_EXPANSION_OVEREXTENDED:
+            score -= 5
+            warnings.append(f"⚠️ RANGE ALREADY EXPANDED: {range_exp:.2f}x ATR > {self.RANGE_EXPANSION_OVEREXTENDED}x — late entry (-5)")
+        
+        # Gate 12: SAME-SYMBOL RE-ENTRY PREVENTION
+        # SBIN entered 4x = all losses, BANDHANBNK 3x = all losses
+        # Don't re-enter a symbol that already lost today
+        sym_base = signal.symbol.replace("NSE:", "").replace("BSE:", "")
+        sym_losses = self.symbol_losses_today.get(sym_base, 0)
+        if should_trade and sym_losses >= self.MAX_LOSSES_SAME_SYMBOL:
+            should_trade = False
+            warnings.append(f"🚫 BLOCKED: {sym_base} already lost {sym_losses}x today — no re-entry after loss")
+        
+        # Track trade attempt (for logging)
+        self.symbol_trades_today[sym_base] = self.symbol_trades_today.get(sym_base, 0) + 1
         
         decision = IntradayOptionDecision(
             should_trade=should_trade,
@@ -1056,6 +1210,31 @@ class IntradayOptionScorer:
             "microstructure_blocked": decision.microstructure_block,
             "microstructure_block_reason": decision.microstructure_block_reason
         }
+    
+    def record_symbol_loss(self, symbol: str):
+        """Record that a symbol had a losing trade today.
+        Called by exit handler when a trade closes at a loss.
+        Prevents re-entering the same losing symbol repeatedly.
+        (SBIN lost 4x on Feb 11, BANDHANBNK lost 3x — this stops that.)
+        """
+        sym_base = symbol.replace("NSE:", "").replace("BSE:", "").replace("NFO:", "")
+        # Strip option suffix to get the base underlying (e.g. SBIN1185CE → SBIN)
+        import re
+        sym_base = re.sub(r'\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC).*', '', sym_base)
+        self.symbol_losses_today[sym_base] = self.symbol_losses_today.get(sym_base, 0) + 1
+        print(f"📊 SCORER: Recorded loss #{self.symbol_losses_today[sym_base]} for {sym_base} (max re-entry: {self.MAX_LOSSES_SAME_SYMBOL})")
+    
+    def record_symbol_win(self, symbol: str):
+        """Record that a symbol had a winning trade today.
+        Winners reset the loss counter — the setup IS working for this symbol.
+        """
+        sym_base = symbol.replace("NSE:", "").replace("BSE:", "").replace("NFO:", "")
+        import re
+        sym_base = re.sub(r'\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC).*', '', sym_base)
+        # Reset loss counter on a win — the setup works for this symbol
+        if sym_base in self.symbol_losses_today:
+            self.symbol_losses_today[sym_base] = max(0, self.symbol_losses_today[sym_base] - 1)
+            print(f"📊 SCORER: Win on {sym_base} — loss counter reduced to {self.symbol_losses_today[sym_base]}")
 
 
 # Singleton instance
@@ -1232,6 +1411,88 @@ class OptionOrderPlan:
     stoploss_premium: float      # Stoploss premium
     rationale: str
     greeks_summary: str
+    # === ENTRY METADATA (for post-trade review) ===
+    entry_metadata: Dict = field(default_factory=dict)  # score, tier, gates, candle data, sizing rationale
+
+
+@dataclass
+class CreditSpreadPlan:
+    """
+    Plan for a credit spread order (SELL option + BUY hedge option)
+    
+    Bull Put Spread: SELL higher PE + BUY lower PE (bullish view)
+    Bear Call Spread: SELL lower CE + BUY higher CE (bearish view)
+    """
+    underlying: str
+    direction: str                    # 'BULLISH' or 'BEARISH' (market view)
+    spread_type: str                  # 'BULL_PUT_SPREAD' or 'BEAR_CALL_SPREAD'
+    # Sold (short) leg — this is where premium is collected
+    sold_contract: OptionContract     # ATM/OTM option we SELL
+    # Bought (long) leg — the hedge
+    hedge_contract: OptionContract    # Further OTM option we BUY
+    # Sizing
+    quantity: int                     # Number of lots
+    lot_size: int                     # Shares per lot
+    # Financials
+    net_credit: float                 # Net premium credit per share (sold - bought)
+    net_credit_total: float           # Total net credit (credit × qty × lot_size)
+    max_risk: float                   # Max risk = (spread_width - net_credit) × qty × lot_size
+    spread_width: float               # Strike difference between legs
+    # Risk management
+    target_credit: float              # Target: keep 65% of credit (exit by buying back cheaper)
+    stop_loss_debit: float            # SL: exit when loss = 2× credit received
+    breakeven: float                  # Breakeven strike price
+    # Greeks (net of both legs)
+    net_delta: float
+    net_theta: float                  # POSITIVE = theta works for us
+    net_vega: float                   # NEGATIVE = benefits from IV drop
+    net_gamma: float
+    # Metadata
+    rationale: str
+    greeks_summary: str
+    credit_pct: float                 # Credit as % of spread width (quality metric)
+    dte: int                          # Days to expiry
+
+
+@dataclass
+class DebitSpreadPlan:
+    """
+    Plan for a debit spread order (BUY near-ATM + SELL further OTM)
+    
+    Intraday momentum strategy — profits from strong directional moves.
+    BULLISH → Bull Call Spread: BUY ATM CE + SELL OTM CE
+    BEARISH → Bear Put Spread: BUY ATM PE + SELL OTM PE
+    """
+    underlying: str
+    direction: str                    # 'BULLISH' or 'BEARISH'
+    spread_type: str                  # 'BULL_CALL_SPREAD' or 'BEAR_PUT_SPREAD'
+    # Bought (long) leg — the directional bet
+    buy_contract: OptionContract      # Near-ATM option we BUY
+    # Sold (short) leg — reduces cost (caps profit)
+    sell_contract: OptionContract     # Further OTM option we SELL
+    # Sizing
+    quantity: int                     # Number of lots
+    lot_size: int                     # Shares per lot
+    # Financials
+    net_debit: float                  # Net premium paid per share (buy - sell)
+    net_debit_total: float            # Total net debit (debit × qty × lot_size)
+    max_profit: float                 # Max profit = (spread_width - net_debit) × qty × lot_size
+    max_loss: float                   # Max loss = net_debit × qty × lot_size
+    spread_width: float               # Strike difference between legs
+    # Risk management
+    target_value: float               # Target spread value per share (exit when spread reaches this)
+    stop_loss_value: float            # SL spread value per share (exit when spread drops to this)
+    breakeven: float                  # Breakeven underlying price
+    # Greeks (net of both legs)
+    net_delta: float                  # POSITIVE for bull, NEGATIVE for bear
+    net_theta: float                  # NEGATIVE = time works against us
+    net_vega: float                   # POSITIVE = benefits from IV rise
+    net_gamma: float
+    # Metadata
+    rationale: str
+    greeks_summary: str
+    move_pct: float                   # Stock's current intraday move %
+    dte: int                          # Days to expiry
 
 
 # F&O Lot Sizes (as of 2026 - may need updates)
@@ -1501,6 +1762,86 @@ class OptionChainFetcher:
             print(f"⚠️ Error fetching NFO instruments: {e}")
             return []
     
+    def quick_check_option_liquidity(self, underlying: str, min_oi: int = 500, 
+                                      max_bid_ask_pct: float = 5.0) -> tuple:
+        """
+        Quick pre-flight liquidity check for an underlying's ATM options.
+        
+        ZERO extra API calls: uses cached chain data only.
+        If no cache exists, falls back to a free NFO instrument count check.
+        The full OI + bid-ask validation happens inside create_debit_spread()
+        which MUST fetch the chain anyway — so we never duplicate that work.
+        
+        Args:
+            underlying: e.g. "NSE:RELIANCE"
+            min_oi: Minimum OI required on ATM strike (default 500)
+            max_bid_ask_pct: Max bid-ask spread as % of LTP (default 5%)
+            
+        Returns:
+            (is_liquid: bool, reason: str)
+        """
+        try:
+            symbol = underlying.replace("NSE:", "")
+            
+            # === LAYER 1: Use cached chain if available (ZERO API calls) ===
+            cached_chain = None
+            for cache_key, chain in self.cache.items():
+                if cache_key.startswith(symbol + "_"):
+                    last = self.last_fetch.get(cache_key, datetime.min)
+                    if (datetime.now() - last).seconds < self.CACHE_TTL_SECONDS * 5:  # 5x normal TTL OK for liquidity check
+                        cached_chain = chain
+                        break
+            
+            if cached_chain is not None:
+                # We have cached chain data — do full OI + bid-ask check
+                atm_strike = cached_chain.get_atm_strike()
+                if atm_strike is None:
+                    return (False, f"No ATM strike for {symbol}")
+                
+                ce_contract = cached_chain.get_contract(atm_strike, OptionType.CE)
+                pe_contract = cached_chain.get_contract(atm_strike, OptionType.PE)
+                
+                if ce_contract is None and pe_contract is None:
+                    return (False, f"No ATM contracts for {symbol} at strike {atm_strike}")
+                
+                # Check at least one side has adequate liquidity
+                for label, contract in [("CE", ce_contract), ("PE", pe_contract)]:
+                    if contract is None:
+                        continue
+                    if contract.oi < min_oi:
+                        continue
+                    if contract.ltp > 0 and contract.bid > 0 and contract.ask > 0:
+                        bid_ask_spread_pct = ((contract.ask - contract.bid) / contract.ltp) * 100
+                        if bid_ask_spread_pct > max_bid_ask_pct:
+                            continue
+                    # This side is liquid enough
+                    return (True, f"ATM {label} @{atm_strike}: OI={contract.oi:,}, LTP=₹{contract.ltp:.2f}")
+                
+                ce_oi = ce_contract.oi if ce_contract else 0
+                pe_oi = pe_contract.oi if pe_contract else 0
+                return (False, f"Low liquidity: ATM {atm_strike} CE_OI={ce_oi} PE_OI={pe_oi} (need ≥{min_oi})")
+            
+            # === LAYER 2: No cache — use FREE NFO instrument check (ZERO API calls) ===
+            # Just verify the stock has enough option strikes listed on NFO
+            # The actual OI + bid-ask check will happen in create_debit_spread()
+            instruments = self._get_nfo_instruments()  # Already cached after first call
+            option_count = sum(
+                1 for inst in instruments 
+                if inst.get('name') == symbol and inst.get('instrument_type') in ('CE', 'PE')
+            )
+            
+            if option_count == 0:
+                return (False, f"{symbol} has no NFO options listed — not F&O eligible")
+            elif option_count < 10:
+                return (False, f"{symbol} only has {option_count} option contracts — likely illiquid")
+            else:
+                # Has enough contracts listed — defer full check to create_debit_spread
+                return (True, f"{symbol} has {option_count} NFO contracts (full liquidity check deferred)")
+            
+        except Exception as e:
+            # On error, don't block — let create_debit_spread handle it
+            return (True, f"Liquidity check skipped (error: {e})")
+    
     def get_expiries(self, underlying: str) -> List[datetime]:
         """Get available expiry dates for an underlying"""
         symbol = underlying.replace("NSE:", "")
@@ -1759,6 +2100,11 @@ class OptionChainFetcher:
 class OptionsPositionSizer:
     """
     Position sizing for options with premium limits and risk management
+    
+    TIERED SIZING (Feb 12 overhaul):
+      Premium tier (score ≥ 70): 5% risk, min 2 lots, up to 25% capital
+      Standard tier (score ≥ 65): 3.5% risk, min 1 lot, up to 20% capital
+      Base tier (below 65):       2% risk, 1 lot, up to 15% capital
     """
     
     def __init__(self, capital: float = 100000):
@@ -1767,16 +2113,22 @@ class OptionsPositionSizer:
         # Risk limits
         self.max_premium_per_trade = 0.50   # Max 50% of capital per option premium (₹1L on ₹2L capital)
         self.max_premium_per_day = 1.00     # Max 100% of capital in option premiums per day
-        self.max_lots_per_trade = 10        # Maximum lots per single trade
+        self.max_lots_per_trade = 15        # Maximum lots per single trade (premium tier)
         self.max_total_premium = 0          # Tracking
         
-        # Risk per trade (as % of capital)
-        self.risk_per_trade = HARD_RULES.get("RISK_PER_TRADE", 0.025)  # Aligned with config (2.5%)
+        # Tiered risk per trade (as % of capital) — base rate
+        self.risk_per_trade = HARD_RULES.get("RISK_PER_TRADE", 0.035)  # Base 3.5%
+        
+        # Tiered risk rates
+        self.risk_premium = 0.05    # 5% risk for premium tier (₹25K on ₹5L)
+        self.risk_standard = 0.035  # 3.5% risk for standard tier (₹17.5K on ₹5L)
+        self.risk_base = 0.02       # 2% risk for base tier (₹10K on ₹5L)
     
     def calculate_position(self, contract: OptionContract, 
                           signal_direction: str,
                           capital: float = None,
-                          max_loss_pct: float = None) -> Dict:
+                          max_loss_pct: float = None,
+                          score_tier: str = "standard") -> Dict:
         """
         Calculate optimal position size for an option trade
         
@@ -1785,12 +2137,22 @@ class OptionsPositionSizer:
             signal_direction: 'BUY' or 'SELL' (underlying direction)
             capital: Override capital
             max_loss_pct: Override max loss percentage
+            score_tier: 'premium', 'standard', or 'base' — determines risk budget
             
         Returns:
             Dict with quantity, premium, risk details
         """
         capital = capital or self.capital
-        max_loss_pct = max_loss_pct or self.risk_per_trade
+        
+        # Tiered risk: premium trades get bigger sizes
+        if max_loss_pct:
+            risk_pct = max_loss_pct
+        elif score_tier == "premium":
+            risk_pct = self.risk_premium    # 5%
+        elif score_tier == "standard":
+            risk_pct = self.risk_standard   # 3.5%
+        else:
+            risk_pct = self.risk_base       # 2%
         
         premium_per_lot = contract.ltp * contract.lot_size
         
@@ -1807,11 +2169,11 @@ class OptionsPositionSizer:
         # Method 1: Premium-based sizing (max 5% of capital)
         lots_by_premium = max(1, int(max_premium / premium_per_lot))
         
-        # Method 2: Risk-based sizing (max loss = 2% of capital)
-        max_loss = capital * max_loss_pct
-        # Assume max loss is 50% of premium for bought options
-        assumed_max_loss_per_lot = premium_per_lot * 0.5
-        lots_by_risk = max(1, int(max_loss / assumed_max_loss_per_lot))
+        # Method 2: Risk-based sizing
+        # Use ACTUAL SL percentage (30%) not assumed 50% — matches stoploss_premium = 0.7x
+        max_loss = capital * risk_pct
+        actual_sl_loss_per_lot = premium_per_lot * 0.30  # 30% SL = actual max loss per lot
+        lots_by_risk = max(1, int(max_loss / actual_sl_loss_per_lot))
         
         # Method 3: Delta-adjusted sizing
         # Higher delta = more exposure = fewer lots
@@ -1830,15 +2192,28 @@ class OptionsPositionSizer:
             self.max_lots_per_trade
         )
         
+        # Minimum lots for premium tier — don't waste high conviction on 1 lot
+        if score_tier == "premium" and quantity < 2 and premium_per_lot * 2 < capital * 0.25:
+            quantity = 2
+        
         total_premium = quantity * premium_per_lot
         
         # Calculate max loss (assuming premium can go to 0 - buying options)
         max_loss = total_premium  # Max loss = premium paid for long options
         
-        # Calculate target and stoploss
-        # For bought options: Target = 50% gain, SL = 30% loss
-        target_premium = contract.ltp * 1.5
-        stoploss_premium = contract.ltp * 0.7
+        # Calculate target and stoploss — TIERED R:R
+        # Premium: Target 80% gain, SL 28% loss → R:R = 2.86:1
+        # Standard: Target 60% gain, SL 28% loss → R:R = 2.14:1
+        # Base: Target 50% gain, SL 30% loss → R:R = 1.67:1
+        if score_tier == "premium":
+            target_premium = contract.ltp * 1.80   # +80% premium gain
+            stoploss_premium = contract.ltp * 0.72  # -28% premium loss
+        elif score_tier == "standard":
+            target_premium = contract.ltp * 1.60   # +60% premium gain
+            stoploss_premium = contract.ltp * 0.72  # -28% premium loss
+        else:
+            target_premium = contract.ltp * 1.50   # +50% premium gain
+            stoploss_premium = contract.ltp * 0.70  # -30% premium loss
         
         # Breakeven
         if contract.option_type == OptionType.CE:
@@ -1859,7 +2234,9 @@ class OptionsPositionSizer:
             'stoploss_premium': stoploss_premium,
             'breakeven': breakeven,
             'delta_exposure': abs(contract.delta) * quantity * contract.lot_size,
-            'sizing_method': 'MIN(premium, risk, delta)',
+            'sizing_method': f'TIERED({score_tier}): MIN(premium, risk, delta)',
+            'score_tier': score_tier,
+            'risk_pct_used': risk_pct * 100,
             'lots_by_premium': lots_by_premium,
             'lots_by_risk': lots_by_risk,
             'lots_by_delta': lots_by_delta
@@ -1977,7 +2354,8 @@ class OptionsTrader:
             chop_zone=market_data.get('chop_zone', False),
             follow_through_candles=market_data.get('follow_through_candles', 0),
             range_expansion_ratio=market_data.get('range_expansion_ratio', 0.0),
-            vwap_slope_steepening=market_data.get('vwap_slope_steepening', False)
+            vwap_slope_steepening=market_data.get('vwap_slope_steepening', False),
+            atr=market_data.get('atr_14', 0.0)
         )
         
         # === PRE-FETCH OPTION CHAIN FOR MICROSTRUCTURE DATA ===
@@ -2034,6 +2412,14 @@ class OptionsTrader:
         log_lines.append(f"   Time: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log_lines.append(f"   Score: {decision.confidence_score:.0f}/100")
         log_lines.append(f"   Direction: {decision.recommended_direction}")
+        log_lines.append(f"   Should Trade: {decision.should_trade}")
+        # Raw indicator snapshot for post-hoc analysis
+        _ind_keys = ['ema_9','ema_21','ema_spread','ema_regime','vwap','vwap_slope','vwap_change_pct',
+                      'volume_regime','volume_vs_avg','orb_signal','orb_strength','orb_hold_candles',
+                      'adx','atr_14','follow_through_candles','range_expansion_ratio',
+                      'vwap_slope_steepening','htf_alignment','chop_zone','rsi_14']
+        _snap = {k: market_data.get(k, '?') for k in _ind_keys}
+        log_lines.append(f"   📐 Indicators: {_snap}")
         log_lines.append(f"   Should Trade: {decision.should_trade}")
         for reason in decision.reasons:
             log_lines.append(f"   {reason}")
@@ -2099,18 +2485,85 @@ class OptionsTrader:
             print(f"   🎯 Selected: {contract.symbol} @ ₹{contract.ltp:.2f}")
             
             # === CALCULATE POSITION SIZE (apply intraday multiplier) ===
-            sizing = self.position_sizer.calculate_position(contract, final_direction, self.capital)
+            # Determine score tier for tiered sizing
+            score = decision.confidence_score
+            if score >= self.PREMIUM_THRESHOLD:
+                score_tier = "premium"
+            elif score >= self.STANDARD_THRESHOLD:
+                score_tier = "standard"
+            else:
+                score_tier = "base"
             
-            # Apply intraday conviction multiplier
-            adjusted_lots = max(1, int(sizing['lots'] * decision.position_size_multiplier))
+            sizing = self.position_sizer.calculate_position(
+                contract, final_direction, self.capital, score_tier=score_tier
+            )
+            
+            # Apply intraday conviction multiplier — use round() not int() to avoid truncation
+            # int(1 * 1.5) = 1, round(1 * 1.5) = 2 ← this was silently killing the multiplier
+            adjusted_lots = max(1, round(sizing['lots'] * decision.position_size_multiplier))
             adjusted_premium = adjusted_lots * sizing['premium_per_lot']
             
-            # Cap at max allowed
-            if adjusted_premium > self.capital * 0.15:  # Max 15% of capital
-                adjusted_lots = max(1, int((self.capital * 0.15) / sizing['premium_per_lot']))
+            # Tiered capital cap — premium trades get bigger allocation
+            if score_tier == "premium":
+                cap_pct = 0.25  # 25% of capital for premium trades
+            elif score_tier == "standard":
+                cap_pct = 0.20  # 20% for standard
+            else:
+                cap_pct = 0.15  # 15% for base
+                
+            if adjusted_premium > self.capital * cap_pct:
+                adjusted_lots = max(1, int((self.capital * cap_pct) / sizing['premium_per_lot']))
                 adjusted_premium = adjusted_lots * sizing['premium_per_lot']
             
             # === CREATE ORDER PLAN ===
+            # === BUILD ENTRY METADATA for post-trade review ===
+            import uuid
+            trade_id = f"T_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            
+            # Candle data snapshot
+            ft_candles = market_data.get('follow_through_candles', 0)
+            adx_val = market_data.get('adx_14', market_data.get('adx', 0))
+            orb_strength_val = market_data.get('orb_strength_pct', market_data.get('orb_strength', 0))
+            range_exp_val = market_data.get('range_expansion_ratio', 0)
+            orb_signal_val = market_data.get('orb_signal', 'INSIDE_ORB')
+            vol_regime_val = market_data.get('volume_regime', 'NORMAL')
+            vol_ratio_val = market_data.get('volume_vs_avg', 1.0)
+            vwap_pos = market_data.get('price_vs_vwap', 'AT_VWAP')
+            htf_align = market_data.get('htf_alignment', 'NEUTRAL')
+            rsi_val = market_data.get('rsi_14', 50)
+            change_pct_val = market_data.get('change_pct', 0)
+            
+            entry_meta = {
+                'trade_id': trade_id,
+                'entry_score': round(decision.confidence_score, 1),
+                'score_tier': score_tier,
+                'trend_state': decision.trend_state,
+                'acceleration_score': round(decision.acceleration_score, 1),
+                'microstructure_score': round(decision.microstructure_score, 1),
+                'microstructure_block': decision.microstructure_block,
+                'position_size_multiplier': round(decision.position_size_multiplier, 2),
+                'original_lots': sizing['lots'],
+                'adjusted_lots': adjusted_lots,
+                'cap_pct_used': cap_pct,
+                'strategy_type': 'NAKED_OPTION',
+                # Candle gate data
+                'follow_through_candles': ft_candles,
+                'adx': round(adx_val, 1),
+                'orb_strength_pct': round(orb_strength_val, 1),
+                'range_expansion_ratio': round(range_exp_val, 2),
+                'orb_signal': orb_signal_val,
+                'volume_regime': vol_regime_val,
+                'volume_ratio': round(vol_ratio_val, 1),
+                'vwap_position': vwap_pos,
+                'htf_alignment': htf_align,
+                'rsi': round(rsi_val, 1),
+                'change_pct': round(change_pct_val, 2),
+                # Gate pass/fail summary
+                'gates_passed': [r for r in decision.reasons if '✅' in r or 'PASS' in r.upper()],
+                'gates_warned': [w for w in decision.warnings],
+                'spot_price': chain.spot_price if chain else 0,
+            }
+            
             plan = OptionOrderPlan(
                 underlying=underlying,
                 direction=final_direction,
@@ -2123,15 +2576,22 @@ class OptionsTrader:
                 target_premium=sizing['target_premium'],
                 stoploss_premium=sizing['stoploss_premium'],
                 rationale=f"{final_direction} {underlying} | {' | '.join(decision.reasons[:3])} | SCORE:{decision.confidence_score:.0f}",
-                greeks_summary=f"Δ:{contract.delta:.2f} Γ:{contract.gamma:.4f} Θ:{contract.theta:.2f} V:{contract.vega:.2f} IV:{contract.iv*100:.1f}%"
+                greeks_summary=f"Δ:{contract.delta:.2f} Γ:{contract.gamma:.4f} Θ:{contract.theta:.2f} V:{contract.vega:.2f} IV:{contract.iv*100:.1f}%",
+                entry_metadata=entry_meta
             )
             
-            print(f"   ✅ Plan: {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}")
+            print(f"   ✅ Plan: {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f} [{score_tier.upper()}]")
             
-            # Log executed order to persistent file
+            # Log executed order to persistent file — ENRICHED with full trade character
             try:
                 with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
                     f.write(f"   ✅ EXECUTED: {contract.symbol} | {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}\n")
+                    f.write(f"      Trade ID: {trade_id}\n")
+                    f.write(f"      Tier: {score_tier.upper()} | Score: {decision.confidence_score:.0f} | Trend: {decision.trend_state}\n")
+                    f.write(f"      Sizing: {sizing['lots']} lots × {decision.position_size_multiplier:.1f}x = {adjusted_lots} lots | Cap: {cap_pct*100:.0f}%\n")
+                    f.write(f"      Candles: FT={ft_candles} ADX={adx_val:.1f} ORB={orb_strength_val:.0f}% RangeExp={range_exp_val:.2f}\n")
+                    f.write(f"      Context: ORB={orb_signal_val} Vol={vol_regime_val}({vol_ratio_val:.1f}x) VWAP={vwap_pos} HTF={htf_align} RSI={rsi_val:.0f}\n")
+                    f.write(f"      Micro: score={decision.microstructure_score:.0f} block={decision.microstructure_block} accel={decision.acceleration_score:.1f}\n")
                     f.write(f"      Greeks: {plan.greeks_summary}\n")
                     f.write(f"      Target: ₹{plan.target_premium:.2f} | SL: ₹{plan.stoploss_premium:.2f}\n")
                     f.write(f"{'='*70}\n")
@@ -2234,6 +2694,998 @@ class OptionsTrader:
         
         return plan
     
+    # ================================================================
+    # CREDIT SPREAD STRATEGY (THETA-POSITIVE)
+    # ================================================================
+    
+    def create_credit_spread(self, underlying: str, direction: str,
+                             market_data: Dict = None,
+                             spread_width_strikes: int = None) -> Optional[CreditSpreadPlan]:
+        """
+        Create a credit spread order plan.
+        
+        BULLISH view → Bull Put Spread: SELL OTM PE + BUY further OTM PE
+        BEARISH view → Bear Call Spread: SELL OTM CE + BUY further OTM CE
+        
+        Why credit spreads:
+        - Theta works FOR us (options decay every day → we profit)
+        - Defined risk (hedge limits max loss)
+        - Higher win rate than naked buys (profit from time decay + direction)
+        - Requires more capital (margins) but ₹5L supports this
+        
+        Args:
+            underlying: e.g. "NSE:RELIANCE"
+            direction: 'BUY' (bullish) or 'SELL' (bearish)
+            market_data: Intraday signals dict for scoring
+            spread_width_strikes: Override spread width (default from config)
+            
+        Returns:
+            CreditSpreadPlan or None if not viable
+        """
+        from config import CREDIT_SPREAD_CONFIG
+        
+        if not CREDIT_SPREAD_CONFIG.get('enabled', False):
+            print(f"   ⚠️ Credit spreads disabled in config")
+            return None
+        
+        spread_width = spread_width_strikes or CREDIT_SPREAD_CONFIG.get('spread_width_strikes', 2)
+        symbol = underlying.replace("NSE:", "")
+        
+        # === INTRADAY SCORING (shared with regular option flow) ===
+        score = 0
+        final_direction = direction
+        if market_data:
+            intraday_signal = IntradaySignal(
+                symbol=underlying,
+                orb_signal=market_data.get('orb_signal', 'INSIDE_ORB'),
+                vwap_position=market_data.get('price_vs_vwap', market_data.get('vwap_position', 'AT_VWAP')),
+                vwap_trend=market_data.get('vwap_slope', market_data.get('vwap_trend', 'FLAT')),
+                ema_regime=market_data.get('ema_regime', 'NORMAL'),
+                volume_regime=market_data.get('volume_regime', 'NORMAL'),
+                rsi=market_data.get('rsi_14', 50.0),
+                price_momentum=market_data.get('momentum_15m', 0.0),
+                htf_alignment=market_data.get('htf_alignment', 'NEUTRAL'),
+                chop_zone=market_data.get('chop_zone', False),
+                follow_through_candles=market_data.get('follow_through_candles', 0),
+                range_expansion_ratio=market_data.get('range_expansion_ratio', 0.0),
+                vwap_slope_steepening=market_data.get('vwap_slope_steepening', False),
+                atr=market_data.get('atr_14', 0.0)
+            )
+            scorer = get_intraday_scorer()
+            decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, caller_direction=direction)
+            score = decision.confidence_score
+            
+            min_score = CREDIT_SPREAD_CONFIG.get('min_score_threshold', 55)
+            if score < min_score:
+                print(f"   ❌ Credit spread REJECTED: {underlying} score {score:.0f} < {min_score}")
+                return None
+            
+            if decision.recommended_direction != "HOLD":
+                final_direction = decision.recommended_direction
+        
+        # Determine spread type
+        is_bullish = final_direction in ('BUY', 'BULLISH')
+        spread_type = "BULL_PUT_SPREAD" if is_bullish else "BEAR_CALL_SPREAD"
+        opt_type = OptionType.PE if is_bullish else OptionType.CE
+        
+        print(f"   📊 Credit Spread: {spread_type} on {underlying} (score: {score:.0f})")
+        
+        try:
+            # === GET OPTION CHAIN ===
+            expiry_sel_str = CREDIT_SPREAD_CONFIG.get('prefer_expiry', 'CURRENT_WEEK')
+            expiry_sel = ExpirySelection[expiry_sel_str]
+            expiry = self.chain_fetcher.get_nearest_expiry(underlying, expiry_sel)
+            
+            if expiry is None:
+                print(f"   ⚠️ No expiry found for {underlying}")
+                return None
+            
+            # DTE check
+            from datetime import date as _date
+            expiry_date = expiry if isinstance(expiry, _date) and not isinstance(expiry, datetime) else expiry.date() if hasattr(expiry, 'date') else expiry
+            dte = (expiry_date - datetime.now().date()).days
+            
+            min_dte = CREDIT_SPREAD_CONFIG.get('min_days_to_expiry', 2)
+            max_dte = CREDIT_SPREAD_CONFIG.get('max_days_to_expiry', 21)
+            
+            if dte < min_dte:
+                print(f"   ⚠️ DTE {dte} < min {min_dte} — gamma risk too high, skipping")
+                return None
+            if dte > max_dte:
+                print(f"   ⚠️ DTE {dte} > max {max_dte} — too far out, theta too slow")
+                return None
+            
+            # Warn about higher DTE needing further OTM strikes
+            if dte > 10:
+                print(f"   ⏳ DTE={dte} (monthly expiry) — using deeper OTM strikes for safety")
+            
+            chain = self.chain_fetcher.fetch_option_chain(underlying, expiry)
+            if chain is None or not chain.contracts:
+                print(f"   ⚠️ No option chain for {underlying}")
+                return None
+            
+            print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
+            
+            # === FIND STRIKES FOR CREDIT SPREAD ===
+            # Get sorted strikes for the option type
+            all_strikes = sorted(set(
+                c.strike for c in chain.contracts
+                if c.option_type == opt_type and (c.expiry is None or c.expiry == expiry)
+            ))
+            
+            if len(all_strikes) < spread_width + 1:
+                print(f"   ⚠️ Not enough strikes ({len(all_strikes)}) for spread width {spread_width}")
+                return None
+            
+            atm_strike = chain.get_atm_strike(expiry)
+            
+            # Find the strike index closest to ATM
+            atm_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - atm_strike))
+            
+            # OTM offset: how far from ATM to sell (higher = safer, less credit)
+            # Scale with DTE: longer DTE → sell further OTM for safety
+            base_otm_offset = CREDIT_SPREAD_CONFIG.get('sold_strike_otm_offset', 3)
+            if dte > 10:
+                otm_offset = base_otm_offset + 1  # Extra strike OTM for monthly expiry
+            elif dte <= 5:
+                otm_offset = max(2, base_otm_offset - 1)  # Slightly closer for weeklies
+            else:
+                otm_offset = base_otm_offset
+            
+            if is_bullish:
+                # BULL PUT SPREAD: sell OTM PE (below spot), buy further OTM PE
+                # Sell further OTM for higher probability of profit
+                sold_idx = max(0, atm_idx - otm_offset)  # N strikes OTM
+                hedge_idx = max(0, sold_idx - spread_width)  # further OTM
+            else:
+                # BEAR CALL SPREAD: sell OTM CE (above spot), buy further OTM CE
+                # Sell further OTM for higher probability of profit
+                sold_idx = min(len(all_strikes) - 1, atm_idx + otm_offset)  # N strikes OTM
+                hedge_idx = min(len(all_strikes) - 1, sold_idx + spread_width)  # further OTM
+            
+            print(f"   📐 Strike selection: ATM={atm_strike}, sold={all_strikes[sold_idx]} ({otm_offset} strikes OTM), hedge={all_strikes[hedge_idx] if hedge_idx < len(all_strikes) else 'N/A'}")
+            
+            sold_strike = all_strikes[sold_idx]
+            hedge_strike = all_strikes[hedge_idx]
+            
+            if sold_strike == hedge_strike:
+                print(f"   ⚠️ Sold and hedge strikes are same — can't form spread")
+                return None
+            
+            # Get contracts
+            sold_contract = chain.get_contract(sold_strike, opt_type, expiry)
+            hedge_contract = chain.get_contract(hedge_strike, opt_type, expiry)
+            
+            if sold_contract is None or hedge_contract is None:
+                print(f"   ⚠️ Could not find contracts for strikes {sold_strike}/{hedge_strike}")
+                return None
+            
+            # === VALIDATE LIQUIDITY ===
+            min_oi = 500
+            if sold_contract.oi < min_oi or hedge_contract.oi < min_oi:
+                print(f"   ⚠️ Low OI: sold={sold_contract.oi}, hedge={hedge_contract.oi} (min: {min_oi})")
+                return None
+            
+            # === VALIDATE SOLD LEG DELTA (probability of profit) ===
+            max_sold_delta = CREDIT_SPREAD_CONFIG.get('max_sold_delta', 0.35)
+            sold_delta_abs = abs(sold_contract.delta) if sold_contract.delta else 0.5
+            if sold_delta_abs > max_sold_delta:
+                # Try one more strike OTM
+                if is_bullish and sold_idx > 0:
+                    sold_idx -= 1
+                    sold_strike = all_strikes[sold_idx]
+                    hedge_idx = max(0, sold_idx - spread_width)
+                    hedge_strike = all_strikes[hedge_idx]
+                    sold_contract = chain.get_contract(sold_strike, opt_type, expiry)
+                    hedge_contract = chain.get_contract(hedge_strike, opt_type, expiry)
+                    if sold_contract:
+                        sold_delta_abs = abs(sold_contract.delta) if sold_contract.delta else 0.5
+                elif not is_bullish and sold_idx < len(all_strikes) - 1:
+                    sold_idx += 1
+                    sold_strike = all_strikes[sold_idx]
+                    hedge_idx = min(len(all_strikes) - 1, sold_idx + spread_width)
+                    hedge_strike = all_strikes[hedge_idx]
+                    sold_contract = chain.get_contract(sold_strike, opt_type, expiry)
+                    hedge_contract = chain.get_contract(hedge_strike, opt_type, expiry)
+                    if sold_contract:
+                        sold_delta_abs = abs(sold_contract.delta) if sold_contract.delta else 0.5
+                
+                if sold_delta_abs > max_sold_delta:
+                    print(f"   ⚠️ Sold leg delta {sold_delta_abs:.2f} > max {max_sold_delta} — too close to ATM, probability too low")
+                    return None
+                print(f"   📐 Adjusted sold strike to {sold_strike} (delta={sold_delta_abs:.2f})")
+            
+            if sold_contract is None or hedge_contract is None:
+                print(f"   ⚠️ Lost contract after delta adjustment")
+                return None
+            
+            # === CALCULATE CREDIT SPREAD FINANCIALS ===
+            # Re-fetch premiums after possible strike adjustment
+            sold_premium = sold_contract.ltp
+            hedge_premium = hedge_contract.ltp
+            net_credit = sold_premium - hedge_premium
+            
+            if net_credit <= 0:
+                print(f"   ⚠️ No net credit: sell@₹{sold_premium:.2f} - buy@₹{hedge_premium:.2f} = ₹{net_credit:.2f}")
+                return None
+            
+            # Spread width in rupees
+            spread_width_rs = abs(sold_strike - hedge_strike)
+            
+            # Credit as % of spread width (quality metric)
+            credit_pct = (net_credit / spread_width_rs) * 100 if spread_width_rs > 0 else 0
+            min_credit_pct = CREDIT_SPREAD_CONFIG.get('min_credit_pct', 25)
+            
+            if credit_pct < min_credit_pct:
+                print(f"   ⚠️ Credit too thin: {credit_pct:.1f}% < {min_credit_pct}% of spread width")
+                return None
+            
+            # === POSITION SIZING ===
+            lot_size = self.chain_fetcher.get_lot_size(underlying)
+            max_risk_per_lot = (spread_width_rs - net_credit) * lot_size
+            max_risk_config = CREDIT_SPREAD_CONFIG.get('max_spread_risk', 25000)
+            max_lots_config = CREDIT_SPREAD_CONFIG.get('max_lots_per_spread', 3)
+            
+            # Calculate lots: limited by risk and config
+            lots_by_risk = max(1, int(max_risk_config / max_risk_per_lot)) if max_risk_per_lot > 0 else 1
+            lots = min(lots_by_risk, max_lots_config)
+            
+            # Check total spread exposure across portfolio
+            max_total_exposure = CREDIT_SPREAD_CONFIG.get('max_total_spread_exposure', 150000)
+            current_spread_exposure = self._get_current_spread_exposure()
+            total_risk = (spread_width_rs - net_credit) * lot_size * lots
+            
+            if current_spread_exposure + total_risk > max_total_exposure:
+                # Reduce lots to fit within exposure limit
+                remaining_expo = max_total_exposure - current_spread_exposure
+                if remaining_expo <= 0:
+                    print(f"   ⚠️ Max spread exposure ₹{max_total_exposure:,.0f} reached (current: ₹{current_spread_exposure:,.0f})")
+                    return None
+                lots = max(1, int(remaining_expo / max_risk_per_lot))
+            
+            net_credit_total = net_credit * lot_size * lots
+            max_risk_total = (spread_width_rs - net_credit) * lot_size * lots
+            
+            # === RISK MANAGEMENT LEVELS ===
+            target_pct = CREDIT_SPREAD_CONFIG.get('target_pct', 65)
+            sl_multiplier = CREDIT_SPREAD_CONFIG.get('sl_multiplier', 2.0)
+            
+            # Target: keep target_pct% of credit (buy back spread when premium drops)
+            target_credit = net_credit * (1 - target_pct / 100)  # Buy back at this net debit
+            # SL: exit when loss = sl_multiplier × credit received
+            stop_loss_debit = net_credit + (net_credit * sl_multiplier)  # Max debit to pay to exit
+            
+            # Breakeven
+            if is_bullish:
+                breakeven = sold_strike - net_credit  # Bull put spread breakeven
+            else:
+                breakeven = sold_strike + net_credit  # Bear call spread breakeven
+            
+            # === NET GREEKS ===
+            net_delta = (sold_contract.delta * -1) + hedge_contract.delta  # Sold delta is flipped
+            net_theta = (sold_contract.theta * -1) + hedge_contract.theta  # Net theta should be POSITIVE
+            net_vega = (sold_contract.vega * -1) + hedge_contract.vega     # Net vega should be NEGATIVE
+            net_gamma = (sold_contract.gamma * -1) + hedge_contract.gamma  # Net gamma is NEGATIVE
+            
+            # Scale by lots and lot_size
+            qty_shares = lots * lot_size
+            
+            plan = CreditSpreadPlan(
+                underlying=underlying,
+                direction='BULLISH' if is_bullish else 'BEARISH',
+                spread_type=spread_type,
+                sold_contract=sold_contract,
+                hedge_contract=hedge_contract,
+                quantity=lots,
+                lot_size=lot_size,
+                net_credit=net_credit,
+                net_credit_total=net_credit_total,
+                max_risk=max_risk_total,
+                spread_width=spread_width_rs,
+                target_credit=target_credit,
+                stop_loss_debit=stop_loss_debit,
+                breakeven=breakeven,
+                net_delta=net_delta * qty_shares,
+                net_theta=net_theta * qty_shares,
+                net_vega=net_vega * qty_shares,
+                net_gamma=net_gamma * qty_shares,
+                rationale=f"{spread_type} on {underlying} | Credit ₹{net_credit:.2f}/share ({credit_pct:.0f}% of width) | Score:{score:.0f}",
+                greeks_summary=f"NetΔ:{net_delta*qty_shares:.2f} NetΘ:{net_theta*qty_shares:+.2f}/day NetV:{net_vega*qty_shares:.2f} NetΓ:{net_gamma*qty_shares:.4f}",
+                credit_pct=credit_pct,
+                dte=dte,
+            )
+            
+            print(f"   ✅ {spread_type}: SELL {sold_contract.symbol}@₹{sold_premium:.2f} + BUY {hedge_contract.symbol}@₹{hedge_premium:.2f}")
+            print(f"      Credit: ₹{net_credit:.2f}/share (₹{net_credit_total:,.0f} total) | {credit_pct:.0f}% of width")
+            print(f"      Max Risk: ₹{max_risk_total:,.0f} | {lots} lots × {lot_size} = {qty_shares} shares")
+            print(f"      Target: buy back at ₹{target_credit:.2f} | SL: exit at ₹{stop_loss_debit:.2f}")
+            print(f"      Breakeven: ₹{breakeven:.2f} | NetΘ: {net_theta*qty_shares:+.2f}/day (POSITIVE = good)")
+            
+            # Log to persistent file
+            try:
+                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                    f.write(f"\n{'='*70}\n")
+                    f.write(f"📊 CREDIT SPREAD: {spread_type} on {underlying}\n")
+                    f.write(f"   SELL: {sold_contract.symbol}@₹{sold_premium:.2f} | BUY: {hedge_contract.symbol}@₹{hedge_premium:.2f}\n")
+                    f.write(f"   Credit: ₹{net_credit_total:,.0f} | Max Risk: ₹{max_risk_total:,.0f} | DTE: {dte}\n")
+                    f.write(f"   Score: {score:.0f} | Credit%: {credit_pct:.0f}% | Lots: {lots}\n")
+                    f.write(f"{'='*70}\n")
+            except Exception:
+                pass
+            
+            return plan
+            
+        except Exception as e:
+            import traceback
+            print(f"   ❌ Credit spread creation failed: {e}")
+            traceback.print_exc()
+            return None
+    
+    def _get_current_spread_exposure(self) -> float:
+        """Get total risk exposure from existing credit spread positions"""
+        total = 0
+        for pos in self.positions:
+            if pos.get('status') == 'OPEN' and pos.get('is_credit_spread'):
+                total += pos.get('max_risk', 0)
+        return total
+    
+    def execute_credit_spread(self, plan: CreditSpreadPlan) -> Dict:
+        """
+        Execute a credit spread order (both legs)
+        
+        Args:
+            plan: CreditSpreadPlan with both legs
+            
+        Returns:
+            Dict with execution result
+        """
+        if self.paper_mode:
+            import random
+            sold_order_id = f"SPREAD_SELL_{random.randint(100000, 999999)}"
+            hedge_order_id = f"SPREAD_HEDGE_{random.randint(100000, 999999)}"
+            spread_id = f"SPREAD_{random.randint(100000, 999999)}"
+            
+            position = {
+                'spread_id': spread_id,
+                'is_credit_spread': True,
+                'spread_type': plan.spread_type,
+                'underlying': plan.underlying,
+                'direction': plan.direction,
+                # Sold leg
+                'sold_symbol': plan.sold_contract.symbol,
+                'sold_strike': plan.sold_contract.strike,
+                'sold_premium': plan.sold_contract.ltp,
+                'sold_order_id': sold_order_id,
+                # Hedge leg
+                'hedge_symbol': plan.hedge_contract.symbol,
+                'hedge_strike': plan.hedge_contract.strike,
+                'hedge_premium': plan.hedge_contract.ltp,
+                'hedge_order_id': hedge_order_id,
+                # Sizing
+                'quantity': plan.quantity,
+                'lot_size': plan.lot_size,
+                'net_credit': plan.net_credit,
+                'net_credit_total': plan.net_credit_total,
+                'max_risk': plan.max_risk,
+                'spread_width': plan.spread_width,
+                # Risk mgmt
+                'target_credit': plan.target_credit,
+                'stop_loss_debit': plan.stop_loss_debit,
+                'breakeven': plan.breakeven,
+                # Greeks
+                'net_delta': plan.net_delta,
+                'net_theta': plan.net_theta,
+                'net_vega': plan.net_vega,
+                'credit_pct': plan.credit_pct,
+                'dte': plan.dte,
+                # Status
+                'status': 'OPEN',
+                'timestamp': datetime.now().isoformat(),
+                'rationale': plan.rationale,
+            }
+            
+            self.positions.append(position)
+            
+            return {
+                'success': True,
+                'paper_trade': True,
+                'spread_id': spread_id,
+                'sold_order_id': sold_order_id,
+                'hedge_order_id': hedge_order_id,
+                'spread_type': plan.spread_type,
+                'underlying': plan.underlying,
+                'sold_symbol': plan.sold_contract.symbol,
+                'hedge_symbol': plan.hedge_contract.symbol,
+                'net_credit': plan.net_credit,
+                'net_credit_total': plan.net_credit_total,
+                'max_risk': plan.max_risk,
+                'credit_pct': plan.credit_pct,
+                'dte': plan.dte,
+                'lots': plan.quantity,
+                'greeks': plan.greeks_summary,
+                'rationale': plan.rationale,
+                'message': f"📊 CREDIT SPREAD: {plan.spread_type} | Credit ₹{plan.net_credit_total:,.0f} | Max Risk ₹{plan.max_risk:,.0f}"
+            }
+        else:
+            # LIVE MODE: Place both legs with Kite
+            try:
+                sold_exchange, sold_ts = plan.sold_contract.symbol.split(':')
+                hedge_exchange, hedge_ts = plan.hedge_contract.symbol.split(':')
+                qty_shares = plan.quantity * plan.lot_size
+                
+                # Leg 1: SELL the option (collect premium)
+                sold_order_id = self.kite.place_order(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=sold_exchange,
+                    tradingsymbol=sold_ts,
+                    transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                    quantity=qty_shares,
+                    product=self.kite.PRODUCT_MIS,
+                    order_type=self.kite.ORDER_TYPE_MARKET
+                )
+                
+                # Leg 2: BUY the hedge (cap risk)
+                hedge_order_id = self.kite.place_order(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=hedge_exchange,
+                    tradingsymbol=hedge_ts,
+                    transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                    quantity=qty_shares,
+                    product=self.kite.PRODUCT_MIS,
+                    order_type=self.kite.ORDER_TYPE_MARKET
+                )
+                
+                return {
+                    'success': True,
+                    'paper_trade': False,
+                    'sold_order_id': str(sold_order_id),
+                    'hedge_order_id': str(hedge_order_id),
+                    'message': f"Credit spread placed: SELL {sold_ts} + BUY {hedge_ts}"
+                }
+                
+            except Exception as e:
+                return {
+                    'success': False,
+                    'error': str(e),
+                    'message': f"Credit spread failed: {e}"
+                }
+
+    # =================================================================
+    # DEBIT SPREAD — INTRADAY MOMENTUM STRATEGY
+    # =================================================================
+
+    def create_debit_spread(self, underlying: str, direction: str,
+                            market_data: Dict = None,
+                            spread_width_strikes: int = None) -> Optional[DebitSpreadPlan]:
+        """
+        Create an intraday debit spread on a big mover.
+        
+        BULLISH → Bull Call Spread: BUY near-ATM CE + SELL further OTM CE
+        BEARISH → Bear Put Spread: BUY near-ATM PE + SELL further OTM PE
+        
+        Profits from continuation of a strong move. Cheaper than naked buy,
+        defined risk = net debit paid.
+        
+        Args:
+            underlying: e.g. "NSE:EICHERMOT"
+            direction: 'BUY' (bullish) or 'SELL' (bearish)
+            market_data: Intraday signals dict for scoring + move detection
+            spread_width_strikes: Override sell offset (default from config)
+        
+        Returns:
+            DebitSpreadPlan or None if not viable
+        """
+        from config import DEBIT_SPREAD_CONFIG
+        
+        if not DEBIT_SPREAD_CONFIG.get('enabled', False):
+            print(f"   ⚠️ Debit spreads disabled in config")
+            return None
+        
+        symbol = underlying.replace("NSE:", "")
+        
+        # === INTRADAY MOVE FILTER (must be a big mover) ===
+        min_move = DEBIT_SPREAD_CONFIG.get('min_move_pct', 2.5)
+        move_pct = 0.0
+        if market_data:
+            # Use LTP vs prev_close for intraday % move (NOT ohlc 'close' which is yesterday's close)
+            ltp = market_data.get('ltp', market_data.get('last_price', 0))
+            prev_close = market_data.get('prev_close', market_data.get('previous_close', 0))
+            if prev_close and prev_close > 0 and ltp > 0:
+                move_pct = ((ltp - prev_close) / prev_close) * 100
+            elif market_data.get('change_pct', 0) != 0:
+                move_pct = market_data.get('change_pct', 0)
+            else:
+                # Fallback: use open price for intraday move
+                open_price = market_data.get('open', 0)
+                if open_price and open_price > 0 and ltp > 0:
+                    move_pct = ((ltp - open_price) / open_price) * 100
+        
+        abs_move = abs(move_pct)
+        if abs_move < min_move:
+            print(f"   ⚠️ Debit spread SKIPPED: {underlying} move {abs_move:.1f}% < {min_move}% min")
+            return None
+        
+        # === VOLUME FILTER ===
+        min_vol_ratio = DEBIT_SPREAD_CONFIG.get('min_volume_ratio', 1.3)
+        vol_regime = market_data.get('volume_regime', 'NORMAL') if market_data else 'NORMAL'
+        vol_ratio = market_data.get('volume_ratio', 1.0) if market_data else 1.0
+        if vol_ratio < min_vol_ratio and vol_regime == 'LOW':
+            print(f"   ⚠️ Debit spread SKIPPED: {underlying} volume too low ({vol_regime}, ratio {vol_ratio:.1f})")
+            return None
+        
+        # === CANDLE-SMART GATES (data-driven — mirrors naked buy gates 8-12) ===
+        # D1 (FT) and D5 (re-entry) = hard blocks. D2-D4 = score penalties (avoid overfitting)
+        debit_gate_penalty = 0  # Accumulated penalty from softened gates
+        if market_data:
+            # Gate D1: Follow-Through Candles (STRONGEST winner signal — 4.1 vs 0.4)
+            ft_candles = market_data.get('follow_through_candles', 0)
+            min_ft = DEBIT_SPREAD_CONFIG.get('min_follow_through_candles', 2)
+            if ft_candles < min_ft:
+                print(f"   ❌ Debit spread BLOCKED [Gate D1]: {underlying} follow-through={ft_candles} < {min_ft} (need momentum confirmation)")
+                return None
+            
+            # Gate D2: ADX Trend Strength (winners avg 37 vs losers 30.8)
+            # SOFTENED: penalty instead of block — scorer already gates ADX too
+            adx = market_data.get('adx_14', market_data.get('adx', 0))
+            min_adx = DEBIT_SPREAD_CONFIG.get('min_adx', 28)
+            if adx > 0 and adx < min_adx:
+                debit_gate_penalty += 8
+                print(f"   ⚠️ Debit spread PENALTY [Gate D2]: {underlying} ADX={adx:.1f} < {min_adx} (weak trend, -8 score)")
+            
+            # Gate D3: ORB Overextension (losers avg 142% — chasing kills profits)
+            # SOFTENED: penalty instead of block. Only hard-block at extreme (>200%)
+            orb_strength = market_data.get('orb_strength_pct', market_data.get('orb_strength', 0))
+            max_orb = DEBIT_SPREAD_CONFIG.get('max_orb_strength_pct', 120)
+            if orb_strength > max_orb:
+                if orb_strength > 200:
+                    print(f"   ❌ Debit spread BLOCKED [Gate D3]: {underlying} ORB={orb_strength:.0f}% > 200% (extreme overextension)")
+                    return None
+                debit_gate_penalty += 6
+                print(f"   ⚠️ Debit spread PENALTY [Gate D3]: {underlying} ORB={orb_strength:.0f}% > {max_orb}% (overextended, -6 score)")
+            
+            # Gate D4: Range Expansion Filter (>0.50 ATR = move exhausted)
+            # SOFTENED: penalty instead of block. Only hard-block at extreme (>0.80)
+            range_exp = market_data.get('range_expansion_ratio', 0)
+            max_range_exp = DEBIT_SPREAD_CONFIG.get('max_range_expansion', 0.50)
+            if range_exp > max_range_exp:
+                if range_exp > 0.80:
+                    print(f"   ❌ Debit spread BLOCKED [Gate D4]: {underlying} range expansion={range_exp:.2f} > 0.80 ATR (extreme exhaustion)")
+                    return None
+                debit_gate_penalty += 5
+                print(f"   ⚠️ Debit spread PENALTY [Gate D4]: {underlying} range expansion={range_exp:.2f} > {max_range_exp} ATR (exhausted, -5 score)")
+            
+            # Gate D5: Same-symbol re-entry prevention (reuses scorer data)
+            scorer_check = get_intraday_scorer()
+            sym = underlying.replace("NSE:", "")
+            max_sym_losses = DEBIT_SPREAD_CONFIG.get('max_losses_same_symbol', 1)
+            sym_losses = scorer_check.symbol_losses_today.get(sym, 0)
+            if sym_losses >= max_sym_losses:
+                print(f"   ❌ Debit spread BLOCKED [Gate D5]: {sym} already lost {sym_losses}x today — no re-entry")
+                return None
+            
+            # Apply accumulated gate penalties to score
+            if debit_gate_penalty > 0:
+                print(f"   ⚠️ Debit spread gate penalties: -{debit_gate_penalty} score for {underlying}")
+            else:
+                print(f"   ✅ Debit spread CANDLE GATES PASSED: {underlying} | FT={ft_candles} ADX={adx:.1f} ORB={orb_strength:.0f}% RangeExp={range_exp:.2f}")
+        
+        # === TREND CONTINUATION CHECK ===
+        if DEBIT_SPREAD_CONFIG.get('require_trend_continuation', True) and market_data:
+            # Move should be IN direction of trade
+            if direction in ('BUY', 'BULLISH') and move_pct < 0:
+                print(f"   ⚠️ Debit spread SKIPPED: {underlying} moving DOWN {move_pct:.1f}% but BUY requested")
+                return None
+            if direction in ('SELL', 'BEARISH') and move_pct > 0:
+                print(f"   ⚠️ Debit spread SKIPPED: {underlying} moving UP +{move_pct:.1f}% but SELL requested")
+                return None
+        
+        # === TIME CHECK ===
+        from config import TRADING_HOURS
+        now = datetime.now()
+        no_entry_after_str = DEBIT_SPREAD_CONFIG.get('no_entry_after', '14:00')
+        no_entry_after = datetime.strptime(no_entry_after_str, '%H:%M').time()
+        if now.time() > no_entry_after:
+            print(f"   ⚠️ Debit spread SKIPPED: past {no_entry_after_str} — not enough time for move")
+            return None
+        
+        # === INTRADAY SCORING ===
+        score = 0
+        final_direction = direction
+        if market_data:
+            intraday_signal = IntradaySignal(
+                symbol=underlying,
+                orb_signal=market_data.get('orb_signal', 'INSIDE_ORB'),
+                vwap_position=market_data.get('price_vs_vwap', market_data.get('vwap_position', 'AT_VWAP')),
+                vwap_trend=market_data.get('vwap_slope', market_data.get('vwap_trend', 'FLAT')),
+                ema_regime=market_data.get('ema_regime', 'NORMAL'),
+                volume_regime=market_data.get('volume_regime', 'NORMAL'),
+                rsi=market_data.get('rsi_14', 50.0),
+                price_momentum=market_data.get('momentum_15m', 0.0),
+                htf_alignment=market_data.get('htf_alignment', 'NEUTRAL'),
+                chop_zone=market_data.get('chop_zone', False),
+                follow_through_candles=market_data.get('follow_through_candles', 0),
+                range_expansion_ratio=market_data.get('range_expansion_ratio', 0.0),
+                vwap_slope_steepening=market_data.get('vwap_slope_steepening', False),
+                atr=market_data.get('atr_14', 0.0)
+            )
+            scorer = get_intraday_scorer()
+            decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, caller_direction=direction)
+            score = decision.confidence_score
+            
+            # Apply debit gate penalties (D2-D4 softened gates)
+            if debit_gate_penalty > 0:
+                score -= debit_gate_penalty
+                print(f"   📉 Debit spread score adjusted: {decision.confidence_score:.0f} → {score:.0f} (gate penalties: -{debit_gate_penalty})")
+            
+            min_score = DEBIT_SPREAD_CONFIG.get('min_score_threshold', 70)
+            if score < min_score:
+                print(f"   ❌ Debit spread REJECTED: {underlying} score {score:.0f} < {min_score} (need high conviction for momentum play)")
+                return None
+            
+            if decision.recommended_direction != "HOLD":
+                final_direction = decision.recommended_direction
+        
+        # Determine spread type
+        is_bullish = final_direction in ('BUY', 'BULLISH')
+        spread_type = "BULL_CALL_SPREAD" if is_bullish else "BEAR_PUT_SPREAD"
+        opt_type = OptionType.CE if is_bullish else OptionType.PE
+        
+        print(f"   📊 Debit Spread: {spread_type} on {underlying} (score: {score:.0f}, move: {move_pct:+.1f}%)")
+        
+        try:
+            # === GET OPTION CHAIN ===
+            expiry_sel_str = 'CURRENT_WEEK'
+            expiry_sel = ExpirySelection[expiry_sel_str]
+            expiry = self.chain_fetcher.get_nearest_expiry(underlying, expiry_sel)
+            
+            if expiry is None:
+                print(f"   ⚠️ No expiry found for {underlying}")
+                return None
+            
+            # DTE check
+            from datetime import date as _date
+            expiry_date = expiry if isinstance(expiry, _date) and not isinstance(expiry, datetime) else expiry.date() if hasattr(expiry, 'date') else expiry
+            dte = (expiry_date - datetime.now().date()).days
+            
+            max_dte = DEBIT_SPREAD_CONFIG.get('max_dte', 7)
+            min_dte = DEBIT_SPREAD_CONFIG.get('min_dte', 0)
+            if dte > max_dte:
+                print(f"   ⚠️ DTE {dte} > max {max_dte} — theta bleed too high for intraday debit spread")
+                return None
+            if dte < min_dte:
+                print(f"   ⚠️ DTE {dte} < min {min_dte}")
+                return None
+            
+            chain = self.chain_fetcher.fetch_option_chain(underlying, expiry)
+            if chain is None or not chain.contracts:
+                print(f"   ⚠️ No option chain for {underlying}")
+                return None
+            
+            print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
+            
+            # === FIND STRIKES ===
+            all_strikes = sorted(set(
+                c.strike for c in chain.contracts
+                if c.option_type == opt_type and (c.expiry is None or c.expiry == expiry)
+            ))
+            
+            sell_offset = spread_width_strikes or DEBIT_SPREAD_CONFIG.get('sell_strike_offset', 3)
+            buy_offset = DEBIT_SPREAD_CONFIG.get('buy_strike_offset', 0)
+            
+            if len(all_strikes) < sell_offset + 1:
+                print(f"   ⚠️ Not enough strikes ({len(all_strikes)}) for debit spread")
+                return None
+            
+            atm_strike = chain.get_atm_strike(expiry)
+            atm_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - atm_strike))
+            
+            if is_bullish:
+                # BULL CALL SPREAD: BUY near-ATM CE, SELL further OTM CE
+                buy_idx = max(0, atm_idx - buy_offset)  # ATM or slightly ITM
+                sell_idx = min(len(all_strikes) - 1, buy_idx + sell_offset)
+            else:
+                # BEAR PUT SPREAD: BUY near-ATM PE, SELL further OTM PE
+                buy_idx = min(len(all_strikes) - 1, atm_idx + buy_offset)  # ATM or slightly ITM
+                sell_idx = max(0, buy_idx - sell_offset)
+            
+            buy_strike = all_strikes[buy_idx]
+            sell_strike = all_strikes[sell_idx]
+            
+            if buy_strike == sell_strike:
+                print(f"   ⚠️ Buy and sell strikes are same — can't form spread")
+                return None
+            
+            buy_contract = chain.get_contract(buy_strike, opt_type, expiry)
+            sell_contract = chain.get_contract(sell_strike, opt_type, expiry)
+            
+            if buy_contract is None or sell_contract is None:
+                print(f"   ⚠️ Could not find contracts for strikes {buy_strike}/{sell_strike}")
+                return None
+            
+            print(f"   📐 Strike selection: ATM={atm_strike}, BUY={buy_strike}, SELL={sell_strike}")
+            
+            # === VALIDATE LIQUIDITY ===
+            min_oi = DEBIT_SPREAD_CONFIG.get('min_oi', 500)
+            if buy_contract.oi < min_oi or sell_contract.oi < min_oi:
+                print(f"   ⚠️ Low OI: buy={buy_contract.oi}, sell={sell_contract.oi} (min: {min_oi})")
+                return None
+            
+            # === BID-ASK SPREAD VALIDATION ===
+            max_bid_ask_pct = DEBIT_SPREAD_CONFIG.get('max_spread_bid_ask_pct', 5.0)
+            for leg_label, contract in [("BUY", buy_contract), ("SELL", sell_contract)]:
+                if contract.ltp > 0 and contract.bid > 0 and contract.ask > 0:
+                    ba_spread_pct = ((contract.ask - contract.bid) / contract.ltp) * 100
+                    if ba_spread_pct > max_bid_ask_pct:
+                        print(f"   ⚠️ Wide bid-ask on {leg_label} leg: {ba_spread_pct:.1f}% > {max_bid_ask_pct}% (bid={contract.bid:.2f} ask={contract.ask:.2f} ltp={contract.ltp:.2f})")
+                        return None
+            
+            # === CALCULATE DEBIT SPREAD FINANCIALS ===
+            buy_premium = buy_contract.ltp
+            sell_premium = sell_contract.ltp
+            net_debit = buy_premium - sell_premium  # We PAY this
+            
+            if net_debit <= 0:
+                print(f"   ⚠️ No net debit: buy@₹{buy_premium:.2f} - sell@₹{sell_premium:.2f} = ₹{net_debit:.2f} — invalid spread")
+                return None
+            
+            # Spread width in rupees
+            spread_width_rs = abs(buy_strike - sell_strike)
+            
+            # Max profit = spread_width - net_debit (if underlying moves past sell strike)
+            max_profit_per_share = spread_width_rs - net_debit
+            if max_profit_per_share <= 0:
+                print(f"   ⚠️ No profit potential: width ₹{spread_width_rs} - debit ₹{net_debit:.2f} = ₹{max_profit_per_share:.2f}")
+                return None
+            
+            # Profit-to-risk ratio check (must be at least 1:1)
+            profit_risk_ratio = max_profit_per_share / net_debit
+            if profit_risk_ratio < 0.5:
+                print(f"   ⚠️ Poor risk/reward: {profit_risk_ratio:.2f} (need >= 0.5)")
+                return None
+            
+            # === POSITION SIZING (TIERED by score — mirrors naked buy sizing) ===
+            lot_size = self.chain_fetcher.get_lot_size(underlying)
+            debit_per_lot = net_debit * lot_size
+            max_debit_config = DEBIT_SPREAD_CONFIG.get('max_debit_per_spread', 60000)
+            max_lots_config = DEBIT_SPREAD_CONFIG.get('max_lots_per_spread', 4)
+            
+            # Score-based tier for debit spreads
+            premium_threshold = 70
+            if score >= premium_threshold:
+                debit_score_tier = "premium"
+                min_lots = DEBIT_SPREAD_CONFIG.get('premium_tier_min_lots', 3)
+            else:
+                debit_score_tier = "standard"
+                min_lots = 2
+            
+            lots_by_debit = max(1, round(max_debit_config / debit_per_lot)) if debit_per_lot > 0 else 1
+            lots = min(lots_by_debit, max_lots_config)
+            lots = max(lots, min_lots)  # Enforce minimum lots for tier
+            
+            # Check total debit spread exposure
+            max_total_exposure = DEBIT_SPREAD_CONFIG.get('max_total_debit_exposure', 75000)
+            current_debit_exposure = self._get_current_debit_spread_exposure()
+            total_debit = net_debit * lot_size * lots
+            
+            if current_debit_exposure + total_debit > max_total_exposure:
+                remaining = max_total_exposure - current_debit_exposure
+                if remaining <= 0:
+                    print(f"   ⚠️ Max debit exposure ₹{max_total_exposure:,.0f} reached (current: ₹{current_debit_exposure:,.0f})")
+                    return None
+                lots = max(1, int(remaining / debit_per_lot))
+            
+            net_debit_total = net_debit * lot_size * lots
+            max_profit_total = max_profit_per_share * lot_size * lots
+            max_loss_total = net_debit_total  # Max loss = total debit paid
+            qty_shares = lots * lot_size
+            
+            # === RISK MANAGEMENT LEVELS ===
+            target_pct = DEBIT_SPREAD_CONFIG.get('target_pct', 50)
+            sl_pct = DEBIT_SPREAD_CONFIG.get('stop_loss_pct', 40)
+            
+            # Target: spread value rises to net_debit * (1 + target_pct/100)
+            target_value = net_debit * (1 + target_pct / 100)
+            # Cap at max profit
+            target_value = min(target_value, spread_width_rs)
+            # SL: spread value drops to net_debit * (1 - sl_pct/100)
+            stop_loss_value = net_debit * (1 - sl_pct / 100)
+            
+            # Breakeven
+            if is_bullish:
+                breakeven = buy_strike + net_debit  # Bull call spread breakeven
+            else:
+                breakeven = buy_strike - net_debit  # Bear put spread breakeven
+            
+            # === NET GREEKS ===
+            net_delta = buy_contract.delta + (sell_contract.delta * -1)  # Sell delta flipped
+            net_theta = buy_contract.theta + (sell_contract.theta * -1)  # Net theta NEGATIVE
+            net_vega = buy_contract.vega + (sell_contract.vega * -1)     # Net vega POSITIVE
+            net_gamma = buy_contract.gamma + (sell_contract.gamma * -1)
+            
+            plan = DebitSpreadPlan(
+                underlying=underlying,
+                direction='BULLISH' if is_bullish else 'BEARISH',
+                spread_type=spread_type,
+                buy_contract=buy_contract,
+                sell_contract=sell_contract,
+                quantity=lots,
+                lot_size=lot_size,
+                net_debit=net_debit,
+                net_debit_total=net_debit_total,
+                max_profit=max_profit_total,
+                max_loss=max_loss_total,
+                spread_width=spread_width_rs,
+                target_value=target_value,
+                stop_loss_value=stop_loss_value,
+                breakeven=breakeven,
+                net_delta=net_delta * qty_shares,
+                net_theta=net_theta * qty_shares,
+                net_vega=net_vega * qty_shares,
+                net_gamma=net_gamma * qty_shares,
+                rationale=f"{spread_type} on {underlying} | Debit ₹{net_debit:.2f}/share | Move {move_pct:+.1f}% | Score:{score:.0f}",
+                greeks_summary=f"NetΔ:{net_delta*qty_shares:.2f} NetΘ:{net_theta*qty_shares:+.2f}/day NetV:{net_vega*qty_shares:.2f} NetΓ:{net_gamma*qty_shares:.4f}",
+                move_pct=move_pct,
+                dte=dte,
+            )
+            
+            print(f"   ✅ {spread_type}: BUY {buy_contract.symbol}@₹{buy_premium:.2f} + SELL {sell_contract.symbol}@₹{sell_premium:.2f}")
+            print(f"      Debit: ₹{net_debit:.2f}/share (₹{net_debit_total:,.0f} total) | R:R = 1:{profit_risk_ratio:.1f}")
+            print(f"      Max Profit: ₹{max_profit_total:,.0f} | Max Loss: ₹{max_loss_total:,.0f}")
+            print(f"      Target: spread at ₹{target_value:.2f} | SL: spread at ₹{stop_loss_value:.2f}")
+            print(f"      Breakeven: ₹{breakeven:.2f} | NetΔ: {net_delta*qty_shares:+.2f} (directional edge)")
+            
+            # Log with candle gate data
+            ft_log = market_data.get('follow_through_candles', 0) if market_data else 0
+            adx_log = market_data.get('adx_14', market_data.get('adx', 0)) if market_data else 0
+            orb_log = market_data.get('orb_strength_pct', market_data.get('orb_strength', 0)) if market_data else 0
+            try:
+                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                    f.write(f"\n{'='*70}\n")
+                    f.write(f"🚀 DEBIT SPREAD: {spread_type} on {underlying} (move: {move_pct:+.1f}%)\n")
+                    f.write(f"   BUY: {buy_contract.symbol}@₹{buy_premium:.2f} | SELL: {sell_contract.symbol}@₹{sell_premium:.2f}\n")
+                    f.write(f"   Debit: ₹{net_debit_total:,.0f} | Max Profit: ₹{max_profit_total:,.0f} | DTE: {dte}\n")
+                    f.write(f"   Score: {score:.0f} | Tier: {debit_score_tier} | R:R = 1:{profit_risk_ratio:.1f} | Lots: {lots}\n")
+                    f.write(f"   Candle Gates: FT={ft_log} ADX={adx_log:.1f} ORB={orb_log:.0f}%\n")
+                    f.write(f"{'='*70}\n")
+            except Exception:
+                pass
+            
+            return plan
+            
+        except Exception as e:
+            import traceback
+            print(f"   ❌ Debit spread creation failed: {e}")
+            traceback.print_exc()
+            return None
+    
+    def _get_current_debit_spread_exposure(self) -> float:
+        """Get total debit exposure from existing debit spread positions"""
+        total = 0
+        for pos in self.positions:
+            if pos.get('status') == 'OPEN' and pos.get('is_debit_spread'):
+                total += pos.get('net_debit_total', 0)
+        return total
+    
+    def execute_debit_spread(self, plan: DebitSpreadPlan) -> Dict:
+        """
+        Execute a debit spread order (both legs).
+        BUY near-ATM option + SELL further OTM option.
+        """
+        if self.paper_mode:
+            import random
+            buy_order_id = f"DSPREAD_BUY_{random.randint(100000, 999999)}"
+            sell_order_id = f"DSPREAD_SELL_{random.randint(100000, 999999)}"
+            spread_id = f"DSPREAD_{random.randint(100000, 999999)}"
+            
+            position = {
+                'spread_id': spread_id,
+                'is_debit_spread': True,
+                'is_credit_spread': False,
+                'spread_type': plan.spread_type,
+                'underlying': plan.underlying,
+                'direction': plan.direction,
+                # Buy leg (near ATM — directional bet)
+                'buy_symbol': plan.buy_contract.symbol,
+                'buy_strike': plan.buy_contract.strike,
+                'buy_premium': plan.buy_contract.ltp,
+                'buy_order_id': buy_order_id,
+                # Sell leg (further OTM — reduces cost)
+                'sell_symbol': plan.sell_contract.symbol,
+                'sell_strike': plan.sell_contract.strike,
+                'sell_premium': plan.sell_contract.ltp,
+                'sell_order_id': sell_order_id,
+                # Sizing
+                'quantity': plan.quantity * plan.lot_size,
+                'lots': plan.quantity,
+                'lot_size': plan.lot_size,
+                'net_debit': plan.net_debit,
+                'net_debit_total': plan.net_debit_total,
+                'max_profit': plan.max_profit,
+                'max_loss': plan.max_loss,
+                'spread_width': plan.spread_width,
+                # Risk mgmt
+                'target_value': plan.target_value,
+                'stop_loss_value': plan.stop_loss_value,
+                'breakeven': plan.breakeven,
+                # Greeks
+                'net_delta': plan.net_delta,
+                'net_theta': plan.net_theta,
+                'net_vega': plan.net_vega,
+                'move_pct': plan.move_pct,
+                'dte': plan.dte,
+                # Status
+                'status': 'OPEN',
+                'timestamp': datetime.now().isoformat(),
+                'rationale': plan.rationale,
+            }
+            
+            self.positions.append(position)
+            
+            return {
+                'success': True,
+                'paper_trade': True,
+                'spread_id': spread_id,
+                'buy_order_id': buy_order_id,
+                'sell_order_id': sell_order_id,
+                'spread_type': plan.spread_type,
+                'underlying': plan.underlying,
+                'buy_symbol': plan.buy_contract.symbol,
+                'sell_symbol': plan.sell_contract.symbol,
+                'net_debit': plan.net_debit,
+                'net_debit_total': plan.net_debit_total,
+                'max_profit': plan.max_profit,
+                'max_loss': plan.max_loss,
+                'move_pct': plan.move_pct,
+                'dte': plan.dte,
+                'lots': plan.quantity,
+                'greeks': plan.greeks_summary,
+                'rationale': plan.rationale,
+                'message': f"🚀 DEBIT SPREAD: {plan.spread_type} | Debit ₹{plan.net_debit_total:,.0f} | Max Profit ₹{plan.max_profit:,.0f}"
+            }
+        else:
+            # LIVE MODE: Place both legs
+            try:
+                buy_exchange, buy_ts = plan.buy_contract.symbol.split(':')
+                sell_exchange, sell_ts = plan.sell_contract.symbol.split(':')
+                qty_shares = plan.quantity * plan.lot_size
+                
+                # Leg 1: BUY the near-ATM option (directional bet)
+                buy_order_id = self.kite.place_order(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=buy_exchange,
+                    tradingsymbol=buy_ts,
+                    transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                    quantity=qty_shares,
+                    product=self.kite.PRODUCT_MIS,
+                    order_type=self.kite.ORDER_TYPE_MARKET
+                )
+                
+                # Leg 2: SELL the further OTM option (reduce cost)
+                sell_order_id = self.kite.place_order(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=sell_exchange,
+                    tradingsymbol=sell_ts,
+                    transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                    quantity=qty_shares,
+                    product=self.kite.PRODUCT_MIS,
+                    order_type=self.kite.ORDER_TYPE_MARKET
+                )
+                
+                return {
+                    'success': True,
+                    'paper_trade': False,
+                    'buy_order_id': str(buy_order_id),
+                    'sell_order_id': str(sell_order_id),
+                    'message': f"Debit spread placed: BUY {buy_ts} + SELL {sell_ts}"
+                }
+                
+            except Exception as e:
+                return {
+                    'success': False,
+                    'error': str(e),
+                    'message': f"Debit spread failed: {e}"
+                }
+
     def execute_option_order(self, plan: OptionOrderPlan) -> Dict:
         """
         Execute an option order plan
@@ -2334,6 +3786,10 @@ class OptionsTrader:
             if pos['status'] != 'OPEN':
                 continue
             
+            # Skip credit spreads — they use exit_manager, not Greeks-based exits
+            if pos.get('is_credit_spread') or pos.get('is_debit_spread') or '|' in pos.get('symbol', ''):
+                continue
+            
             symbol = pos['symbol']
             
             try:
@@ -2395,11 +3851,19 @@ class OptionsTrader:
             if pos['status'] != 'OPEN':
                 continue
             
+            # Skip credit spreads (they store Greeks differently)
+            if pos.get('is_credit_spread') or '|' in pos.get('symbol', ''):
+                continue
+            
+            greeks = pos.get('greeks', {})
+            if not greeks:
+                continue
+            
             qty = pos['quantity'] * pos['lot_size']
-            total_delta += pos['greeks']['delta'] * qty
-            total_gamma += pos['greeks']['gamma'] * qty
-            total_theta += pos['greeks']['theta'] * qty
-            total_vega += pos['greeks']['vega'] * qty
+            total_delta += greeks.get('delta', 0) * qty
+            total_gamma += greeks.get('gamma', 0) * qty
+            total_theta += greeks.get('theta', 0) * qty
+            total_vega += greeks.get('vega', 0) * qty
         
         return {
             'total_delta': total_delta,

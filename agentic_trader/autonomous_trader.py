@@ -55,6 +55,7 @@ class AutonomousTrader:
         self.paper_mode = paper_mode
         self.start_capital = capital
         self.daily_pnl = 0
+        self._pnl_lock = threading.Lock()  # Thread-safe P&L updates
         self.trades_today = []
         self.positions = []
         
@@ -88,8 +89,9 @@ class AutonomousTrader:
         # Sync self.daily_pnl and self.capital so the display is correct.
         persisted_pnl = getattr(self.tools, 'paper_pnl', 0) or 0
         if persisted_pnl != 0:
-            self.daily_pnl = persisted_pnl
-            self.capital = capital + persisted_pnl
+            with self._pnl_lock:
+                self.daily_pnl = persisted_pnl
+                self.capital = capital + persisted_pnl
             print(f"  📊 Restored daily P&L: ₹{persisted_pnl:+,.0f} | Capital: ₹{self.capital:,.0f}")
         
         # Real-time monitoring
@@ -98,8 +100,9 @@ class AutonomousTrader:
         self.monitor_interval = 3  # Check every 3 seconds
         
         # ORB trade tracking - once per direction per symbol per day
-        self.orb_trades_today = {}  # {symbol: {"UP": False, "DOWN": False}}
-        self.orb_tracking_date = datetime.now().date()
+        # Persisted to disk so mid-day restarts don't allow duplicate ORB entries
+        self._orb_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'orb_trades_state.json')
+        self.orb_trades_today, self.orb_tracking_date = self._load_orb_state()
         
         # Exit Manager for consistent exits
         self.exit_manager = get_exit_manager()
@@ -155,12 +158,43 @@ class AutonomousTrader:
         print("  📊 Options Trading: ACTIVE (F&O stocks)")
         print("="*60)
     
+    def _save_orb_state(self):
+        """Persist ORB trade tracking to disk for restart safety"""
+        try:
+            state = {
+                'date': str(self.orb_tracking_date),
+                'trades': self.orb_trades_today
+            }
+            with open(self._orb_state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"⚠️ Failed to save ORB state: {e}")
+
+    def _load_orb_state(self):
+        """Load persisted ORB state; returns empty if file missing or stale date"""
+        today = datetime.now().date()
+        try:
+            if os.path.exists(self._orb_state_file):
+                with open(self._orb_state_file, 'r') as f:
+                    state = json.load(f)
+                saved_date = state.get('date', '')
+                if saved_date == str(today):
+                    trades = state.get('trades', {})
+                    count = sum(1 for s in trades.values() for d, v in s.items() if v)
+                    if count:
+                        print(f"📊 ORB state restored: {count} direction(s) already traded today")
+                    return trades, today
+        except Exception as e:
+            print(f"⚠️ Failed to load ORB state: {e}")
+        return {}, today
+
     def _reset_orb_tracker_if_new_day(self):
         """Reset ORB tracker at start of new trading day"""
         today = datetime.now().date()
         if today != self.orb_tracking_date:
             self.orb_trades_today = {}
             self.orb_tracking_date = today
+            self._save_orb_state()
             print(f"📅 New trading day - ORB tracker reset")
     
     def _is_orb_trade_allowed(self, symbol: str, direction: str) -> bool:
@@ -217,6 +251,20 @@ class AutonomousTrader:
                     target=target,
                     quantity=qty
                 )
+                # Mark credit spread fields on the trade state
+                if trade.get('is_credit_spread'):
+                    state = self.exit_manager.trade_states.get(symbol)
+                    if state:
+                        state.is_credit_spread = True
+                        state.net_credit = trade.get('net_credit', 0)
+                        state.spread_width = trade.get('spread_width', 0)
+                # Mark debit spread fields on the trade state
+                if trade.get('is_debit_spread'):
+                    state = self.exit_manager.trade_states.get(symbol)
+                    if state:
+                        state.is_debit_spread = True
+                        state.net_debit = trade.get('net_debit', 0)
+                        state.spread_width = trade.get('spread_width', 0)
                 # Estimate candles from trade entry timestamp
                 ts = trade.get('timestamp', '')
                 if ts:
@@ -241,6 +289,7 @@ class AutonomousTrader:
         if symbol not in self.orb_trades_today:
             self.orb_trades_today[symbol] = {"UP": False, "DOWN": False}
         self.orb_trades_today[symbol][direction] = True
+        self._save_orb_state()
         print(f"📊 ORB {direction} marked as taken for {symbol} today")
     
     def start_realtime_monitor(self):
@@ -286,19 +335,40 @@ class AutonomousTrader:
         eod_exit_time = datetime.strptime("15:15", "%H:%M").time()  # Exit 5 mins before 3:20
         
         if now >= eod_exit_time:
-            active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+            with self.tools._positions_lock:
+                active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
             
             if active_trades:
                 print(f"\n⏰ END OF DAY - Closing all positions...")
                 
-                # Get current prices
-                symbols = [t['symbol'] for t in active_trades]
+                # Separate trade types
+                regular_trades = [t for t in active_trades if not t.get('is_credit_spread', False) and not t.get('is_debit_spread', False)]
+                spread_trades_eod = [t for t in active_trades if t.get('is_credit_spread', False)]
+                debit_spread_trades_eod = [t for t in active_trades if t.get('is_debit_spread', False)]
+                
+                # Collect all symbols needed for quotes
+                all_symbols = [t['symbol'] for t in regular_trades]
+                for st in spread_trades_eod:
+                    sold_sym = st.get('sold_symbol', '')
+                    hedge_sym = st.get('hedge_symbol', '')
+                    if sold_sym: all_symbols.append(sold_sym)
+                    if hedge_sym: all_symbols.append(hedge_sym)
+                for dt in debit_spread_trades_eod:
+                    buy_sym = dt.get('buy_symbol', '')
+                    sell_sym = dt.get('sell_symbol', '')
+                    if buy_sym: all_symbols.append(buy_sym)
+                    if sell_sym: all_symbols.append(sell_sym)
+                
+                if not all_symbols:
+                    return
+                    
                 try:
-                    quotes = self.tools.kite.quote(symbols)
+                    quotes = self.tools.kite.quote(all_symbols)
                 except:
                     return
                 
-                for trade in active_trades:
+                # --- Close regular trades ---
+                for trade in regular_trades:
                     symbol = trade['symbol']
                     if symbol not in quotes:
                         continue
@@ -316,9 +386,67 @@ class AutonomousTrader:
                     print(f"   🚪 EOD EXIT: {symbol} @ ₹{ltp:.2f}")
                     print(f"      P&L: ₹{pnl:+,.2f}")
                     
-                    self.tools.update_trade_status(symbol, 'EOD_EXIT', ltp, pnl)
-                    self.daily_pnl += pnl
-                    self.capital += pnl
+                    # Grab exit manager state for this trade
+                    eod_exit_detail = {'exit_reason': 'EOD_AUTO_CLOSE', 'exit_type': 'EOD_EXIT'}
+                    try:
+                        em_st = self.exit_manager.get_trade_state(symbol)
+                        if em_st:
+                            eod_exit_detail['candles_held'] = em_st.candles_since_entry
+                            eod_exit_detail['r_multiple_achieved'] = round(em_st.max_favorable_move, 3)
+                            eod_exit_detail['max_favorable_excursion'] = round(em_st.highest_price, 2)
+                    except Exception:
+                        pass
+                    
+                    self.tools.update_trade_status(symbol, 'EOD_EXIT', ltp, pnl, exit_detail=eod_exit_detail)
+                    with self._pnl_lock:
+                        self.daily_pnl += pnl
+                        self.capital += pnl
+                
+                # --- Close credit spreads (both legs) ---
+                for trade in spread_trades_eod:
+                    spread_id = trade.get('spread_id', trade['symbol'])
+                    sold_sym = trade.get('sold_symbol', '')
+                    hedge_sym = trade.get('hedge_symbol', '')
+                    qty = trade['quantity']
+                    net_credit = trade.get('net_credit', 0)
+                    
+                    sold_ltp = quotes.get(sold_sym, {}).get('last_price', 0) if sold_sym else 0
+                    hedge_ltp = quotes.get(hedge_sym, {}).get('last_price', 0) if hedge_sym else 0
+                    current_debit = sold_ltp - hedge_ltp  # Cost to close the spread
+                    pnl = (net_credit - current_debit) * qty
+                    
+                    print(f"   🚪 EOD EXIT SPREAD: {spread_id}")
+                    print(f"      Sold leg: {sold_sym} @ ₹{sold_ltp:.2f} | Hedge: {hedge_sym} @ ₹{hedge_ltp:.2f}")
+                    print(f"      Credit: ₹{net_credit:.2f} → Debit: ₹{current_debit:.2f} | P&L: ₹{pnl:+,.2f}")
+                    
+                    self.tools.update_trade_status(trade['symbol'], 'EOD_EXIT', current_debit, pnl,
+                                                   exit_detail={'exit_reason': 'EOD_AUTO_CLOSE', 'exit_type': 'EOD_EXIT'})
+                    with self._pnl_lock:
+                        self.daily_pnl += pnl
+                        self.capital += pnl
+                
+                # --- Close debit spreads (both legs) ---
+                for trade in debit_spread_trades_eod:
+                    spread_id = trade.get('spread_id', trade['symbol'])
+                    buy_sym = trade.get('buy_symbol', '')
+                    sell_sym = trade.get('sell_symbol', '')
+                    qty = trade['quantity']
+                    net_debit = trade.get('net_debit', 0)
+                    
+                    buy_ltp = quotes.get(buy_sym, {}).get('last_price', 0) if buy_sym else 0
+                    sell_ltp = quotes.get(sell_sym, {}).get('last_price', 0) if sell_sym else 0
+                    current_value = buy_ltp - sell_ltp
+                    pnl = (current_value - net_debit) * qty
+                    
+                    print(f"   🚪 EOD EXIT DEBIT SPREAD: {spread_id}")
+                    print(f"      Buy leg: {buy_sym} @ ₹{buy_ltp:.2f} | Sell: {sell_sym} @ ₹{sell_ltp:.2f}")
+                    print(f"      Debit: ₹{net_debit:.2f} → Value: ₹{current_value:.2f} | P&L: ₹{pnl:+,.2f}")
+                    
+                    self.tools.update_trade_status(trade['symbol'], 'EOD_EXIT', current_value, pnl,
+                                                   exit_detail={'exit_reason': 'EOD_AUTO_CLOSE', 'exit_type': 'EOD_EXIT'})
+                    with self._pnl_lock:
+                        self.daily_pnl += pnl
+                        self.capital += pnl
     
     def _check_positions_realtime(self):
         """Check all positions for target/stoploss hits using Exit Manager"""
@@ -330,12 +458,26 @@ class AutonomousTrader:
         # === SYNC: Register any new trades the agent placed since last check ===
         self._sync_exit_manager_with_positions()
         
-        # Separate equity and option positions
+        # Separate trade types
         equity_trades = [t for t in active_trades if not t.get('is_option', False)]
-        option_trades = [t for t in active_trades if t.get('is_option', False)]
+        option_trades = [t for t in active_trades if t.get('is_option', False) and not t.get('is_credit_spread', False) and not t.get('is_debit_spread', False)]
+        spread_trades = [t for t in active_trades if t.get('is_credit_spread', False)]
+        debit_spread_trades = [t for t in active_trades if t.get('is_debit_spread', False)]
         
-        # Get current prices for ALL positions (equity + options)
-        all_symbols = [t['symbol'] for t in active_trades]
+        # === GET CURRENT PRICES ===
+        # For spreads (credit & debit), we need both leg symbols
+        all_symbols = set()
+        for t in active_trades:
+            if t.get('is_credit_spread'):
+                all_symbols.add(t.get('sold_symbol', ''))
+                all_symbols.add(t.get('hedge_symbol', ''))
+            elif t.get('is_debit_spread'):
+                all_symbols.add(t.get('buy_symbol', ''))
+                all_symbols.add(t.get('sell_symbol', ''))
+            else:
+                all_symbols.add(t['symbol'])
+        all_symbols.discard('')
+        all_symbols = list(all_symbols)
         if all_symbols:
             try:
                 quotes = self.tools.kite.quote(all_symbols)
@@ -365,16 +507,23 @@ class AutonomousTrader:
         show_status = (self._monitor_count % 10 == 0)  # Every 30 seconds
         
         # === CHECK OPTION EXITS (Greeks-based) ===
+        # Only check naked option trades — credit spreads use exit_manager
         if option_trades:
             try:
                 option_exits = self.tools.check_option_exits()
                 for exit_signal in option_exits:
                     symbol = exit_signal['symbol']
+                    # Skip credit spread symbols (contain '|')
+                    if '|' in symbol:
+                        continue
                     reason = exit_signal.get('reason', 'Greeks exit')
                     
                     # Find the option trade
                     opt_trade = next((t for t in option_trades if t['symbol'] == symbol), None)
                     if opt_trade:
+                        # Guard: re-check status to prevent double-close from main thread
+                        if opt_trade.get('status', 'OPEN') != 'OPEN':
+                            continue
                         entry = opt_trade['avg_price']
                         qty = opt_trade['quantity']
                         # Try to get current price
@@ -391,26 +540,59 @@ class AutonomousTrader:
                         print(f"   P&L: ₹{pnl:+,.0f}")
                         
                         self.tools.update_trade_status(symbol, exit_signal.get('exit_type', 'GREEKS_EXIT'), ltp, pnl)
-                        self.daily_pnl += pnl
-                        self.capital += pnl
+                        with self._pnl_lock:
+                            self.daily_pnl += pnl
+                            self.capital += pnl
                         
                         # Record with Risk Governor (include unrealized P&L from open positions)
                         open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
                         unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                         self.risk_governor.record_trade_result(symbol, pnl, pnl > 0, unrealized_pnl=unrealized)
                         self.risk_governor.update_capital(self.capital)
+                        
+                        # Notify scorer for per-symbol re-entry prevention
+                        try:
+                            from options_trader import get_intraday_scorer
+                            scorer = get_intraday_scorer()
+                            if pnl > 0:
+                                scorer.record_symbol_win(symbol)
+                            else:
+                                scorer.record_symbol_loss(symbol)
+                        except Exception:
+                            pass
             except Exception as e:
                 if show_status:
                     print(f"   ⚠️ Option exit check error: {e}")
         
         # === EXIT MANAGER INTEGRATION ===
-        # Check all trades via exit manager (equity AND options)
+        # Check all trades via exit manager (equity AND options AND spreads)
         # Filter out zero-price entries (quote failures) to prevent phantom SL triggers
         price_dict = {}
         for t in active_trades:
-            ltp_val = quotes.get(t['symbol'], {}).get('last_price', 0)
-            if ltp_val and ltp_val > 0:
-                price_dict[t['symbol']] = ltp_val
+            if t.get('is_credit_spread'):
+                # For credit spreads: compute current net debit (cost to close)
+                sold_sym = t.get('sold_symbol', '')
+                hedge_sym = t.get('hedge_symbol', '')
+                sold_ltp = quotes.get(sold_sym, {}).get('last_price', 0)
+                hedge_ltp = quotes.get(hedge_sym, {}).get('last_price', 0)
+                if sold_ltp > 0 and hedge_ltp > 0:
+                    # Current debit to close = sold_ltp - hedge_ltp (buy back sold, sell hedge)
+                    current_debit = sold_ltp - hedge_ltp
+                    price_dict[t['symbol']] = max(0, current_debit)  # Debit can't be negative
+            elif t.get('is_debit_spread'):
+                # For debit spreads: compute current spread value
+                buy_sym = t.get('buy_symbol', '')
+                sell_sym = t.get('sell_symbol', '')
+                buy_ltp = quotes.get(buy_sym, {}).get('last_price', 0)
+                sell_ltp = quotes.get(sell_sym, {}).get('last_price', 0)
+                if buy_ltp > 0 and sell_ltp > 0:
+                    # Current value = buy_ltp - sell_ltp (what we'd receive if closing)
+                    current_value = buy_ltp - sell_ltp
+                    price_dict[t['symbol']] = max(0, current_value)
+            else:
+                ltp_val = quotes.get(t['symbol'], {}).get('last_price', 0)
+                if ltp_val and ltp_val > 0:
+                    price_dict[t['symbol']] = ltp_val
         exit_signals = self.exit_manager.check_all_exits(price_dict)
         
         # Process exit signals first (highest priority)
@@ -419,6 +601,9 @@ class AutonomousTrader:
                 trade = next((t for t in active_trades if t['symbol'] == signal.symbol), None)
                 if trade:
                     symbol = signal.symbol
+                    # Guard: re-check status to prevent double-close from main thread
+                    if trade.get('status', 'OPEN') != 'OPEN':
+                        continue
                     ltp = price_dict.get(symbol, 0) or signal.exit_price
                     # Guard: never exit at price 0 (quote failure)
                     if ltp <= 0:
@@ -455,8 +640,9 @@ class AutonomousTrader:
                         
                         # Update trade quantity to remaining
                         self.tools.partial_exit_trade(symbol, exit_qty, ltp, partial_pnl)
-                        self.daily_pnl += partial_pnl
-                        self.capital += partial_pnl
+                        with self._pnl_lock:
+                            self.daily_pnl += partial_pnl
+                            self.capital += partial_pnl
                         
                         # Update exit manager state with reduced quantity
                         em_state = self.exit_manager.get_trade_state(symbol)
@@ -472,12 +658,24 @@ class AutonomousTrader:
                         continue
                     
                     # === FULL EXIT ===
-                    if side == 'BUY':
+                    if trade.get('is_credit_spread'):
+                        # Credit spread P&L = (net_credit - current_debit) × quantity
+                        credit = trade.get('net_credit', 0)
+                        current_debit = ltp  # For spreads, ltp stores current net debit
+                        pnl = (credit - current_debit) * qty
+                        pnl_pct = (credit - current_debit) / credit * 100 if credit > 0 else 0
+                    elif trade.get('is_debit_spread'):
+                        # Debit spread P&L = (current_value - net_debit) × quantity
+                        net_debit = trade.get('net_debit', 0)
+                        current_value = ltp  # For debit spreads, ltp stores current spread value
+                        pnl = (current_value - net_debit) * qty
+                        pnl_pct = (current_value - net_debit) / net_debit * 100 if net_debit > 0 else 0
+                    elif side == 'BUY':
                         pnl = (ltp - entry) * qty
                     else:
                         pnl = (entry - ltp) * qty
                     
-                    pnl_pct = pnl / (entry * qty) * 100
+                    pnl_pct = pnl / (entry * qty) * 100 if not trade.get('is_debit_spread') else pnl_pct
                     was_win = pnl > 0
                     
                     # Exit based on signal type
@@ -488,7 +686,12 @@ class AutonomousTrader:
                         'TIME_STOP': '⏱️',
                         'TRAILING_SL': '📈',
                         'PARTIAL_PROFIT': '💰',
-                        'OPTION_SPEED_GATE': '🚀'
+                        'OPTION_SPEED_GATE': '🚀',
+                        'DEBIT_SPREAD_SL': '❌',
+                        'DEBIT_SPREAD_TARGET': '🎯',
+                        'DEBIT_SPREAD_TIME_EXIT': '⏰',
+                        'DEBIT_SPREAD_TRAIL_SL': '📈',
+                        'DEBIT_SPREAD_MAX_PROFIT': '💰',
                     }.get(signal.exit_type, '🚪')
                     
                     print(f"\n{emoji} {signal.exit_type}! {symbol}")
@@ -496,15 +699,47 @@ class AutonomousTrader:
                     print(f"   Entry: ₹{entry:.2f} → Exit: ₹{ltp:.2f}")
                     print(f"   P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)")
                     
-                    self.tools.update_trade_status(symbol, signal.exit_type, ltp, pnl)
-                    self.daily_pnl += pnl
-                    self.capital += pnl
+                    # Grab exit manager state BEFORE removing trade (has candles, R-multiple, etc.)
+                    exit_detail = {}
+                    try:
+                        em_state = self.exit_manager.get_trade_state(symbol)
+                        if em_state:
+                            exit_detail = {
+                                'candles_held': em_state.candles_since_entry,
+                                'r_multiple_achieved': round(em_state.max_favorable_move, 3),
+                                'max_favorable_excursion': round(em_state.highest_price, 2) if em_state.highest_price else 0,
+                                'exit_reason': signal.reason,
+                                'exit_type': signal.exit_type,
+                                'breakeven_applied': em_state.breakeven_applied,
+                                'trailing_active': em_state.trailing_active,
+                                'partial_booked': em_state.partial_booked,
+                                'current_sl_at_exit': round(em_state.current_sl, 2),
+                            }
+                            print(f"   📋 Exit context: {em_state.candles_since_entry} candles | MaxR: {em_state.max_favorable_move:.2f} | BE: {em_state.breakeven_applied} | Trail: {em_state.trailing_active}")
+                    except Exception as e:
+                        print(f"   ⚠️ Could not capture exit detail: {e}")
+                    
+                    self.tools.update_trade_status(symbol, signal.exit_type, ltp, pnl, exit_detail=exit_detail)
+                    with self._pnl_lock:
+                        self.daily_pnl += pnl
+                        self.capital += pnl
                     
                     # Record with Risk Governor (include unrealized P&L from open positions)
                     open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
                     unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                     self.risk_governor.record_trade_result(symbol, pnl, was_win, unrealized_pnl=unrealized)
                     self.risk_governor.update_capital(self.capital)
+                    
+                    # Notify scorer for per-symbol re-entry prevention
+                    try:
+                        from options_trader import get_intraday_scorer
+                        scorer = get_intraday_scorer()
+                        if was_win:
+                            scorer.record_symbol_win(symbol)
+                        else:
+                            scorer.record_symbol_loss(symbol)
+                    except Exception:
+                        pass
                     
                     # Record slippage if we have expected price
                     if hasattr(trade, 'expected_exit') and trade.expected_exit:
@@ -528,15 +763,106 @@ class AutonomousTrader:
             if state:
                 # Sync trailing SL back to trade
                 if state.current_sl != trade['stop_loss']:
+                    old_sl = trade['stop_loss']
                     trade['stop_loss'] = state.current_sl
                     self.tools._save_active_trades()
+                    
+                    # LIVE MODE: Modify the SL order on the exchange
+                    if not self.tools.paper_mode:
+                        sl_order_id = trade.get('sl_order_id')
+                        if sl_order_id:
+                            try:
+                                new_trigger = state.current_sl * (0.999 if trade['side'] == 'BUY' else 1.001)
+                                self.tools.kite.modify_order(
+                                    variety=self.tools.kite.VARIETY_REGULAR,
+                                    order_id=sl_order_id,
+                                    trigger_price=round(new_trigger, 1)
+                                )
+                                print(f"   🔄 LIVE SL modified on exchange: {symbol} {old_sl} → {state.current_sl}")
+                            except Exception as e:
+                                print(f"   ⚠️ Failed to modify SL order on exchange for {symbol}: {e}")
         
         if show_status and active_trades:
             print(f"\n👁️ LIVE POSITIONS [{datetime.now().strftime('%H:%M:%S')}]:")
-            print(f"{'Symbol':15} {'Side':6} {'Entry':>10} {'LTP':>10} {'SL':>10} {'Target':>10} {'P&L':>12} {'Status'}")
-            print("-" * 95)
+            
+            # --- Show credit spreads first ---
+            if spread_trades:
+                print(f"{'Spread':30} {'Credit':>10} {'Debit':>10} {'MaxRisk':>10} {'P&L':>12} {'Status'}")
+                print("-" * 95)
+                for trade in spread_trades:
+                    if trade.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    spread_id = trade.get('spread_id', trade['symbol'])
+                    sold_sym = trade.get('sold_symbol', '')
+                    hedge_sym = trade.get('hedge_symbol', '')
+                    qty = trade['quantity']
+                    net_credit = trade.get('net_credit', 0)
+                    max_risk = trade.get('max_risk', (trade.get('spread_width', 0) - net_credit) * qty)
+                    
+                    sold_ltp = quotes.get(sold_sym, {}).get('last_price', 0) if sold_sym else 0
+                    hedge_ltp = quotes.get(hedge_sym, {}).get('last_price', 0) if hedge_sym else 0
+                    current_debit = sold_ltp - hedge_ltp
+                    pnl = (net_credit - current_debit) * qty
+                    pnl_pct = (net_credit - current_debit) / net_credit * 100 if net_credit > 0 else 0
+                    
+                    state = self.exit_manager.get_trade_state(trade['symbol'])
+                    status_flags = "θ+ "
+                    if state:
+                        target_cr = getattr(state, 'target_credit', net_credit * 0.35)
+                        sl_debit = getattr(state, 'stop_loss_debit', net_credit * 2)
+                        status_flags += f"TGT:{target_cr:.1f} SL:{sl_debit:.1f}"
+                    
+                    status = "🟢" if pnl > 0 else "🔴"
+                    # Shorten spread_id for display
+                    display_name = spread_id[:28] if len(spread_id) > 28 else spread_id
+                    print(f"{status} {display_name:28} ₹{net_credit:>9.2f} ₹{current_debit:>9.2f} ₹{max_risk:>9,.0f} ₹{pnl:>+10,.0f} ({pnl_pct:+.1f}%) {status_flags}")
+                    print(f"   └─ SELL {sold_sym} @ ₹{sold_ltp:.2f} | HEDGE {hedge_sym} @ ₹{hedge_ltp:.2f}")
+                print()
+            
+            # --- Show debit spreads ---
+            if debit_spread_trades:
+                print(f"{'DebitSpread':30} {'Entry':>10} {'Value':>10} {'MaxProfit':>10} {'P&L':>12} {'Status'}")
+                print("-" * 95)
+                for trade in debit_spread_trades:
+                    if trade.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    spread_id = trade.get('spread_id', trade['symbol'])
+                    buy_sym = trade.get('buy_symbol', '')
+                    sell_sym = trade.get('sell_symbol', '')
+                    qty = trade['quantity']
+                    net_debit = trade.get('net_debit', 0)
+                    max_profit = trade.get('max_profit', 0)
+                    
+                    buy_ltp = quotes.get(buy_sym, {}).get('last_price', 0) if buy_sym else 0
+                    sell_ltp = quotes.get(sell_sym, {}).get('last_price', 0) if sell_sym else 0
+                    current_value = buy_ltp - sell_ltp
+                    pnl = (current_value - net_debit) * qty
+                    pnl_pct = (current_value - net_debit) / net_debit * 100 if net_debit > 0 else 0
+                    
+                    state = self.exit_manager.get_trade_state(trade['symbol'])
+                    status_flags = "Δ+ "
+                    if state:
+                        if state.trailing_active:
+                            status_flags += "📈TRAIL "
+                        if state.breakeven_applied:
+                            status_flags += "🔒BE "
+                        status_flags += f"TGT:{state.target:.1f} SL:{state.current_sl:.1f}"
+                    
+                    status = "🟢" if pnl > 0 else "🔴"
+                    display_name = spread_id[:28] if len(spread_id) > 28 else spread_id
+                    print(f"{status} {display_name:28} ₹{net_debit:>9.2f} ₹{current_value:>9.2f} ₹{max_profit:>9,.0f} ₹{pnl:>+10,.0f} ({pnl_pct:+.1f}%) {status_flags}")
+                    print(f"   └─ BUY {buy_sym} @ ₹{buy_ltp:.2f} | SELL {sell_sym} @ ₹{sell_ltp:.2f}")
+                print()
+            
+            # --- Show regular trades ---
+            regular_open = [t for t in active_trades if not t.get('is_credit_spread', False) and not t.get('is_debit_spread', False) and t.get('status', 'OPEN') == 'OPEN']
+            if regular_open:
+                print(f"{'Symbol':15} {'Side':6} {'Entry':>10} {'LTP':>10} {'SL':>10} {'Target':>10} {'P&L':>12} {'Status'}")
+                print("-" * 95)
         
         for trade in active_trades:
+            if trade.get('is_credit_spread', False) or trade.get('is_debit_spread', False):
+                continue  # Already displayed above
             symbol = trade['symbol']
             if symbol not in quotes:
                 continue
@@ -584,12 +910,30 @@ class AutonomousTrader:
         
         # Print summary after all positions
         if show_status and active_trades:
-            total_pnl = sum(
-                (quotes[t['symbol']]['last_price'] - t['avg_price']) * t['quantity'] 
-                if t['side'] == 'BUY' 
-                else (t['avg_price'] - quotes[t['symbol']]['last_price']) * t['quantity']
-                for t in active_trades if t['symbol'] in quotes and t.get('status', 'OPEN') == 'OPEN'
-            )
+            # Calculate total P&L including all spread types
+            total_pnl = 0
+            for t in active_trades:
+                if t.get('status', 'OPEN') != 'OPEN':
+                    continue
+                if t.get('is_credit_spread', False):
+                    sold_sym = t.get('sold_symbol', '')
+                    hedge_sym = t.get('hedge_symbol', '')
+                    sold_ltp = quotes.get(sold_sym, {}).get('last_price', 0) if sold_sym else 0
+                    hedge_ltp = quotes.get(hedge_sym, {}).get('last_price', 0) if hedge_sym else 0
+                    current_debit = sold_ltp - hedge_ltp
+                    total_pnl += (t.get('net_credit', 0) - current_debit) * t['quantity']
+                elif t.get('is_debit_spread', False):
+                    buy_sym = t.get('buy_symbol', '')
+                    sell_sym = t.get('sell_symbol', '')
+                    buy_ltp = quotes.get(buy_sym, {}).get('last_price', 0) if buy_sym else 0
+                    sell_ltp = quotes.get(sell_sym, {}).get('last_price', 0) if sell_sym else 0
+                    current_value = buy_ltp - sell_ltp
+                    total_pnl += (current_value - t.get('net_debit', 0)) * t['quantity']
+                elif t['symbol'] in quotes:
+                    if t['side'] == 'BUY':
+                        total_pnl += (quotes[t['symbol']]['last_price'] - t['avg_price']) * t['quantity']
+                    else:
+                        total_pnl += (t['avg_price'] - quotes[t['symbol']]['last_price']) * t['quantity']
             print("-" * 95)
             print(f"📊 TOTAL UNREALIZED P&L: ₹{total_pnl:+,.0f} | Capital: ₹{self.capital:,.0f} | Daily P&L: ₹{self.daily_pnl:+,.0f}")
             # Print exit manager status
@@ -644,7 +988,9 @@ class AutonomousTrader:
                 print(f"   {emoji} {update['symbol']}: {update['result']}")
                 print(f"      Entry: ₹{update['entry']:.2f} → Exit: ₹{update['exit']:.2f}")
                 print(f"      P&L: ₹{update['pnl']:+,.2f}")
-                self.daily_pnl += update['pnl']
+                with self._pnl_lock:
+                    self.daily_pnl += update['pnl']
+                    self.capital += update['pnl']  # Also update capital (was missing)
         
         # Show current active positions
         active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
@@ -696,12 +1042,13 @@ class AutonomousTrader:
                     line = f"""
 {symbol}:
   Price: ₹{data['ltp']:.2f} | Change: {data.get('change_pct', 0):.2f}% | Trend: {data.get('trend', 'N/A')}
-  RSI: {data.get('rsi_14', 50):.0f} | ATR: ₹{data.get('atr_14', 0):.2f}
+  RSI: {data.get('rsi_14', 50):.0f} | ATR: ₹{data.get('atr_14', 0):.2f} | ADX: {data.get('adx', 20):.0f}
   VWAP: ₹{data.get('vwap', 0):.2f} ({data.get('price_vs_vwap', 'N/A')}) Slope: {data.get('vwap_slope', 'FLAT')}
   EMA9: ₹{data.get('ema_9', 0):.2f} | EMA21: ₹{data.get('ema_21', 0):.2f} | Regime: {data.get('ema_regime', 'N/A')}
-  ORB: H=₹{data.get('orb_high', 0):.2f} L=₹{data.get('orb_low', 0):.2f} → {data.get('orb_signal', 'N/A')} (Str:{data.get('orb_strength', 0):.1f}%)
+  ORB: H=₹{data.get('orb_high', 0):.2f} L=₹{data.get('orb_low', 0):.2f} → {data.get('orb_signal', 'N/A')} (Str:{data.get('orb_strength', 0):.1f}%) Hold:{data.get('orb_hold_candles', 0)}
   Volume: {data.get('volume_regime', 'N/A')} ({data.get('volume_vs_avg', 1.0):.1f}x avg) | Order Flow: {order_flow} | Buy%: {buy_ratio}%
   HTF: {data.get('htf_trend', 'N/A')} ({data.get('htf_alignment', 'N/A')}) | Chop: {'⚠️YES' if data.get('chop_zone', False) else 'NO'}
+  Accel: FollowThru:{data.get('follow_through_candles', 0)} RangeExp:{data.get('range_expansion_ratio', 0):.1f} VWAPSteep:{'Y' if data.get('vwap_slope_steepening', False) else 'N'}
   Support: ₹{data.get('support_1', 0):.2f} / ₹{data.get('support_2', 0):.2f}
   Resistance: ₹{data.get('resistance_1', 0):.2f} / ₹{data.get('resistance_2', 0):.2f}
   EOD Prediction: {eod_pred}"""
@@ -726,7 +1073,7 @@ class AutonomousTrader:
                     # Get regime detection signals
                     vwap_slope = data.get('vwap_slope', 'FLAT')
                     price_vs_vwap = data.get('price_vs_vwap', 'AT_VWAP')
-                    ema_regime = data.get('ema_regime', 'NEUTRAL')
+                    ema_regime = data.get('ema_regime', 'NORMAL')
                     orb_signal = data.get('orb_signal', 'INSIDE_ORB')
                     orb_strength = data.get('orb_strength', 0)
                     volume_regime = data.get('volume_regime', 'NORMAL')
@@ -763,7 +1110,7 @@ class AutonomousTrader:
                     
                     # REGIME-BASED SETUPS (highest priority)
                     # ORB trades - only once per direction per symbol per day
-                    if orb_signal == "BREAKOUT_UP" and volume_regime in ["HIGH", "EXPLOSIVE"] and ema_regime == "EXPANDING_BULL":
+                    if orb_signal == "BREAKOUT_UP" and volume_regime in ["HIGH", "EXPLOSIVE"] and ema_regime in ["EXPANDING", "NORMAL"]:
                         intended_direction = "BUY"
                         # HTF Check: Block BUY if HTF is BEARISH (unless explosive volume)
                         if htf_trend == "BEARISH" and htf_ema_slope == "FALLING" and volume_regime != "EXPLOSIVE":
@@ -774,7 +1121,7 @@ class AutonomousTrader:
                             regime_signals.append(f"  🚀 {symbol}: ORB↑ +{orb_strength:.1f}% | Vol:{volume_regime} | EMA:BULL | HTF:{htf_trend}")
                         else:
                             setup = "⛔ORB-UP-ALREADY-TAKEN"
-                    elif orb_signal == "BREAKOUT_DOWN" and volume_regime in ["HIGH", "EXPLOSIVE"] and ema_regime == "EXPANDING_BEAR":
+                    elif orb_signal == "BREAKOUT_DOWN" and volume_regime in ["HIGH", "EXPLOSIVE"] and ema_regime in ["EXPANDING", "NORMAL"]:
                         intended_direction = "SELL"
                         # HTF Check: Block SELL if HTF is BULLISH (unless explosive volume)
                         if htf_trend == "BULLISH" and htf_ema_slope == "RISING" and volume_regime != "EXPLOSIVE":
@@ -913,7 +1260,7 @@ class AutonomousTrader:
                     direction = None
                     orb_sig = data.get('orb_signal', 'INSIDE_ORB')
                     vol_reg = data.get('volume_regime', 'NORMAL')
-                    ema_reg = data.get('ema_regime', 'NEUTRAL')
+                    ema_reg = data.get('ema_regime', 'NORMAL')
                     htf_a = data.get('htf_alignment', 'NEUTRAL')
                     rsi = data.get('rsi_14', 50)
                     pvw = data.get('price_vs_vwap', 'AT_VWAP')
@@ -925,10 +1272,10 @@ class AutonomousTrader:
                     elif orb_sig == "BREAKOUT_DOWN" and vol_reg in ["HIGH", "EXPLOSIVE"]:
                         setup_type = "ORB_BREAKOUT"
                         direction = "SELL"
-                    elif pvw == "ABOVE_VWAP" and vs == "RISING" and ema_reg in ["EXPANDING_BULL", "EXPANDING", "COMPRESSED"]:
+                    elif pvw == "ABOVE_VWAP" and vs == "RISING" and ema_reg in ["EXPANDING", "COMPRESSED"]:
                         setup_type = "VWAP_TREND"
                         direction = "BUY"
-                    elif pvw == "BELOW_VWAP" and vs == "FALLING" and ema_reg in ["EXPANDING_BEAR", "EXPANDING", "COMPRESSED"]:
+                    elif pvw == "BELOW_VWAP" and vs == "FALLING" and ema_reg in ["EXPANDING", "COMPRESSED"]:
                         setup_type = "VWAP_TREND"
                         direction = "SELL"
                     elif pvw == "ABOVE_VWAP" and vs == "RISING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
@@ -952,6 +1299,122 @@ class AutonomousTrader:
                         fno_opportunities.append(
                             f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]"
                         )
+            
+            # === PROACTIVE DEBIT SPREAD SCANNER ===
+            # Scan for debit spread opportunities INDEPENDENTLY from the cascade
+            # This is the key fix: debit spreads are no longer just a fallback
+            debit_spread_placed = []
+            try:
+                from config import DEBIT_SPREAD_CONFIG
+                if DEBIT_SPREAD_CONFIG.get('proactive_scan', False) and DEBIT_SPREAD_CONFIG.get('enabled', False):
+                    now_time = datetime.now().time()
+                    debit_cutoff = datetime.strptime(DEBIT_SPREAD_CONFIG.get('no_entry_after', '14:30'), '%H:%M').time()
+                    
+                    if now_time < debit_cutoff:
+                        proactive_min_score = DEBIT_SPREAD_CONFIG.get('proactive_scan_min_score', 68)
+                        proactive_min_move = DEBIT_SPREAD_CONFIG.get('proactive_scan_min_move_pct', 1.5)
+                        
+                        # Find momentum setups that qualify for debit spreads
+                        debit_candidates = []
+                        for symbol, data in sorted_data:
+                            if not isinstance(data, dict) or 'ltp' not in data:
+                                continue
+                            # Skip if already holding or in chop zone
+                            if self.tools.is_symbol_in_active_trades(symbol):
+                                continue
+                            if data.get('chop_zone', False):
+                                continue
+                            # Skip if not F&O eligible
+                            if symbol not in fno_prefer_set:
+                                continue
+                            
+                            # Check move % — momentum plays need real movement
+                            chg = abs(data.get('change_pct', 0))
+                            if chg < proactive_min_move:
+                                continue
+                            
+                            # Check follow-through (strongest winner signal)
+                            ft = data.get('follow_through_candles', 0)
+                            min_ft = DEBIT_SPREAD_CONFIG.get('min_follow_through_candles', 2)
+                            if ft < min_ft:
+                                continue
+                            
+                            # Check ADX
+                            adx = data.get('adx_14', data.get('adx', 0))
+                            min_adx = DEBIT_SPREAD_CONFIG.get('min_adx', 28)
+                            if adx > 0 and adx < min_adx:
+                                continue
+                            
+                            # Determine direction from price action
+                            change_pct = data.get('change_pct', 0)
+                            direction = "BUY" if change_pct > 0 else "SELL"
+                            
+                            # Check trend continuation — move must be in direction of trade
+                            orb_sig = data.get('orb_signal', 'INSIDE_ORB')
+                            vol_reg = data.get('volume_regime', 'NORMAL')
+                            
+                            # Priority scoring for debit spread candidates
+                            ds_priority = 0
+                            ds_priority += ft * 10  # Follow-through is king
+                            ds_priority += min(adx, 50)  # ADX contribution
+                            ds_priority += chg * 5  # Bigger move = better
+                            if orb_sig in ("BREAKOUT_UP", "BREAKOUT_DOWN"):
+                                ds_priority += 15
+                            if vol_reg in ("HIGH", "EXPLOSIVE"):
+                                ds_priority += 10
+                            
+                            debit_candidates.append((symbol, data, direction, ds_priority))
+                        
+                        # Sort by priority and try top candidates
+                        debit_candidates.sort(key=lambda x: x[3], reverse=True)
+                        
+                        max_debit_entries = 2  # Max 2 proactive debit spreads per scan cycle
+                        for symbol, data, direction, priority in debit_candidates[:max_debit_entries]:
+                            try:
+                                print(f"\n   🎯 PROACTIVE DEBIT SPREAD: Trying {symbol} ({direction}) — Priority: {priority:.0f}")
+                                
+                                # === PRE-FLIGHT LIQUIDITY CHECK ===
+                                # Verify option chain has adequate OI + tight bid-ask BEFORE
+                                # spending API calls on full debit spread creation
+                                try:
+                                    from options_trader import get_options_trader
+                                    _ot = get_options_trader(
+                                        kite=self.tools.kite,
+                                        capital=getattr(self.tools, 'paper_capital', 500000),
+                                        paper_mode=getattr(self.tools, 'paper_mode', True)
+                                    )
+                                    is_liquid, liq_reason = _ot.chain_fetcher.quick_check_option_liquidity(
+                                        underlying=symbol,
+                                        min_oi=DEBIT_SPREAD_CONFIG.get('min_oi', 500),
+                                        max_bid_ask_pct=DEBIT_SPREAD_CONFIG.get('max_spread_bid_ask_pct', 5.0)
+                                    )
+                                    if not is_liquid:
+                                        print(f"   ❌ LIQUIDITY PRE-CHECK FAILED for {symbol}: {liq_reason}")
+                                        continue
+                                    print(f"   ✅ Liquidity OK: {liq_reason}")
+                                except Exception as liq_e:
+                                    print(f"   ⚠️ Liquidity check skipped (error: {liq_e}) — proceeding anyway")
+                                
+                                result = self.tools.place_debit_spread(
+                                    underlying=symbol,
+                                    direction=direction,
+                                    rationale=f"Proactive debit spread: FT={data.get('follow_through_candles', 0)} ADX={data.get('adx_14', 0):.0f} Move={data.get('change_pct', 0):+.1f}%",
+                                    pre_fetched_market_data=data
+                                )
+                                if result.get('success'):
+                                    print(f"   ✅ PROACTIVE DEBIT SPREAD PLACED on {symbol}!")
+                                    debit_spread_placed.append(symbol)
+                                else:
+                                    print(f"   ℹ️ Debit spread not viable for {symbol}: {result.get('error', 'unknown')}")
+                            except Exception as e:
+                                print(f"   ⚠️ Debit spread attempt failed for {symbol}: {e}")
+                        
+                        if debit_spread_placed:
+                            print(f"\n   🚀 PROACTIVE DEBIT SPREADS PLACED: {', '.join(debit_spread_placed)}")
+                        elif debit_candidates:
+                            print(f"\n   ℹ️ {len(debit_candidates)} debit spread candidates found, none viable this cycle")
+            except Exception as e:
+                print(f"   ⚠️ Proactive debit spread scan error: {e}")
             
             # Select top detailed stocks for GPT (most active + those with setups)
             top_detail_symbols = [s for s, _ in sorted_data[:10] if isinstance(market_data.get(s), dict) and 'ltp' in market_data.get(s, {})]
@@ -1163,8 +1626,9 @@ W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_
         if pos['side'] == 'SELL':
             pnl = -pnl
         
-        self.daily_pnl += pnl
-        self.capital += pnl
+        with self._pnl_lock:
+            self.daily_pnl += pnl
+            self.capital += pnl
         
         print(f"\n🚪 EXIT: {pos['symbol']} @ ₹{exit_price:.2f}")
         print(f"   Reason: {reason}")
@@ -1200,16 +1664,202 @@ W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_
             self._print_summary()
     
     def _print_summary(self):
-        """Print trading summary"""
+        """Print trading summary AND save structured daily report"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # === Collect data from trade_history.json ===
+        history = []
+        try:
+            import json
+            history_file = os.path.join(os.path.dirname(__file__), 'trade_history.json')
+            if os.path.exists(history_file):
+                with open(history_file, 'r') as f:
+                    all_history = json.load(f)
+                history = [t for t in all_history if t.get('closed_at', '').startswith(today) or t.get('timestamp', '').startswith(today)]
+        except Exception:
+            pass
+        
+        total_trades = len(history)
+        winners = [t for t in history if t.get('pnl', 0) > 0]
+        losers = [t for t in history if t.get('pnl', 0) < 0]
+        breakevens = [t for t in history if t.get('pnl', 0) == 0]
+        
+        total_pnl = sum(t.get('pnl', 0) for t in history)
+        avg_win = sum(t['pnl'] for t in winners) / len(winners) if winners else 0
+        avg_loss = sum(t['pnl'] for t in losers) / len(losers) if losers else 0
+        win_rate = len(winners) / total_trades * 100 if total_trades > 0 else 0
+        
+        # By strategy
+        by_strategy = {}
+        for t in history:
+            strat = t.get('strategy_type', t.get('spread_type', 'NAKED_OPTION'))
+            if t.get('is_credit_spread'):
+                strat = 'CREDIT_SPREAD'
+            elif t.get('is_debit_spread'):
+                strat = 'DEBIT_SPREAD'
+            if strat not in by_strategy:
+                by_strategy[strat] = {'wins': 0, 'losses': 0, 'pnl': 0}
+            if t.get('pnl', 0) > 0:
+                by_strategy[strat]['wins'] += 1
+            elif t.get('pnl', 0) < 0:
+                by_strategy[strat]['losses'] += 1
+            by_strategy[strat]['pnl'] += t.get('pnl', 0)
+        
+        # By exit type
+        by_exit = {}
+        for t in history:
+            exit_type = t.get('result', 'UNKNOWN')
+            by_exit[exit_type] = by_exit.get(exit_type, 0) + 1
+        
+        # By score tier
+        by_tier = {}
+        for t in history:
+            tier = t.get('score_tier', t.get('entry_metadata', {}).get('score_tier', 'unknown'))
+            if tier not in by_tier:
+                by_tier[tier] = {'wins': 0, 'losses': 0, 'pnl': 0}
+            if t.get('pnl', 0) > 0:
+                by_tier[tier]['wins'] += 1
+            elif t.get('pnl', 0) < 0:
+                by_tier[tier]['losses'] += 1
+            by_tier[tier]['pnl'] += t.get('pnl', 0)
+        
+        # Candle gate analysis — did entry characteristics predict outcome?
+        gate_analysis = {'ft_winners_avg': 0, 'ft_losers_avg': 0, 'adx_winners_avg': 0, 'adx_losers_avg': 0}
+        for t in history:
+            meta = t.get('entry_metadata', {})
+            ft = meta.get('follow_through_candles', 0)
+            adx = meta.get('adx', 0)
+            if t.get('pnl', 0) > 0:
+                gate_analysis['ft_winners_avg'] = (gate_analysis['ft_winners_avg'] + ft) / 2 if gate_analysis['ft_winners_avg'] else ft
+                gate_analysis['adx_winners_avg'] = (gate_analysis['adx_winners_avg'] + adx) / 2 if gate_analysis['adx_winners_avg'] else adx
+            elif t.get('pnl', 0) < 0:
+                gate_analysis['ft_losers_avg'] = (gate_analysis['ft_losers_avg'] + ft) / 2 if gate_analysis['ft_losers_avg'] else ft
+                gate_analysis['adx_losers_avg'] = (gate_analysis['adx_losers_avg'] + adx) / 2 if gate_analysis['adx_losers_avg'] else adx
+        
+        # Exit manager quality — candles held, R achieved
+        avg_candles_held = 0
+        avg_r_achieved = 0
+        max_r_left_on_table = 0
+        r_trades = 0
+        for t in history:
+            ed = t.get('exit_detail', {})
+            candles = ed.get('candles_held', 0)
+            r_mult = ed.get('r_multiple_achieved', 0)
+            if candles > 0:
+                avg_candles_held += candles
+                r_trades += 1
+            if r_mult:
+                avg_r_achieved += r_mult
+        if r_trades > 0:
+            avg_candles_held /= r_trades
+            avg_r_achieved /= r_trades
+        
+        # === PRINT TO TERMINAL ===
         print("\n" + "="*60)
-        print("📊 TRADING SUMMARY")
+        print(f"📊 DAILY TRADING SUMMARY — {today}")
         print("="*60)
-        print(f"  Start capital: ₹{self.start_capital:,}")
-        print(f"  End capital: ₹{self.capital:,}")
-        print(f"  Daily P&L: ₹{self.daily_pnl:,.0f}")
-        print(f"  Return: {(self.capital/self.start_capital - 1)*100:.2f}%")
-        print(f"  Trades: {len(self.trades_today)}")
+        print(f"  Capital: ₹{self.start_capital:,.0f} → ₹{self.capital:,.0f}")
+        print(f"  Daily P&L: ₹{self.daily_pnl:,.0f} ({(self.capital/self.start_capital - 1)*100:+.2f}%)")
+        print(f"  Trades: {total_trades} | W: {len(winners)} | L: {len(losers)} | BE: {len(breakevens)}")
+        print(f"  Win Rate: {win_rate:.1f}%")
+        print(f"  Avg Winner: ₹{avg_win:+,.0f} | Avg Loser: ₹{avg_loss:+,.0f}")
+        if avg_loss != 0:
+            print(f"  Payoff Ratio: {abs(avg_win/avg_loss):.2f}:1")
+        
+        if by_strategy:
+            print(f"\n  📈 BY STRATEGY:")
+            for strat, data in by_strategy.items():
+                print(f"    {strat}: W{data['wins']}/L{data['losses']} P&L: ₹{data['pnl']:+,.0f}")
+        
+        if by_exit:
+            print(f"\n  🚪 BY EXIT TYPE:")
+            for exit_type, count in sorted(by_exit.items(), key=lambda x: x[1], reverse=True):
+                print(f"    {exit_type}: {count}")
+        
+        if by_tier:
+            print(f"\n  🏆 BY SCORE TIER:")
+            for tier, data in by_tier.items():
+                print(f"    {tier}: W{data['wins']}/L{data['losses']} P&L: ₹{data['pnl']:+,.0f}")
+        
+        if r_trades > 0:
+            print(f"\n  ⏱️ EXIT QUALITY:")
+            print(f"    Avg Candles Held: {avg_candles_held:.1f}")
+            print(f"    Avg R-Multiple: {avg_r_achieved:.2f}")
+        
         print("="*60)
+        
+        # === SAVE TO DAILY SUMMARY FILE ===
+        try:
+            import json
+            summary = {
+                'date': today,
+                'capital_start': self.start_capital,
+                'capital_end': round(self.capital, 2),
+                'daily_pnl': round(self.daily_pnl, 2),
+                'return_pct': round((self.capital/self.start_capital - 1)*100, 2),
+                'total_trades': total_trades,
+                'wins': len(winners),
+                'losses': len(losers),
+                'breakevens': len(breakevens),
+                'win_rate': round(win_rate, 1),
+                'avg_winner': round(avg_win, 2),
+                'avg_loser': round(avg_loss, 2),
+                'payoff_ratio': round(abs(avg_win/avg_loss), 2) if avg_loss != 0 else 0,
+                'by_strategy': by_strategy,
+                'by_exit_type': by_exit,
+                'by_score_tier': by_tier,
+                'gate_analysis': gate_analysis,
+                'exit_quality': {
+                    'avg_candles_held': round(avg_candles_held, 1),
+                    'avg_r_multiple': round(avg_r_achieved, 2),
+                },
+                'individual_trades': [
+                    {
+                        'trade_id': t.get('trade_id', ''),
+                        'symbol': t.get('symbol', ''),
+                        'underlying': t.get('underlying', ''),
+                        'side': t.get('side', ''),
+                        'entry_score': t.get('entry_score', t.get('entry_metadata', {}).get('entry_score', 0)),
+                        'score_tier': t.get('score_tier', 'unknown'),
+                        'strategy_type': t.get('strategy_type', ''),
+                        'entry': t.get('avg_price', 0),
+                        'exit': t.get('exit_price', 0),
+                        'pnl': t.get('pnl', 0),
+                        'result': t.get('result', ''),
+                        'candles_held': t.get('exit_detail', {}).get('candles_held', 0),
+                        'r_multiple': t.get('exit_detail', {}).get('r_multiple_achieved', 0),
+                        'ft_at_entry': t.get('entry_metadata', {}).get('follow_through_candles', 0),
+                        'adx_at_entry': t.get('entry_metadata', {}).get('adx', 0),
+                        'orb_at_entry': t.get('entry_metadata', {}).get('orb_strength_pct', 0),
+                        'timestamp': t.get('timestamp', ''),
+                    }
+                    for t in history
+                ],
+            }
+            
+            summary_dir = os.path.join(os.path.dirname(__file__), 'daily_summaries')
+            os.makedirs(summary_dir, exist_ok=True)
+            summary_file = os.path.join(summary_dir, f'daily_summary_{today}.json')
+            
+            with open(summary_file, 'w') as f:
+                json.dump(summary, f, indent=2)
+            print(f"\n  💾 Daily summary saved to: daily_summaries/daily_summary_{today}.json")
+            
+            # Also append to trade_decisions.log
+            from options_trader import TRADE_DECISIONS_LOG
+            with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*70}\n")
+                f.write(f"📊 DAILY SUMMARY — {today}\n")
+                f.write(f"   Capital: ₹{self.start_capital:,.0f} → ₹{self.capital:,.0f}\n")
+                f.write(f"   P&L: ₹{self.daily_pnl:,.0f} ({(self.capital/self.start_capital - 1)*100:+.2f}%)\n")
+                f.write(f"   Trades: {total_trades} | W: {len(winners)} L: {len(losers)}\n")
+                f.write(f"   Win Rate: {win_rate:.1f}% | Payoff: {abs(avg_win/avg_loss):.2f}:1\n" if avg_loss != 0 else f"   Win Rate: {win_rate:.1f}%\n")
+                for strat, data in by_strategy.items():
+                    f.write(f"   {strat}: W{data['wins']}/L{data['losses']} ₹{data['pnl']:+,.0f}\n")
+                f.write(f"   Avg Candles: {avg_candles_held:.1f} | Avg R: {avg_r_achieved:.2f}\n")
+                f.write(f"{'='*70}\n")
+        except Exception as e:
+            print(f"  ⚠️ Could not save daily summary: {e}")
 
 
 def main():
