@@ -174,7 +174,274 @@ class AutonomousTrader:
         print("  🛡️ GTT Safety Net: ACTIVE (server-side SL+target)")
         print("  📦 Autoslice: ACTIVE (freeze qty protection)")
         print("  ⚡ IOC Validity: ACTIVE (spread legs)")
+        
+        # === NEW: Decision Log + Elite Auto-Fire + Adaptive Scan ===
+        from config import DECISION_LOG, ELITE_AUTO_FIRE, ADAPTIVE_SCAN, DYNAMIC_MAX_PICKS
+        self._decision_log_cfg = DECISION_LOG
+        self._elite_auto_fire_cfg = ELITE_AUTO_FIRE
+        self._adaptive_scan_cfg = ADAPTIVE_SCAN
+        self._dynamic_max_picks_cfg = DYNAMIC_MAX_PICKS
+        self._decision_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), DECISION_LOG.get('file', 'scan_decisions.json'))
+        self._auto_fired_this_session = set()   # Symbols auto-fired today (no re-fire)
+        self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
+        
+        if ELITE_AUTO_FIRE.get('enabled'): print("  🎯 Elite Auto-Fire: ACTIVE (score ≥78 → instant execution)")
+        if DYNAMIC_MAX_PICKS.get('enabled'): print(f"  📊 Dynamic Max Picks: ACTIVE (3→5 when signals are hot)")
+        if ADAPTIVE_SCAN.get('enabled'): print(f"  ⏱️ Adaptive Scan: ACTIVE ({ADAPTIVE_SCAN['fast_interval_minutes']}min/{ADAPTIVE_SCAN['normal_interval_minutes']}min/{ADAPTIVE_SCAN['slow_interval_minutes']}min)")
+        if DECISION_LOG.get('enabled'): print(f"  📝 Decision Log: ACTIVE ({DECISION_LOG['file']})")
         print("="*60)
+    
+    # ========== DECISION LOG ==========
+    def _log_decision(self, cycle_time: str, symbol: str, score: float, outcome: str,
+                      reason: str = '', setup: str = '', direction: str = '', extra: dict = None):
+        """Log a scanning decision to scan_decisions.json for post-hoc analysis"""
+        if not self._decision_log_cfg.get('enabled', False):
+            return
+        try:
+            entry = {
+                'timestamp': datetime.now().isoformat(),
+                'cycle': cycle_time,
+                'symbol': symbol,
+                'score': round(score, 1),
+                'outcome': outcome,    # TRADED, AUTO_FIRED, REJECTED, FILTERED, GPT_SKIP, SCORED
+                'reason': reason,
+                'setup': setup,
+                'direction': direction,
+            }
+            if extra:
+                entry.update(extra)
+            
+            # Append to file
+            log_data = []
+            if os.path.exists(self._decision_log_file):
+                try:
+                    with open(self._decision_log_file, 'r') as f:
+                        log_data = json.load(f)
+                except (json.JSONDecodeError, Exception):
+                    log_data = []
+            
+            log_data.append(entry)
+            
+            # Rotate if too large
+            max_entries = self._decision_log_cfg.get('max_entries', 50000)
+            if len(log_data) > max_entries:
+                log_data = log_data[-max_entries:]
+            
+            with open(self._decision_log_file, 'w') as f:
+                json.dump(log_data, f, indent=1)
+        except Exception as e:
+            pass  # Silent — decision log should never break trading
+    
+    # ========== ELITE AUTO-FIRE ==========
+    def _elite_auto_fire(self, pre_scores: dict, cycle_decisions: dict,
+                         sorted_data: list, market_data: dict, fno_nfo_verified: set,
+                         cycle_time: str) -> list:
+        """Auto-execute elite-scored stocks (≥78) without waiting for GPT.
+        
+        Returns list of auto-fired symbols (to exclude from GPT prompt).
+        """
+        cfg = self._elite_auto_fire_cfg
+        if not cfg.get('enabled', False):
+            return []
+        
+        threshold = cfg.get('elite_threshold', 78)
+        max_fires = cfg.get('max_auto_fires_per_cycle', 3)
+        require_setup = cfg.get('require_setup', True)
+        
+        # Find elite candidates
+        elite_candidates = []
+        for sym, score in sorted(pre_scores.items(), key=lambda x: x[1], reverse=True):
+            if score < threshold:
+                break
+            # Skip if already holding
+            if self.tools.is_symbol_in_active_trades(sym):
+                continue
+            # Skip if already auto-fired this session
+            if sym in self._auto_fired_this_session:
+                continue
+            # Skip if not F&O eligible
+            if sym not in fno_nfo_verified:
+                continue
+            # Determine direction from cached decision
+            cached = cycle_decisions.get(sym, {})
+            decision = cached.get('decision')
+            if not decision:
+                continue
+            # Get direction from the decision's signal analysis
+            direction = None
+            if hasattr(decision, 'direction') and decision.direction:
+                direction = decision.direction
+            else:
+                # Fallback: infer from market data
+                data = market_data.get(sym, {})
+                if isinstance(data, dict):
+                    chg = data.get('change_pct', 0)
+                    direction = 'BUY' if chg > 0 else 'SELL'
+            
+            if not direction:
+                continue
+            
+            # Check setup exists if required
+            data = market_data.get(sym, {})
+            if require_setup and isinstance(data, dict):
+                orb = data.get('orb_signal', 'INSIDE_ORB')
+                vwap = data.get('price_vs_vwap', 'AT_VWAP')
+                vol = data.get('volume_regime', 'NORMAL')
+                ema = data.get('ema_regime', 'NORMAL')
+                has_setup = (
+                    orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') or
+                    (vwap in ('ABOVE_VWAP', 'BELOW_VWAP') and vol in ('HIGH', 'EXPLOSIVE')) or
+                    ema == 'COMPRESSED' or
+                    data.get('rsi_14', 50) < 30 or data.get('rsi_14', 50) > 70
+                )
+                if not has_setup:
+                    self._log_decision(cycle_time, sym, score, 'ELITE_BLOCKED',
+                                      reason='No valid setup despite high score', direction=direction)
+                    continue
+            
+            elite_candidates.append((sym, score, direction, data))
+        
+        # Execute top N elite candidates
+        auto_fired = []
+        for sym, score, direction, data in elite_candidates[:max_fires]:
+            # Check position limits
+            active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+            if len(active_positions) >= HARD_RULES['MAX_POSITIONS']:
+                break
+            
+            print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}")
+            try:
+                result = self.tools.place_option_order(
+                    underlying=sym,
+                    direction=direction,
+                    strike_selection="ATM",
+                    rationale=f"ELITE AUTO-FIRE: Score {score:.0f} (threshold {threshold}) — bypassing GPT for immediate execution"
+                )
+                if result and result.get('success'):
+                    print(f"   ✅ ELITE AUTO-FIRED: {sym} ({direction}) score={score:.0f}")
+                    auto_fired.append(sym)
+                    self._auto_fired_this_session.add(sym)
+                    self._log_decision(cycle_time, sym, score, 'AUTO_FIRED',
+                                      reason=f'Elite score {score:.0f} ≥ {threshold}',
+                                      direction=direction, setup='ELITE_AUTO')
+                else:
+                    error = result.get('error', 'unknown') if result else 'no result'
+                    print(f"   ⚠️ Elite auto-fire failed for {sym}: {error}")
+                    self._log_decision(cycle_time, sym, score, 'AUTO_FIRE_FAILED',
+                                      reason=f'Execution failed: {str(error)[:80]}',
+                                      direction=direction)
+            except Exception as e:
+                print(f"   ❌ Elite auto-fire error for {sym}: {e}")
+                self._log_decision(cycle_time, sym, score, 'AUTO_FIRE_ERROR',
+                                  reason=str(e)[:100], direction=direction)
+        
+        if auto_fired:
+            print(f"\n   🎯 ELITE AUTO-FIRED: {len(auto_fired)} trades — {', '.join(auto_fired)}")
+        
+        return auto_fired
+    
+    # ========== DYNAMIC MAX PICKS ==========
+    def _compute_max_picks(self, pre_scores: dict, breadth: str) -> int:
+        """Compute dynamic max picks for GPT based on signal quality."""
+        cfg = self._dynamic_max_picks_cfg
+        if not cfg.get('enabled', False):
+            return 3  # Default
+        
+        default_max = cfg.get('default_max', 3)
+        bonus_max = cfg.get('elite_bonus_max', 5)
+        min_score = cfg.get('min_score_for_bonus', 70)
+        min_count = cfg.get('min_count_for_bonus', 3)
+        choppy_max = cfg.get('choppy_max', 2)
+        
+        # Count high-scoring stocks
+        high_score_count = sum(1 for s in pre_scores.values() if s >= min_score)
+        medium_score_count = sum(1 for s in pre_scores.values() if s >= 60)
+        
+        # Bonus: many high-scoring setups → allow more picks
+        if high_score_count >= min_count:
+            return bonus_max
+        
+        # Restriction: choppy market with few setups → restrict
+        if breadth == 'MIXED' and medium_score_count < 3:
+            return choppy_max
+        
+        return default_max
+    
+    # ========== ADAPTIVE SCAN INTERVAL ==========
+    def _adapt_scan_interval(self, pre_scores: dict):
+        """Adjust the next scan interval based on current signal quality."""
+        cfg = self._adaptive_scan_cfg
+        if not cfg.get('enabled', False):
+            return
+        
+        # Already in early session mode — don't override
+        if not getattr(self, '_switched_to_normal', True):
+            return
+        
+        fast_trigger = cfg.get('fast_trigger_signals', 3)
+        slow_trigger = cfg.get('slow_trigger_signals', 0)
+        
+        hot_count = sum(1 for s in pre_scores.values() if s >= 65)
+        warm_count = sum(1 for s in pre_scores.values() if s >= 55)
+        
+        if hot_count >= fast_trigger:
+            new_interval = cfg.get('fast_interval_minutes', 3)
+            quality = 'fast'
+        elif warm_count <= slow_trigger:
+            new_interval = cfg.get('slow_interval_minutes', 7)
+            quality = 'slow'
+        else:
+            new_interval = cfg.get('normal_interval_minutes', 5)
+            quality = 'normal'
+        
+        # Only reschedule if quality changed
+        if quality != self._last_signal_quality:
+            self._last_signal_quality = quality
+            self._normal_interval = new_interval
+            try:
+                import schedule
+                schedule.clear()
+                schedule.every(new_interval).minutes.do(self.scan_and_trade)
+                _icons = {'fast': '🔥', 'normal': '⏱️', 'slow': '💤'}
+                print(f"\n   {_icons.get(quality, '⏱️')} ADAPTIVE SCAN: Switched to {new_interval}min interval ({quality.upper()}) — {hot_count} hot signals, {warm_count} warm signals")
+            except Exception:
+                pass
+    
+    # ========== LOG FULL CYCLE DECISIONS ==========
+    def _log_cycle_decisions(self, cycle_time: str, pre_scores: dict, 
+                             fno_opportunities: list, auto_fired: list,
+                             sorted_data: list, market_data: dict):
+        """Log all scored stocks from this cycle to the decision log."""
+        if not self._decision_log_cfg.get('enabled', False):
+            return
+        
+        # Build set of symbols that became F&O opportunities
+        fno_syms = set()
+        for opp in fno_opportunities:
+            import re
+            m = re.search(r'underlying="(NSE:\w+)"', opp)
+            if m:
+                fno_syms.add(m.group(1))
+        
+        for sym, score in sorted(pre_scores.items(), key=lambda x: x[1], reverse=True):
+            if sym in auto_fired:
+                continue  # Already logged during auto-fire
+            
+            data = market_data.get(sym, {})
+            chg = data.get('change_pct', 0) if isinstance(data, dict) else 0
+            
+            if sym in fno_syms:
+                outcome = 'FNO_OPPORTUNITY'
+            elif score >= 49:
+                outcome = 'SCORED_PASS'
+            elif score >= 40:
+                outcome = 'SCORED_MARGINAL'
+            else:
+                outcome = 'SCORED_LOW'
+            
+            self._log_decision(cycle_time, sym, score, outcome,
+                              reason=f'chg={chg:+.2f}%',
+                              extra={'change_pct': round(chg, 2)})
     
     def _save_orb_state(self):
         """Persist ORB trade tracking to disk for restart safety"""
@@ -1472,6 +1739,17 @@ class AutonomousTrader:
                 print(f"   ⚠️ Scoring failed: {_e}")
                 self.tools._cached_cycle_decisions = {}
             
+            # === ELITE AUTO-FIRE: Execute top-scoring stocks BEFORE GPT ===
+            _cycle_time = datetime.now().strftime('%H:%M:%S')
+            _auto_fired_syms = self._elite_auto_fire(
+                pre_scores=_pre_scores,
+                cycle_decisions=_cycle_decisions,
+                sorted_data=sorted_data,
+                market_data=market_data,
+                fno_nfo_verified=_all_fo_syms if '_all_fo_syms' in dir() else set(),
+                cycle_time=_cycle_time
+            )
+            
             # Create a quick summary of all stocks for scanning with EOD predictions
             quick_scan = []
             eod_opportunities = []
@@ -1515,6 +1793,9 @@ class AutonomousTrader:
                         setup = f"⚠️CHOP-ZONE({chop_reason})"
                         if symbol in self._wildcard_symbols:
                             print(f"   ⭐ WILDCARD CHOP-BLOCKED: {symbol} — {chop_reason}")
+                        # Decision log: chop rejection
+                        self._log_decision(_cycle_time, symbol, _pre_scores.get(symbol, 0),
+                                          'CHOP_FILTERED', reason=chop_reason)
                         quick_scan.append(f"{symbol}: {chg:+.2f}% RSI:{rsi:.0f} {trend} {setup}")
                         continue  # Skip further analysis for this symbol
                     
@@ -1660,6 +1941,9 @@ class AutonomousTrader:
             for symbol, data in sorted_data:
                 if isinstance(data, dict) and 'ltp' in data and symbol in fno_prefer_set and symbol in fno_nfo_verified:
                     if self.tools.is_symbol_in_active_trades(symbol):
+                        continue
+                    # Skip auto-fired stocks (already executed this cycle)
+                    if symbol in _auto_fired_syms:
                         continue
                     if data.get('chop_zone', False):
                         continue
@@ -2213,6 +2497,17 @@ class AutonomousTrader:
                     _avg = sum(_changes) / len(_changes)
                     _sector_perf.append(f"  {_sec}: {_avg:+.2f}% avg ({len([c for c in _changes if c > 0])}/{len(_changes)} ↑)")
             
+            # === DYNAMIC MAX PICKS: Scale GPT picks with signal quality ===
+            _dynamic_max = self._compute_max_picks(_pre_scores, _breadth)
+            if _dynamic_max != 3:
+                print(f"   📊 DYNAMIC PICKS: GPT allowed up to {_dynamic_max} trades (signal quality {'HIGH' if _dynamic_max > 3 else 'LOW'})")
+            
+            # === AUTO-FIRED MESSAGE: Tell GPT which stocks were already executed ===
+            if _auto_fired_syms:
+                _auto_fired_msg = f"\n⚡ ALREADY AUTO-FIRED (DO NOT re-pick): {', '.join(_auto_fired_syms)}"
+            else:
+                _auto_fired_msg = ""
+            
             prompt = f"""ANALYZE → REASON → EXECUTE. Use your GPT-5.2 reasoning depth.
 
 === 🌐 MARKET BREADTH ===
@@ -2264,7 +2559,7 @@ W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_
 1. Assess MARKET REGIME first (trending/range/mixed day, sector rotation)
 2. ONLY pick from the '⚡ F&O READY SIGNALS' section above — these are pre-validated. Do NOT invent your own picks.
 3. Look at the S: (Score) tags — ONLY pick stocks scoring ≥49✅. Stocks with ❌ WILL BE REJECTED.
-4. Identify TOP 3 setups from the listed opportunities using CONFLUENCE SCORING
+4. Identify TOP {_dynamic_max} setups from the listed opportunities using CONFLUENCE SCORING
 5. Check CONTRARIAN risks (chasing? extended? volume divergence?)
 6. EXECUTE via tools — place_option_order(underlying, direction) for F&O, place_order() for cash
 7. State your reasoning briefly: Setup | Score | Why
@@ -2273,8 +2568,8 @@ W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_
 - Do NOT pick stocks outside the F&O READY SIGNALS list. They are NOT tradeable.
 - Do NOT pick stocks scoring below 49. The scorer WILL block them.
 - If no setups score ≥49, say 'NO TRADES' — do NOT force a trade.
-
-RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.5% | Max 3 trades"""
+{_auto_fired_msg}
+RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.5% | Max {_dynamic_max} trades"""
 
             response = self.agent.run(prompt)
             print(f"\n📊 Agent response:\n{response[:300]}...")
@@ -2477,6 +2772,26 @@ RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.
                 print(f"🔌 Ticker: {_ws_status} | Sub:{_ts['subscribed']}(+{_fut_count} futures) | Hits:{_ts['cache_hits']} | Fallbacks:{_ts['fallbacks']} | Ticks:{_ts['ticks']}")
             
             print(f"⏱️ Cycle: {_cycle_elapsed:.0f}s | Next scan in ~{getattr(self, '_normal_interval', 5)}min")
+            
+            # === ADAPTIVE SCAN INTERVAL: Adjust next scan based on signal quality ===
+            self._adapt_scan_interval(_pre_scores)
+            
+            # === DECISION LOG: Record all scored stocks this cycle ===
+            self._log_cycle_decisions(
+                cycle_time=_cycle_time,
+                pre_scores=_pre_scores,
+                fno_opportunities=fno_opportunities if 'fno_opportunities' in dir() else [],
+                auto_fired=_auto_fired_syms,
+                sorted_data=sorted_data,
+                market_data=market_data
+            )
+            
+            # Auto-fire stats in summary
+            if _auto_fired_syms:
+                print(f"🎯 Auto-Fired: {', '.join(s.replace('NSE:','') for s in _auto_fired_syms)}")
+            if _dynamic_max != 3:
+                print(f"📊 Dynamic Picks: {_dynamic_max} (was 3)")
+            
             print(f"{'='*80}\n")
             
         except Exception as e:

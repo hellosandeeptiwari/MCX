@@ -76,6 +76,57 @@ GTT_CONFIG = {
 # Without this, large F&O orders (e.g., >1800 qty NIFTY) get flat REJECTED.
 AUTOSLICE_ENABLED = True
 
+# === ELITE AUTO-FIRE (Score-Based Autonomous Execution) ===
+# Stocks scoring ≥ elite_threshold are executed IMMEDIATELY via the options
+# pipeline — no need to wait for GPT to pick them. GPT validated the scoring
+# logic; scores 78+ have 80% WR and generate the monster trades.
+# This happens BEFORE the GPT prompt is built, so GPT only sees remaining setups.
+ELITE_AUTO_FIRE = {
+    "enabled": True,
+    "elite_threshold": 78,            # Score ≥ this → auto-fire (78+ = 80% WR historically)
+    "max_auto_fires_per_cycle": 3,    # Max auto-fired trades per scan cycle
+    "require_setup": True,            # Must have a valid setup (ORB/VWAP/MOMENTUM), not just high score
+    "log_all": True,                  # Log every auto-fire decision to scan_decisions.json
+}
+
+# === DYNAMIC MAX PICKS (GPT picks scale with signal quality) ===
+# When market is trending and there are many high-scoring setups, let GPT pick
+# more than the default 3. On choppy days, restrict to 2.
+DYNAMIC_MAX_PICKS = {
+    "enabled": True,
+    "default_max": 3,                 # Standard max picks per GPT call
+    "elite_bonus_max": 5,             # If ≥3 stocks score 70+, allow up to 5 picks
+    "min_score_for_bonus": 70,        # Threshold to count toward bonus check
+    "min_count_for_bonus": 3,         # Need this many stocks above threshold
+    "choppy_max": 2,                  # If breadth is MIXED and <3 setups score 60+, restrict to 2
+}
+
+# === ADAPTIVE SCAN INTERVAL ===
+# Dynamically adjust scan frequency based on signal quality from last cycle.
+# Hot market (many signals) → scan faster to catch more.
+# Dead market (no signals) → scan slower to save GPT calls.
+ADAPTIVE_SCAN = {
+    "enabled": True,
+    "fast_interval_minutes": 3,       # Fast scan when signals are hot
+    "normal_interval_minutes": 5,     # Standard scan (default)
+    "slow_interval_minutes": 7,       # Slow scan when nothing is moving
+    "fast_trigger_signals": 3,        # Switch to fast if ≥ N signals scored 65+
+    "slow_trigger_signals": 0,        # Switch to slow if 0 signals scored 55+
+    "min_fast_interval_minutes": 2,   # Never scan faster than this (API limits)
+}
+
+# === DECISION LOG (Full Scan Audit Trail) ===
+# Logs every stock evaluated each cycle with score, outcome, and reason.
+# Enables post-hoc analysis of missed opportunities.
+DECISION_LOG = {
+    "enabled": True,
+    "file": "scan_decisions.json",
+    "max_entries": 50000,             # Rotate after this many entries
+    "log_all_scored": True,           # Log every scored stock (not just trades)
+    "log_rejections": True,           # Log chop/HTF/gate rejections
+    "log_auto_fires": True,           # Log elite auto-fire decisions
+}
+
 # Trading Hours
 TRADING_HOURS = {
     "start": "09:15",  # Market open
