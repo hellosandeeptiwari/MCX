@@ -245,34 +245,33 @@ class RegimeScorer:
         )
     
     def _score_ema_expansion(self, direction: str, data: Dict) -> ScoreComponent:
-        """Score EMA expansion (max +20)"""
+        """Score EMA expansion (max +20) — direction-aware"""
         max_points = 20
         points = 0
         reason = ""
         
-        ema_regime = data.get('ema_regime', 'NEUTRAL')
+        ema_regime = data.get('ema_regime', 'NORMAL')
         ema_spread = data.get('ema_spread', 0)
+        ema_9 = data.get('ema_9', 0)
+        ema_21 = data.get('ema_21', 0)
         
-        if direction == "BUY":
-            if ema_regime == "EXPANDING_BULL":
+        # Determine EMA direction: bullish = ema_9 > ema_21, bearish = ema_9 < ema_21
+        ema_bullish = ema_9 > ema_21 if ema_9 > 0 and ema_21 > 0 else True
+        direction_aligned = (direction == "BUY" and ema_bullish) or (direction == "SELL" and not ema_bullish)
+        
+        if ema_regime == "EXPANDING":
+            if direction_aligned:
                 points = 20
-                reason = f"Bullish expansion ({ema_spread:.2f}%)"
-            elif ema_regime == "COMPRESSED":
-                points = 10  # Pending breakout
-                reason = "EMA compressed - breakout potential"
-            elif ema_regime == "EXPANDING_BEAR":
-                points = 0
-                reason = "Against trend: EMAs expanding bearish"
-        else:  # SELL
-            if ema_regime == "EXPANDING_BEAR":
-                points = 20
-                reason = f"Bearish expansion ({ema_spread:.2f}%)"
-            elif ema_regime == "COMPRESSED":
-                points = 10
-                reason = "EMA compressed - breakout potential"
-            elif ema_regime == "EXPANDING_BULL":
-                points = 0
-                reason = "Against trend: EMAs expanding bullish"
+                reason = f"EMA expanding in favor ({ema_spread:.2f}%)"
+            else:
+                points = 5  # Expanding AGAINST trade direction — penalize
+                reason = f"EMA expanding AGAINST direction ({ema_spread:.2f}%)"
+        elif ema_regime == "COMPRESSED":
+            points = 10  # Pending breakout — direction unknown
+            reason = "EMA compressed - breakout potential"
+        elif ema_regime == "NORMAL":
+            points = 5
+            reason = "EMA normal range"
         
         return ScoreComponent(
             name="EMA",

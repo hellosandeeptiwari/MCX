@@ -532,8 +532,8 @@ class ExitManager:
                 urgency="NORMAL"
             )
         
-        # 5. TRAILING SL: once >40% profit captured, trail the SL tighter
-        if profit_pct >= 40 and not state.trailing_active:
+        # 5. TRAILING SL: once >17% profit captured, trail the SL tighter
+        if profit_pct >= 17 and not state.trailing_active:
             # Activate trailing — move SL to breakeven (net_credit = entry cost)
             state.trailing_active = True
             state.current_sl = state.net_credit  # SL at breakeven (debit = credit = no loss)
@@ -686,6 +686,18 @@ class ExitManager:
                     reason=f"No follow-through: {state.candles_since_entry} candles, max R: {state.max_favorable_move:.2f}",
                     urgency="NORMAL"
                 )
+            
+            # GAVE-BACK CHECK: Trade had some R but faded back to near zero
+            # If MaxR was decent but current R is < 0.1, the move has stalled/reversed
+            if state.max_favorable_move >= self.time_stop_min_r and r_multiple < 0.1:
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="TIME_STOP",
+                    exit_price=0,
+                    reason=f"Gave back gains: {state.candles_since_entry} candles, had {state.max_favorable_move:.2f}R now {r_multiple:.2f}R — dead trade",
+                    urgency="NORMAL"
+                )
         return None
     
     def _apply_breakeven(self, state: TradeState, r_multiple: float):
@@ -712,9 +724,10 @@ class ExitManager:
             trail_distance = profit * (1 - self.trailing_pct)
             new_sl = state.highest_price - trail_distance
             
-            if new_sl > state.current_sl:
+            rounded_new_sl = round(new_sl, 2)
+            if rounded_new_sl > state.current_sl:
                 old_sl = state.current_sl
-                state.current_sl = round(new_sl, 2)
+                state.current_sl = rounded_new_sl
                 state.trailing_active = True
                 self._persist_state()
                 print(f"📈 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
@@ -724,9 +737,10 @@ class ExitManager:
             trail_distance = profit * (1 - self.trailing_pct)
             new_sl = state.lowest_price + trail_distance
             
-            if new_sl < state.current_sl:
+            rounded_new_sl = round(new_sl, 2)
+            if rounded_new_sl < state.current_sl:
                 old_sl = state.current_sl
-                state.current_sl = round(new_sl, 2)
+                state.current_sl = rounded_new_sl
                 state.trailing_active = True
                 self._persist_state()
                 print(f"📉 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
@@ -740,16 +754,18 @@ class ExitManager:
             
             # === RESET HYSTERESIS FOR TREND FOLLOWING + REGIME SCORER ===
             # This allows fresh trend detection on next entry
-            try:
-                from trend_following import get_trend_engine
-                get_trend_engine().reset_hysteresis(symbol, "POSITION_CLOSED")
-            except ImportError:
-                pass
+            # Note: regime_scorer.reset_hysteresis() internally calls trend_engine.reset_hysteresis()
+            # so we only call regime_scorer to avoid duplicate reset prints
             try:
                 from regime_score import get_regime_scorer
                 get_regime_scorer().reset_hysteresis(symbol, "POSITION_CLOSED")
             except ImportError:
-                pass
+                # Fallback to direct trend engine if regime_scorer unavailable
+                try:
+                    from trend_following import get_trend_engine
+                    get_trend_engine().reset_hysteresis(symbol, "POSITION_CLOSED")
+                except ImportError:
+                    pass
     
     def get_trade_state(self, symbol: str) -> Optional[TradeState]:
         """Get current state of a trade"""

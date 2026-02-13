@@ -10,5 +10,65 @@
     "volume_regime": "NORMAL",
     "timestamp": "2026-02-09T10:37:18.441784",
     "order_type": "LIMIT"
+  },
+  {
+    "symbol": "NSE:IDEA",
+    "side": "BUY",
+    "expected_price": 11.67,
+    "actual_price": 11.66,
+    "slippage_abs": -0.009999999999999787,
+    "slippage_pct": -0.08568980291345148,
+    "slippage_bps": -8.568980291345147,
+    "volume_regime": "HIGH",
+    "timestamp": "2026-02-11T12:51:12.604179",
+    "order_type": "MARKET"
+  },
+  {
+    "symbol": "NSE:IDEA",
+    "side": "BUY",
+    "expected_price": 11.69,
+    "actual_price": 11.68,
+    "slippage_abs": -0.009999999999999787,
+    "slippage_pct": -0.08554319931565259,
+    "slippage_bps": -8.554319931565258,
+    "volume_regime": "HIGH",
+    "timestamp": "2026-02-11T13:57:59.547232",
+    "order_type": "MARKET"
+  },
+  {
+    "symbol": "NSE:IDEA",
+    "side": "SELL",
+    "expected_price": 11.38,
+    "actual_price": 11.38,
+    "slippage_abs": 0.0,
+    "slippage_pct": 0.0,
+    "slippage_bps": 0.0,
+    "volume_regime": "NORMAL",
+    "timestamp": "2026-02-13T09:32:59.968120",
+    "order_type": "LIMIT"
+  },
+  {
+    "symbol": "NSE:PAYTM",
+    "side": "SELL",
+    "expected_price": 1111,
+    "actual_price": 1111.2,
+    "slippage_abs": -0.20000000000004547,
+    "slippage_pct": -0.018001800180022093,
+    "slippage_bps": -1.8001800180022092,
+    "volume_regime": "EXPLOSIVE",
+    "timestamp": "2026-02-13T09:42:07.249615",
+    "order_type": "IOC"
+  },
+  {
+    "symbol": "NSE:PAYTM",
+    "side": "BUY",
+    "expected_price": 1125.1,
+    "actual_price": 1125.1,
+    "slippage_abs": 0.0,
+    "slippage_pct": 0.0,
+    "slippage_bps": 0.0,
+    "volume_regime": "EXPLOSIVE",
+    "timestamp": "2026-02-13T12:54:28.813122",
+    "order_type": "IOC"
   }
 ]

@@ -134,7 +134,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "place_option_order",
-            "description": "Place an F&O option order with automatic strike selection and IntradayOptionScorer validation. Use this for F&O-eligible stocks instead of place_order(). The system auto-selects CE for BUY direction and PE for SELL direction.",
+            "description": "FALLBACK: Place a naked option BUY order. Only use this when place_credit_spread() is not viable or returns fallback. The system auto-selects CE for BUY direction and PE for SELL direction. Requires score >= 70 for entry.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -144,6 +144,55 @@ TOOL_DEFINITIONS = [
                     "rationale": {"type": "string", "description": "Trade rationale (e.g., 'ORB breakout + high volume')"}
                 },
                 "required": ["underlying", "direction"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_credit_spread",
+            "description": "PRIMARY STRATEGY: Place a credit spread (SELL option + BUY hedge). Theta-positive — time decay works in our favor. ALWAYS try this FIRST before place_option_order(). BULLISH view = Bull Put Spread (sell PE + buy further OTM PE). BEARISH view = Bear Call Spread (sell CE + buy further OTM CE). Max risk is defined. If this returns a fallback suggestion, then try place_option_order().",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "underlying": {"type": "string", "description": "Underlying stock symbol like 'NSE:RELIANCE'"},
+                    "direction": {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY = bullish (bull put spread), SELL = bearish (bear call spread)"},
+                    "spread_width": {"type": "integer", "description": "Number of strikes between sold and hedge leg (default: 2)", "default": 2},
+                    "rationale": {"type": "string", "description": "Trade rationale"}
+                },
+                "required": ["underlying", "direction"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_debit_spread",
+            "description": "INTRADAY MOMENTUM: Place a debit spread on a big mover (>2.5% move + high volume). BUY near-ATM + SELL further OTM in direction of move. Cheaper than naked buy, defined risk = net debit. BULLISH → Bull Call Spread (BUY CE + SELL OTM CE). BEARISH → Bear Put Spread (BUY PE + SELL OTM PE). Auto-exits by 3:05 PM. Only use on stocks with strong intraday momentum. Score must be >= 70.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "underlying": {"type": "string", "description": "Underlying stock symbol like 'NSE:EICHERMOT' — must be moving >2.5% intraday"},
+                    "direction": {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY = bullish (bull call spread), SELL = bearish (bear put spread)"},
+                    "spread_width": {"type": "integer", "description": "Number of strikes between buy and sell leg (default: 3)", "default": 3},
+                    "rationale": {"type": "string", "description": "Trade rationale — must mention the big move and momentum"}
+                },
+                "required": ["underlying", "direction"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_iron_condor",
+            "description": "Place an Iron Condor on a range-bound/choppy stock or index. Sells OTM CE + PE (collect premium) and buys further OTM CE + PE (hedge). Best for low-directional stocks with score 15-45. Works on NIFTY/BANKNIFTY (weekly expiry, 0-2 DTE) or F&O stocks (monthly expiry, 3-15 DTE). Auto-exits at 2:50 PM. Max profit = total credit, max loss = spread width - credit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "underlying": {"type": "string", "description": "Underlying symbol like 'NSE:NIFTY 50', 'NSE:NIFTY BANK', or 'NSE:TATASTEEL'"},
+                    "rationale": {"type": "string", "description": "Why this stock is range-bound/choppy — mention low score, flat VWAP, compressed regime, etc."}
+                },
+                "required": ["underlying", "rationale"]
             }
         }
     },
@@ -312,6 +361,84 @@ If auto_execute is False, you must output trade plans for user approval instead 
                         rationale=arguments.get("rationale", ""),
                         use_intraday_scoring=True
                     )
+            elif tool_name == "place_credit_spread":
+                # === ARGUMENT VALIDATION ===
+                underlying = arguments.get("underlying", "")
+                direction = arguments.get("direction", "")
+                
+                if not underlying or not isinstance(underlying, str):
+                    return json.dumps({"success": False, "error": "VALIDATION: 'underlying' is required"})
+                if not underlying.startswith("NSE:"):
+                    underlying = f"NSE:{underlying}"
+                    arguments["underlying"] = underlying
+                
+                if direction not in ("BUY", "SELL"):
+                    return json.dumps({"success": False, "error": f"VALIDATION: 'direction' must be 'BUY' or 'SELL', got '{direction}'"})
+                
+                if not self.auto_execute:
+                    result = {
+                        "success": False,
+                        "message": "Auto-execution disabled. Credit spread plan saved for user approval.",
+                        "trade_plan": arguments
+                    }
+                    self.trade_plans.append(arguments)
+                else:
+                    result = self.tools.place_credit_spread(
+                        underlying=arguments["underlying"],
+                        direction=arguments["direction"],
+                        spread_width=arguments.get("spread_width"),
+                        rationale=arguments.get("rationale", "")
+                    )
+            elif tool_name == "place_debit_spread":
+                # === ARGUMENT VALIDATION ===
+                underlying = arguments.get("underlying", "")
+                direction = arguments.get("direction", "")
+                
+                if not underlying or not isinstance(underlying, str):
+                    return json.dumps({"success": False, "error": "VALIDATION: 'underlying' is required"})
+                if not underlying.startswith("NSE:"):
+                    underlying = f"NSE:{underlying}"
+                    arguments["underlying"] = underlying
+                
+                if direction not in ("BUY", "SELL"):
+                    return json.dumps({"success": False, "error": f"VALIDATION: 'direction' must be 'BUY' or 'SELL', got '{direction}'"})
+                
+                if not self.auto_execute:
+                    result = {
+                        "success": False,
+                        "message": "Auto-execution disabled. Debit spread plan saved for user approval.",
+                        "trade_plan": arguments
+                    }
+                    self.trade_plans.append(arguments)
+                else:
+                    result = self.tools.place_debit_spread(
+                        underlying=arguments["underlying"],
+                        direction=arguments["direction"],
+                        spread_width=arguments.get("spread_width"),
+                        rationale=arguments.get("rationale", "")
+                    )
+            elif tool_name == "place_iron_condor":
+                # === ARGUMENT VALIDATION ===
+                underlying = arguments.get("underlying", "")
+                
+                if not underlying or not isinstance(underlying, str):
+                    return json.dumps({"success": False, "error": "VALIDATION: 'underlying' is required"})
+                if not underlying.startswith("NSE:"):
+                    underlying = f"NSE:{underlying}"
+                    arguments["underlying"] = underlying
+                
+                if not self.auto_execute:
+                    result = {
+                        "success": False,
+                        "message": "Auto-execution disabled. Iron Condor plan saved for user approval.",
+                        "trade_plan": arguments
+                    }
+                    self.trade_plans.append(arguments)
+                else:
+                    result = self.tools.place_iron_condor(
+                        underlying=arguments["underlying"],
+                        rationale=arguments.get("rationale", "Agent requested IC")
+                    )
             elif tool_name == "place_order":
                 # === ARGUMENT VALIDATION ===
                 order_args = arguments if isinstance(arguments, dict) else {}
@@ -385,11 +512,11 @@ If auto_execute is False, you must output trade plans for user approval instead 
             
             # Call OpenAI with sufficient output tokens
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.2",
                 messages=self.conversation,
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
-                max_tokens=4096
+                max_completion_tokens=4096
             )
             
             message = response.choices[0].message

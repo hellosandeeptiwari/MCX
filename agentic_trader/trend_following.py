@@ -505,6 +505,10 @@ class TrendFollowingEngine:
             reasons.append(f"✨ SHALLOW pullback ({signal.pullback_depth_pct:.2f}%, {signal.pullback_candles} candles) (+{pullback_score['score']:.0f})")
         elif pullback_score['quality'] == 'GOOD':
             reasons.append(f"👍 Good pullback entry ({signal.pullback_depth_pct:.2f}%) (+{pullback_score['score']:.0f})")
+        elif pullback_score['quality'] == 'ACCEPTABLE':
+            reasons.append(f"🔄 Acceptable pullback ({signal.pullback_depth_pct:.2f}%) (+{pullback_score['score']:.0f})")
+        elif pullback_score['quality'] == 'NO_DATA':
+            warnings.append(f"⚠️ No pullback data - neutral score (+{pullback_score['score']:.0f})")
         elif pullback_score['quality'] == 'DEEP':
             warnings.append(f"⚠️ Pullback too deep ({signal.pullback_depth_pct:.2f}%) - trend may reverse")
         
@@ -678,6 +682,10 @@ class TrendFollowingEngine:
         # Ideal: < 0.3% depth, < 2 candles
         # Good: < 0.5% depth, < 3 candles
         # Deep: > 0.5% depth
+        
+        # No pullback data = no signal, give neutral score (not max)
+        if depth == 0 and candles == 0:
+            return {"score": max_points * 0.5, "quality": "NO_DATA"}
         
         if depth <= 0.2 and candles <= 2:
             return {"score": max_points, "quality": "EXCELLENT"}
@@ -871,23 +879,27 @@ def build_trend_signal_from_market_data(symbol: str, market_data: Dict) -> Trend
     
     ltp = market_data.get('ltp', 0)
     
-    # Handle vwap_slope - can be numeric OR string ('RISING', 'FALLING', 'FLAT')
-    vwap_slope_raw = market_data.get('vwap_slope', 0)
-    if isinstance(vwap_slope_raw, str):
-        # Convert string to approximate numeric value
-        if vwap_slope_raw.upper() == 'RISING':
-            vwap_slope = 0.2
-        elif vwap_slope_raw.upper() == 'FALLING':
-            vwap_slope = -0.2
-        else:
-            vwap_slope = 0.0
+    # Prefer numeric vwap_change_pct over lossy string conversion
+    vwap_change_pct = market_data.get('vwap_change_pct', 0)
+    if vwap_change_pct != 0:
+        vwap_slope = float(vwap_change_pct)
     else:
-        vwap_slope = float(vwap_slope_raw)
+        # Fallback: string → approximate numeric
+        vwap_slope_raw = market_data.get('vwap_slope', 0)
+        if isinstance(vwap_slope_raw, str):
+            if vwap_slope_raw.upper() == 'RISING':
+                vwap_slope = 0.2
+            elif vwap_slope_raw.upper() == 'FALLING':
+                vwap_slope = -0.2
+            else:
+                vwap_slope = 0.0
+        else:
+            vwap_slope = float(vwap_slope_raw)
     
     # Handle ema_expanding - can be bool OR string
     ema_regime = market_data.get('ema_regime', 'NORMAL')
     if isinstance(ema_regime, str):
-        ema_expanding = 'EXPANDING' in ema_regime.upper()
+        ema_expanding = ema_regime.upper() == 'EXPANDING'
     else:
         ema_expanding = bool(ema_regime)
     

@@ -28,7 +28,7 @@ from kiteconnect import KiteConnect
 
 SCANNER_CONFIG = {
     # How many wild-card stocks to surface per scan cycle
-    "max_wildcards": 7,
+    "max_wildcards": 25,
 
     # Minimum % change (absolute) to consider a stock as a mover
     "min_change_pct": 1.5,
@@ -120,6 +120,7 @@ class MarketScanner:
         self._fo_stocks: List[Dict] = []       # [{name, lot_size, token}, ...]
         self._fo_cache_time: Optional[datetime] = None
         self._last_scan: Optional[ScanSummary] = None
+        self._all_results: List[ScannerResult] = []  # ALL scanned stocks (for heat map)
         self._exclude = set(self.config["exclude_symbols"])
 
     # ------------------------------------------------------------------
@@ -163,6 +164,11 @@ class MarketScanner:
         """Return {symbol: lot_size} for all F&O stocks discovered from Kite API."""
         self._refresh_fo_list()
         return {s["name"]: s["lot_size"] for s in self._fo_stocks}
+
+    def get_all_fo_symbols(self) -> List[str]:
+        """Return all F&O stock symbols as NSE:NAME for scan_universe expansion."""
+        self._refresh_fo_list()
+        return [f"NSE:{s['name']}" for s in self._fo_stocks]
 
     # ------------------------------------------------------------------
     # Core scan
@@ -376,6 +382,7 @@ class MarketScanner:
         )
 
         self._last_scan = summary
+        self._all_results = all_results  # Store ALL for heat map
         self._metal_is_hot = metal_is_hot
         self._avg_metal_move = avg_metal_move
         return summary
@@ -420,6 +427,29 @@ class MarketScanner:
             lines.append("  ⭐ No wild-cards — fixed universe covers the action today")
 
         return "\n".join(lines)
+
+    def get_broad_market_heat(self, existing_universe: set = None) -> str:
+        """Return a compact one-liner-per-stock heat map of ALL scanned F&O stocks.
+        
+        Sorted by absolute change_pct descending. Includes stocks NOT in the
+        fixed universe so GPT can see opportunities outside the 31 curated.
+        Shows top 40 movers (beyond that it's mostly flat/noise).
+        """
+        if not self._all_results:
+            return "No scanner data available yet"
+        
+        existing_universe = existing_universe or set()
+        
+        # Sort by abs change — biggest movers first
+        sorted_all = sorted(self._all_results, key=lambda r: abs(r.change_pct), reverse=True)
+        
+        lines = []
+        for r in sorted_all[:40]:
+            tag = "⭐NEW" if r.nse_symbol not in existing_universe else "CUR"
+            arrow = "🟢" if r.change_pct > 0.5 else "🔴" if r.change_pct < -0.5 else "⚪"
+            lines.append(f"  {arrow} {r.symbol:15} {r.change_pct:+.2f}% ₹{r.ltp:.0f} Vol:{r.volume:,} [{r.category}] {tag}")
+        
+        return "\n".join(lines) if lines else "No significant movers"
 
     # ------------------------------------------------------------------
     # Accessor

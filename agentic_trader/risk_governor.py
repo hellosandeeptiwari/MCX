@@ -32,9 +32,9 @@ class RiskLimits:
     """Risk limit configuration"""
     max_daily_loss_pct: float = 6.0      # Max 6% daily loss
     max_consecutive_losses: int = 4       # Max 4 losses in a row
-    max_trades_per_day: int = 20          # Max 20 trades per day
+    max_trades_per_day: int = 80          # Max 80 trades per day
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
-    cooldown_minutes: int = 10            # 10 min cooldown after loss (was 15, skipping 3 scan cycles was too aggressive)
+    cooldown_minutes: int = 0             # No cooldown after loss (disabled per user request)
     max_position_pct: float = 25.0        # Max 25% of capital in one position
     max_total_exposure_pct: float = 80.0  # Max 80% of capital deployed
 
@@ -268,8 +268,13 @@ class RiskGovernor:
         if self.state.trades_today >= self.limits.max_trades_per_day:
             return TradePermission(allowed=False, reason=f"Max trades per day reached: {self.state.trades_today}", warnings=[])
         
-        # Total exposure check
-        total_exposure = sum(p.get('avg_price', 0) * p.get('quantity', 0) for p in active_positions)
+        # Total exposure check — use max_risk for IC positions (avg_price is just credit, understates risk)
+        total_exposure = sum(
+            p.get('max_risk', p.get('avg_price', 0) * p.get('quantity', 0))
+            if p.get('is_iron_condor', False)
+            else p.get('avg_price', 0) * p.get('quantity', 0)
+            for p in active_positions
+        )
         total_exposure_pct = (total_exposure / self.current_capital) * 100
         if total_exposure_pct > self.limits.max_total_exposure_pct:
             return TradePermission(allowed=False, reason=f"Max total exposure: {total_exposure_pct:.1f}%", warnings=[])
@@ -392,9 +397,11 @@ class RiskGovernor:
             size_multiplier = self.limits.max_position_pct / position_pct
             warnings.append(f"Position size reduced: {position_pct:.1f}% → {self.limits.max_position_pct}%")
         
-        # 8. Check total exposure
+        # 8. Check total exposure — use max_risk for IC positions
         total_exposure = sum(
-            p.get('avg_price', 0) * p.get('quantity', 0) 
+            p.get('max_risk', p.get('avg_price', 0) * p.get('quantity', 0))
+            if p.get('is_iron_condor', False)
+            else p.get('avg_price', 0) * p.get('quantity', 0)
             for p in active_positions
         )
         total_exposure_pct = (total_exposure / self.current_capital) * 100

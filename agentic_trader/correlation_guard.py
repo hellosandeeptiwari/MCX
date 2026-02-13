@@ -124,9 +124,9 @@ class CorrelationIndexGuard:
         }
         
         # Limits
-        self.max_high_beta_positions = 2
-        self.max_same_sector_positions = 2
-        self.max_index_plus_stocks = 3  # If holding index, max 2 additional stocks
+        self.max_high_beta_positions = 6   # Raised from 3 — user wants 20 max positions
+        self.max_same_sector_positions = 3   # Raised from 2 — allow more sector diversity
+        self.max_index_plus_stocks = 5  # Raised from 3 — allow more with index
         self.correlation_threshold = 0.75  # Real-time correlation threshold
         
         # Track active positions for correlation
@@ -147,6 +147,16 @@ class CorrelationIndexGuard:
         if "NIFTY" in symbol or "BANKNIFTY" in symbol:
             return "INDEX"
         
+        # For NFO options (e.g. "NFO:SBIN26FEB750CE"), extract underlying and check NSE mapping
+        if symbol.startswith("NFO:"):
+            import re
+            # Extract alphabetic prefix as underlying (e.g. SBIN from SBIN26FEB750CE)
+            match = re.match(r'^NFO:([A-Z&-]+)', symbol)
+            if match:
+                underlying = f"NSE:{match.group(1)}"
+                if underlying in self.beta_mapping:
+                    return self.beta_mapping[underlying]
+        
         # Default to MEDIUM_BETA for unknown symbols
         return "MEDIUM_BETA"
     
@@ -155,6 +165,17 @@ class CorrelationIndexGuard:
         for sector, symbols in self.sector_groups.items():
             if symbol in symbols:
                 return sector
+        
+        # For NFO options, check underlying's sector
+        if symbol.startswith("NFO:"):
+            import re
+            match = re.match(r'^NFO:([A-Z&-]+)', symbol)
+            if match:
+                underlying = f"NSE:{match.group(1)}"
+                for sector, syms in self.sector_groups.items():
+                    if underlying in syms:
+                        return sector
+        
         return None
     
     def update_positions(self, active_positions: List[Dict]):

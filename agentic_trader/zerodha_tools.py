@@ -6,6 +6,7 @@ Provides structured tools that the LLM agent can call
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
@@ -17,6 +18,7 @@ from config import (
     ZERODHA_API_KEY, ZERODHA_API_SECRET, 
     HARD_RULES, TRADING_HOURS, APPROVED_UNIVERSE, FNO_CONFIG
 )
+from config import GTT_CONFIG, AUTOSLICE_ENABLED
 from execution_guard import get_execution_guard
 from idempotent_order_engine import get_idempotent_engine
 from correlation_guard import get_correlation_guard
@@ -24,6 +26,7 @@ from regime_score import get_regime_scorer
 from position_reconciliation import get_position_reconciliation
 from data_health_gate import get_data_health_gate
 from options_trader import get_options_trader, OptionType, StrikeSelection, ExpirySelection, get_intraday_scorer, IntradaySignal
+from kite_ticker import get_ticker, TitanTicker
 
 
 @dataclass
@@ -185,6 +188,38 @@ class ZerodhaTools:
         # Load saved token
         self._load_token()
         
+        # === INITIALIZE KITE TICKER (WebSocket streaming) ===
+        self.ticker: TitanTicker = None
+        if self.access_token:
+            try:
+                self.ticker = get_ticker(ZERODHA_API_KEY, self.access_token, self.kite)
+                self.ticker.start()
+                # Subscribe to universe stocks
+                from config import TIER_1_OPTIONS, TIER_2_OPTIONS
+                all_symbols = TIER_1_OPTIONS + TIER_2_OPTIONS
+                # Add NIFTY 50 index
+                all_symbols.append("NSE:NIFTY 50")
+                self.ticker.subscribe_symbols(all_symbols, mode='quote')
+                # Subscribe ALL near-month F&O futures for real-time OI data
+                # This eliminates per-stock REST calls in _get_futures_oi_quick()
+                try:
+                    _nfo_instruments = self.kite.instruments("NFO")
+                    self.ticker.subscribe_fo_futures(_nfo_instruments)
+                    # Also subscribe ALL F&O equity symbols (for full universe scanning)
+                    _fo_equities = set()
+                    for inst in _nfo_instruments:
+                        if inst.get('instrument_type') == 'FUT' and inst.get('segment') == 'NFO-FUT':
+                            _fo_equities.add(f"NSE:{inst['name']}")
+                    _extra_equities = [s for s in _fo_equities if s not in all_symbols]
+                    if _extra_equities:
+                        self.ticker.subscribe_symbols(_extra_equities, mode='quote')
+                        print(f"🔌 Ticker: Subscribed {len(_extra_equities)} additional F&O equities (full universe)")
+                except Exception as e:
+                    print(f"⚠️ Ticker: Futures/equity subscription error (non-fatal): {e}")
+            except Exception as e:
+                print(f"⚠️ Ticker init failed (REST fallback active): {e}")
+                self.ticker = None
+        
         # Load active trades from file
         self._load_active_trades()
     
@@ -227,6 +262,255 @@ class ZerodhaTools:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"⚠️ Error saving trades: {e}")
+    
+    # =================================================================
+    # AUTOSLICE — Freeze Quantity Protection
+    # =================================================================
+    
+    def _place_order_autoslice(self, **kwargs):
+        """
+        Place order with autoslice=true to auto-split orders exceeding exchange freeze limits.
+        Without autoslice, orders >1800 qty NIFTY (or similar) get REJECTED.
+        
+        Uses route monkey-patching since the kiteconnect Python SDK doesn't expose
+        autoslice as a keyword argument (it's a URL query parameter).
+        """
+        if not AUTOSLICE_ENABLED or not hasattr(self.kite, '_routes'):
+            return self.kite.place_order(**kwargs)
+        
+        orig_route = self.kite._routes.get("orders.place", "/orders/{variety}")
+        try:
+            if "autoslice" not in orig_route:
+                self.kite._routes["orders.place"] = "/orders/{variety}?autoslice=true"
+            return self.kite.place_order(**kwargs)
+        finally:
+            self.kite._routes["orders.place"] = orig_route
+    
+    # =================================================================
+    # GTT SAFETY NET — Server-Side SL + Target (survives crashes)
+    # =================================================================
+    
+    GTT_LOG_FILE = os.path.join(os.path.dirname(__file__), 'gtt_safety_log.json')
+    
+    def _place_gtt_safety_net(self, symbol: str, side: str, quantity: int,
+                               entry_price: float, sl_price: float, target_price: float,
+                               product: str = "MIS", tag: str = "TITAN") -> Optional[int]:
+        """
+        Place a GTT TWO-LEG (OCO) order as a crash-protection safety net.
+        
+        The GTT lives on Zerodha's servers. If Titan crashes:
+        - SL trigger fires → exits at SL (server-side)
+        - Target trigger fires → exits at target (server-side)
+        - Whichever fires first cancels the other (OCO)
+        
+        Args:
+            symbol: "NSE:SBIN" or "NFO:SBIN26FEB180CE"
+            side: Original trade side ("BUY" or "SELL")
+            quantity: Trade quantity
+            entry_price: Entry price (used as last_price for GTT)
+            sl_price: Stop loss price
+            target_price: Target price
+            product: "MIS" or "NRML"
+            tag: Trade tag for identification
+            
+        Returns:
+            GTT trigger_id if placed successfully, None otherwise
+        """
+        if self.paper_mode or not GTT_CONFIG.get('enabled', False):
+            return None
+        
+        try:
+            exchange, tradingsymbol = symbol.split(":")
+            
+            # Determine exit direction (opposite of entry)
+            exit_type = self.kite.TRANSACTION_TYPE_SELL if side == "BUY" else self.kite.TRANSACTION_TYPE_BUY
+            
+            # Apply buffers to avoid double-triggering with primary SL-M
+            sl_buffer = GTT_CONFIG.get('sl_buffer_pct', 1.0) / 100
+            target_buffer = GTT_CONFIG.get('target_buffer_pct', 0.5) / 100
+            limit_buffer = GTT_CONFIG.get('limit_price_buffer_pct', 2.0) / 100
+            
+            if side == "BUY":
+                # BUY trade: SL is below entry, target is above entry
+                gtt_sl_trigger = round(sl_price * (1 - sl_buffer), 2)      # Wider SL than primary
+                gtt_target_trigger = round(target_price * (1 - target_buffer), 2)  # Slightly tighter target
+                # LIMIT prices with buffer to ensure fill in gaps
+                sl_limit_price = round(gtt_sl_trigger * (1 - limit_buffer), 2)     # Sell below trigger
+                target_limit_price = round(gtt_target_trigger * (1 - limit_buffer), 2)
+            else:
+                # SELL trade: SL is above entry, target is below entry
+                gtt_sl_trigger = round(sl_price * (1 + sl_buffer), 2)
+                gtt_target_trigger = round(target_price * (1 + target_buffer), 2)
+                sl_limit_price = round(gtt_sl_trigger * (1 + limit_buffer), 2)     # Buy above trigger
+                target_limit_price = round(gtt_target_trigger * (1 + limit_buffer), 2)
+            
+            # Ensure trigger values are in correct order for TWO-LEG
+            # First trigger = lower value, Second trigger = upper value
+            if gtt_sl_trigger < gtt_target_trigger:
+                trigger_values = [gtt_sl_trigger, gtt_target_trigger]
+                orders = [
+                    {
+                        "exchange": exchange,
+                        "tradingsymbol": tradingsymbol,
+                        "transaction_type": exit_type,
+                        "quantity": quantity,
+                        "order_type": self.kite.ORDER_TYPE_LIMIT,
+                        "product": product,
+                        "price": sl_limit_price
+                    },
+                    {
+                        "exchange": exchange,
+                        "tradingsymbol": tradingsymbol,
+                        "transaction_type": exit_type,
+                        "quantity": quantity,
+                        "order_type": self.kite.ORDER_TYPE_LIMIT,
+                        "product": product,
+                        "price": target_limit_price
+                    }
+                ]
+            else:
+                trigger_values = [gtt_target_trigger, gtt_sl_trigger]
+                orders = [
+                    {
+                        "exchange": exchange,
+                        "tradingsymbol": tradingsymbol,
+                        "transaction_type": exit_type,
+                        "quantity": quantity,
+                        "order_type": self.kite.ORDER_TYPE_LIMIT,
+                        "product": product,
+                        "price": target_limit_price
+                    },
+                    {
+                        "exchange": exchange,
+                        "tradingsymbol": tradingsymbol,
+                        "transaction_type": exit_type,
+                        "quantity": quantity,
+                        "order_type": self.kite.ORDER_TYPE_LIMIT,
+                        "product": product,
+                        "price": sl_limit_price
+                    }
+                ]
+            
+            # Place GTT TWO-LEG (OCO)
+            result = self.kite.place_gtt(
+                trigger_type=self.kite.GTT_TYPE_OCO,
+                tradingsymbol=tradingsymbol,
+                exchange=exchange,
+                trigger_values=trigger_values,
+                last_price=entry_price,
+                orders=orders
+            )
+            
+            trigger_id = result.get('trigger_id')
+            
+            if GTT_CONFIG.get('log_gtt_events', True):
+                self._log_gtt_event('PLACED', symbol, trigger_id, {
+                    'side': side, 'quantity': quantity,
+                    'entry': entry_price, 'sl': sl_price, 'target': target_price,
+                    'gtt_sl_trigger': gtt_sl_trigger, 'gtt_target_trigger': gtt_target_trigger,
+                    'tag': tag
+                })
+                print(f"   🛡️ GTT safety net placed: {symbol} trigger_id={trigger_id} "
+                      f"(SL@{gtt_sl_trigger} / Target@{gtt_target_trigger})")
+            
+            return trigger_id
+            
+        except Exception as e:
+            print(f"   ⚠️ GTT safety net failed for {symbol}: {e}")
+            if GTT_CONFIG.get('log_gtt_events', True):
+                self._log_gtt_event('FAILED', symbol, None, {'error': str(e), 'tag': tag})
+            return None
+    
+    def _cancel_gtt(self, trigger_id: int, symbol: str = "") -> bool:
+        """
+        Cancel a GTT order (called when trade exits normally).
+        
+        Args:
+            trigger_id: The GTT trigger ID to cancel
+            symbol: Symbol for logging (optional)
+            
+        Returns:
+            True if cancelled successfully
+        """
+        if self.paper_mode or not trigger_id:
+            return False
+        
+        try:
+            self.kite.delete_gtt(trigger_id)
+            if GTT_CONFIG.get('log_gtt_events', True):
+                self._log_gtt_event('CANCELLED', symbol, trigger_id, {'reason': 'trade_exited_normally'})
+                print(f"   🛡️ GTT cancelled: {symbol} trigger_id={trigger_id}")
+            return True
+        except Exception as e:
+            # GTT may have already triggered or expired
+            print(f"   ⚠️ GTT cancel failed for {symbol} (trigger_id={trigger_id}): {e}")
+            self._log_gtt_event('CANCEL_FAILED', symbol, trigger_id, {'error': str(e)})
+            return False
+    
+    def _cleanup_orphaned_gtts(self):
+        """
+        On startup, check for GTTs that are still active but the trade was already closed.
+        This handles the case where Titan crashed and the GTT persisted.
+        """
+        if self.paper_mode or not GTT_CONFIG.get('cleanup_on_startup', True):
+            return
+        
+        try:
+            gtts = self.kite.get_gtts()
+            active_symbols = set()
+            for trade in self.paper_positions:
+                if trade.get('status', 'OPEN') == 'OPEN':
+                    active_symbols.add(trade.get('symbol', ''))
+            
+            orphaned = 0
+            for gtt in gtts:
+                if gtt.get('status') != 'active':
+                    continue
+                # Check if this GTT belongs to Titan (check orders for our tradingsymbols)
+                gtt_orders = gtt.get('orders', [])
+                if not gtt_orders:
+                    continue
+                gtt_symbol = f"{gtt_orders[0].get('exchange', '')}:{gtt_orders[0].get('tradingsymbol', '')}"
+                
+                # If no active trade for this symbol, the GTT is orphaned
+                if gtt_symbol not in active_symbols:
+                    try:
+                        self.kite.delete_gtt(gtt['id'])
+                        orphaned += 1
+                        self._log_gtt_event('ORPHAN_CLEANUP', gtt_symbol, gtt['id'], 
+                                          {'gtt_status': gtt.get('status')})
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to cleanup orphaned GTT {gtt['id']}: {e}")
+            
+            if orphaned > 0:
+                print(f"   🛡️ Cleaned up {orphaned} orphaned GTT(s) from previous session")
+        except Exception as e:
+            print(f"   ⚠️ GTT orphan cleanup failed: {e}")
+    
+    def _log_gtt_event(self, event: str, symbol: str, trigger_id: Optional[int], details: Dict):
+        """Log GTT events to gtt_safety_log.json"""
+        try:
+            log = []
+            if os.path.exists(self.GTT_LOG_FILE):
+                with open(self.GTT_LOG_FILE, 'r') as f:
+                    log = json.load(f)
+            
+            log.append({
+                'timestamp': datetime.now().isoformat(),
+                'event': event,
+                'symbol': symbol,
+                'trigger_id': trigger_id,
+                **details
+            })
+            
+            # Keep last 500 events
+            if len(log) > 500:
+                log = log[-500:]
+            
+            with open(self.GTT_LOG_FILE, 'w') as f:
+                json.dump(log, f, indent=2)
+        except Exception:
+            pass  # Never crash on logging
     
     def _save_to_history(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
         """Save completed trade to history file with full exit context"""
@@ -343,9 +627,14 @@ class ZerodhaTools:
                     # Save to history and remove from active
                     if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
                                   'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
-                                  'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT']:
+                                  'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT',
+                                  'IC_TARGET_HIT', 'IC_SL_HIT', 'IC_TIME_EXIT', 'IC_BREAKOUT_EXIT', 'IC_EOD_EXIT']:
                         self._save_to_history(trade, status, pnl or 0, exit_detail=exit_detail)
                         if status != 'PARTIAL_PROFIT':
+                            # === CANCEL GTT SAFETY NET ON TRADE EXIT ===
+                            gtt_id = trade.get('gtt_trigger_id')
+                            if gtt_id and GTT_CONFIG.get('cleanup_on_exit', True):
+                                self._cancel_gtt(gtt_id, symbol)
                             self.paper_positions.pop(i)
                     
                     self._save_active_trades()
@@ -399,11 +688,22 @@ class ZerodhaTools:
             return updates
         
         try:
-            quotes = self.kite.quote(symbols)
+            # Try WebSocket cache first (zero API calls), fallback to REST
+            if self.ticker and self.ticker.connected:
+                quotes = {}
+                ltp_batch = self.ticker.get_ltp_batch(symbols)
+                for sym, ltp in ltp_batch.items():
+                    quotes[sym] = {'last_price': ltp}
+            else:
+                quotes = self.kite.ltp(symbols)
             
             with self._positions_lock:
                 for trade in self.paper_positions[:]:  # Copy list to avoid modification during iteration
                     if trade.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    
+                    # Skip iron condors — they have dedicated monitoring in autonomous_trader
+                    if trade.get('is_iron_condor', False):
                         continue
                     
                     symbol = trade['symbol']
@@ -550,13 +850,16 @@ class ZerodhaTools:
             return False
     
     def _rate_limit(self):
-        """Enforce API rate limiting"""
-        min_interval = HARD_RULES["API_RATE_LIMIT_MS"] / 1000
-        elapsed = time.time() - self.last_api_call
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        self.last_api_call = time.time()
-        self.api_call_count += 1
+        """Enforce API rate limiting (thread-safe)"""
+        if not hasattr(self, '_rate_lock'):
+            self._rate_lock = threading.Lock()
+        with self._rate_lock:
+            min_interval = HARD_RULES["API_RATE_LIMIT_MS"] / 1000
+            elapsed = time.time() - self.last_api_call
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            self.last_api_call = time.time()
+            self.api_call_count += 1
     
     def _is_trading_hours(self) -> tuple[bool, str]:
         """Check if within trading hours"""
@@ -844,67 +1147,100 @@ class ZerodhaTools:
             return {"error": str(e)}
     
     def _get_futures_oi_quick(self, symbol: str) -> Dict:
-        """Quick futures OI check for a symbol"""
+        """Quick futures OI check — WebSocket cache first, REST fallback.
+        
+        With ticker subscribed to ALL ~200 near-month futures, this is now
+        a zero-API-call cache read for any F&O stock. No hardcoded list needed.
+        """
         try:
-            if ":" in symbol:
-                _, stock = symbol.split(":")
-            else:
-                stock = symbol
-            
-            # Check if this is an F&O stock
-            fno_stocks = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
-                         "SBIN", "AXISBANK", "KOTAKBANK", "BAJFINANCE", "BHARTIARTL",
-                         "ITC", "TATASTEEL", "HINDUNILVR", "MARUTI", "TITAN",
-                         "LT", "SUNPHARMA", "ETERNAL", "ONGC", "COALINDIA",
-                         "TATAPOWER", "BANKBARODA", "PNB", "MCX",
-                         "HINDALCO", "JSWSTEEL", "VEDL", "JINDALSTEL", "NMDC",
-                         "NATIONALUM", "SAIL"]
-            
-            if stock not in fno_stocks:
+            if ":" not in symbol:
+                symbol = f"NSE:{symbol}"
+            _, stock = symbol.split(":")
+
+            # ---- TIER 1: Read from WebSocket cache (0 API calls, ~0ms) ----
+            if self.ticker and hasattr(self.ticker, '_futures_tokens'):
+                oi_data = self.ticker.get_futures_oi(symbol)
+                if oi_data and oi_data.get('oi', 0) > 0:
+                    # Get equity price change from ticker cache too
+                    eq_ltp = self.ticker.get_ltp(symbol)
+                    eq_quote = self.ticker.get_quote(symbol)
+                    if eq_quote:
+                        prev_close = eq_quote.get('ohlc', {}).get('close', eq_ltp or 0)
+                        change_pct = ((eq_ltp - prev_close) / prev_close * 100) if prev_close and eq_ltp else 0
+                    elif eq_ltp:
+                        change_pct = 0  # Have LTP but no prev_close from cache
+                    else:
+                        change_pct = 0
+
+                    oi = oi_data['oi']
+                    oi_day_low = oi_data.get('oi_day_low', oi)
+                    oi_change_pct = ((oi - oi_day_low) / oi_day_low * 100) if oi_day_low else 0
+
+                    # Classify OI signal
+                    if change_pct > 0.3 and oi_change_pct > 2:
+                        oi_signal = "LONG_BUILDUP"
+                    elif change_pct < -0.3 and oi_change_pct > 2:
+                        oi_signal = "SHORT_BUILDUP"
+                    elif change_pct < -0.3 and oi_change_pct < -2:
+                        oi_signal = "LONG_UNWINDING"
+                    elif change_pct > 0.3 and oi_change_pct < -2:
+                        oi_signal = "SHORT_COVERING"
+                    else:
+                        oi_signal = "NEUTRAL"
+
+                    return {
+                        "has_futures": True,
+                        "futures_symbol": oi_data.get('futures_symbol', ''),
+                        "oi": oi,
+                        "oi_change_pct": round(oi_change_pct, 2),
+                        "price_change_pct": round(change_pct, 2),
+                        "oi_signal": oi_signal
+                    }
+
+            # ---- TIER 2: REST fallback (2 API calls) ----
+            # Get instruments to find futures (CACHED — NFO instruments don't change intraday)
+            if not hasattr(self, '_nfo_instruments_cache'):
+                self._nfo_instruments_cache = None
+                self._nfo_instruments_ts = 0
+            if self._nfo_instruments_cache is None or (time.time() - self._nfo_instruments_ts) > 1800:
+                self._nfo_instruments_cache = self.kite.instruments("NFO")
+                self._nfo_instruments_ts = time.time()
+            instruments = self._nfo_instruments_cache
+
+            # Find current month futures — dynamic, works for ANY F&O stock
+            futures = [i for i in instruments if
+                      i['name'] == stock and
+                      i['instrument_type'] == 'FUT' and
+                      i['segment'] == 'NFO-FUT']
+
+            if not futures:
                 return {"has_futures": False}
-            
-            # Get current quote for price change
+
+            futures.sort(key=lambda x: x['expiry'])
+            current_fut = futures[0]
+            fut_symbol = f"NFO:{current_fut['tradingsymbol']}"
+
+            self._rate_limit()
             quote = self.kite.quote([symbol])
             if symbol not in quote:
                 return {"has_futures": False}
-            
             q = quote[symbol]
             ltp = q.get('last_price', 0)
-            ohlc = q.get('ohlc', {})
-            prev_close = ohlc.get('close', ltp)
+            prev_close = q.get('ohlc', {}).get('close', ltp)
             change_pct = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
-            
-            # Get instruments to find futures
-            instruments = self.kite.instruments("NFO")
-            
-            # Find current month futures
-            futures = [i for i in instruments if 
-                      i['name'] == stock and 
-                      i['instrument_type'] == 'FUT' and
-                      i['segment'] == 'NFO-FUT']
-            
-            if not futures:
-                return {"has_futures": False}
-            
-            # Sort by expiry, get nearest
-            futures.sort(key=lambda x: x['expiry'])
-            current_fut = futures[0]
-            
-            fut_symbol = f"NFO:{current_fut['tradingsymbol']}"
+
+            self._rate_limit()
             fut_quote = self.kite.quote([fut_symbol])
-            
             if fut_symbol not in fut_quote:
                 return {"has_futures": False}
-            
+
             fq = fut_quote[fut_symbol]
             oi = fq.get('oi', 0)
             oi_day_high = fq.get('oi_day_high', oi)
             oi_day_low = fq.get('oi_day_low', oi)
-            
-            # OI change from day's low (intraday buildup)
+
             oi_change_pct = ((oi - oi_day_low) / oi_day_low * 100) if oi_day_low else 0
-            
-            # Determine OI signal
+
             if change_pct > 0.3 and oi_change_pct > 2:
                 oi_signal = "LONG_BUILDUP"
             elif change_pct < -0.3 and oi_change_pct > 2:
@@ -915,7 +1251,7 @@ class ZerodhaTools:
                 oi_signal = "SHORT_COVERING"
             else:
                 oi_signal = "NEUTRAL"
-            
+
             return {
                 "has_futures": True,
                 "futures_symbol": fut_symbol,
@@ -1082,13 +1418,45 @@ class ZerodhaTools:
                     age = (datetime.now() - last_trade_time).seconds
                     is_stale = age > HARD_RULES["STALE_DATA_SECONDS"]
                 
-                # Get historical data for indicators
-                indicators = self._calculate_indicators(symbol)
-                
-                # Skip symbol entirely if indicator calculation failed
+                # indicators fetched in parallel below — just store quote for now
+                result[symbol] = {'_quote': q, '_ohlc': ohlc, '_is_stale': is_stale}
+            
+            # === PARALLEL INDICATOR CALCULATION ===
+            # Each _calculate_indicators makes 2 API calls (~1.5s/stock).
+            # With 8 workers we overlap network latency for full F&O universe scan.
+            _symbols_to_calc = list(result.keys())
+            _indicators_map = {}
+            _t0 = time.time()
+            
+            def _calc_one(sym):
+                try:
+                    return sym, self._calculate_indicators(sym)
+                except Exception as e:
+                    print(f"   ⚠️ Indicator error {sym}: {e}")
+                    return sym, None
+            
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(_calc_one, s): s for s in _symbols_to_calc}
+                for future in as_completed(futures):
+                    sym, ind = future.result()
+                    if ind:
+                        _indicators_map[sym] = ind
+            
+            _elapsed = time.time() - _t0
+            _cached = sum(1 for s in _symbols_to_calc if hasattr(self, '_ind_cache') and s in self._ind_cache and (time.time() - self._ind_cache[s][0]) < 300)
+            print(f"   ⚡ Indicators: {len(_indicators_map)}/{len(_symbols_to_calc)} stocks in {_elapsed:.1f}s ({_cached} cached)")
+            
+            # === REBUILD RESULT with indicators ===
+            final_result = {}
+            for symbol in _symbols_to_calc:
+                indicators = _indicators_map.get(symbol)
                 if not indicators:
-                    print(f"   ⚠️ Skipping {symbol} — indicator calculation failed")
                     continue
+                
+                _saved = result[symbol]
+                q = _saved['_quote']
+                ohlc = _saved['_ohlc']
+                is_stale = _saved['_is_stale']
                 
                 # === DATA HEALTH GATE: Add health check result ===
                 health_gate = get_data_health_gate()
@@ -1179,26 +1547,45 @@ class ZerodhaTools:
                     pullback_candles=indicators.get('pullback_candles', 0)
                 )
                 
-                result[symbol] = asdict(data)
+                final_result[symbol] = asdict(data)
             
-            return result
+            return final_result
             
         except Exception as e:
             return {"error": str(e)}
     
     def _calculate_indicators(self, symbol: str) -> Dict:
-        """Calculate technical indicators for a symbol using BOTH daily and intraday data"""
+        """Calculate technical indicators for a symbol using BOTH daily and intraday data.
+        
+        Results are cached for INDICATOR_CACHE_TTL seconds to avoid redundant
+        API calls when the same stock appears in consecutive scan cycles.
+        """
+        # --- Indicator cache (10-minute TTL — scans every 3-5min, so ~50% cache hit rate) ---
+        INDICATOR_CACHE_TTL = 600  # seconds
+        if not hasattr(self, '_ind_cache'):
+            self._ind_cache: Dict[str, tuple] = {}  # symbol -> (timestamp, result)
+        
+        _cached = self._ind_cache.get(symbol)
+        if _cached:
+            _cache_age = time.time() - _cached[0]
+            if _cache_age < INDICATOR_CACHE_TTL:
+                return _cached[1]  # Cache hit — skip API calls
+        
         self._rate_limit()
         
         try:
             # Get instrument token
             exchange, tradingsymbol = symbol.split(":")
             
-            # Cache instruments list to avoid repeated API calls
+            # Cache instruments list to avoid repeated API calls (thread-safe)
             if not hasattr(self, '_instrument_cache'):
                 self._instrument_cache = {}
+            if not hasattr(self, '_inst_lock'):
+                self._inst_lock = threading.Lock()
             if exchange not in self._instrument_cache:
-                self._instrument_cache[exchange] = self.kite.instruments(exchange)
+                with self._inst_lock:
+                    if exchange not in self._instrument_cache:  # double-check after lock
+                        self._instrument_cache[exchange] = self.kite.instruments(exchange)
             
             instruments = self._instrument_cache[exchange]
             token = None
@@ -1236,7 +1623,27 @@ class ZerodhaTools:
             if not data:
                 return {}
             
-            # === FETCH INTRADAY 5-MINUTE DATA for proper VWAP & ORB ===
+            # === FETCH INTRADAY DATA for proper VWAP & ORB ===
+            # Early session (before 09:45): use 3-minute candles for faster indicator maturation
+            # After 09:45: use standard 5-minute candles
+            from config import EARLY_SESSION
+            _now_time = datetime.now()
+            _early_end = _now_time.replace(hour=int(EARLY_SESSION['end_time'].split(':')[0]), 
+                                           minute=int(EARLY_SESSION['end_time'].split(':')[1]), 
+                                           second=0, microsecond=0)
+            _is_early_session = EARLY_SESSION.get('enabled', True) and _now_time < _early_end
+            
+            if _is_early_session:
+                _candle_interval = EARLY_SESSION.get('candle_interval', '3minute')
+                _orb_candle_count = EARLY_SESSION.get('orb_candle_count', 5)  # 15 min = 5 x 3min
+                _vwap_slope_lookback = EARLY_SESSION.get('vwap_slope_lookback', 10)  # 30 min = 10 x 3min
+                _momentum_lookback = EARLY_SESSION.get('momentum_lookback', 5)  # 15 min = 5 x 3min
+            else:
+                _candle_interval = '5minute'
+                _orb_candle_count = 3   # 15 min = 3 x 5min
+                _vwap_slope_lookback = 6  # 30 min = 6 x 5min
+                _momentum_lookback = 3   # 15 min = 3 x 5min
+            
             intraday_df = None
             try:
                 today = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
@@ -1248,7 +1655,7 @@ class ZerodhaTools:
                             instrument_token=token,
                             from_date=today,
                             to_date=datetime.now(),
-                            interval="5minute"
+                            interval=_candle_interval
                         )
                         break
                     except Exception as e:
@@ -1301,6 +1708,51 @@ class ZerodhaTools:
                 adx_series = dx.rolling(14).mean()
                 if len(adx_series.dropna()) > 0:
                     adx = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 20.0
+            
+            # === INTRADAY ADX OVERRIDE ===
+            # Daily ADX is blind to today's price action — a stock crashing 4% intraday
+            # still shows daily ADX=20 because it looks at past 14+ daily bars.
+            # Fix: if today's move from prev_close exceeds N× daily ATR, override ADX
+            # to reflect the real intraday trend strength.
+            #
+            # Tiers (conservative — only boosts, never reduces):
+            #   Move ≥ 2.0× ATR → ADX = max(daily, 45)  "Very strong intraday trend"
+            #   Move ≥ 1.5× ATR → ADX = max(daily, 35)  "Strong intraday trend"
+            #   Move ≥ 1.0× ATR → ADX = max(daily, 28)  "Moderate intraday trend"
+            #
+            # Also checks intraday candle consistency: if 70%+ candles move in same
+            # direction, it confirms directional conviction (not just a gap).
+            _daily_adx = adx  # preserve original for logging
+            _adx_overridden = False
+            _prev_close_for_adx = close.iloc[-2] if len(close) > 1 else close.iloc[-1]
+            _current_price_for_adx = close.iloc[-1]
+            if atr > 0 and _prev_close_for_adx > 0:
+                _todays_move = abs(_current_price_for_adx - _prev_close_for_adx)
+                _atr_multiple = _todays_move / atr
+                
+                # Check intraday directional consistency (anti-whipsaw)
+                _directional_pct = 0.0
+                if intraday_df is not None and len(intraday_df) >= 3:
+                    _bodies = intraday_df['close'] - intraday_df['open']
+                    _bullish_count = (_bodies > 0).sum()
+                    _bearish_count = (_bodies < 0).sum()
+                    _total = len(_bodies)
+                    _directional_pct = max(_bullish_count, _bearish_count) / _total if _total > 0 else 0
+                
+                # Only override if move is significant AND directionally consistent
+                # OR if move is very large (gap + continuation, direction inherently clear)
+                _direction_confirmed = _directional_pct >= 0.6 or _atr_multiple >= 2.0
+                
+                if _direction_confirmed:
+                    if _atr_multiple >= 2.0:
+                        adx = max(adx, 45.0)
+                    elif _atr_multiple >= 1.5:
+                        adx = max(adx, 35.0)
+                    elif _atr_multiple >= 1.0:
+                        adx = max(adx, 28.0)
+                    
+                    if adx > _daily_adx:
+                        _adx_overridden = True
             
             # Additional context for informed decisions
             high_20d = high.tail(20).max()
@@ -1384,7 +1836,7 @@ class ZerodhaTools:
             
             # 2. VWAP calculation - USE INTRADAY DATA if available
             if intraday_df is not None and len(intraday_df) >= 2:
-                # REAL intraday VWAP from today's 5-min candles
+                # REAL intraday VWAP from today's candles
                 itp = (intraday_df['high'] + intraday_df['low'] + intraday_df['close']) / 3
                 ivol = intraday_df['volume']
                 i_cum_tpv = (itp * ivol).cumsum()
@@ -1393,11 +1845,11 @@ class ZerodhaTools:
                 vwap_series = vwap_series.replace([float('inf'), float('-inf')], current_price).fillna(current_price)
                 vwap = vwap_series.iloc[-1]
                 
-                # VWAP slope over last 6 candles (30 min)
-                if len(vwap_series) >= 6:
-                    vwap_6_ago = vwap_series.iloc[-6]
+                # VWAP slope over lookback window (30 min equivalent)
+                if len(vwap_series) >= _vwap_slope_lookback:
+                    vwap_back = vwap_series.iloc[-_vwap_slope_lookback]
                     vwap_now = vwap_series.iloc[-1]
-                    vwap_change_pct = (vwap_now - vwap_6_ago) / vwap_6_ago * 100 if vwap_6_ago > 0 else 0
+                    vwap_change_pct = (vwap_now - vwap_back) / vwap_back * 100 if vwap_back > 0 else 0
                     
                     if vwap_change_pct > 0.15:
                         vwap_slope = "RISING"
@@ -1434,9 +1886,14 @@ class ZerodhaTools:
                 price_vs_vwap = "AT_VWAP"
             
             # 3. Opening Range Breakout - USE INTRADAY DATA if available
-            if intraday_df is not None and len(intraday_df) >= 3:
-                # TRUE ORB: First 15 minutes (3 x 5-min candles)
-                orb_candles = intraday_df.head(3)
+            if intraday_df is not None and len(intraday_df) >= _orb_candle_count:
+                # TRUE ORB: First 15 minutes (dynamic: 3x5min or 5x3min)
+                orb_candles = intraday_df.head(_orb_candle_count)
+                orb_high = orb_candles['high'].max()
+                orb_low = orb_candles['low'].min()
+            elif intraday_df is not None and len(intraday_df) >= 2:
+                # Partial ORB: use whatever candles we have (ORB still forming)
+                orb_candles = intraday_df
                 orb_high = orb_candles['high'].max()
                 orb_low = orb_candles['low'].min()
             else:
@@ -1456,10 +1913,10 @@ class ZerodhaTools:
                 orb_signal = "INSIDE_ORB"
                 orb_strength = 0
             
-            # ORB hold: count 5-min candles that held the breakout level
+            # ORB hold: count candles that held the breakout level
             orb_hold_candles = 0
-            if intraday_df is not None and len(intraday_df) > 3 and orb_signal != "INSIDE_ORB":
-                post_orb_candles = intraday_df.iloc[3:]
+            if intraday_df is not None and len(intraday_df) > _orb_candle_count and orb_signal != "INSIDE_ORB":
+                post_orb_candles = intraday_df.iloc[_orb_candle_count:]
                 if orb_signal == "BREAKOUT_UP":
                     orb_hold_candles = int((post_orb_candles['low'] >= orb_high * 0.998).sum())
                 elif orb_signal == "BREAKOUT_DOWN":
@@ -1478,6 +1935,15 @@ class ZerodhaTools:
                 volume_regime = "HIGH"
             else:
                 volume_regime = "EXPLOSIVE"
+            
+            # 4b. RECENT VOLUME RATE — last 3 candles vs session average candle volume
+            # Answers: "Is volume intense RIGHT NOW or was it front-loaded earlier?"
+            recent_vol_rate = 1.0  # default: same as session average
+            if intraday_df is not None and len(intraday_df) >= 5:
+                candle_volumes = intraday_df['volume'].values
+                avg_candle_vol = candle_volumes.mean()
+                recent_3_avg = candle_volumes[-3:].mean()
+                recent_vol_rate = recent_3_avg / avg_candle_vol if avg_candle_vol > 0 else 1.0
             
             # === 5. CHOP FILTER (Anti-Whipsaw) ===
             chop_zone = False
@@ -1577,7 +2043,7 @@ class ZerodhaTools:
             if intraday_df is not None and len(intraday_df) >= 6:
                 idf = intraday_df
                 
-                # Calculate 5-min ATR from available intraday candles
+                # Calculate intraday ATR from available candles
                 idf_tr = pd.concat([
                     idf['high'] - idf['low'],
                     abs(idf['high'] - idf['close'].shift(1)),
@@ -1594,7 +2060,7 @@ class ZerodhaTools:
                 
                 # Follow-through: count confirming candles post-ORB (doji-tolerant)
                 if orb_signal in ("BREAKOUT_UP", "BREAKOUT_DOWN"):
-                    post_orb = idf.iloc[3:]  # Skip ORB period
+                    post_orb = idf.iloc[_orb_candle_count:]  # Skip ORB period (dynamic)
                     confirming = 0
                     non_confirming = 0
                     for i in range(len(post_orb)):
@@ -1646,22 +2112,22 @@ class ZerodhaTools:
                 
                 if orb_signal == "BREAKOUT_UP":
                     # Find the highest high after ORB, then measure pullback from there
-                    post_orb_highs = idf_high[3:]  # skip first 3 ORB candles
+                    post_orb_highs = idf_high[_orb_candle_count:]  # skip ORB candles
                     if len(post_orb_highs) > 0:
                         swing_high_idx = int(post_orb_highs.argmax())  # relative to post_orb
                         swing_high = float(post_orb_highs[swing_high_idx])
                         # Measure pullback from swing high to current low
                         if swing_high > 0 and swing_high_idx < len(post_orb_highs) - 1:
                             # There are candles after the swing high — measure pullback
-                            after_swing = idf_low[3 + swing_high_idx + 1:]
+                            after_swing = idf_low[_orb_candle_count + swing_high_idx + 1:]
                             if len(after_swing) > 0:
                                 lowest_after = float(after_swing.min())
                                 pullback_depth_pct = (swing_high - lowest_after) / swing_high * 100
                                 # Count candles pulling back (close < prev close)
                                 pb_candles = 0
-                                closes_after = idf_close[3 + swing_high_idx + 1:]
+                                closes_after = idf_close[_orb_candle_count + swing_high_idx + 1:]
                                 for k in range(len(closes_after)):
-                                    prev_c = idf_close[3 + swing_high_idx + k] if k == 0 else closes_after[k - 1]
+                                    prev_c = idf_close[_orb_candle_count + swing_high_idx + k] if k == 0 else closes_after[k - 1]
                                     if closes_after[k] < prev_c:
                                         pb_candles += 1
                                     else:
@@ -1670,34 +2136,34 @@ class ZerodhaTools:
                 
                 elif orb_signal == "BREAKOUT_DOWN":
                     # Find the lowest low after ORB, then measure pullback from there
-                    post_orb_lows = idf_low[3:]
+                    post_orb_lows = idf_low[_orb_candle_count:]
                     if len(post_orb_lows) > 0:
                         swing_low_idx = int(post_orb_lows.argmin())
                         swing_low = float(post_orb_lows[swing_low_idx])
                         if swing_low > 0 and swing_low_idx < len(post_orb_lows) - 1:
-                            after_swing = idf_high[3 + swing_low_idx + 1:]
+                            after_swing = idf_high[_orb_candle_count + swing_low_idx + 1:]
                             if len(after_swing) > 0:
                                 highest_after = float(after_swing.max())
                                 pullback_depth_pct = (highest_after - swing_low) / swing_low * 100
                                 pb_candles = 0
-                                closes_after = idf_close[3 + swing_low_idx + 1:]
+                                closes_after = idf_close[_orb_candle_count + swing_low_idx + 1:]
                                 for k in range(len(closes_after)):
-                                    prev_c = idf_close[3 + swing_low_idx + k] if k == 0 else closes_after[k - 1]
+                                    prev_c = idf_close[_orb_candle_count + swing_low_idx + k] if k == 0 else closes_after[k - 1]
                                     if closes_after[k] > prev_c:
                                         pb_candles += 1
                                     else:
                                         break
                                 pullback_candles = pb_candles
             
-            # === MOMENTUM 15m: price change over last 3 candles (15 min on 5-min timeframe) ===
+            # === MOMENTUM 15m: price change over lookback candles (15 min equivalent) ===
             momentum_15m = 0.0
-            if intraday_df is not None and len(intraday_df) >= 4:
+            if intraday_df is not None and len(intraday_df) >= (_momentum_lookback + 1):
                 close_now = float(intraday_df['close'].iloc[-1])
-                close_3ago = float(intraday_df['close'].iloc[-4])  # 3 candles back = 15 min
-                if close_3ago > 0:
-                    momentum_15m = ((close_now - close_3ago) / close_3ago) * 100
+                close_back = float(intraday_df['close'].iloc[-(_momentum_lookback + 1)])  # lookback candles back
+                if close_back > 0:
+                    momentum_15m = ((close_now - close_back) / close_back) * 100
             
-            return {
+            _ind_result = {
                 'sma_20': round(sma_20, 2),
                 'sma_50': round(sma_50, 2),
                 'rsi_14': round(rsi, 2),
@@ -1734,6 +2200,7 @@ class ZerodhaTools:
                 'volume_5d_avg': round(volume_5d_avg, 0),
                 'volume_vs_avg': round(volume_vs_avg, 2),
                 'volume_regime': volume_regime,
+                'recent_vol_rate': round(recent_vol_rate, 2),
                 # === CHOP FILTER FIELDS ===
                 'chop_zone': chop_zone,
                 'chop_reason': chop_reason,
@@ -1747,6 +2214,8 @@ class ZerodhaTools:
                 'vwap_change_pct': round(vwap_change_pct, 4),
                 'orb_hold_candles': orb_hold_candles,
                 'adx': round(adx, 1),
+                'adx_daily': round(_daily_adx, 1),
+                'adx_overridden': _adx_overridden,
                 # === ACCELERATION FIELDS ===
                 'follow_through_candles': follow_through_candles,
                 'range_expansion_ratio': round(range_expansion_ratio, 2),
@@ -1758,6 +2227,10 @@ class ZerodhaTools:
                 # === MOMENTUM ===
                 'momentum_15m': round(momentum_15m, 4),
             }
+            
+            # Store in cache for TTL reuse
+            self._ind_cache[symbol] = (time.time(), _ind_result)
+            return _ind_result
             
         except Exception as e:
             import traceback
@@ -2184,6 +2657,90 @@ class ZerodhaTools:
         order['_regime_score'] = regime_result.total_score
         order['_regime_confidence'] = regime_result.confidence
         
+        # === INTRADAY SIGNAL SCORING FOR CASH EQUITY ===
+        # Same IntradayOptionScorer used for options, but with lower thresholds
+        # Prevents blindly placing cash trades without signal quality check
+        from config import CASH_INTRADAY_CONFIG
+        cash_scoring_enabled = CASH_INTRADAY_CONFIG.get('enabled', True)
+        
+        if cash_scoring_enabled and market_data:
+            try:
+                scorer = get_intraday_scorer()
+                
+                # Build IntradaySignal from market_data (same as options flow)
+                intraday_signal = IntradaySignal(
+                    symbol=symbol,
+                    orb_signal=market_data.get('orb_signal', 'INSIDE_ORB'),
+                    vwap_position=market_data.get('price_vs_vwap', market_data.get('vwap_position', 'AT_VWAP')),
+                    vwap_trend=market_data.get('vwap_slope', market_data.get('vwap_trend', 'FLAT')),
+                    ema_regime=market_data.get('ema_regime', 'NORMAL'),
+                    volume_regime=market_data.get('volume_regime', 'NORMAL'),
+                    rsi=market_data.get('rsi_14', 50.0),
+                    price_momentum=market_data.get('momentum_15m', 0.0),
+                    htf_alignment=market_data.get('htf_alignment', 'NEUTRAL'),
+                    chop_zone=market_data.get('chop_zone', False),
+                    follow_through_candles=market_data.get('follow_through_candles', 0),
+                    range_expansion_ratio=market_data.get('range_expansion_ratio', 0.0),
+                    vwap_slope_steepening=market_data.get('vwap_slope_steepening', False),
+                    atr=market_data.get('atr_14', 0.0)
+                )
+                
+                # Score the signal (skip microstructure for cash equity)
+                cash_decision = scorer.score_intraday_signal(
+                    signal=intraday_signal,
+                    market_data=market_data,
+                    option_data=None,  # No option microstructure for cash
+                    caller_direction=side
+                )
+                
+                cash_min_score = CASH_INTRADAY_CONFIG.get('min_score', 40)
+                cash_min_conviction = CASH_INTRADAY_CONFIG.get('min_conviction_points', 5)
+                
+                # Extract directional conviction from decision reasons
+                actual_score = cash_decision.confidence_score
+                
+                # Check minimum score
+                if actual_score < cash_min_score:
+                    self._scorer_rejected_symbols.add(symbol.replace('NSE:', ''))
+                    if CASH_INTRADAY_CONFIG.get('log_rejections', True):
+                        print(f"   🚫 CASH INTRADAY BLOCK: {symbol} score {actual_score:.0f}/{cash_min_score}")
+                        for r in cash_decision.reasons[:5]:
+                            print(f"      {r}")
+                        for w in cash_decision.warnings[:5]:
+                            print(f"      {w}")
+                    return {
+                        "success": False,
+                        "error": f"CASH INTRADAY BLOCK: Score {actual_score:.0f}/{cash_min_score} - signals too weak for entry",
+                        "intraday_score": actual_score,
+                        "threshold": cash_min_score,
+                        "direction": cash_decision.recommended_direction,
+                        "reasons": cash_decision.reasons[:5],
+                        "warnings": cash_decision.warnings[:5],
+                        "action": "SKIP - intraday signals insufficient for cash trade"
+                    }
+                
+                # Check direction alignment — agent said BUY but signals say SELL (or vice versa)
+                if cash_decision.recommended_direction != "HOLD" and cash_decision.recommended_direction != side:
+                    if CASH_INTRADAY_CONFIG.get('log_rejections', True):
+                        print(f"   🚫 CASH DIRECTION CONFLICT: Agent wants {side} but signals say {cash_decision.recommended_direction}")
+                    return {
+                        "success": False,
+                        "error": f"DIRECTION CONFLICT: Agent wants {side} but intraday signals say {cash_decision.recommended_direction} (score: {actual_score:.0f})",
+                        "intraday_score": actual_score,
+                        "agent_direction": side,
+                        "signal_direction": cash_decision.recommended_direction,
+                        "action": "SKIP - direction mismatch between analysis and signals"
+                    }
+                
+                print(f"   ✅ Cash Intraday Score: {actual_score:.0f}/{cash_min_score} ({cash_decision.recommended_direction}) — PASSED")
+                order['_intraday_score'] = actual_score
+                order['_intraday_direction'] = cash_decision.recommended_direction
+                
+            except Exception as e:
+                print(f"   ⚠️ Cash intraday scoring failed: {e} — allowing trade (fallback)")
+        elif cash_scoring_enabled and not market_data:
+            print(f"   ⚠️ No market data for cash scoring — allowing trade (no data)")
+        
         # First validate
         validation = self.validate_trade(order)
         if not validation['all_passed']:
@@ -2302,7 +2859,7 @@ class ZerodhaTools:
                 
                 # ALWAYS use CURRENT LTP as entry price (not what LLM passed)
                 try:
-                    quote = self.kite.quote([symbol])
+                    quote = self.kite.ltp([symbol])
                     current_ltp = quote[symbol]['last_price']
                 except:
                     current_ltp = order.get('entry_price', 0)
@@ -2380,8 +2937,8 @@ class ZerodhaTools:
             # LIVE MODE: Place real order
             exchange, tradingsymbol = symbol.split(":")
             
-            # Place main order
-            order_id = self.kite.place_order(
+            # Place main order (with autoslice for freeze qty protection)
+            order_id = self._place_order_autoslice(
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=exchange,
                 tradingsymbol=tradingsymbol,
@@ -2389,14 +2946,16 @@ class ZerodhaTools:
                 quantity=order['quantity'],
                 product=self.kite.PRODUCT_MIS,  # Intraday
                 order_type=self.kite.ORDER_TYPE_MARKET,
-                validity=self.kite.VALIDITY_DAY
+                validity=self.kite.VALIDITY_DAY,
+                market_protection=-1,
+                tag='TITAN_EQ'
             )
             
-            # Place SL order
+            # Place SL order (with autoslice)
             sl_side = self.kite.TRANSACTION_TYPE_SELL if order['side'] == 'BUY' else self.kite.TRANSACTION_TYPE_BUY
             sl_trigger = order['stop_loss'] * (0.999 if order['side'] == 'BUY' else 1.001)
             
-            sl_order_id = self.kite.place_order(
+            sl_order_id = self._place_order_autoslice(
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=exchange,
                 tradingsymbol=tradingsymbol,
@@ -2405,8 +2964,31 @@ class ZerodhaTools:
                 product=self.kite.PRODUCT_MIS,
                 order_type=self.kite.ORDER_TYPE_SLM,
                 trigger_price=sl_trigger,
-                validity=self.kite.VALIDITY_DAY
+                validity=self.kite.VALIDITY_DAY,
+                tag='TITAN_SL'
             )
+            
+            # === GTT SAFETY NET (server-side backup SL + target) ===
+            gtt_trigger_id = None
+            if GTT_CONFIG.get('equity_gtt', True):
+                gtt_trigger_id = self._place_gtt_safety_net(
+                    symbol=symbol,
+                    side=order['side'],
+                    quantity=order['quantity'],
+                    entry_price=current_ltp,
+                    sl_price=stop_loss,
+                    target_price=target,
+                    product="MIS",
+                    tag='TITAN_EQ'
+                )
+                # Store GTT ID in the trade record for cleanup on exit
+                if gtt_trigger_id:
+                    with self._positions_lock:
+                        for trade in self.paper_positions:
+                            if trade.get('order_id') == str(order_id) or trade.get('symbol') == symbol:
+                                trade['gtt_trigger_id'] = gtt_trigger_id
+                                break
+                        self._save_active_trades()
             
             # === RECORD ORDER IN IDEMPOTENT ENGINE ===
             order_intent = order.get('_order_intent')
@@ -2423,6 +3005,7 @@ class ZerodhaTools:
                 "success": True,
                 "order_id": order_id,
                 "sl_order_id": sl_order_id,
+                "gtt_trigger_id": gtt_trigger_id,
                 "message": f"Order placed: {order['side']} {order['quantity']} {symbol}",
                 "client_order_id": order_intent.generate_client_order_id() if order_intent else None,
                 "details": order
@@ -2586,49 +3169,55 @@ class ZerodhaTools:
         if option_type:
             opt_type = OptionType[option_type.upper()]
         
-        # === AUTO-TRY CREDIT SPREAD FIRST (code-level enforcement) ===
-        from config import CREDIT_SPREAD_CONFIG
-        if CREDIT_SPREAD_CONFIG.get('enabled', False) and CREDIT_SPREAD_CONFIG.get('primary_strategy', False):
-            try:
-                print(f"   🔄 Auto-trying credit spread FIRST for {underlying} ({direction})...")
-                spread_result = self.place_credit_spread(
-                    underlying=underlying,
-                    direction=direction,
-                    rationale=rationale or "Auto-routed from option order",
-                    pre_fetched_market_data=market_data if market_data else None
-                )
-                if spread_result.get('success'):
-                    print(f"   ✅ Credit spread placed instead of naked buy!")
-                    spread_result['auto_routed'] = True
-                    spread_result['original_tool'] = 'place_option_order'
-                    return spread_result
-                else:
-                    fallback_reason = spread_result.get('error', 'Unknown')
-                    print(f"   🔄 Credit spread not viable for {underlying}, checking debit spread fallback...")
-            except Exception as e:
-                print(f"   ⚠️ Credit spread attempt failed ({e}), checking debit spread fallback...")
+        # === LOOKUP CACHED CYCLE DECISION (avoid re-scoring) ===
+        _cached = getattr(self, '_cached_cycle_decisions', {}).get(underlying, None)
         
-        # === AUTO-TRY DEBIT SPREAD SECOND (before naked buy) ===
+        # === AUTO-TRY DEBIT SPREAD FIRST (directional momentum play) ===
         from config import DEBIT_SPREAD_CONFIG
         if DEBIT_SPREAD_CONFIG.get('enabled', False):
             try:
+                print(f"   🔄 Auto-trying debit spread FIRST for {underlying} ({direction})...")
                 debit_result = self.place_debit_spread(
                     underlying=underlying,
                     direction=direction,
-                    rationale=rationale or "Auto-routed: credit spread failed, trying debit spread",
-                    pre_fetched_market_data=market_data if market_data else None
+                    rationale=rationale or "Auto-routed from option order (debit spread primary)",
+                    pre_fetched_market_data=market_data if market_data else None,
+                    cached_decision=_cached
                 )
                 if debit_result.get('success'):
                     print(f"   ✅ Debit spread placed instead of naked buy!")
                     debit_result['auto_routed'] = True
                     debit_result['original_tool'] = 'place_option_order'
-                    debit_result['fallback_from'] = 'credit_spread'
                     return debit_result
                 else:
                     debit_reason = debit_result.get('error', 'Unknown')
-                    print(f"   🔄 Debit spread not viable ({debit_reason}), falling back to naked buy...")
+                    print(f"   🔄 Debit spread not viable ({debit_reason}), checking credit spread...")
             except Exception as e:
-                print(f"   ⚠️ Debit spread attempt failed ({e}), falling back to naked buy...")
+                print(f"   ⚠️ Debit spread attempt failed ({e}), checking credit spread...")
+        
+        # === AUTO-TRY CREDIT SPREAD SECOND (theta-positive hedge) ===
+        from config import CREDIT_SPREAD_CONFIG
+        if CREDIT_SPREAD_CONFIG.get('enabled', False) and CREDIT_SPREAD_CONFIG.get('primary_strategy', False):
+            try:
+                print(f"   🔄 Auto-trying credit spread for {underlying} ({direction})...")
+                spread_result = self.place_credit_spread(
+                    underlying=underlying,
+                    direction=direction,
+                    rationale=rationale or "Auto-routed: debit spread failed, trying credit spread",
+                    pre_fetched_market_data=market_data if market_data else None,
+                    cached_decision=_cached
+                )
+                if spread_result.get('success'):
+                    print(f"   ✅ Credit spread placed instead of naked buy!")
+                    spread_result['auto_routed'] = True
+                    spread_result['original_tool'] = 'place_option_order'
+                    spread_result['fallback_from'] = 'debit_spread'
+                    return spread_result
+                else:
+                    fallback_reason = spread_result.get('error', 'Unknown')
+                    print(f"   🔄 Credit spread not viable for {underlying}, falling back to naked buy...")
+            except Exception as e:
+                print(f"   ⚠️ Credit spread attempt failed ({e}), falling back to naked buy...")
         
         strike_sel = StrikeSelection[strike_selection.upper()] if strike_selection != "AUTO" else None
         expiry_sel = ExpirySelection[expiry_selection.upper()] if expiry_selection != "AUTO" else None
@@ -2640,12 +3229,81 @@ class ZerodhaTools:
             option_type=opt_type,
             strike_selection=strike_sel,
             expiry_selection=expiry_sel,
-            market_data=market_data if use_intraday_scoring else None
+            market_data=market_data if use_intraday_scoring else None,
+            cached_decision=_cached
         )
         
         if plan is None:
             # Track rejection so autonomous_trader won't retry this symbol
             self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+            
+            # === AUTO-TRY IRON CONDOR for LOW-SCORE stocks (choppy theta harvest) ===
+            from config import IRON_CONDOR_CONFIG
+            if IRON_CONDOR_CONFIG.get('enabled', False):
+                rejected_score = getattr(options_trader, '_last_rejected_score', 999)
+                max_ic_score = IRON_CONDOR_CONFIG.get('max_directional_score', 45)
+                min_ic_score = IRON_CONDOR_CONFIG.get('min_directional_score', 15)
+                if min_ic_score <= rejected_score <= max_ic_score:
+                    # DTE pre-check: skip IC if no eligible expiry today (0-1 DTE only)
+                    ic_dte_ok = getattr(self, '_ic_dte_eligible', None)
+                    if ic_dte_ok is None:
+                        # Compute once per session
+                        ic_dte_ok = False
+                        try:
+                            # ExpirySelection already imported at module level (line 26)
+                            idx_mode = IRON_CONDOR_CONFIG.get('index_mode', {})
+                            stk_mode = IRON_CONDOR_CONFIG.get('stock_mode', {})
+                            today_date = datetime.now().date()
+                            # Quick check: index weekly
+                            for idx_sym in ['NSE:NIFTY 50']:
+                                try:
+                                    idx_exp = options_trader.chain_fetcher.get_nearest_expiry(idx_sym, ExpirySelection[idx_mode.get('prefer_expiry', 'CURRENT_WEEK')])
+                                    if idx_exp:
+                                        from datetime import date as _date
+                                        exp_d = idx_exp if isinstance(idx_exp, _date) and not isinstance(idx_exp, datetime) else idx_exp.date() if hasattr(idx_exp, 'date') else idx_exp
+                                        if (exp_d - today_date).days <= idx_mode.get('max_dte', 2):
+                                            ic_dte_ok = True
+                                except Exception:
+                                    pass
+                            if not ic_dte_ok:
+                                try:
+                                    stk_exp = options_trader.chain_fetcher.get_nearest_expiry("NSE:RELIANCE", ExpirySelection[stk_mode.get('prefer_expiry', 'CURRENT_MONTH')])
+                                    if stk_exp:
+                                        from datetime import date as _date
+                                        exp_d = stk_exp if isinstance(stk_exp, _date) and not isinstance(stk_exp, datetime) else stk_exp.date() if hasattr(stk_exp, 'date') else stk_exp
+                                        if (exp_d - today_date).days <= stk_mode.get('max_dte', 15):
+                                            ic_dte_ok = True
+                                except Exception:
+                                    pass
+                            self._ic_dte_eligible = ic_dte_ok
+                            if not ic_dte_ok:
+                                print(f"   🦅 IC DTE check: No expiry within limits — IC disabled for today")
+                        except Exception:
+                            self._ic_dte_eligible = False
+                            ic_dte_ok = False
+                    
+                    if not ic_dte_ok:
+                        pass  # Silently skip — already printed once
+                    else:
+                        print(f"   🦅 Score {rejected_score:.0f} too low for directional, trying IRON CONDOR...")
+                        try:
+                            ic_result = self.place_iron_condor(
+                                underlying=underlying,
+                                rationale=rationale or f"Auto-routed: directional score {rejected_score:.0f} → iron condor",
+                                directional_score=rejected_score,
+                                pre_fetched_market_data=market_data if market_data else None
+                            )
+                            if ic_result.get('success'):
+                                print(f"   ✅ Iron Condor placed instead of directional trade!")
+                                ic_result['auto_routed'] = True
+                                ic_result['original_tool'] = 'place_option_order'
+                                ic_result['fallback_from'] = 'directional_rejected'
+                                return ic_result
+                            else:
+                                print(f"   🔄 Iron Condor not viable: {ic_result.get('error', 'Unknown')}")
+                        except Exception as e:
+                            print(f"   ⚠️ Iron Condor attempt failed: {e}")
+            
             return {
                 "success": False,
                 "error": f"Intraday scorer REJECTED {underlying} - score below threshold. Do NOT retry this symbol.",
@@ -2728,7 +3386,8 @@ class ZerodhaTools:
     def place_credit_spread(self, underlying: str, direction: str,
                             spread_width: int = None,
                             rationale: str = "",
-                            pre_fetched_market_data: dict = None) -> Dict:
+                            pre_fetched_market_data: dict = None,
+                            cached_decision: dict = None) -> Dict:
         """
         Tool: Place a credit spread (SELL option + BUY hedge) — theta-positive strategy
         
@@ -2825,7 +3484,8 @@ class ZerodhaTools:
             underlying=underlying,
             direction=direction,
             market_data=market_data,
-            spread_width_strikes=spread_width
+            spread_width_strikes=spread_width,
+            cached_decision=cached_decision
         )
         
         if plan is None:
@@ -2903,7 +3563,8 @@ class ZerodhaTools:
     def place_debit_spread(self, underlying: str, direction: str,
                            spread_width: int = None,
                            rationale: str = "",
-                           pre_fetched_market_data: dict = None) -> Dict:
+                           pre_fetched_market_data: dict = None,
+                           cached_decision: dict = None) -> Dict:
         """
         Tool: Place an intraday debit spread on a momentum mover.
         
@@ -3004,7 +3665,8 @@ class ZerodhaTools:
             underlying=underlying,
             direction=direction,
             market_data=market_data,
-            spread_width_strikes=spread_width
+            spread_width_strikes=spread_width,
+            cached_decision=cached_decision
         )
         
         if plan is None:
@@ -3077,6 +3739,165 @@ class ZerodhaTools:
         
         return result
     
+    # =================================================================
+    # IRON CONDOR — NEUTRAL THETA HARVEST (CHOPPY STOCKS)
+    # =================================================================
+    
+    def place_iron_condor(self, underlying: str,
+                          rationale: str = "",
+                          directional_score: float = 0,
+                          pre_fetched_market_data: dict = None) -> Dict:
+        """
+        Tool: Place an Iron Condor on a choppy/range-bound stock to harvest theta.
+        
+        4 legs: SELL OTM CE + BUY further OTM CE + SELL OTM PE + BUY further OTM PE
+        Profits when stock stays INSIDE the sold strikes (range-bound).
+        
+        Best for stocks with low directional score (< 45) and small intraday move.
+        
+        Args:
+            underlying: e.g., "NSE:BHEL"
+            rationale: Trade rationale
+            directional_score: The low score from directional scoring
+            pre_fetched_market_data: Pre-fetched market data dict
+            
+        Returns:
+            Dict with IC execution result
+        """
+        from options_trader import get_options_trader, IronCondorPlan
+        from config import TRADING_HOURS, IRON_CONDOR_CONFIG
+        
+        if not IRON_CONDOR_CONFIG.get('enabled', False):
+            return {"success": False, "error": "Iron Condor disabled in config"}
+        
+        # === SAFETY GATES ===
+        now = datetime.now()
+        no_new_after = datetime.strptime(TRADING_HOURS['no_new_after'], '%H:%M').time()
+        market_start = datetime.strptime(TRADING_HOURS['start'], '%H:%M').time()
+        ic_cutoff = datetime.strptime(IRON_CONDOR_CONFIG.get('no_entry_after', '13:30'), '%H:%M').time()
+        
+        if now.time() < market_start or now.time() > no_new_after:
+            return {"success": False, "error": "Outside trading hours"}
+        if now.time() > ic_cutoff:
+            return {"success": False, "error": f"Past IC cutoff ({IRON_CONDOR_CONFIG['no_entry_after']})"}
+        
+        # Risk governor
+        from risk_governor import get_risk_governor
+        risk_gov = get_risk_governor()
+        active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        trade_perm = risk_gov.can_trade_general(active_positions=active_positions)
+        if not trade_perm.allowed:
+            return {"success": False, "error": f"RISK GOVERNOR: {trade_perm.reason}"}
+        
+        # Duplicate check
+        for pos in self.paper_positions:
+            if pos.get('status', 'OPEN') == 'OPEN' and pos.get('underlying') == underlying:
+                return {"success": False, "error": f"Already have position on {underlying}"}
+        
+        # Get market data
+        market_data = {}
+        if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3:
+            market_data = pre_fetched_market_data
+        else:
+            try:
+                md = self.get_market_data([underlying])
+                if underlying in md and isinstance(md[underlying], dict):
+                    market_data = md[underlying]
+                else:
+                    return {"success": False, "error": f"No indicator data for {underlying}"}
+            except Exception as e:
+                return {"success": False, "error": f"Market data fetch failed: {e}"}
+        
+        # === CREATE IRON CONDOR PLAN ===
+        options_trader = get_options_trader(
+            kite=self.kite,
+            capital=getattr(self, 'paper_capital', 500000),
+            paper_mode=self.paper_mode
+        )
+        
+        plan = options_trader.create_iron_condor(
+            underlying=underlying,
+            market_data=market_data,
+            directional_score=directional_score
+        )
+        
+        if plan is None:
+            return {"success": False, "error": f"Iron Condor not viable for {underlying}"}
+        
+        # === EXECUTE ===
+        result = options_trader.execute_iron_condor(plan)
+        
+        if result.get('success'):
+            print(f"   ✅ IRON CONDOR PLACED: {plan.underlying}")
+            print(f"      PE wing: SELL {plan.sold_pe_contract.symbol} + BUY {plan.hedge_pe_contract.symbol}")
+            print(f"      CE wing: SELL {plan.sold_ce_contract.symbol} + BUY {plan.hedge_ce_contract.symbol}")
+            print(f"      Credit: ₹{plan.total_credit_amount:,.0f} | Risk: ₹{plan.max_risk:,.0f}")
+            print(f"      Zone: ₹{plan.lower_breakeven:.0f} — ₹{plan.upper_breakeven:.0f}")
+            
+            if self.paper_mode:
+                ic_position = {
+                    'symbol': f"{plan.sold_pe_contract.symbol}|{plan.sold_ce_contract.symbol}|{plan.hedge_pe_contract.symbol}|{plan.hedge_ce_contract.symbol}",
+                    'underlying': plan.underlying,
+                    'is_iron_condor': True,
+                    'is_credit_spread': False,
+                    'is_debit_spread': False,
+                    'strategy_type': 'IRON_CONDOR',
+                    'direction': 'NEUTRAL',
+                    # Upper wing
+                    'sold_ce_symbol': plan.sold_ce_contract.symbol,
+                    'sold_ce_strike': plan.sold_ce_contract.strike,
+                    'sold_ce_premium': plan.sold_ce_contract.ltp,
+                    'hedge_ce_symbol': plan.hedge_ce_contract.symbol,
+                    'hedge_ce_strike': plan.hedge_ce_contract.strike,
+                    'hedge_ce_premium': plan.hedge_ce_contract.ltp,
+                    # Lower wing
+                    'sold_pe_symbol': plan.sold_pe_contract.symbol,
+                    'sold_pe_strike': plan.sold_pe_contract.strike,
+                    'sold_pe_premium': plan.sold_pe_contract.ltp,
+                    'hedge_pe_symbol': plan.hedge_pe_contract.symbol,
+                    'hedge_pe_strike': plan.hedge_pe_contract.strike,
+                    'hedge_pe_premium': plan.hedge_pe_contract.ltp,
+                    # Sizing
+                    'quantity': plan.quantity * plan.lot_size,
+                    'lots': plan.quantity,
+                    'lot_size': plan.lot_size,
+                    'avg_price': plan.total_credit,
+                    'side': 'SELL',
+                    'total_credit': plan.total_credit,
+                    'total_credit_amount': plan.total_credit_amount,
+                    'max_risk': plan.max_risk,
+                    'ce_wing_width': plan.ce_wing_width,
+                    'pe_wing_width': plan.pe_wing_width,
+                    'upper_breakeven': plan.upper_breakeven,
+                    'lower_breakeven': plan.lower_breakeven,
+                    'profit_zone_width': plan.profit_zone_width,
+                    'stop_loss': plan.stop_loss_debit,
+                    'target': plan.target_buyback,
+                    'net_delta': plan.net_delta,
+                    'net_theta': plan.net_theta,
+                    'net_vega': plan.net_vega,
+                    'credit_pct': plan.credit_pct,
+                    'dte': plan.dte,
+                    'directional_score': plan.directional_score,
+                    'is_option': True,
+                    'order_id': result.get('condor_id'),
+                    'condor_id': result.get('condor_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': rationale or plan.rationale,
+                    'total_premium': 0,
+                    'entry_metadata': {
+                        'strategy_type': 'IRON_CONDOR',
+                        'directional_score': plan.directional_score,
+                        'profit_zone': f"₹{plan.lower_breakeven:.0f}-₹{plan.upper_breakeven:.0f}",
+                    },
+                }
+                with self._positions_lock:
+                    self.paper_positions.append(ic_position)
+                    self._save_active_trades()
+        
+        return result
+
     def get_option_greeks_update(self, symbol: str = None) -> Dict:
         """
         Tool: Get current Greeks for option positions
@@ -3215,8 +4036,8 @@ class ZerodhaTools:
             # Extract trading symbol
             exchange, tradingsymbol = symbol.split(":")
             
-            # Get spot price
-            quote = self.kite.quote([symbol])
+            # Get spot price (ltp is lighter than full quote)
+            quote = self.kite.ltp([symbol])
             spot_price = quote[symbol]['last_price']
             
             # Get all instruments
@@ -3389,19 +4210,47 @@ class ZerodhaTools:
                 }
             
             # LIVE MODE: Place real order
-            order_id = self.kite.place_order(
+            # LIVE MODE: Place real order (with autoslice for freeze qty protection)
+            order_id = self._place_order_autoslice(
                 variety=self.kite.VARIETY_REGULAR,
                 exchange="NFO",
                 tradingsymbol=tradingsymbol,
                 transaction_type=self.kite.TRANSACTION_TYPE_BUY,
                 quantity=total_qty,
                 product=self.kite.PRODUCT_MIS,  # Intraday
-                order_type=self.kite.ORDER_TYPE_MARKET
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                market_protection=-1,
+                tag='TITAN_OPT'
             )
+            
+            # === GTT SAFETY NET for naked option buys ===
+            gtt_trigger_id = None
+            if GTT_CONFIG.get('option_gtt', True):
+                option_sl = premium * (1 - stop_loss_pct/100)
+                option_target = premium * 1.5  # 50% profit target for safety net
+                gtt_trigger_id = self._place_gtt_safety_net(
+                    symbol=option_symbol,
+                    side="BUY",
+                    quantity=total_qty,
+                    entry_price=premium,
+                    sl_price=option_sl,
+                    target_price=option_target,
+                    product="MIS",
+                    tag='TITAN_OPT'
+                )
+                # Store in trade record
+                if gtt_trigger_id:
+                    with self._positions_lock:
+                        for trade in self.paper_positions:
+                            if trade.get('symbol') == option_symbol and trade.get('status', 'OPEN') == 'OPEN':
+                                trade['gtt_trigger_id'] = gtt_trigger_id
+                                break
+                        self._save_active_trades()
             
             return {
                 "success": True,
                 "order_id": order_id,
+                "gtt_trigger_id": gtt_trigger_id,
                 "message": f"Option order placed: BUY {quantity} lots of {tradingsymbol}",
                 "details": {
                     "symbol": option_symbol,
