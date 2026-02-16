@@ -17,6 +17,9 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 import json
 import os
+import logging
+
+logger = logging.getLogger('risk_governor')
 
 
 class SystemState(Enum):
@@ -30,8 +33,8 @@ class SystemState(Enum):
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_daily_loss_pct: float = 6.0      # Max 6% daily loss
-    max_consecutive_losses: int = 4       # Max 4 losses in a row
+    max_daily_loss_pct: float = 15.0     # Max 15% daily loss
+    max_consecutive_losses: int = 5       # Max 5 losses in a row
     max_trades_per_day: int = 80          # Max 80 trades per day
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
     cooldown_minutes: int = 0             # No cooldown after loss (disabled per user request)
@@ -154,12 +157,37 @@ class RiskGovernor:
                 print(f"⚠️ Error loading risk state: {e}")
     
     def _reconcile_pnl_from_history(self):
-        """Reconcile daily_pnl from trade_history.json (source of truth).
+        """Reconcile daily_pnl using active_trades.json realized_pnl as single source of truth.
         
-        Prevents drift caused by restarts or manual edits.
-        trade_history.json is written by zerodha_tools on every trade close.
+        active_trades.json's realized_pnl is updated by zerodha_tools.paper_pnl on EVERY
+        trade close (before archival), so it always reflects the true cumulative P&L —
+        even if some trades weren't archived to trade_history.json.
+        
+        Falls back to trade_history.json sum if active_trades.json is unavailable.
         """
-        history_file = os.path.join(os.path.dirname(__file__), 'trade_history.json')
+        base_dir = os.path.dirname(__file__)
+        
+        # --- PRIMARY SOURCE: active_trades.json realized_pnl ---
+        active_file = os.path.join(base_dir, 'active_trades.json')
+        if os.path.exists(active_file):
+            try:
+                with open(active_file, 'r') as f:
+                    active_data = json.load(f)
+                active_pnl = active_data.get('realized_pnl', None)
+                if active_pnl is not None:
+                    old_pnl = self.state.daily_pnl
+                    if abs(old_pnl - active_pnl) > 1.0:
+                        self.state.daily_pnl = active_pnl
+                        self.state.daily_pnl_pct = (active_pnl / self.starting_capital) * 100
+                        self.current_capital = self.starting_capital + active_pnl
+                        self._save_state()
+                        print(f"📊 Risk Governor: Reconciled daily P&L from active_trades: ₹{old_pnl:+,.0f} → ₹{active_pnl:+,.0f}")
+                    return
+            except Exception as e:
+                print(f"⚠️ Risk Governor: active_trades reconciliation failed: {e}")
+        
+        # --- FALLBACK: trade_history.json sum ---
+        history_file = os.path.join(base_dir, 'trade_history.json')
         if not os.path.exists(history_file):
             return
         try:
@@ -176,12 +204,12 @@ class RiskGovernor:
             ]
             if today_trades:
                 old_pnl = self.state.daily_pnl
-                if abs(old_pnl - today_pnl) > 1.0:  # Only fix if meaningful drift
+                if abs(old_pnl - today_pnl) > 1.0:
                     self.state.daily_pnl = today_pnl
                     self.state.daily_pnl_pct = (today_pnl / self.starting_capital) * 100
                     self.current_capital = self.starting_capital + today_pnl
                     self._save_state()
-                    print(f"📊 Risk Governor: Reconciled daily P&L from trade history: ₹{old_pnl:+,.0f} → ₹{today_pnl:+,.0f}")
+                    print(f"📊 Risk Governor: Reconciled daily P&L from trade history (fallback): ₹{old_pnl:+,.0f} → ₹{today_pnl:+,.0f}")
         except Exception as e:
             print(f"⚠️ Risk Governor: P&L reconciliation failed: {e}")
     
@@ -498,6 +526,9 @@ class RiskGovernor:
         print(f"   Day P&L: ₹{self.state.daily_pnl:+,.0f} ({self.state.daily_pnl_pct:+.2f}%)")
         print(f"   Trades: {self.state.trades_today} | W/L: {self.state.wins_today}/{self.state.losses_today}")
         self._save_state()
+        
+        # === DhanHQ Kill Switch — server-side backup halt ===
+        self._activate_dhan_kill_switch(reason)
     
     def trigger_circuit_breaker(self, reason: str):
         """
@@ -513,6 +544,31 @@ class RiskGovernor:
         print(f"\n🚨 CIRCUIT BREAKER TRIGGERED: {reason}")
         print(f"   Trading suspended until manual reset")
         self._save_state()
+        
+        # === DhanHQ Kill Switch — server-side EMERGENCY halt ===
+        self._activate_dhan_kill_switch(f"CIRCUIT_BREAK: {reason}")
+    
+    def _activate_dhan_kill_switch(self, reason: str):
+        """Activate DhanHQ server-side kill switch as backup safety net.
+        
+        This is a SUPPLEMENTARY halt on DhanHQ's side. Even if Titan crashes
+        after this, DhanHQ will prevent any new orders.
+        """
+        try:
+            from dhan_risk_tools import get_dhan_risk_tools
+            drt = get_dhan_risk_tools()
+            if drt.ready:
+                result = drt.emergency_halt()
+                ks = result.get('kill_switch', {})
+                if ks.get('success'):
+                    logger.info(f"🛑 DhanHQ Kill Switch activated (backup): {reason}")
+                else:
+                    logger.warning(f"⚠️ DhanHQ Kill Switch failed: {ks.get('message', 'unknown')}")
+            else:
+                logger.debug("DhanHQ not configured — kill switch skipped")
+        except Exception as e:
+            # Never let Dhan failure break the risk governor
+            logger.warning(f"DhanHQ kill switch error (non-fatal): {e}")
     
     def record_order_rejection(self):
         """Record an order rejection (for circuit breaker)"""
@@ -539,6 +595,19 @@ class RiskGovernor:
             self.state.data_stale_count = 0
             print("✅ Circuit breaker reset - trading resumed")
             self._save_state()
+            
+            # === Deactivate DhanHQ Kill Switch ===
+            try:
+                from dhan_risk_tools import get_dhan_risk_tools
+                drt = get_dhan_risk_tools()
+                if drt.ready:
+                    ok, msg = drt.deactivate_kill_switch()
+                    if ok:
+                        logger.info("✅ DhanHQ Kill Switch deactivated")
+                    else:
+                        logger.warning(f"⚠️ DhanHQ Kill Switch deactivation failed: {msg}")
+            except Exception as e:
+                logger.warning(f"DhanHQ kill switch deactivation error: {e}")
     
     def force_halt(self, reason: str = "Manual halt"):
         """Manually halt trading"""

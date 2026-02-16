@@ -25,7 +25,7 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS, FULL_FNO_SCAN
+from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS, FULL_FNO_SCAN, calc_brokerage
 from llm_agent import TradingAgent
 from zerodha_tools import get_tools, reset_tools
 from market_scanner import get_market_scanner
@@ -116,6 +116,31 @@ class AutonomousTrader:
         # Risk Governor for account-level risk
         self.risk_governor = get_risk_governor(capital)
         
+        # === DhanHQ Daily Safety Nets ===
+        self._dhan_risk = None
+        try:
+            from dhan_risk_tools import get_dhan_risk_tools
+            self._dhan_risk = get_dhan_risk_tools()
+            if self._dhan_risk.ready:
+                max_loss = capital * (self.risk_governor.limits.max_daily_loss_pct / 100)  # 6% = ₹30K on ₹5L
+                max_profit = max_loss * 3  # ₹90K profit cap
+                safety = self._dhan_risk.setup_daily_safety(
+                    max_loss=max_loss,
+                    max_profit=max_profit,
+                    starting_capital=capital,
+                )
+                print(f"  🛡️ DhanHQ Safety: loss_cap=₹{max_loss:,.0f} profit_cap=₹{max_profit:,.0f}")
+                print(f"     Kill Switch: {safety.get('kill_switch', 'N/A')}")
+                pnl_exit = safety.get('pnl_exit', {})
+                if pnl_exit.get('success'):
+                    print(f"     P&L Auto-Exit: ACTIVE")
+                else:
+                    print(f"     P&L Auto-Exit: {pnl_exit.get('message', 'failed')}")
+            else:
+                print("  🛡️ DhanHQ Safety: DISABLED (not configured)")
+        except Exception as e:
+            print(f"  🛡️ DhanHQ Safety: DISABLED ({e})")
+        
         # Correlation Guard for hidden overexposure
         self.correlation_guard = get_correlation_guard()
         
@@ -189,6 +214,39 @@ class AutonomousTrader:
         if DYNAMIC_MAX_PICKS.get('enabled'): print(f"  📊 Dynamic Max Picks: ACTIVE (3→5 when signals are hot)")
         if ADAPTIVE_SCAN.get('enabled'): print(f"  ⏱️ Adaptive Scan: ACTIVE ({ADAPTIVE_SCAN['fast_interval_minutes']}min/{ADAPTIVE_SCAN['normal_interval_minutes']}min/{ADAPTIVE_SCAN['slow_interval_minutes']}min)")
         if DECISION_LOG.get('enabled'): print(f"  📝 Decision Log: ACTIVE ({DECISION_LOG['file']})")
+        
+        # === ML MOVE PREDICTOR ===
+        self._ml_predictor = None
+        try:
+            from ml_models.predictor import MovePredictor
+            self._ml_predictor = MovePredictor()
+            if self._ml_predictor.ready:
+                print("  🧠 ML Move Predictor: ACTIVE (XGBoost score booster)")
+            else:
+                print("  🧠 ML Move Predictor: STANDBY (no trained model yet)")
+                self._ml_predictor = None
+        except Exception as e:
+            print(f"  🧠 ML Move Predictor: DISABLED ({e})")
+        
+        # === OI FLOW ANALYZER (post-ML overlay using live options chain) ===
+        self._oi_analyzer = None
+        try:
+            from options_flow_analyzer import get_options_flow_analyzer
+            from options_trader import get_options_trader
+            _ot_init = get_options_trader(
+                kite=self.tools.kite,
+                capital=getattr(self.tools, 'paper_capital', 500000),
+                paper_mode=getattr(self.tools, 'paper_mode', True)
+            )
+            self._oi_analyzer = get_options_flow_analyzer(_ot_init.chain_fetcher)
+            if self._oi_analyzer and self._oi_analyzer.ready:
+                print("  📊 OI Flow Analyzer: ACTIVE (real-time PCR/IV/MaxPain overlay)")
+            else:
+                print("  📊 OI Flow Analyzer: STANDBY (no chain fetcher)")
+                self._oi_analyzer = None
+        except Exception as e:
+            print(f"  📊 OI Flow Analyzer: DISABLED ({e})")
+        
         print("="*60)
     
     # ========== DECISION LOG ==========
@@ -299,6 +357,57 @@ class AutonomousTrader:
                                       reason='No valid setup despite high score', direction=direction)
                     continue
             
+            # === FOLLOW-THROUGH GATE (prevents auto-firing dead momentum) ===
+            # Pro trader rule: don't auto-fire if breakout has ZERO follow-through.
+            # 8 TIME_STOP losses had MaxR=0 — stock never moved after entry.
+            # Require at least 1 follow-through candle for auto-fire confidence.
+            if isinstance(data, dict):
+                ft_candles = data.get('follow_through_candles', 0)
+                adx_val = data.get('adx', 20)
+                oi_signal = data.get('oi_signal', 'NEUTRAL')
+                
+                # Block auto-fire if: zero follow-through AND not a fresh breakout
+                # (orb_hold_candles > 2 means breakout happened a while ago)
+                orb_hold = data.get('orb_hold_candles', 0)
+                if ft_candles == 0 and orb_hold > 2:
+                    self._log_decision(cycle_time, sym, score, 'ELITE_NO_FOLLOWTHROUGH',
+                                      reason=f'FT=0, ORB hold={orb_hold} candles — stale breakout, no confirmation',
+                                      direction=direction)
+                    continue
+                
+                # Block auto-fire if ADX < 25 (no trend strength)
+                if adx_val < 25:
+                    self._log_decision(cycle_time, sym, score, 'ELITE_WEAK_ADX',
+                                      reason=f'ADX={adx_val:.0f} < 25 — no trend strength for auto-fire',
+                                      direction=direction)
+                    continue
+                
+                # Block auto-fire if OI conflicts with direction
+                if direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
+                    self._log_decision(cycle_time, sym, score, 'ELITE_OI_CONFLICT',
+                                      reason=f'BUY direction but OI={oi_signal} — institutions selling',
+                                      direction=direction)
+                    continue
+                if direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
+                    self._log_decision(cycle_time, sym, score, 'ELITE_OI_CONFLICT',
+                                      reason=f'SELL direction but OI={oi_signal} — institutions buying',
+                                      direction=direction)
+                    continue
+            
+            # ML soft gate: if ML strongly says FLAT, skip auto-fire
+            # (GPT can still pick this stock — just don't auto-fire it)
+            # FAIL-SAFE: if ML check crashes, proceed with auto-fire as before
+            try:
+                _cached_ml = cycle_decisions.get(sym, {}).get('ml_prediction', {})
+                if _cached_ml.get('ml_elite_ok') is False:
+                    _ml_flat_p = _cached_ml.get('ml_prob_flat', 0)
+                    self._log_decision(cycle_time, sym, score, 'ELITE_ML_SKIP',
+                                      reason=f"ML: FLAT ({_ml_flat_p:.0%} flat prob) — GPT can still pick",
+                                      direction=direction)
+                    continue
+            except Exception:
+                pass  # ML check failed — proceed with auto-fire
+            
             elite_candidates.append((sym, score, direction, data))
         
         # Execute top N elite candidates
@@ -309,7 +418,22 @@ class AutonomousTrader:
             if len(active_positions) >= HARD_RULES['MAX_POSITIONS']:
                 break
             
-            print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}")
+            # === ML DIRECTION OVERRIDE for elite auto-fire ===
+            # Same logic: if ML strongly disagrees with tech direction, flip.
+            _elite_ml_override = ""
+            try:
+                _cached_ml = cycle_decisions.get(sym, {}).get('ml_prediction', {})
+                _ml_dir = _cached_ml.get('ml_direction_hint', 'NEUTRAL')
+                if _ml_dir == 'BULLISH' and direction == 'SELL':
+                    direction = 'BUY'
+                    _elite_ml_override = " [ML_OVERRIDE:BUY]"
+                elif _ml_dir == 'BEARISH' and direction == 'BUY':
+                    direction = 'SELL'
+                    _elite_ml_override = " [ML_OVERRIDE:SELL]"
+            except Exception:
+                pass  # ML unavailable — proceed with original direction
+            
+            print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}{_elite_ml_override}")
             try:
                 result = self.tools.place_option_order(
                     underlying=sym,
@@ -683,6 +807,7 @@ class AutonomousTrader:
                         pnl = (ltp - entry) * qty
                     else:
                         pnl = (entry - ltp) * qty
+                    pnl -= calc_brokerage(entry, ltp, qty)
                     
                     print(f"   🚪 EOD EXIT: {symbol} @ ₹{ltp:.2f}")
                     print(f"      P&L: ₹{pnl:+,.2f}")
@@ -715,6 +840,7 @@ class AutonomousTrader:
                     hedge_ltp = quotes.get(hedge_sym, {}).get('last_price', 0) if hedge_sym else 0
                     current_debit = sold_ltp - hedge_ltp  # Cost to close the spread
                     pnl = (net_credit - current_debit) * qty
+                    pnl -= calc_brokerage(net_credit, current_debit, qty)
                     
                     print(f"   🚪 EOD EXIT SPREAD: {spread_id}")
                     print(f"      Sold leg: {sold_sym} @ ₹{sold_ltp:.2f} | Hedge: {hedge_sym} @ ₹{hedge_ltp:.2f}")
@@ -738,6 +864,7 @@ class AutonomousTrader:
                     sell_ltp = quotes.get(sell_sym, {}).get('last_price', 0) if sell_sym else 0
                     current_value = buy_ltp - sell_ltp
                     pnl = (current_value - net_debit) * qty
+                    pnl -= calc_brokerage(net_debit, current_value, qty)
                     
                     print(f"   🚪 EOD EXIT DEBIT SPREAD: {spread_id}")
                     print(f"      Buy leg: {buy_sym} @ ₹{buy_ltp:.2f} | Sell: {sell_sym} @ ₹{sell_ltp:.2f}")
@@ -767,6 +894,7 @@ class AutonomousTrader:
                     # Current debit to close all 4 legs
                     current_debit = (sold_ce_ltp - hedge_ce_ltp) + (sold_pe_ltp - hedge_pe_ltp)
                     pnl = (total_credit - current_debit) * qty
+                    pnl -= calc_brokerage(total_credit, current_debit, qty)
                     
                     print(f"   🚪 EOD EXIT IRON CONDOR: {condor_id}")
                     print(f"      CE wing: Sold ₹{sold_ce_ltp:.2f} / Hedge ₹{hedge_ce_ltp:.2f}")
@@ -892,6 +1020,7 @@ class AutonomousTrader:
                             ltp = entry  # Assume flat if can't get price
                         
                         pnl = (ltp - entry) * qty
+                        pnl -= calc_brokerage(entry, ltp, qty)
                         print(f"\n📊 OPTION EXIT: {symbol}")
                         print(f"   Reason: {reason}")
                         print(f"   Entry: ₹{entry:.2f} → Exit: ₹{ltp:.2f}")
@@ -986,6 +1115,7 @@ class AutonomousTrader:
                             partial_pnl = (ltp - entry) * exit_qty
                         else:
                             partial_pnl = (entry - ltp) * exit_qty
+                        partial_pnl -= calc_brokerage(entry, ltp, exit_qty)
                         
                         remaining_qty = qty - exit_qty
                         pnl_pct = partial_pnl / (entry * exit_qty) * 100
@@ -1021,17 +1151,21 @@ class AutonomousTrader:
                         credit = trade.get('net_credit', 0)
                         current_debit = ltp  # For spreads, ltp stores current net debit
                         pnl = (credit - current_debit) * qty
+                        pnl -= calc_brokerage(credit, current_debit, qty)
                         pnl_pct = (credit - current_debit) / credit * 100 if credit > 0 else 0
                     elif trade.get('is_debit_spread'):
                         # Debit spread P&L = (current_value - net_debit) × quantity
                         net_debit = trade.get('net_debit', 0)
                         current_value = ltp  # For debit spreads, ltp stores current spread value
                         pnl = (current_value - net_debit) * qty
+                        pnl -= calc_brokerage(net_debit, current_value, qty)
                         pnl_pct = (current_value - net_debit) / net_debit * 100 if net_debit > 0 else 0
                     elif side == 'BUY':
                         pnl = (ltp - entry) * qty
+                        pnl -= calc_brokerage(entry, ltp, qty)
                     else:
                         pnl = (entry - ltp) * qty
+                        pnl -= calc_brokerage(entry, ltp, qty)
                     
                     pnl_pct = pnl / (entry * qty) * 100 if not trade.get('is_debit_spread') else pnl_pct
                     was_win = pnl > 0
@@ -1181,6 +1315,7 @@ class AutonomousTrader:
                     pe_debit = sold_pe_ltp - hedge_pe_ltp  # Cost to close PE wing
                     current_debit = ce_debit + pe_debit     # Total cost to close
                     ic_pnl = (total_credit - current_debit) * qty
+                    ic_pnl -= calc_brokerage(total_credit, current_debit, qty)
                     ic_pnl_pct = (total_credit - current_debit) / total_credit * 100 if total_credit > 0 else 0
                     
                     # Get underlying spot price for breakout check
@@ -1735,9 +1870,510 @@ class AutonomousTrader:
                 if _top10:
                     _top10_str = " | ".join(f"{s.replace('NSE:', '')}={v:.0f}" for s, v in _top10)
                     print(f"   🏆 TOP 10: {_top10_str}")
+                
+                # === ML MOVE PREDICTOR: Full Titan Integration (FAIL-SAFE) ===
+                # All ML is wrapped in try/except. If model crashes, _ml_results
+                # stays empty and Titan runs identically to pre-ML behavior.
+                _ml_results = {}  # symbol -> full titan signals (always defined)
+                try:
+                    _has_candle = hasattr(self.tools, '_candle_cache')
+                    _has_daily = hasattr(self.tools, '_daily_cache')
+                    _candle_count = len(getattr(self.tools, '_candle_cache', {}))
+                    _daily_count = len(getattr(self.tools, '_daily_cache', {}))
+                    if self._ml_predictor and (_has_candle or _has_daily):
+                        # Load futures OI data once per cycle (FAIL-SAFE)
+                        _futures_oi_cache = {}
+                        try:
+                            if not hasattr(self, '_futures_oi_data'):
+                                from dhan_futures_oi import load_all_futures_oi_daily
+                                self._futures_oi_data = load_all_futures_oi_daily()
+                            _futures_oi_cache = self._futures_oi_data or {}
+                        except Exception:
+                            pass
+                        
+                        _ml_boosted = 0
+                        _candle_cache = getattr(self.tools, '_candle_cache', {})
+                        _daily_cache = getattr(self.tools, '_daily_cache', {})
+                        for _sym in list(_pre_scores.keys()):
+                            _candles = _candle_cache.get(_sym)
+                            _daily_df = _daily_cache.get(_sym)
+                            # Use intraday candles if >=50, otherwise fall back to daily candles
+                            if _candles is not None and len(_candles) >= 50:
+                                _ml_candles = _candles
+                            elif _daily_df is not None and len(_daily_df) >= 50:
+                                _ml_candles = _daily_df
+                            else:
+                                _ml_candles = None
+                            if _ml_candles is not None:
+                                try:
+                                    _sym_clean = _sym.replace('NSE:', '')
+                                    _fut_oi = _futures_oi_cache.get(_sym_clean)
+                                    _ml_pred = self._ml_predictor.get_titan_signals(
+                                        _ml_candles, futures_oi_df=_fut_oi,
+                                        nifty_5min_df=getattr(self, '_nifty_5min_df', None),
+                                        nifty_daily_df=getattr(self, '_nifty_daily_df', None)
+                                    )
+                                    if _ml_pred.get('ml_score_boost', 0) != 0:
+                                        _boost = _ml_pred['ml_score_boost']
+                                        _pre_scores[_sym] += _boost
+                                        _ml_boosted += 1
+                                    # Store ALL predictions (even zero-boost) for GPT/sizing/gating
+                                    if _ml_pred.get('ml_signal') != 'UNKNOWN':
+                                        _ml_results[_sym] = _ml_pred
+                                        if _sym in _cycle_decisions:
+                                            _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                                            _cycle_decisions[_sym]['ml_prediction'] = _ml_pred
+                                except Exception as _ml_stock_err:
+                                    if _ml_boosted == 0 and len(_ml_results) == 0:
+                                        # Print first error for debugging
+                                        print(f"   ⚠️ ML stock error ({_sym}): {_ml_stock_err}")
+                        if _ml_boosted > 0 or _ml_results:
+                            _ml_up = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'UP')
+                            _ml_down = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'DOWN')
+                            _ml_flat = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'FLAT')
+                            _ml_caution = sum(1 for r in _ml_results.values() if r.get('ml_entry_caution'))
+                            print(f"   🧠 ML: {len(_ml_results)} analyzed | {_ml_boosted} score-adjusted | {_ml_up} UP | {_ml_down} DOWN | {_ml_flat} FLAT | {_ml_caution} CAUTION")
+                        else:
+                            _eligible = sum(1 for s in _pre_scores if (_candle_cache.get(s) is not None and len(_candle_cache.get(s, [])) >= 50) or (_daily_cache.get(s) is not None and len(_daily_cache.get(s, [])) >= 50))
+                            print(f"   🧠 ML: NO predictions (candle_cache={_candle_count}, daily_cache={_daily_count}, eligible={_eligible}/{len(_pre_scores)})")
+                except Exception as _ml_err:
+                    print(f"   ⚠️ ML predictor error (non-fatal, continuing without ML): {_ml_err}")
+                
+                # Store ML results for downstream use (GPT prompt, sizing, etc.)
+                self._cycle_ml_results = _ml_results
+                
+                # === OI FLOW OVERLAY: Adjust ML predictions with live options chain data ===
+                # Only analyze top-scoring F&O stocks to minimize API calls (max 15)
+                # FAIL-SAFE: If OI analyzer crashes, _ml_results stays unchanged
+                _oi_results = {}
+                try:
+                    if self._oi_analyzer and _ml_results:
+                        # Pick top stocks worth analyzing OI for (scored >=45 + have ML data)
+                        _oi_candidates = [
+                            sym for sym in list(_pre_scores.keys())
+                            if _pre_scores.get(sym, 0) >= 45 and sym in _ml_results
+                        ]
+                        # Sort by score descending, limit to 15 to save API calls
+                        _oi_candidates.sort(key=lambda s: _pre_scores.get(s, 0), reverse=True)
+                        _oi_candidates = _oi_candidates[:15]
+                        
+                        _oi_adjusted_count = 0
+                        for _oi_sym in _oi_candidates:
+                            try:
+                                _oi_data = self._oi_analyzer.analyze(_oi_sym)
+                                if _oi_data and _oi_data.get('flow_bias') != 'NEUTRAL':
+                                    _oi_results[_oi_sym] = _oi_data
+                                # Apply overlay to ML prediction (modifies _ml_results in-place)
+                                if self._ml_predictor:
+                                    self._ml_predictor.apply_oi_overlay(_ml_results[_oi_sym], _oi_data)
+                                    if _ml_results[_oi_sym].get('oi_adjusted'):
+                                        _oi_adjusted_count += 1
+                                        # Update cycle decisions too
+                                        if _oi_sym in _cycle_decisions:
+                                            _cycle_decisions[_oi_sym]['ml_prediction'] = _ml_results[_oi_sym]
+                            except Exception:
+                                pass
+                        
+                        if _oi_adjusted_count > 0 or _oi_results:
+                            print(f"   📊 OI: {len(_oi_candidates)} analyzed | {len(_oi_results)} directional | {_oi_adjusted_count} ML-adjusted")
+                except Exception as _oi_err:
+                    print(f"   ⚠️ OI analyzer error (non-fatal): {_oi_err}")
+                
+                # Store OI results for GPT prompt
+                self._cycle_oi_results = _oi_results
+                
+                # === OI SNAPSHOT LOGGER: Collect data for future model retraining ===
+                # Now includes NSE OI change data (richer than Kite-only snapshots)
+                try:
+                    if _oi_results:
+                        import json
+                        _oi_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'oi_snapshots')
+                        os.makedirs(_oi_log_path, exist_ok=True)
+                        _oi_log_file = os.path.join(_oi_log_path, f"oi_{datetime.now().strftime('%Y%m%d')}.jsonl")
+                        with open(_oi_log_file, 'a', encoding='utf-8') as _oi_f:
+                            for _oi_sym, _oi_d in _oi_results.items():
+                                _oi_snapshot = {
+                                    'timestamp': datetime.now().isoformat(),
+                                    'symbol': _oi_sym,
+                                    'pcr_oi': _oi_d.get('pcr_oi'),
+                                    'iv_skew': _oi_d.get('iv_skew'),
+                                    'max_pain': _oi_d.get('max_pain'),
+                                    'spot_price': _oi_d.get('spot_price'),
+                                    'flow_bias': _oi_d.get('flow_bias'),
+                                    'flow_confidence': _oi_d.get('flow_confidence'),
+                                    'call_resistance': _oi_d.get('call_resistance'),
+                                    'put_support': _oi_d.get('put_support'),
+                                    'ml_move_prob': _ml_results.get(_oi_sym, {}).get('ml_move_prob'),
+                                    'ml_signal': _ml_results.get(_oi_sym, {}).get('ml_signal'),
+                                    'ml_prob_up': _ml_results.get(_oi_sym, {}).get('ml_prob_up'),
+                                    'ml_prob_down': _ml_results.get(_oi_sym, {}).get('ml_prob_down'),
+                                    'ml_direction_hint': _ml_results.get(_oi_sym, {}).get('ml_direction_hint'),
+                                    'score': _pre_scores.get(_oi_sym, 0),
+                                    # NSE-exclusive fields (OI change — unavailable from Kite)
+                                    'nse_call_oi_change': _oi_d.get('nse_total_call_oi_change', None),
+                                    'nse_put_oi_change': _oi_d.get('nse_total_put_oi_change', None),
+                                    'nse_pcr_volume': _oi_d.get('nse_pcr_volume', None),
+                                    'nse_oi_buildup': _oi_d.get('nse_oi_buildup', None),
+                                    'nse_oi_buildup_strength': _oi_d.get('nse_oi_buildup_strength', None),
+                                    'nse_enriched': _oi_d.get('nse_enriched', False),
+                                    'oi_source': _oi_d.get('oi_source', 'NSE'),
+                                    # DhanHQ exclusive: ATM Greeks
+                                    'atm_greeks': _oi_d.get('atm_greeks', None),
+                                }
+                                _oi_f.write(json.dumps(_oi_snapshot) + '\n')
+                        
+                        # Log dedicated DhanHQ snapshots (richest: OI + Greeks + bid/ask)
+                        if self._oi_analyzer and hasattr(self._oi_analyzer, 'get_dhan_snapshot'):
+                            _dhan_log_file = os.path.join(_oi_log_path, f"dhan_oi_{datetime.now().strftime('%Y%m%d')}.jsonl")
+                            _dhan_logged = 0
+                            with open(_dhan_log_file, 'a', encoding='utf-8') as _dhan_f:
+                                for _oi_sym in _oi_results:
+                                    _dhan_snap = self._oi_analyzer.get_dhan_snapshot(_oi_sym)
+                                    if _dhan_snap:
+                                        _dhan_snap['ml_move_prob'] = _ml_results.get(_oi_sym, {}).get('ml_move_prob')
+                                        _dhan_snap['ml_signal'] = _ml_results.get(_oi_sym, {}).get('ml_signal')
+                                        _dhan_snap['score'] = _pre_scores.get(_oi_sym, 0)
+                                        _dhan_f.write(json.dumps(_dhan_snap) + '\n')
+                                        _dhan_logged += 1
+                            if _dhan_logged > 0:
+                                print(f"   📋 DhanHQ OI snapshots logged: {_dhan_logged} stocks")
+                        
+                        # Also log dedicated NSE snapshots (full strike-level data)
+                        if self._oi_analyzer and hasattr(self._oi_analyzer, 'get_nse_snapshot'):
+                            _nse_log_file = os.path.join(_oi_log_path, f"nse_oi_{datetime.now().strftime('%Y%m%d')}.jsonl")
+                            _nse_logged = 0
+                            with open(_nse_log_file, 'a', encoding='utf-8') as _nse_f:
+                                for _oi_sym in _oi_results:
+                                    _nse_snap = self._oi_analyzer.get_nse_snapshot(_oi_sym)
+                                    if _nse_snap:
+                                        _nse_snap['ml_move_prob'] = _ml_results.get(_oi_sym, {}).get('ml_move_prob')
+                                        _nse_snap['ml_signal'] = _ml_results.get(_oi_sym, {}).get('ml_signal')
+                                        _nse_snap['score'] = _pre_scores.get(_oi_sym, 0)
+                                        _nse_f.write(json.dumps(_nse_snap) + '\n')
+                                        _nse_logged += 1
+                            if _nse_logged > 0:
+                                print(f"   📋 NSE OI snapshots logged: {_nse_logged} stocks")
+                except Exception:
+                    pass  # Logging failure is never fatal
+                
+                # === OI COLLECTOR: Structured parquet snapshots for ML training ===
+                try:
+                    if _oi_results:
+                        from ml_models.oi_collector import OICollector
+                        if not hasattr(self, '_oi_collector'):
+                            self._oi_collector = OICollector()
+                        for _oi_sym, _oi_d in _oi_results.items():
+                            self._oi_collector.collect(_oi_sym.replace('NSE:', ''), _oi_d)
+                except Exception:
+                    pass  # OI collection failure is never fatal
+                
             except Exception as _e:
                 print(f"   ⚠️ Scoring failed: {_e}")
                 self.tools._cached_cycle_decisions = {}
+                _ml_results = {}  # Ensure defined even on scoring failure
+            
+            # === REVERSAL SNIPE MANAGEMENT: Trailing SL + Time Guard ===
+            # Snipe trades target 10% with trailing SL. Time guard cuts at 12 min if < 3%.
+            try:
+                _snipe_positions = [t for t in self.tools.paper_positions 
+                                   if t.get('status', 'OPEN') == 'OPEN' and t.get('is_reversal_snipe')]
+                for snipe in _snipe_positions:
+                    snipe_sym = snipe.get('symbol', '')
+                    snipe_entry_price = snipe.get('avg_price', 0)
+                    snipe_entry_time_str = snipe.get('snipe_entry_time', '')
+                    if not snipe_entry_time_str or not snipe_entry_price:
+                        continue
+                    
+                    try:
+                        snipe_entry_dt = datetime.fromisoformat(snipe_entry_time_str)
+                    except Exception:
+                        continue
+                    
+                    held_minutes = (datetime.now() - snipe_entry_dt).total_seconds() / 60
+                    
+                    # Get current price
+                    try:
+                        _snipe_ltp_data = self.tools.kite.ltp([snipe_sym])
+                        if snipe_sym not in _snipe_ltp_data:
+                            continue
+                        snipe_ltp = _snipe_ltp_data[snipe_sym]['last_price']
+                    except Exception:
+                        continue
+                    
+                    snipe_pnl_pct = ((snipe_ltp - snipe_entry_price) / snipe_entry_price) * 100
+                    
+                    # === TRAILING SL: Lock in profits as price moves up ===
+                    # Activates at +4% gain, then trails at 50% of gains from high watermark.
+                    # Example: entry ₹100, HWM reaches ₹108 (+8%) → trailing SL = ₹108 - (8*0.5)% = ₹104 (+4%)
+                    # This ensures minimum +4% profit once trailing kicks in.
+                    _hwm = snipe.get('snipe_high_watermark', snipe_entry_price)
+                    if snipe_ltp > _hwm:
+                        # New high watermark — update
+                        with self.tools._positions_lock:
+                            snipe['snipe_high_watermark'] = snipe_ltp
+                        _hwm = snipe_ltp
+                    
+                    _hwm_gain_pct = ((_hwm - snipe_entry_price) / snipe_entry_price) * 100
+                    
+                    # Activate trailing once gain reaches 4%
+                    if _hwm_gain_pct >= 4.0 and not snipe.get('snipe_trailing_active'):
+                        with self.tools._positions_lock:
+                            snipe['snipe_trailing_active'] = True
+                        underlying_snipe = snipe.get('underlying', '')
+                        print(f"   📈 SNIPE TRAILING ACTIVATED: {underlying_snipe} HWM +{_hwm_gain_pct:.1f}%")
+                    
+                    if snipe.get('snipe_trailing_active'):
+                        # Trail at 50% of gains from high watermark
+                        # i.e., give back half of peak profit before exiting
+                        _trail_give_back = _hwm_gain_pct * 0.50
+                        _trailing_sl_price = snipe_entry_price * (1 + (_hwm_gain_pct - _trail_give_back) / 100)
+                        
+                        # Trailing SL should never be below original SL (entry * 0.94)
+                        _original_sl = snipe_entry_price * 0.94
+                        _trailing_sl_price = max(_trailing_sl_price, _original_sl)
+                        
+                        # Update SL if trailing is higher than current SL
+                        _current_sl = snipe.get('stop_loss', _original_sl)
+                        if _trailing_sl_price > _current_sl:
+                            with self.tools._positions_lock:
+                                snipe['stop_loss'] = _trailing_sl_price
+                        
+                        # Check if price dropped below trailing SL
+                        if snipe_ltp <= _trailing_sl_price:
+                            snipe_qty = snipe.get('quantity', 0)
+                            snipe_pnl = (snipe_ltp - snipe_entry_price) * snipe_qty
+                            
+                            from config import calc_brokerage
+                            snipe_brokerage = calc_brokerage(snipe_entry_price, snipe_ltp, snipe_qty)
+                            snipe_pnl -= snipe_brokerage
+                            
+                            underlying_snipe = snipe.get('underlying', '')
+                            _locked_pct = ((_trailing_sl_price - snipe_entry_price) / snipe_entry_price) * 100
+                            print(f"\n   📈 SNIPE TRAILING SL HIT: {underlying_snipe}")
+                            print(f"      Entry: ₹{snipe_entry_price:.2f} → HWM: ₹{_hwm:.2f} (+{_hwm_gain_pct:.1f}%) → Exit: ₹{snipe_ltp:.2f}")
+                            print(f"      Trailing SL: ₹{_trailing_sl_price:.2f} (locked +{_locked_pct:.1f}%) | P&L: ₹{snipe_pnl:+,.0f}")
+                            
+                            _snipe_exit_detail = {
+                                'exit_type': 'SNIPE_TRAILING_SL',
+                                'exit_reason': f'Trailing SL hit — HWM +{_hwm_gain_pct:.1f}%, trail locked +{_locked_pct:.1f}%',
+                                'held_minutes': round(held_minutes, 1),
+                                'pnl_pct_at_exit': round(snipe_pnl_pct, 2),
+                                'high_watermark': round(_hwm, 2),
+                                'hwm_gain_pct': round(_hwm_gain_pct, 2),
+                                'trailing_sl_price': round(_trailing_sl_price, 2),
+                                'brokerage': round(snipe_brokerage, 2),
+                                'was_reversal_snipe': True,
+                            }
+                            
+                            self.tools.update_trade_status(snipe_sym, 'SNIPE_TRAILING_SL', snipe_ltp, snipe_pnl, exit_detail=_snipe_exit_detail)
+                            with self._pnl_lock:
+                                self.daily_pnl += snipe_pnl
+                                self.capital += snipe_pnl
+                            
+                            _snipe_open = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != snipe_sym]
+                            _snipe_unreal = self.risk_governor._calc_unrealized_pnl(_snipe_open)
+                            self.risk_governor.record_trade_result(snipe_sym, snipe_pnl, True, unrealized_pnl=_snipe_unreal)
+                            self.risk_governor.update_capital(self.capital)
+                            
+                            self._log_decision(_cycle_time, underlying_snipe, 0, 'SNIPE_TRAILING_SL',
+                                              reason=f'HWM +{_hwm_gain_pct:.1f}%, trail hit, P&L={snipe_pnl:+,.0f}',
+                                              direction=snipe.get('direction', ''))
+                            
+                            print(f"      ✅ Snipe trailing SL exit | Profit: ₹{snipe_pnl:+,.0f}")
+                            continue  # Don't also check time-guard
+                    
+                    # === TIME GUARD: 12 min with < 3% → cut ===
+                    if held_minutes < 12:
+                        continue
+                    
+                    # If profit ≥ 3%, let it ride to 10% target / trailing SL
+                    if snipe_pnl_pct >= 3.0:
+                        continue
+                    
+                    # Time's up and not at 3%+ — exit at market
+                    snipe_qty = snipe.get('quantity', 0)
+                    snipe_pnl = (snipe_ltp - snipe_entry_price) * snipe_qty
+                    
+                    from config import calc_brokerage
+                    snipe_brokerage = calc_brokerage(snipe_entry_price, snipe_ltp, snipe_qty)
+                    snipe_pnl -= snipe_brokerage
+                    
+                    underlying_snipe = snipe.get('underlying', '')
+                    print(f"\n   ⏱️ SNIPE TIME-GUARD: {underlying_snipe} held {held_minutes:.0f}min, P&L {snipe_pnl_pct:+.1f}% (< 3%) — cutting")
+                    print(f"      Entry: ₹{snipe_entry_price:.2f} → ₹{snipe_ltp:.2f} | P&L: ₹{snipe_pnl:+,.0f}")
+                    
+                    _snipe_exit_detail = {
+                        'exit_type': 'SNIPE_TIME_GUARD',
+                        'exit_reason': f'Reversal snipe held {held_minutes:.0f}min with only {snipe_pnl_pct:+.1f}% — time guard exit',
+                        'held_minutes': round(held_minutes, 1),
+                        'pnl_pct_at_exit': round(snipe_pnl_pct, 2),
+                        'brokerage': round(snipe_brokerage, 2),
+                        'was_reversal_snipe': True,
+                    }
+                    
+                    self.tools.update_trade_status(snipe_sym, 'SNIPE_TIME_GUARD', snipe_ltp, snipe_pnl, exit_detail=_snipe_exit_detail)
+                    with self._pnl_lock:
+                        self.daily_pnl += snipe_pnl
+                        self.capital += snipe_pnl
+                    
+                    _snipe_was_win = snipe_pnl > 0
+                    _snipe_open = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != snipe_sym]
+                    _snipe_unreal = self.risk_governor._calc_unrealized_pnl(_snipe_open)
+                    self.risk_governor.record_trade_result(snipe_sym, snipe_pnl, _snipe_was_win, unrealized_pnl=_snipe_unreal)
+                    self.risk_governor.update_capital(self.capital)
+                    
+                    self._log_decision(_cycle_time, underlying_snipe, 0, 'SNIPE_TIME_GUARD',
+                                      reason=f'Snipe held {held_minutes:.0f}min, {snipe_pnl_pct:+.1f}%, P&L={snipe_pnl:+,.0f}',
+                                      direction=snipe.get('direction', ''))
+                    
+                    print(f"      ✅ Snipe time-guard exit | {'Profit' if _snipe_was_win else 'Cut loss'}: ₹{snipe_pnl:+,.0f}")
+                    
+            except Exception as _snipe_guard_err:
+                print(f"   ⚠️ Snipe management error (non-fatal): {_snipe_guard_err}")
+            
+            # === CONVICTION REVERSAL EXIT: Your own system says you're wrong ===
+            # Pro trader rule: if your system flips direction on a stock you're holding
+            # with HIGH conviction (score ≥ 70), exit IMMEDIATELY. Don't wait for SL.
+            # GODREJCP: entered BUY at 11:15 score 81, system said SELL at 11:24 score 78.
+            # Instead of waiting 23 more min for SL (-₹23K), exit NOW at smaller loss.
+            try:
+                active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+                for trade in active_trades:
+                    # Only check naked options (not spreads/ICs)
+                    if trade.get('is_credit_spread') or trade.get('is_debit_spread') or trade.get('is_iron_condor'):
+                        continue
+                    
+                    underlying = trade.get('underlying', '')
+                    if not underlying or underlying not in _cycle_decisions:
+                        continue
+                    
+                    cached = _cycle_decisions[underlying]
+                    new_decision = cached.get('decision')
+                    if not new_decision:
+                        continue
+                    
+                    new_direction = new_decision.recommended_direction
+                    new_score = new_decision.confidence_score
+                    trade_direction = trade.get('direction', '')
+                    
+                    # Check: is the system now saying the OPPOSITE with high conviction?
+                    direction_flipped = (
+                        (trade_direction == 'BUY' and new_direction == 'SELL') or
+                        (trade_direction == 'SELL' and new_direction == 'BUY')
+                    )
+                    
+                    if direction_flipped and new_score >= 70:
+                        symbol = trade.get('symbol', '')
+                        entry_price = trade.get('avg_price', 0)
+                        
+                        # Get current price
+                        try:
+                            ltp_data = self.tools.kite.ltp([symbol])
+                            if symbol in ltp_data:
+                                ltp = ltp_data[symbol]['last_price']
+                            else:
+                                continue  # Can't get price — skip
+                        except Exception:
+                            continue
+                        
+                        pnl = (ltp - entry_price) * trade.get('quantity', 0)
+                        if trade.get('side') == 'SELL':
+                            pnl = -pnl
+                        
+                        entry_score = trade.get('entry_score', 0)
+                        
+                        print(f"\n   🔄 CONVICTION REVERSAL EXIT: {underlying}")
+                        print(f"      Held: {trade_direction} (entry score {entry_score:.0f})")
+                        print(f"      Now: system says {new_direction} with score {new_score:.0f}")
+                        print(f"      Entry: ₹{entry_price:.2f} → Current: ₹{ltp:.2f}")
+                        print(f"      P&L: ₹{pnl:+,.0f} — EXITING NOW instead of waiting for SL")
+                        
+                        # Exit immediately
+                        from config import calc_brokerage
+                        brokerage = calc_brokerage(entry_price, ltp, trade.get('quantity', 0))
+                        pnl -= brokerage
+                        
+                        exit_detail = {
+                            'exit_type': 'CONVICTION_REVERSAL',
+                            'exit_reason': f'System flipped to {new_direction} with score {new_score:.0f} — own conviction reversed',
+                            'new_direction': new_direction,
+                            'new_score': new_score,
+                            'entry_score': entry_score,
+                            'brokerage': round(brokerage, 2),
+                        }
+                        
+                        self.tools.update_trade_status(symbol, 'CONVICTION_REVERSAL', ltp, pnl, exit_detail=exit_detail)
+                        with self._pnl_lock:
+                            self.daily_pnl += pnl
+                            self.capital += pnl
+                        
+                        was_win = pnl > 0
+                        open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
+                        unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
+                        self.risk_governor.record_trade_result(symbol, pnl, was_win, unrealized_pnl=unrealized)
+                        self.risk_governor.update_capital(self.capital)
+                        
+                        # Log for audit
+                        self._log_decision(_cycle_time, underlying, new_score, 'CONVICTION_REVERSAL_EXIT',
+                                          reason=f'Held {trade_direction}, system flipped {new_direction}@{new_score:.0f}, P&L={pnl:+,.0f}',
+                                          direction=new_direction)
+                        
+                        print(f"      ✅ EXITED via conviction reversal | Saved from waiting for SL")
+                        
+                        # === REVERSAL SNIPE: Aggressive reverse trade for quick 10% profit ===
+                        # Pro rule: when your system flips with conviction, the momentum is real.
+                        # Ride the reversal for a quick scalp — tight target, tight SL, trailing SL.
+                        # GODREJCP: exited LONG at 11:24, system says SHORT@78 → BUY PE, grab 10%.
+                        try:
+                            print(f"\n      🎯 REVERSAL SNIPE: Placing aggressive {new_direction} trade on {underlying}")
+                            snipe_result = self.tools.place_option_order(
+                                underlying=underlying,
+                                direction=new_direction,
+                                strike_selection="ATM",
+                                rationale=f"REVERSAL_SNIPE: Conviction flipped from {trade_direction} to {new_direction} with score {new_score:.0f}. Quick 10% scalp on momentum reversal."
+                            )
+                            
+                            if snipe_result and snipe_result.get('success'):
+                                snipe_entry = snipe_result.get('entry_price', 0)
+                                print(f"      ✅ REVERSAL SNIPE FIRED: {underlying} {new_direction} @ ₹{snipe_entry:.2f}")
+                                
+                                # Override SL/target for aggressive quick scalp
+                                # Target: +10%  |  SL: -6%  |  Trailing SL activates at +4%
+                                snipe_target = snipe_entry * 1.10  # 10% profit target
+                                snipe_sl = snipe_entry * 0.94       # 6% SL
+                                
+                                # Find the new position and override SL/target + tag it
+                                with self.tools._positions_lock:
+                                    for pos in reversed(self.tools.paper_positions):
+                                        if (pos.get('underlying') == underlying and 
+                                            pos.get('status', 'OPEN') == 'OPEN'):
+                                            pos['stop_loss'] = snipe_sl
+                                            pos['target'] = snipe_target
+                                            pos['is_reversal_snipe'] = True
+                                            pos['snipe_entry_time'] = datetime.now().isoformat()
+                                            pos['snipe_original_direction'] = trade_direction
+                                            pos['snipe_trigger_score'] = new_score
+                                            pos['snipe_high_watermark'] = snipe_entry  # For trailing SL
+                                            pos['snipe_trailing_active'] = False        # Activates at +4%
+                                            print(f"      📐 Snipe overrides: Target ₹{snipe_target:.2f} (+10%) | SL ₹{snipe_sl:.2f} (-6%)")
+                                            print(f"      📈 Trailing SL: activates at +4%, trails at 50% of gains")
+                                            print(f"      ⏱️ Time guard: auto-exit in 12 min if < 3% profit")
+                                            break
+                                
+                                self._log_decision(_cycle_time, underlying, new_score, 'REVERSAL_SNIPE_FIRED',
+                                                  reason=f'Reversed {trade_direction}→{new_direction}, target +10%, SL -6%, trailing@4%',
+                                                  direction=new_direction, setup='REVERSAL_SNIPE')
+                            else:
+                                snipe_err = snipe_result.get('error', 'unknown') if snipe_result else 'no result'
+                                print(f"      ⚠️ Reversal snipe blocked: {snipe_err}")
+                                self._log_decision(_cycle_time, underlying, new_score, 'REVERSAL_SNIPE_BLOCKED',
+                                                  reason=f'Snipe blocked: {str(snipe_err)[:80]}',
+                                                  direction=new_direction)
+                        except Exception as _snipe_err:
+                            print(f"      ⚠️ Reversal snipe error (non-fatal): {_snipe_err}")
+                        
+            except Exception as _conv_err:
+                print(f"   ⚠️ Conviction reversal check error (non-fatal): {_conv_err}")
             
             # === ELITE AUTO-FIRE: Execute top-scoring stocks BEFORE GPT ===
             _cycle_time = datetime.now().strftime('%H:%M:%S')
@@ -1878,7 +2514,7 @@ class AutonomousTrader:
                     _score_tag = ""
                     if symbol in _pre_scores:
                         _s = _pre_scores[symbol]
-                        _score_tag = f" S:{_s:.0f}" + ("✅" if _s >= 49 else "⚠️" if _s >= 40 else "❌")
+                        _score_tag = f" S:{_s:.0f}" + ("🔥" if _s >= 70 else "✅" if _s >= 56 else "⚠️" if _s >= 45 else "❌")
                     quick_scan.append(f"{symbol}{fno_tag}: {chg:+.2f}% RSI:{rsi:.0f} {trend} ORB:{orb_signal} Vol:{volume_regime} HTF:{htf_icon}{_score_tag} {setup}")
             
             # Print regime signals
@@ -2036,6 +2672,22 @@ class AutonomousTrader:
                             direction = "BUY"
                     
                     if setup_type and direction:
+                        # === ML DIRECTION OVERRIDE (smart flip) ===
+                        # If ML has HIGH conviction in opposite direction, flip CE↔PE.
+                        # Only triggers for BULLISH / BEARISH (≥60% directional confidence),
+                        # NOT for _LEAN variants (too weak to override technicals).
+                        _ml_override_tag = ""
+                        try:
+                            _ml_dir = _ml_results.get(symbol, {}).get('ml_direction_hint', 'NEUTRAL')
+                            if _ml_dir == 'BULLISH' and direction == 'SELL':
+                                direction = 'BUY'
+                                _ml_override_tag = " [🧠ML_OVERRIDE:CE]"
+                            elif _ml_dir == 'BEARISH' and direction == 'BUY':
+                                direction = 'SELL'
+                                _ml_override_tag = " [🧠ML_OVERRIDE:PE]"
+                        except Exception:
+                            pass  # ML unavailable — proceed with technical direction
+                        
                         opt_type = "CE" if direction == "BUY" else "PE"
                         wc_tag = " [⭐WILDCARD]" if is_wildcard else ""
                         _fno_score = _pre_scores.get(symbol, 0)
@@ -2047,8 +2699,24 @@ class AutonomousTrader:
                         _micro_absent_offset = 12
                         if _fno_score > 0 and _fno_score + _micro_absent_offset < 40:
                             continue
+                        # Append ML signal tag if available (fail-safe: empty string if not)
+                        _ml_tag = ""
+                        try:
+                            _ml_info = _ml_results.get(symbol, {})
+                            if _ml_info.get('ml_gpt_summary'):
+                                _ml_tag = f" {_ml_info['ml_gpt_summary']}"
+                        except Exception:
+                            pass
+                        # Append OI flow tag if available (fail-safe)
+                        _oi_tag = ""
+                        try:
+                            _oi_info = getattr(self, '_cycle_oi_results', {}).get(symbol, {})
+                            if _oi_info.get('flow_gpt_line'):
+                                _oi_tag = f" {_oi_info['flow_gpt_line']}"
+                        except Exception:
+                            pass
                         fno_opportunities.append(
-                            f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]{_fno_score_tag}{wc_tag}"
+                            f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]{_fno_score_tag}{_ml_tag}{_oi_tag}{wc_tag}{_ml_override_tag}"
                         )
             
             # === PROACTIVE DEBIT SPREAD SCANNER ===
@@ -2114,6 +2782,27 @@ class AutonomousTrader:
                             if vol_reg in ("HIGH", "EXPLOSIVE"):
                                 ds_priority += 10
                             
+                            # === ML DIRECTION PREDICTION BOOST (FAIL-SAFE) ===
+                            # ML UP/DOWN = perfect for debit spreads (directional move expected)
+                            # ML FLAT = soft skip (stock likely flat, debit spread loses)
+                            try:
+                                _ds_ml = getattr(self, '_cycle_ml_results', {}).get(symbol, {})
+                                _ds_ml_signal = _ds_ml.get('ml_signal', 'UNKNOWN')
+                                _ds_prob_up = _ds_ml.get('ml_prob_up', 0.33)
+                                _ds_prob_down = _ds_ml.get('ml_prob_down', 0.33)
+                                _ds_prob_flat = _ds_ml.get('ml_prob_flat', 0.34)
+                                _ds_max_dir = max(_ds_prob_up, _ds_prob_down)
+                                if _ds_ml_signal in ('UP', 'DOWN') and _ds_max_dir >= 0.50:
+                                    ds_priority += 20  # Strong directional ML confirmation
+                                    print(f"      🧠 ML BOOST: {symbol} {_ds_ml_signal} prob={_ds_max_dir:.0%} → +20 priority")
+                                elif _ds_ml_signal in ('UP', 'DOWN') and _ds_max_dir >= 0.40:
+                                    ds_priority += 10  # Moderate ML confirmation
+                                elif _ds_ml_signal == 'FLAT' and _ds_prob_flat >= 0.70:
+                                    print(f"      🧠 ML SKIP: {symbol} FLAT prob={_ds_prob_flat:.0%} → skipping debit spread")
+                                    continue  # Soft skip — stock likely flat
+                            except Exception:
+                                pass  # ML crash → no impact, proceed normally
+                            
                             debit_candidates.append((symbol, data, direction, ds_priority))
                         
                         # Sort by priority and try top candidates
@@ -2168,7 +2857,7 @@ class AutonomousTrader:
                 print(f"   ⚠️ Proactive debit spread scan error: {e}")
             
             # === PROACTIVE IRON CONDOR SCANNER (INDEX + STOCK) ===
-            # Scan NIFTY/BANKNIFTY for IC opportunities (weekly expiry, 0-2 DTE)
+            # Scan NIFTY/BANKNIFTY for IC opportunities (weekly expiry, 0DTE only)
             # Also check recently rejected stocks with low scores
             ic_placed = []
             try:
@@ -2408,6 +3097,24 @@ class AutonomousTrader:
                                 if is_chop:
                                     ic_quality += 10; ic_reasons.append("CHOP_CONFIRMED")
                                 
+                                # FACTOR 9: ML MOVE PREDICTION (0-15 pts bonus for NO_MOVE, -10 penalty for MOVE)
+                                # ML NO_MOVE = ideal for IC (stock predicted flat)
+                                # ML MOVE = dangerous for IC (breakout could blow through wings)
+                                try:
+                                    _ic_ml = getattr(self, '_cycle_ml_results', {}).get(symbol, {})
+                                    _ic_move_prob = _ic_ml.get('ml_move_prob', 0.5)
+                                    _ic_ml_signal = _ic_ml.get('ml_signal', 'UNKNOWN')
+                                    if _ic_ml_signal == 'NO_MOVE' and _ic_move_prob < 0.15:
+                                        ic_quality += 15; ic_reasons.append(f"ML_FLAT({_ic_move_prob:.0%})")
+                                    elif _ic_ml_signal == 'NO_MOVE':
+                                        ic_quality += 8; ic_reasons.append(f"ML_NO_MOVE({_ic_move_prob:.0%})")
+                                    elif _ic_ml_signal == 'MOVE' and _ic_move_prob >= 0.50:
+                                        ic_quality -= 15; ic_reasons.append(f"ML_MOVE_DANGER({_ic_move_prob:.0%})")
+                                    elif _ic_ml_signal == 'MOVE':
+                                        ic_quality -= 8; ic_reasons.append(f"ML_MOVE_WARN({_ic_move_prob:.0%})")
+                                except Exception:
+                                    pass  # ML crash → no impact on IC quality
+                                
                                 # === MINIMUM IC QUALITY GATE ===
                                 min_ic_quality = IRON_CONDOR_CONFIG.get('min_ic_quality_score', 50)
                                 if ic_quality < min_ic_quality:
@@ -2508,6 +3215,68 @@ class AutonomousTrader:
             else:
                 _auto_fired_msg = ""
             
+            # === BUILD ML SUMMARY FOR GPT PROMPT (fail-safe: empty if ML unavailable) ===
+            _ml_prompt_section = 'ML predictor not available this cycle'
+            try:
+                if _ml_results:
+                    _ml_summary_lines = []
+                    # Top movers (high move probability)
+                    _ml_movers = [(s, r) for s, r in _ml_results.items() if r.get('ml_move_prob', 0) >= 0.40]
+                    _ml_movers.sort(key=lambda x: x[1]['ml_move_prob'], reverse=True)
+                    if _ml_movers:
+                        for s, r in _ml_movers[:10]:
+                            _ml_summary_lines.append(f"  {s.replace('NSE:','')}: {r['ml_gpt_summary']} (boost:{r['ml_score_boost']:+d}, size:{r.get('ml_sizing_factor', 1.0):.1f}x)")
+                    # Flat/choppy stocks (ML caution)
+                    _ml_flat = [(s, r) for s, r in _ml_results.items() if r.get('ml_entry_caution')]
+                    if _ml_flat:
+                        _flat_names = [s.replace('NSE:', '') for s, _ in _ml_flat[:10]]
+                        _ml_summary_lines.append(f"  ⚠️ LIKELY FLAT (ML caution — avoid or size down): {', '.join(_flat_names)}")
+                    # Summary stats
+                    _total_ml = len(_ml_results)
+                    _move_count = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'MOVE')
+                    _ml_summary_lines.append(f"  Stats: {_total_ml} analyzed | {_move_count} MOVE signals | {_total_ml - _move_count} NO_MOVE")
+                    _ml_prompt_section = chr(10).join(_ml_summary_lines)
+            except Exception:
+                pass  # ML summary failed — GPT continues without it
+            
+            # === BUILD OI FLOW SUMMARY FOR GPT PROMPT (fail-safe) ===
+            _oi_prompt_section = 'OI flow data not available this cycle'
+            try:
+                _oi_results_gpt = getattr(self, '_cycle_oi_results', {})
+                if _oi_results_gpt:
+                    _oi_lines = []
+                    # Sort by confidence descending
+                    _oi_sorted = sorted(_oi_results_gpt.items(), key=lambda x: x[1].get('flow_confidence', 0), reverse=True)
+                    for _os, _od in _oi_sorted[:12]:
+                        _os_clean = _os.replace('NSE:', '')
+                        _bias = _od.get('flow_bias', 'NEUTRAL')
+                        _pcr = _od.get('pcr_oi', 1.0)
+                        _ivs = _od.get('iv_skew', 0)
+                        _mp = _od.get('max_pain', 0)
+                        _spot = _od.get('spot_price', 0)
+                        _mp_dist = _od.get('spot_vs_max_pain_pct', 0)
+                        _cr = _od.get('call_resistance', 0)
+                        _ps = _od.get('put_support', 0)
+                        _oi_line = f"  {_os_clean}: {_bias} | PCR:{_pcr:.2f} | IVskew:{_ivs:+.1f}% | MaxPain:{_mp:.0f} ({_mp_dist:+.1f}% from spot) | CallRes:{_cr:.0f} PutSup:{_ps:.0f}"
+                        # Add OI buildup signal (from DhanHQ or NSE)
+                        _nse_buildup = _od.get('nse_oi_buildup')
+                        _nse_strength = _od.get('nse_oi_buildup_strength', 0)
+                        _oi_src = _od.get('oi_source', 'NSE')
+                        if _nse_buildup and _nse_buildup != 'NEUTRAL':
+                            _oi_line += f" | OI_Buildup[{_oi_src}]:{_nse_buildup}({_nse_strength:.0%})"
+                        _nse_ce_chg = _od.get('nse_total_call_oi_change', 0)
+                        _nse_pe_chg = _od.get('nse_total_put_oi_change', 0)
+                        if _nse_ce_chg or _nse_pe_chg:
+                            _oi_line += f" | ΔOI:CE{_nse_ce_chg:+,}/PE{_nse_pe_chg:+,}"
+                        # DhanHQ exclusive: ATM Greeks
+                        _atm_g = _od.get('atm_greeks', {})
+                        if _atm_g and _atm_g.get('ce_delta'):
+                            _oi_line += f" | δ:{_atm_g['ce_delta']:.2f} θ:{_atm_g.get('ce_theta', 0):.1f}"
+                        _oi_lines.append(_oi_line)
+                    _oi_prompt_section = chr(10).join(_oi_lines)
+            except Exception:
+                pass  # OI summary failed — GPT continues without it
+            
             prompt = f"""ANALYZE → REASON → EXECUTE. Use your GPT-5.2 reasoning depth.
 
 === 🌐 MARKET BREADTH ===
@@ -2534,6 +3303,12 @@ F&O stocks: {', '.join(fno_prefer)}
 === 🎯 REGIME SIGNALS ===
 {chr(10).join(regime_signals) if regime_signals else 'No strong regime signals'}
 
+=== 🧠 ML MOVE PREDICTIONS (XGBoost volatility model) ===
+{_ml_prompt_section}
+
+=== 📊 LIVE OI FLOW (Real-time PCR / IV Skew / Max Pain) ===
+{_oi_prompt_section}
+
 === 📊 EOD PREDICTIONS ===
 {chr(10).join(eod_opportunities) if eod_opportunities else 'No EOD signals'}
 
@@ -2558,18 +3333,30 @@ W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_
 === 🧠 YOUR TASK ===
 1. Assess MARKET REGIME first (trending/range/mixed day, sector rotation)
 2. ONLY pick from the '⚡ F&O READY SIGNALS' section above — these are pre-validated. Do NOT invent your own picks.
-3. Look at the S: (Score) tags — ONLY pick stocks scoring ≥49✅. Stocks with ❌ WILL BE REJECTED.
-4. Identify TOP {_dynamic_max} setups from the listed opportunities using CONFLUENCE SCORING
-5. Check CONTRARIAN risks (chasing? extended? volume divergence?)
-6. EXECUTE via tools — place_option_order(underlying, direction) for F&O, place_order() for cash
-7. State your reasoning briefly: Setup | Score | Why
+3. Look at the [Score:XX] tags — ONLY pick stocks scoring ≥56. Stocks below 56 WILL BE BLOCKED by the scorer.
+4. Identify TOP {_dynamic_max} setups from the listed opportunities using CONFLUENCE SCORING:
+   - Score ≥70 = PREMIUM (high conviction, sized up)
+   - Score 65-69 = STANDARD (normal conviction)
+   - Score 56-64 = BASELINE (enters but smaller size)
+   - Score <56 = BLOCKED (do NOT pick)
+5. USE ML + OI DATA to validate your picks:
+   - 🧠ML:STRONG_MOVE or MOVE → PREFER these stocks (confirmed volatility)
+   - 🧠ML:FLAT → AVOID for directional trades (stock predicted dead)
+   - OI BULLISH + BUY direction → strong confluence (PREFER)
+   - OI BEARISH + SELL direction → strong confluence (PREFER)
+   - OI contradicts direction → extra caution, mention in reasoning
+6. Check CONTRARIAN risks (chasing? extended? volume divergence? ML says FLAT?)
+7. EXECUTE via tools — place_option_order(underlying, direction) for F&O, place_order() for cash
+8. State your reasoning briefly: Setup | Score | ML Signal | OI Bias | Why
 
 ⚠️ CRITICAL RULES:
 - Do NOT pick stocks outside the F&O READY SIGNALS list. They are NOT tradeable.
-- Do NOT pick stocks scoring below 49. The scorer WILL block them.
-- If no setups score ≥49, say 'NO TRADES' — do NOT force a trade.
+- Do NOT pick stocks scoring below 56. The scorer WILL block them.
+- If ML says FLAT (🧠ML:FLAT) on a stock, do NOT pick it for directional trades — it will likely not move.
+- If ML says MOVE and OI confirms direction — this is the STRONGEST signal. Prioritize these.
+- If no setups score ≥56 with ML confirmation, say 'NO TRADES' — do NOT force a trade.
 {_auto_fired_msg}
-RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.5% | Max {_dynamic_max} trades"""
+RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max} trades"""
 
             response = self.agent.run(prompt)
             print(f"\n📊 Agent response:\n{response[:300]}...")
@@ -2758,11 +3545,8 @@ RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.
                 pass
             
             # P&L and timing
-            _risk_status = self.risk_governor.get_current_state(
-                self.daily_pnl, self.capital,
-                [t for t in self.tools.paper_positions if t.get('status') == 'OPEN']
-            )
-            print(f"\n💰 P&L: ₹{_risk_status.daily_pnl:+,.0f} ({_risk_status.daily_pnl_pct:+.2f}%) | Trades: {_risk_status.trades_today} | W:{_risk_status.wins_today} L:{_risk_status.losses_today}")
+            _rs = self.risk_governor.state
+            print(f"\n💰 P&L: ₹{_rs.daily_pnl:+,.0f} ({_rs.daily_pnl_pct:+.2f}%) | Trades: {_rs.trades_today} | W:{_rs.wins_today} L:{_rs.losses_today}")
             
             # Ticker stats
             if self.tools.ticker:
@@ -2885,6 +3669,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.
         pnl = (exit_price - pos['entry_price']) * pos['quantity']
         if pos['side'] == 'SELL':
             pnl = -pnl
+        pnl -= calc_brokerage(pos['entry_price'], exit_price, pos['quantity'])
         
         with self._pnl_lock:
             self.daily_pnl += pnl
@@ -2930,7 +3715,8 @@ RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.
         
         # Track whether we've switched from early to normal mode
         self._switched_to_normal = not _is_early
-        self._normal_interval = scan_interval_minutes
+        # After 9:45 always use 5-min interval regardless of CLI arg
+        self._normal_interval = 5
         
         # Schedule tasks with current interval
         schedule.every(current_interval).minutes.do(self.scan_and_trade)
@@ -3141,6 +3927,14 @@ RULES: F&O → place_option_order() | Cash → place_order() | SL 1% | Target 1.
             with open(summary_file, 'w') as f:
                 json.dump(summary, f, indent=2)
             print(f"\n  💾 Daily summary saved to: daily_summaries/daily_summary_{today}.json")
+            
+            # Flush OI collector buffers to parquet (EOD)
+            try:
+                if hasattr(self, '_oi_collector'):
+                    self._oi_collector.flush_all()
+                    print(f"  💾 OI snapshots flushed to parquet for ML training")
+            except Exception:
+                pass
             
             # Also append to trade_decisions.log
             from options_trader import TRADE_DECISIONS_LOG

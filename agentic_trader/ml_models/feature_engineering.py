@@ -1,0 +1,1252 @@
+"""
+FEATURE ENGINEERING — Convert raw OHLCV candles into ML features
+
+Computes ~35 features per candle that capture:
+- Momentum (RSI, rate of change, EMA cross)
+- Trend (EMA alignment, slope, ADX proxy)
+- Volume (ratio vs avg, accumulation/distribution)
+- Volatility (ATR %, range expansion, Bollinger width)
+- Structure (VWAP distance, ORB position, time-of-day)
+- Daily Context (vol regime, trend regime, proximity to highs, move frequency)
+
+All features are computed without lookahead bias.
+"""
+
+import warnings
+import numpy as np
+import pandas as pd
+from typing import Optional
+
+# Suppress divide-by-zero warnings from ATR/range calculations (handled by np.where guards)
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='divide by zero')
+
+
+def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame = None,
+                      oi_df: pd.DataFrame = None,
+                      futures_oi_df: pd.DataFrame = None,
+                      nifty_5min_df: pd.DataFrame = None,
+                      nifty_daily_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Compute all ML features from raw OHLCV candles.
+    
+    Args:
+        df: DataFrame with columns: date, open, high, low, close, volume
+        symbol: Optional symbol name for debugging
+        daily_df: Optional daily OHLCV candles (341+ days) for context features
+        oi_df: Optional OI snapshot DataFrame with columns:
+               timestamp, pcr_oi, pcr_oi_change, buildup_strength,
+               spot_vs_max_pain, iv_skew, atm_iv, atm_delta, call_resistance_dist
+        futures_oi_df: Optional futures OI daily features DataFrame with columns:
+               date, fut_oi_change_pct, fut_oi_buildup, fut_basis_pct,
+               fut_oi_5d_trend, fut_vol_ratio
+        nifty_5min_df: Optional NIFTY50 5-min candles for market context.
+        nifty_daily_df: Optional NIFTY50 daily candles for market context.
+        
+    Returns:
+        DataFrame with original columns + feature columns.
+        Rows with insufficient history for indicators are dropped.
+    """
+    if len(df) < 50:
+        return pd.DataFrame()
+    
+    df = df.copy()
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    c = df['close'].values
+    h = df['high'].values
+    l = df['low'].values
+    o = df['open'].values
+    v = df['volume'].values.astype(float)
+    
+    # === MOMENTUM ===
+    
+    # RSI (14-period)
+    df['rsi_14'] = _rsi(c, 14)
+    
+    # RSI (7-period) — faster for intraday
+    df['rsi_7'] = _rsi(c, 7)
+    
+    # Rate of change (% change over N candles)
+    df['roc_6'] = pd.Series(c).pct_change(6).values * 100    # 30-min momentum
+    df['roc_12'] = pd.Series(c).pct_change(12).values * 100   # 60-min momentum
+    
+    # Price momentum (close vs close 6 candles ago, normalized by ATR)
+    atr14 = _atr(h, l, c, 14)
+    df['momentum_atr_norm'] = np.where(
+        atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+    )
+    
+    # === TREND ===
+    
+    # EMA 9 and 21
+    ema9 = _ema(c, 9)
+    ema21 = _ema(c, 21)
+    df['ema_9'] = ema9
+    df['ema_21'] = ema21
+    
+    # EMA spread (normalized)
+    df['ema_spread'] = np.where(ema21 > 0, (ema9 - ema21) / ema21 * 100, 0)
+    
+    # EMA 9 slope (rate of change over 3 candles)
+    df['ema9_slope'] = pd.Series(ema9).pct_change(3).values * 100
+    
+    # Price vs EMA9 (normalized distance)
+    df['price_vs_ema9'] = np.where(ema9 > 0, (c - ema9) / ema9 * 100, 0)
+    
+    # SMA 20 (daily trend proxy)
+    sma20 = _sma(c, 20)
+    df['price_vs_sma20'] = np.where(sma20 > 0, (c - sma20) / sma20 * 100, 0)
+    
+    # ADX proxy — average directional movement (simplified)
+    df['adx_proxy'] = _adx_proxy(h, l, c, 14)
+    
+    # === VOLUME ===
+    
+    # Volume ratio vs 20-period average
+    vol_ma20 = _sma(v, 20)
+    df['volume_ratio'] = np.where(vol_ma20 > 0, v / vol_ma20, 1.0)
+    
+    # Volume trend (rising or falling over last 5 candles)
+    vol_sma5 = _sma(v, 5)
+    vol_sma20 = _sma(v, 20)
+    df['volume_trend'] = np.where(vol_sma20 > 0, vol_sma5 / vol_sma20, 1.0)
+    
+    # On-Balance Volume change rate
+    obv = _obv(c, v)
+    df['obv_slope'] = pd.Series(obv).pct_change(6).values * 100
+    
+    # === VOLATILITY ===
+    
+    # ATR as % of price
+    df['atr_pct'] = np.where(c > 0, atr14 / c * 100, 0)
+    
+    # Range expansion ratio (current candle range vs ATR)
+    candle_range = h - l
+    df['range_expansion'] = np.where(atr14 > 0, candle_range / atr14, 0)
+    
+    # Bollinger Band width (normalized)
+    sma20_v = _sma(c, 20)
+    std20 = _rolling_std(c, 20)
+    df['bb_width'] = np.where(sma20_v > 0, (2 * std20) / sma20_v * 100, 0)
+    
+    # Bollinger Band position (-1 to +1, where 0 = at SMA)
+    upper_bb = sma20_v + 2 * std20
+    lower_bb = sma20_v - 2 * std20
+    bb_range = upper_bb - lower_bb
+    df['bb_position'] = np.where(bb_range > 0, (c - lower_bb) / bb_range * 2 - 1, 0)
+    
+    # === STRUCTURE (INTRADAY) ===
+    
+    # VWAP (intraday — resets each day)
+    df['vwap'] = _intraday_vwap(df)
+    vwap = df['vwap'].values
+    df['price_vs_vwap'] = np.where(vwap > 0, (c - vwap) / vwap * 100, 0)
+    
+    # Time of day (minutes since market open, normalized 0-1)
+    df['time_of_day'] = _time_of_day_feature(df)
+    
+    # Candle body ratio (bullish/bearish strength)
+    candle_body = c - o
+    df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+    
+    # Upper/lower wick ratios
+    df['upper_wick'] = np.where(candle_range > 0, 
+                                (h - np.maximum(c, o)) / candle_range, 0)
+    df['lower_wick'] = np.where(candle_range > 0,
+                                (np.minimum(c, o) - l) / candle_range, 0)
+    
+    # Consecutive up/down candles
+    df['consec_up'] = _consecutive_direction(c, o, direction='up')
+    df['consec_down'] = _consecutive_direction(c, o, direction='down')
+    
+    # Day's cumulative return (from open)
+    df['day_return_pct'] = _intraday_return(df)
+    
+    # === MACD (key missing momentum indicator) ===
+    ema12 = _ema(c, 12)
+    ema26 = _ema(c, 26)
+    macd_line = ema12 - ema26
+    macd_signal = _ema(macd_line, 9)
+    macd_hist = macd_line - macd_signal
+    # Normalize MACD histogram by price (makes it comparable across stocks)
+    df['macd_hist_pct'] = np.where(c > 0, macd_hist / c * 100, 0)
+    # MACD histogram slope (acceleration of momentum)
+    df['macd_hist_slope'] = pd.Series(macd_hist).diff(3).values
+    df['macd_hist_slope'] = np.where(c > 0, df['macd_hist_slope'].values / c * 100, 0)
+    
+    # === GAP OPEN (overnight gap — avg 0.58%, max 8.36%) ===
+    df['gap_open_pct'] = _gap_open_feature(df)
+    
+    # === PRICE POSITION IN DAY'S RANGE ===
+    # (close - day_low) / (day_high - day_low) → 0 to 1
+    # Near 1 = at highs (momentum or reversal pending)
+    # Near 0 = at lows (weakness or bounce pending)
+    df['day_position'] = _intraday_position(df)
+    
+    # === RETURN DISTRIBUTION SHAPE (what ATR/BB miss entirely) ===
+    # Rolling skewness: positive = upside tail fatter → more likely to spike up
+    # Rolling kurtosis: high = fat tails → more likely to have extreme moves
+    returns = pd.Series(c).pct_change().values * 100
+    df['return_skew_20'] = pd.Series(returns).rolling(20, min_periods=10).skew().fillna(0).values
+    df['return_kurtosis_20'] = pd.Series(returns).rolling(20, min_periods=10).kurt().fillna(0).values
+    # Clip extreme kurtosis (can be 50+ with few candles)
+    df['return_kurtosis_20'] = np.clip(df['return_kurtosis_20'].values, -10, 10)
+    
+    # === VOLUME-MOMENTUM CONFLUENCE (conviction signal) ===
+    # When momentum and volume agree = institutional flow
+    # momentum_atr_norm * volume_ratio: big value → high-conviction directional move
+    mom_atr = df['momentum_atr_norm'].values
+    vol_rat = df['volume_ratio'].values
+    df['volume_momentum'] = mom_atr * np.clip(vol_rat, 0, 5)
+    
+    # Volume-price divergence: price moving but volume declining → weak move
+    price_chg_6 = pd.Series(c).pct_change(6).values * 100
+    vol_chg_6 = pd.Series(v).pct_change(6).values
+    df['vol_price_divergence'] = np.where(
+        np.abs(price_chg_6) > 0.01,
+        np.sign(price_chg_6) * np.where(vol_chg_6 < -0.1, -1, np.where(vol_chg_6 > 0.1, 1, 0)),
+        0
+    )
+    
+    # === PRICE ACCELERATION (2nd derivative — catches momentum inflections) ===
+    # 1st derivative = roc_6 (already have). 2nd derivative = change of roc
+    roc_6 = df['roc_6'].values
+    df['price_acceleration'] = pd.Series(roc_6).diff(3).fillna(0).values
+    
+    # === VOLATILITY-OF-VOLATILITY (vol regime changes) ===
+    # Rising ATR% → trending regime forming. Falling → compression → breakout pending
+    atr_series = pd.Series(atr14)
+    df['atr_change_pct'] = atr_series.pct_change(6).fillna(0).values * 100
+    df['atr_change_pct'] = np.clip(df['atr_change_pct'].values, -100, 100)
+    
+    # === TEMPORAL MICROSTRUCTURE (market session effects) ===
+    # Day of week: encoding as sin/cos for cyclical nature
+    # Monday (0) = gap plays, Friday (4) = position squaring
+    dow = df['date'].dt.dayofweek.values.astype(float)
+    df['dow_sin'] = np.sin(2 * np.pi * dow / 5)
+    df['dow_cos'] = np.cos(2 * np.pi * dow / 5)
+    
+    # Session bucket: Indian market has distinct session profiles
+    # 0=pre-market rush (9:15-9:45), 1=mid-morning, 2=lunch lull, 3=afternoon, 4=closing rush
+    df['session_bucket'] = _session_bucket(df)
+    
+    # === DAILY CONTEXT FEATURES (from 341-day daily candles) ===
+    if daily_df is not None and len(daily_df) >= 50:
+        df = _add_daily_context(df, daily_df)
+    else:
+        # Fill with neutral defaults so model still works without daily data
+        for col in _get_daily_feature_names():
+            df[col] = 0.0
+    
+    # === OI CONTEXT FEATURES (REMOVED from model — always zero historically) ===
+    # Option chain OI features require live snapshots and have no historical data.
+    # They were always zero-importance. Kept _add_oi_context() for future live use.
+    # No longer included in get_feature_names() or model training.
+    
+    # === FUTURES OI FEATURES (from DhanHQ historical futures data) ===
+    if futures_oi_df is not None and len(futures_oi_df) > 0:
+        df = _add_futures_oi_context(df, futures_oi_df)
+    else:
+        for col in _get_futures_oi_feature_names():
+            df[col] = 0.0
+    
+    # === DIRECTION-DISCRIMINATIVE FEATURES ===
+    # Features that specifically help distinguish UP from DOWN (not just MOVE vs FLAT)
+    
+    # 1. Chaikin Money Flow (CMF-20) — institutional accumulation vs distribution
+    #    Positive = buying pressure (bullish), Negative = selling pressure (bearish)
+    mfv = np.where(candle_range > 0,
+                   ((c - l) - (h - c)) / candle_range * v,
+                   0.0)
+    cmf_sum_vol = pd.Series(v).rolling(20, min_periods=10).sum().values
+    cmf_sum_mfv = pd.Series(mfv).rolling(20, min_periods=10).sum().values
+    df['cmf_20'] = np.where(cmf_sum_vol > 0, cmf_sum_mfv / cmf_sum_vol, 0.0)
+    
+    # 2. Net buying pressure — per-candle buy/sell volume estimate
+    #    (close-low)/(high-low) = fraction of range that is "buying"
+    buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+    df['net_buying_pressure'] = pd.Series(buy_pct * 2 - 1).rolling(12, min_periods=6).mean().fillna(0).values  # -1 to +1
+    
+    # 3. Momentum alignment — do multiple timeframes agree on direction?
+    #    Count how many of: roc_6, macd_hist, ema_spread, day_return_pct agree
+    #    Range: -1 (all bearish) to +1 (all bullish)
+    sig_roc = np.sign(df['roc_6'].values)
+    sig_macd = np.sign(df['macd_hist_pct'].values)
+    sig_ema = np.sign(df['ema_spread'].values)
+    sig_day = np.sign(df['day_return_pct'].values)
+    df['momentum_alignment'] = (sig_roc + sig_macd + sig_ema + sig_day) / 4.0
+    
+    # 4. Opening Range Breakout (ORB) direction
+    #    After first 6 candles (30 min), is price above or below the opening range?
+    df['orb_signal'] = _orb_direction(df)
+    
+    # 5. Previous close strength — where did yesterday's close land in yesterday's range?
+    #    Near 1.0 = strong close (bullish follow-through), near 0.0 = weak close (bearish)
+    df['prev_close_strength'] = _prev_close_strength(df)
+    
+    # 6. First-hour momentum persistence
+    #    The return during first 60 min (12 candles) — if strong, rest of day follows
+    df['first_hour_return'] = _first_hour_return(df)
+    
+    # 7. Volume-weighted direction — OBV rate sign over 12 candles
+    #    Positive OBV slope = buying, negative = selling
+    obv_dir = np.sign(df['obv_slope'].values)
+    vol_agree = obv_dir * np.abs(df['volume_ratio'].values - 1.0)
+    df['volume_direction'] = np.clip(vol_agree, -3, 3)
+    
+    # 8. Intraday trend consistency — fraction of last 12 candles that closed up
+    #    > 0.5 = bullish, < 0.5 = bearish
+    close_up = (c > o).astype(float)
+    df['trend_consistency'] = pd.Series(close_up).rolling(12, min_periods=6).mean().fillna(0.5).values * 2 - 1  # -1 to +1
+    
+    # 9. Relative strength vs NIFTY (short-term: 3 candles = 15 min)
+    #    Faster version of relative_strength for immediate momentum
+    roc_3 = pd.Series(c).pct_change(3).values * 100
+    df['roc_3'] = np.nan_to_num(roc_3, 0.0)
+    
+    # 10. Futures OI × price direction interaction
+    #     When OI builds AND price moves same direction → strong conviction signal
+    if 'fut_oi_buildup' in df.columns:
+        df['oi_price_confirm'] = df['fut_oi_buildup'].values * np.sign(df['day_return_pct'].values)
+    else:
+        df['oi_price_confirm'] = 0.0
+    
+    # === CROSS-FEATURE INTERACTION FEATURES ===
+    # Following the oi_price_confirm pattern — interactions between directional signals
+    # compound their predictive power for UP vs DOWN.
+    
+    # 11. CMF × momentum alignment — money flow agrees with multi-TF momentum?
+    #     Strong positive = institutional buying + all timeframes bullish
+    df['cmf_x_momentum'] = df['cmf_20'].values * df['momentum_alignment'].values
+    
+    # 12. Volume direction × trend consistency — volume flow + candle pattern agree?
+    df['voldir_x_trend'] = df['volume_direction'].values * df['trend_consistency'].values
+    
+    # 13. Net buying pressure × ATR-normalized momentum — buying conviction + price move
+    df['pressure_x_mom'] = df['net_buying_pressure'].values * df['momentum_atr_norm'].values
+    
+    # 14. ORB signal × volume ratio — breakout with volume confirmation
+    df['orb_x_volume'] = df['orb_signal'].values * np.clip(df['volume_ratio'].values, 0, 5)
+    
+    # 15. EMA trend × OBV direction — trend direction confirmed by volume flow
+    sig_ema_spread = np.sign(df['ema_spread'].values)
+    sig_obv = np.sign(df['obv_slope'].values)
+    df['ema_obv_confirm'] = sig_ema_spread * sig_obv  # +1=agree, -1=disagree
+    
+    # 16. RSI deviation from neutral × momentum alignment — overbought/oversold + direction
+    rsi_dev = (df['rsi_14'].values - 50.0) / 50.0  # -1 to +1
+    df['rsi_x_alignment'] = rsi_dev * df['momentum_alignment'].values
+    
+    # === NIFTY50 MARKET CONTEXT FEATURES ===
+    if nifty_5min_df is not None and len(nifty_5min_df) > 50:
+        df = _add_nifty_context(df, nifty_5min_df, nifty_daily_df)
+    else:
+        for col in _get_nifty_feature_names():
+            df[col] = 0.0
+    
+    # === CLEAN UP ===
+    
+    # Drop rows where indicators aren't ready (need ~25 candle warmup)
+    feature_cols = [col for col in df.columns if col not in ['date', 'open', 'high', 'low', 'close', 'volume']]
+    
+    # Replace inf/nan
+    for col in feature_cols:
+        df[col] = df[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    # Drop warmup rows (first 25 candles of each day are unreliable for some indicators)
+    # But we keep them tagged — the training pipeline will handle warmup filtering
+    df['_warmup'] = False
+    
+    return df
+
+
+# === HELPER FUNCTIONS ===
+
+def _ema(values: np.ndarray, period: int) -> np.ndarray:
+    """Exponential Moving Average"""
+    result = np.full_like(values, np.nan, dtype=float)
+    if len(values) < period:
+        return result
+    
+    multiplier = 2.0 / (period + 1)
+    result[period - 1] = np.mean(values[:period])
+    
+    for i in range(period, len(values)):
+        result[i] = (values[i] - result[i-1]) * multiplier + result[i-1]
+    
+    return result
+
+
+def _sma(values: np.ndarray, period: int) -> np.ndarray:
+    """Simple Moving Average"""
+    result = np.full_like(values, np.nan, dtype=float)
+    if len(values) < period:
+        return result
+    
+    cumsum = np.cumsum(values)
+    result[period-1:] = (cumsum[period-1:] - np.concatenate([[0], cumsum[:-period]])) / period
+    return result
+
+
+def _rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Relative Strength Index"""
+    result = np.full_like(close, 50.0, dtype=float)
+    if len(close) < period + 1:
+        return result
+    
+    deltas = np.diff(close)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    
+    if avg_loss == 0:
+        result[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        result[period] = 100.0 - 100.0 / (1.0 + rs)
+    
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+        if avg_loss == 0:
+            result[i + 1] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            result[i + 1] = 100.0 - 100.0 / (1.0 + rs)
+    
+    return result
+
+
+def _atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Average True Range"""
+    result = np.full_like(close, 0.0, dtype=float)
+    if len(close) < period + 1:
+        return result
+    
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    
+    tr = np.maximum(
+        high - low,
+        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close))
+    )
+    
+    # Wilder smoothing
+    result[period] = np.mean(tr[1:period+1])
+    for i in range(period + 1, len(close)):
+        result[i] = (result[i-1] * (period - 1) + tr[i]) / period
+    
+    return result
+
+
+def _adx_proxy(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Simplified ADX - measures trend strength without full DI+/DI- computation."""
+    atr = _atr(high, low, close, period)
+    
+    # Use price range / ATR ratio as trend strength proxy
+    lookback = period * 2
+    result = np.full_like(close, 20.0, dtype=float)
+    
+    for i in range(lookback, len(close)):
+        window_range = np.max(close[i-lookback:i+1]) - np.min(close[i-lookback:i+1])
+        if atr[i] > 0:
+            # Normalize to 0-100 range
+            result[i] = min(100, (window_range / atr[i]) * 3.5)
+    
+    return result
+
+
+def _rolling_std(values: np.ndarray, period: int) -> np.ndarray:
+    """Rolling standard deviation"""
+    result = np.full_like(values, 0.0, dtype=float)
+    for i in range(period - 1, len(values)):
+        result[i] = np.std(values[i-period+1:i+1])
+    return result
+
+
+def _obv(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    """On-Balance Volume"""
+    result = np.zeros_like(close, dtype=float)
+    for i in range(1, len(close)):
+        if close[i] > close[i-1]:
+            result[i] = result[i-1] + volume[i]
+        elif close[i] < close[i-1]:
+            result[i] = result[i-1] - volume[i]
+        else:
+            result[i] = result[i-1]
+    return result
+
+
+def _intraday_vwap(df: pd.DataFrame) -> pd.Series:
+    """Compute intraday VWAP (resets each trading day)"""
+    df = df.copy()
+    df['_date'] = df['date'].dt.date
+    df['_typical'] = (df['high'] + df['low'] + df['close']) / 3
+    df['_tp_vol'] = df['_typical'] * df['volume']
+    
+    vwap = pd.Series(0.0, index=df.index)
+    
+    for day, group in df.groupby('_date'):
+        idx = group.index
+        cum_tp_vol = group['_tp_vol'].cumsum()
+        cum_vol = group['volume'].cumsum()
+        day_vwap = np.where(cum_vol > 0, cum_tp_vol / cum_vol, group['close'])
+        vwap.iloc[idx] = day_vwap
+    
+    return vwap
+
+
+def _time_of_day_feature(df: pd.DataFrame) -> np.ndarray:
+    """Minutes since market open (9:15), normalized to 0-1 range.
+    0 = market open, 1 = market close (15:30).
+    """
+    market_minutes = 375  # 9:15 to 15:30
+    result = np.zeros(len(df))
+    
+    for i, dt in enumerate(df['date']):
+        if hasattr(dt, 'hour'):
+            mins = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
+            result[i] = max(0, min(1, mins / market_minutes))
+    
+    return result
+
+
+def _consecutive_direction(close: np.ndarray, open_: np.ndarray, direction: str = 'up') -> np.ndarray:
+    """Count consecutive bullish or bearish candles."""
+    result = np.zeros(len(close), dtype=float)
+    
+    for i in range(1, len(close)):
+        if direction == 'up' and close[i] > open_[i]:
+            result[i] = result[i-1] + 1
+        elif direction == 'down' and close[i] < open_[i]:
+            result[i] = result[i-1] + 1
+        else:
+            result[i] = 0
+    
+    return result
+
+
+def _gap_open_feature(df: pd.DataFrame) -> np.ndarray:
+    """Overnight gap: (today's open - yesterday's close) / yesterday's close * 100.
+    
+    For first candle of each day: gap from previous day's last close.
+    For subsequent intraday candles: 0 (gap only applies at open).
+    """
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    prev_close = None
+    for day, group in df_copy.groupby('_date', sort=True):
+        idx = group.index
+        day_open = group['open'].iloc[0]
+        
+        if prev_close is not None and prev_close > 0:
+            gap_pct = (day_open - prev_close) / prev_close * 100
+            # Apply gap to ALL candles of the day (it's a daily-level feature)
+            result[idx] = gap_pct
+        
+        prev_close = group['close'].iloc[-1]
+    
+    return result
+
+
+def _session_bucket(df: pd.DataFrame) -> np.ndarray:
+    """Indian market session bucket (normalized 0-1).
+    
+    0.0 = Opening rush (9:15-9:45)  — gap plays, high volatility
+    0.25 = Mid-morning (9:45-11:30) — trend establishment
+    0.50 = Lunch lull (11:30-13:30) — low volume, choppy
+    0.75 = Afternoon (13:30-14:45)  — institutional flow
+    1.0 = Closing rush (14:45-15:30) — position squaring, high volume
+    """
+    result = np.full(len(df), 0.5)  # default mid-day
+    for i, dt in enumerate(df['date']):
+        if not hasattr(dt, 'hour'):
+            continue
+        mins = dt.hour * 60 + dt.minute
+        if mins < 9 * 60 + 45:      # 9:15-9:45
+            result[i] = 0.0
+        elif mins < 11 * 60 + 30:    # 9:45-11:30
+            result[i] = 0.25
+        elif mins < 13 * 60 + 30:    # 11:30-13:30
+            result[i] = 0.50
+        elif mins < 14 * 60 + 45:    # 13:30-14:45
+            result[i] = 0.75
+        else:                         # 14:45-15:30
+            result[i] = 1.0
+    return result
+
+
+def _intraday_position(df: pd.DataFrame) -> np.ndarray:
+    """Price position within the day's range so far: (close - day_low) / (day_high - day_low).
+    
+    Returns 0-1 where 1 = at day's high, 0 = at day's low.
+    Uses rolling day high/low up to current candle (no lookahead).
+    """
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    for day, group in df_copy.groupby('_date'):
+        idx = group.index
+        highs = group['high'].values
+        lows = group['low'].values
+        closes = group['close'].values
+        
+        running_high = np.maximum.accumulate(highs)
+        running_low = np.minimum.accumulate(lows)
+        day_range = running_high - running_low
+        
+        pos = np.where(day_range > 0, (closes - running_low) / day_range, 0.5)
+        result[idx] = pos
+    
+    return result
+
+
+def _intraday_return(df: pd.DataFrame) -> np.ndarray:
+    """Cumulative return from day's open price."""
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    for day, group in df_copy.groupby('_date'):
+        idx = group.index
+        day_open = group['open'].iloc[0]
+        if day_open > 0:
+            result[idx] = (group['close'].values - day_open) / day_open * 100
+    
+    return result
+
+
+def _get_daily_feature_names() -> list:
+    """Feature names from daily context."""
+    return [
+        'daily_vol_regime',       # ATR% percentile vs last 100 days (0-1)
+        'daily_trend_strength',   # 20d EMA slope normalized
+        'daily_trend_direction',  # Price vs 50d EMA (%)
+        'daily_dist_from_high',   # Distance from 100d high (%)
+        'daily_dist_from_low',    # Distance from 100d low (%)
+        'daily_range_pct_20d',    # 20d price range as % of price
+        'daily_move_freq_10d',    # Fraction of last 10 days with >1% move
+        'daily_move_freq_20d',    # Fraction of last 20 days with >1% move
+        'daily_volume_regime',    # Today volume vs 20d avg
+        'daily_rsi_14',           # Daily RSI(14)
+    ]
+
+
+def _get_oi_feature_names() -> list:
+    """Feature names from options OI context (DhanHQ/NSE)."""
+    return [
+        'oi_pcr',                 # Put-Call ratio by OI (>1 bearish, <1 bullish)
+        'oi_pcr_change',          # PCR change from previous close OI
+        'oi_buildup_strength',    # -1 (forte short) to +1 (forte long)
+        'oi_spot_vs_max_pain',    # (spot - max_pain) / spot * 100
+        'oi_iv_skew',             # ATM put IV - call IV (>0 bearish fear)
+        'oi_atm_iv',              # ATM average IV (high = expected big move)
+        'oi_atm_delta',           # ATM call delta (market direction expectation)
+        'oi_call_resistance_dist', # Distance from top-call-OI strike (% of spot)
+    ]
+
+
+def _get_futures_oi_feature_names() -> list:
+    """Feature names from DhanHQ historical futures OI data."""
+    return [
+        'fut_oi_change_pct',   # Daily % change in futures OI
+        'fut_oi_buildup',      # +1=long buildup, -1=short buildup, +0.5=short cover, -0.5=long unwind
+        'fut_basis_pct',       # Futures premium/discount vs spot (%)
+        'fut_oi_5d_trend',     # 5-day OI trend (%)
+        'fut_vol_ratio',       # Futures volume / Equity volume
+    ]
+
+
+def _get_nifty_feature_names() -> list:
+    """Feature names derived from NIFTY50 index (market context)."""
+    return [
+        'nifty_roc_6',            # NIFTY momentum (same timeframe as stock roc_6)
+        'nifty_rsi_14',           # NIFTY RSI-14
+        'nifty_bb_position',      # NIFTY Bollinger Band position (0-1)
+        'nifty_ema9_slope',       # NIFTY EMA-9 slope (trend direction)
+        'nifty_atr_pct',          # NIFTY ATR% (market volatility)
+        'relative_strength',      # Stock roc_6 minus NIFTY roc_6 (ALPHA signal)
+        'nifty_daily_trend',      # NIFTY daily: price vs EMA-50 (%)
+        'nifty_daily_rsi',        # NIFTY daily RSI-14
+    ]
+
+
+def _get_direction_feature_names() -> list:
+    """Feature names that specifically discriminate UP from DOWN."""
+    return [
+        'cmf_20',                  # Chaikin Money Flow (20-period)
+        'net_buying_pressure',     # Buy/sell pressure from candle structure
+        'momentum_alignment',      # Multi-timeframe direction agreement (-1 to +1)
+        'orb_signal',              # Opening Range Breakout direction
+        'prev_close_strength',     # Previous day close position in range
+        'first_hour_return',       # First 60 min cumulative return
+        'volume_direction',        # OBV direction × volume ratio
+        'trend_consistency',       # Fraction of recent candles closing up (-1 to +1)
+        'roc_3',                   # Short-term 15 min momentum
+        'oi_price_confirm',        # Futures OI buildup × price direction
+    ]
+
+
+def _get_interaction_feature_names() -> list:
+    """Cross-feature interaction names — signals that compound each other."""
+    return [
+        'cmf_x_momentum',          # CMF × momentum alignment
+        'voldir_x_trend',          # Volume direction × trend consistency
+        'pressure_x_mom',          # Net buying pressure × ATR-norm momentum
+        'orb_x_volume',            # ORB signal × volume ratio
+        'ema_obv_confirm',         # EMA direction × OBV direction agreement
+        'rsi_x_alignment',         # RSI deviation × momentum alignment
+    ]
+
+
+def get_feature_names() -> list:
+    """Return the list of feature column names (for model training)."""
+    return [
+        'rsi_14', 'rsi_7',
+        'roc_6', 'roc_12', 'momentum_atr_norm',
+        'ema_spread', 'ema9_slope', 'price_vs_ema9', 'price_vs_sma20', 'adx_proxy',
+        'volume_ratio', 'volume_trend', 'obv_slope',
+        'atr_pct', 'range_expansion', 'bb_width', 'bb_position',
+        'price_vs_vwap', 'time_of_day',
+        'body_ratio', 'upper_wick', 'lower_wick',
+        'consec_up', 'consec_down',
+        'day_return_pct',
+        'macd_hist_pct', 'macd_hist_slope',
+        'gap_open_pct',
+        'day_position',
+        # Distribution shape (what ATR/BB miss)
+        'return_skew_20', 'return_kurtosis_20',
+        # Volume-momentum interaction
+        'volume_momentum', 'vol_price_divergence',
+        # 2nd derivative
+        'price_acceleration',
+        # Volatility regime change
+        'atr_change_pct',
+        # Temporal microstructure
+        'dow_sin', 'dow_cos', 'session_bucket',
+    ] + _get_direction_feature_names() + _get_interaction_feature_names() + _get_daily_feature_names() + _get_futures_oi_feature_names() + _get_nifty_feature_names()
+
+
+def _orb_direction(df: pd.DataFrame) -> np.ndarray:
+    """Opening Range Breakout direction signal.
+    
+    After the first 6 candles (30 min) of each day, measures whether the current
+    price is above or below the Opening Range (first 30 min high/low).
+    
+    Returns:
+        Values from -1 (below ORB low, bearish) to +1 (above ORB high, bullish).
+        During the first 30 min, returns 0 (ORB not established yet).
+    """
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    for day, group in df_copy.groupby('_date'):
+        idx = group.index
+        if len(group) < 7:
+            continue
+        
+        # Opening range: high/low of first 6 candles (30 min)
+        orb_high = group['high'].iloc[:6].max()
+        orb_low = group['low'].iloc[:6].min()
+        orb_range = orb_high - orb_low
+        
+        if orb_range <= 0:
+            continue
+        
+        # After first 6 candles: position relative to ORB
+        for i in range(6, len(group)):
+            pos = idx[i]
+            close_val = group['close'].iloc[i]
+            if close_val > orb_high:
+                # Above ORB high — bullish breakout
+                result[pos] = min(1.0, (close_val - orb_high) / orb_range)
+            elif close_val < orb_low:
+                # Below ORB low — bearish breakout
+                result[pos] = max(-1.0, (close_val - orb_low) / orb_range)
+            else:
+                # Inside ORB range
+                result[pos] = (close_val - (orb_high + orb_low) / 2) / (orb_range / 2)
+    
+    return result
+
+
+def _prev_close_strength(df: pd.DataFrame) -> np.ndarray:
+    """Previous day's close position within the day's range.
+    
+    Near 1.0 = closed at the high (strong, bullish follow-through likely).
+    Near 0.0 = closed at the low (weak, bearish follow-through likely).
+    Uses previous day to avoid lookahead.
+    """
+    result = np.full(len(df), 0.5)  # Default neutral
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    prev_strength = 0.5
+    prev_date = None
+    
+    for day, group in sorted(df_copy.groupby('_date'), key=lambda x: x[0]):
+        idx = group.index
+        
+        # Apply previous day's strength to all candles of current day
+        if prev_date is not None:
+            result[idx] = prev_strength
+        
+        # Compute this day's close strength
+        day_high = group['high'].max()
+        day_low = group['low'].min()
+        day_close = group['close'].iloc[-1]
+        day_range = day_high - day_low
+        
+        if day_range > 0:
+            prev_strength = (day_close - day_low) / day_range
+        else:
+            prev_strength = 0.5
+        
+        prev_date = day
+    
+    return result
+
+
+def _first_hour_return(df: pd.DataFrame) -> np.ndarray:
+    """Cumulative return during the first 60 minutes (12 candles) of each day.
+    
+    Applied to all subsequent candles of the day (after the first hour).
+    During the first hour itself, shows the running return.
+    Strong first-hour moves tend to persist.
+    """
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    for day, group in df_copy.groupby('_date'):
+        idx = group.index
+        day_open = group['open'].iloc[0]
+        
+        if day_open <= 0 or len(group) < 2:
+            continue
+        
+        # First hour return = close at candle 12 vs open
+        first_hour_candles = min(12, len(group))
+        close_at_1hr = group['close'].iloc[first_hour_candles - 1]
+        fh_return = (close_at_1hr - day_open) / day_open * 100
+        
+        # During first hour: running return
+        for i in range(first_hour_candles):
+            pos = idx[i]
+            result[pos] = (group['close'].iloc[i] - day_open) / day_open * 100
+        
+        # After first hour: fixed first-hour return value
+        for i in range(first_hour_candles, len(group)):
+            pos = idx[i]
+            result[pos] = fh_return
+    
+    return result
+
+
+def _add_daily_context(intraday_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge daily-derived context features onto each 5-min candle.
+    
+    For each trading day in intraday_df, computes features from daily_df
+    using ONLY data available up to the PREVIOUS day (no lookahead).
+    
+    Args:
+        intraday_df: 5-min candle DataFrame (already has date column)
+        daily_df: Daily OHLCV DataFrame (341+ days)
+    
+    Returns:
+        intraday_df with 10 new daily context columns added
+    """
+    daily = daily_df.copy().sort_values('date').reset_index(drop=True)
+    daily['_date'] = daily['date'].dt.date if hasattr(daily['date'].dt, 'date') else daily['date'].apply(lambda x: x.date() if hasattr(x, 'date') else x)
+    
+    # Pre-compute daily indicators
+    dc = daily['close'].values
+    dh = daily['high'].values
+    dl = daily['low'].values
+    dv = daily['volume'].values.astype(float)
+    
+    daily_atr = _atr(dh, dl, dc, 14)
+    daily_atr_pct = np.where(dc > 0, daily_atr / dc * 100, 0)
+    daily_ema20 = _ema(dc, 20)
+    daily_ema50 = _ema(dc, 50)
+    daily_rsi = _rsi(dc, 14)
+    daily_vol_ma20 = _sma(dv, 20)
+    
+    # Daily returns for move frequency
+    daily_returns = np.zeros(len(dc))
+    daily_returns[1:] = np.abs(np.diff(dc) / dc[:-1] * 100)
+    
+    # Build lookup: date → context features
+    context_by_date = {}
+    
+    for i in range(50, len(daily)):  # Need 50 days warmup
+        d = daily['_date'].iloc[i]
+        
+        # Use data up to PREVIOUS day (index i-1) to avoid lookahead
+        prev_idx = i - 1
+        
+        # 1. Volatility regime: ATR% percentile over last 100 days
+        lookback = min(100, prev_idx)
+        atr_window = daily_atr_pct[max(0, prev_idx - lookback):prev_idx + 1]
+        vol_regime = np.searchsorted(np.sort(atr_window), daily_atr_pct[prev_idx]) / max(len(atr_window), 1)
+        
+        # 2. Trend strength: EMA20 slope (% change over 5 days)
+        if prev_idx >= 5 and daily_ema20[prev_idx] > 0 and daily_ema20[prev_idx - 5] > 0:
+            trend_strength = (daily_ema20[prev_idx] / daily_ema20[prev_idx - 5] - 1) * 100
+        else:
+            trend_strength = 0.0
+        
+        # 3. Trend direction: price vs 50d EMA
+        if daily_ema50[prev_idx] > 0:
+            trend_dir = (dc[prev_idx] - daily_ema50[prev_idx]) / daily_ema50[prev_idx] * 100
+        else:
+            trend_dir = 0.0
+        
+        # 4-5. Distance from 100d high/low
+        high_100d = np.max(dh[max(0, prev_idx - 99):prev_idx + 1])
+        low_100d = np.min(dl[max(0, prev_idx - 99):prev_idx + 1])
+        dist_from_high = (dc[prev_idx] - high_100d) / high_100d * 100 if high_100d > 0 else 0
+        dist_from_low = (dc[prev_idx] - low_100d) / low_100d * 100 if low_100d > 0 else 0
+        
+        # 6. 20d price range as % of price
+        high_20d = np.max(dh[max(0, prev_idx - 19):prev_idx + 1])
+        low_20d = np.min(dl[max(0, prev_idx - 19):prev_idx + 1])
+        range_20d = (high_20d - low_20d) / dc[prev_idx] * 100 if dc[prev_idx] > 0 else 0
+        
+        # 7-8. Move frequency (fraction of days with >1% absolute move)
+        returns_10d = daily_returns[max(0, prev_idx - 9):prev_idx + 1]
+        returns_20d = daily_returns[max(0, prev_idx - 19):prev_idx + 1]
+        move_freq_10d = np.mean(returns_10d > 1.0) if len(returns_10d) > 0 else 0
+        move_freq_20d = np.mean(returns_20d > 1.0) if len(returns_20d) > 0 else 0
+        
+        # 9. Volume regime
+        vol_regime_v = dv[prev_idx] / daily_vol_ma20[prev_idx] if daily_vol_ma20[prev_idx] > 0 else 1.0
+        
+        # 10. Daily RSI
+        d_rsi = daily_rsi[prev_idx]
+        
+        context_by_date[d] = {
+            'daily_vol_regime': float(vol_regime),
+            'daily_trend_strength': float(trend_strength),
+            'daily_trend_direction': float(trend_dir),
+            'daily_dist_from_high': float(dist_from_high),
+            'daily_dist_from_low': float(dist_from_low),
+            'daily_range_pct_20d': float(range_20d),
+            'daily_move_freq_10d': float(move_freq_10d),
+            'daily_move_freq_20d': float(move_freq_20d),
+            'daily_volume_regime': float(vol_regime_v),
+            'daily_rsi_14': float(d_rsi),
+        }
+    
+    # Map daily context onto each 5-min candle
+    intraday_df = intraday_df.copy()
+    intraday_df['_date'] = intraday_df['date'].dt.date
+    
+    for col in _get_daily_feature_names():
+        intraday_df[col] = intraday_df['_date'].map(
+            lambda d, c=col: context_by_date.get(d, {}).get(c, 0.0)
+        )
+    
+    intraday_df.drop(columns=['_date'], inplace=True, errors='ignore')
+    
+    # Replace inf/nan
+    for col in _get_daily_feature_names():
+        intraday_df[col] = intraday_df[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return intraday_df
+
+
+def _add_oi_context(intraday_df: pd.DataFrame, oi_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge OI-derived context features onto each 5-min candle.
+    
+    OI snapshots are taken periodically (every 3-5 min) during market hours.
+    Each candle gets the most recent OI snapshot that is <= candle timestamp
+    (no lookahead).
+    
+    Args:
+        intraday_df: 5-min candle DataFrame (with date column)
+        oi_df: OI snapshot DataFrame with columns:
+            timestamp (datetime), pcr_oi, pcr_oi_change, buildup_strength,
+            spot_vs_max_pain, iv_skew, atm_iv, atm_delta, call_resistance_dist
+    
+    Returns:
+        intraday_df with 8 new OI context columns added
+    """
+    result = intraday_df.copy()
+    oi = oi_df.copy()
+    
+    # Ensure timestamps are datetime
+    if not pd.api.types.is_datetime64_any_dtype(oi['timestamp']):
+        oi['timestamp'] = pd.to_datetime(oi['timestamp'])
+    
+    oi = oi.sort_values('timestamp').reset_index(drop=True)
+    
+    oi_feature_cols = _get_oi_feature_names()
+    
+    # Map OI columns to expected feature names
+    col_map = {
+        'pcr_oi': 'oi_pcr',
+        'pcr_oi_change': 'oi_pcr_change',
+        'buildup_strength': 'oi_buildup_strength',
+        'spot_vs_max_pain': 'oi_spot_vs_max_pain',
+        'iv_skew': 'oi_iv_skew',
+        'atm_iv': 'oi_atm_iv',
+        'atm_delta': 'oi_atm_delta',
+        'call_resistance_dist': 'oi_call_resistance_dist',
+    }
+    
+    # Reverse map: feature_name -> oi_df column name
+    rev_map = {v: k for k, v in col_map.items()}
+    
+    # Use merge_asof for efficient time-based join (no lookahead)
+    result = result.sort_values('date').reset_index(drop=True)
+    
+    # Prepare OI data for merge_asof
+    oi_merge = oi[['timestamp'] + [c for c in rev_map.values() if c in oi.columns]].copy()
+    oi_merge = oi_merge.rename(columns=col_map)
+    oi_merge = oi_merge.rename(columns={'timestamp': 'date'})
+    oi_merge = oi_merge.sort_values('date')
+    
+    # Merge: each candle gets the latest OI snapshot at or before its timestamp
+    available_oi_cols = [c for c in oi_feature_cols if c in oi_merge.columns]
+    
+    if available_oi_cols:
+        merged = pd.merge_asof(
+            result[['date']],
+            oi_merge[['date'] + available_oi_cols],
+            on='date',
+            direction='backward',
+        )
+        for col in available_oi_cols:
+            result[col] = merged[col].values
+    
+    # Fill any missing OI features with 0
+    for col in oi_feature_cols:
+        if col not in result.columns:
+            result[col] = 0.0
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return result
+
+
+def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
+                       nifty_daily_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Merge NIFTY50 market context features onto each 5-min candle.
+    
+    Uses time-aligned NIFTY candles (merge_asof) to add market direction,
+    momentum, and relative strength features. These are the #1 missing signal
+    for directional prediction — individual stocks are 60-80% correlated with
+    the index.
+    
+    The killer feature: relative_strength = stock_roc - nifty_roc
+    This isolates genuine stock-specific alpha from market beta.
+    
+    Args:
+        intraday_df: 5-min stock candles (with 'date', 'close', and 'roc_6' columns)
+        nifty_5min_df: NIFTY50 5-min OHLCV candles
+        nifty_daily_df: Optional NIFTY50 daily candles for daily context
+    
+    Returns:
+        intraday_df with 8 new NIFTY market context columns
+    """
+    nifty_feat_names = _get_nifty_feature_names()
+    result = intraday_df.copy()
+    
+    # ── Compute NIFTY 5-min features ──
+    nf = nifty_5min_df.copy().sort_values('date').reset_index(drop=True)
+    nc = nf['close'].values
+    nh = nf['high'].values
+    nl = nf['low'].values
+    
+    # NIFTY momentum (same as stock roc_6: % change over 6 candles = 30 min)
+    nifty_roc_6 = np.zeros(len(nc))
+    nifty_roc_6[6:] = (nc[6:] - nc[:-6]) / nc[:-6] * 100
+    nf['nifty_roc_6'] = nifty_roc_6
+    
+    # NIFTY RSI-14
+    nf['nifty_rsi_14'] = _rsi(nc, 14)
+    
+    # NIFTY Bollinger position
+    sma20 = _sma(nc, 20)
+    std20 = pd.Series(nc).rolling(20).std().values
+    bb_upper = sma20 + 2 * std20
+    bb_lower = sma20 - 2 * std20
+    bb_range = np.maximum(bb_upper - bb_lower, 1e-8)
+    nf['nifty_bb_position'] = np.clip((nc - bb_lower) / bb_range, 0, 1)
+    
+    # NIFTY EMA-9 slope (% change over 3 candles)
+    nifty_ema9 = _ema(nc, 9)
+    nifty_slope = np.zeros(len(nc))
+    nifty_slope[3:] = np.where(
+        nifty_ema9[:-3] > 0,
+        (nifty_ema9[3:] - nifty_ema9[:-3]) / nifty_ema9[:-3] * 100,
+        0
+    )
+    nf['nifty_ema9_slope'] = nifty_slope
+    
+    # NIFTY ATR%
+    nifty_atr14 = _atr(nh, nl, nc, 14)
+    nf['nifty_atr_pct'] = np.where(nc > 0, nifty_atr14 / nc * 100, 0)
+    
+    # Prepare for merge_asof
+    nifty_merge_cols = ['date', 'nifty_roc_6', 'nifty_rsi_14', 'nifty_bb_position',
+                        'nifty_ema9_slope', 'nifty_atr_pct']
+    nf_merge = nf[nifty_merge_cols].copy()
+    nf_merge = nf_merge.sort_values('date')
+    
+    result = result.sort_values('date').reset_index(drop=True)
+    
+    # Time-aligned merge: each stock candle gets the NIFTY values at same timestamp
+    merged = pd.merge_asof(
+        result[['date']],
+        nf_merge,
+        on='date',
+        direction='backward',  # Use most recent NIFTY data at or before stock candle
+        tolerance=pd.Timedelta('10min'),  # Don't use stale data
+    )
+    
+    for col in ['nifty_roc_6', 'nifty_rsi_14', 'nifty_bb_position', 'nifty_ema9_slope', 'nifty_atr_pct']:
+        result[col] = merged[col].values
+    
+    # relative_strength = stock momentum - NIFTY momentum (THE alpha signal)
+    # If stock goes +0.5% while NIFTY goes +0.3%, relative_strength = +0.2%
+    # Positive = stock outperforming market = genuine bullish signal
+    if 'roc_6' in result.columns:
+        result['relative_strength'] = result['roc_6'] - result['nifty_roc_6'].fillna(0)
+    else:
+        result['relative_strength'] = 0.0
+    
+    # ── NIFTY Daily context (previous day's values) ──
+    if nifty_daily_df is not None and len(nifty_daily_df) >= 60:
+        nd = nifty_daily_df.copy().sort_values('date').reset_index(drop=True)
+        ndc = nd['close'].values
+        nd_ema50 = _ema(ndc, 50)
+        nd_rsi = _rsi(ndc, 14)
+        
+        nd['_date'] = nd['date'].dt.date if hasattr(nd['date'].dt, 'date') else nd['date'].apply(
+            lambda x: x.date() if hasattr(x, 'date') else x
+        )
+        
+        # Build lookup: date D → previous day's NIFTY daily features
+        daily_ctx = {}
+        for i in range(51, len(nd)):
+            d = nd['_date'].iloc[i]
+            prev = i - 1
+            trend = (ndc[prev] - nd_ema50[prev]) / nd_ema50[prev] * 100 if nd_ema50[prev] > 0 else 0.0
+            daily_ctx[d] = {
+                'nifty_daily_trend': float(trend),
+                'nifty_daily_rsi': float(nd_rsi[prev]),
+            }
+        
+        result['_date'] = result['date'].dt.date
+        result['nifty_daily_trend'] = result['_date'].map(
+            lambda d: daily_ctx.get(d, {}).get('nifty_daily_trend', 0.0)
+        )
+        result['nifty_daily_rsi'] = result['_date'].map(
+            lambda d: daily_ctx.get(d, {}).get('nifty_daily_rsi', 0.0)
+        )
+        result.drop(columns=['_date'], inplace=True, errors='ignore')
+    else:
+        result['nifty_daily_trend'] = 0.0
+        result['nifty_daily_rsi'] = 0.0
+    
+    # Clean up
+    for col in nifty_feat_names:
+        if col not in result.columns:
+            result[col] = 0.0
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return result
+
+
+def _add_futures_oi_context(intraday_df: pd.DataFrame, futures_oi_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge daily futures OI features onto each 5-min candle.
+    
+    For each trading day in intraday_df, uses the PREVIOUS day's futures OI
+    features to avoid lookahead bias (same logic as _add_daily_context).
+    
+    Args:
+        intraday_df: 5-min candle DataFrame (already has 'date' column)
+        futures_oi_df: Daily futures OI DataFrame with columns:
+            date, symbol, fut_oi_change_pct, fut_oi_buildup,
+            fut_basis_pct, fut_oi_5d_trend, fut_vol_ratio
+    
+    Returns:
+        intraday_df with 5 new futures OI context columns added
+    """
+    fut_features = _get_futures_oi_feature_names()
+    
+    if futures_oi_df is None or len(futures_oi_df) == 0:
+        for col in fut_features:
+            intraday_df[col] = 0.0
+        return intraday_df
+    
+    foi = futures_oi_df.copy().sort_values('date').reset_index(drop=True)
+    
+    # Normalize dates to date-only for lookup
+    foi['_date'] = foi['date'].dt.date if hasattr(foi['date'].dt, 'date') else foi['date'].apply(
+        lambda x: x.date() if hasattr(x, 'date') else x
+    )
+    
+    # Build lookup: for each date, store the PREVIOUS day's features
+    # This means for date D, we use features from the row at index i-1
+    context_by_date = {}
+    sorted_dates = foi['_date'].unique()
+    
+    for i in range(1, len(foi)):
+        current_date = foi['_date'].iloc[i]
+        prev_row = foi.iloc[i - 1]
+        
+        context_by_date[current_date] = {
+            col: float(prev_row[col]) if col in foi.columns and pd.notna(prev_row[col])
+            else 0.0
+            for col in fut_features
+        }
+    
+    # Map onto each 5-min candle
+    result = intraday_df.copy()
+    result['_date'] = result['date'].dt.date
+    
+    for col in fut_features:
+        result[col] = result['_date'].map(
+            lambda d, c=col: context_by_date.get(d, {}).get(c, 0.0)
+        )
+    
+    result.drop(columns=['_date'], inplace=True, errors='ignore')
+    
+    # Replace inf/nan
+    for col in fut_features:
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return result
+
+
+if __name__ == '__main__':
+    # Quick test on synthetic data
+    np.random.seed(42)
+    n = 500
+    dates = pd.date_range('2026-01-02 09:15', periods=n, freq='5min')
+    price = 100 + np.cumsum(np.random.randn(n) * 0.3)
+    
+    test_df = pd.DataFrame({
+        'date': dates,
+        'open': price + np.random.randn(n) * 0.1,
+        'high': price + abs(np.random.randn(n) * 0.5),
+        'low': price - abs(np.random.randn(n) * 0.5),
+        'close': price,
+        'volume': np.random.randint(10000, 500000, n)
+    })
+    
+    result = compute_features(test_df, symbol="TEST")
+    print(f"Input: {len(test_df)} candles")
+    print(f"Output: {len(result)} rows, {len(result.columns)} columns")
+    print(f"\nFeature columns ({len(get_feature_names())}):")
+    for f in get_feature_names():
+        vals = result[f].dropna()
+        print(f"  {f:<25s} min={vals.min():>8.2f}  max={vals.max():>8.2f}  mean={vals.mean():>8.2f}")

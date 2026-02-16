@@ -1,0 +1,67 @@
+MOVE PREDICTOR TRAINING REPORT (BINARY)
+============================================================
+Date: 2026-02-15T13:08:12.134610
+Train samples: 823,139
+Test samples: 73,140
+Accuracy: 0.7472
+MOVE F1: 0.5355
+
+              precision    recall  f1-score   support
+
+     NO_MOVE       0.75      0.92      0.83     47941
+        MOVE       0.73      0.42      0.54     25199
+
+    accuracy                           0.75     73140
+   macro avg       0.74      0.67      0.68     73140
+weighted avg       0.74      0.75      0.73     73140
+
+
+Feature Importances:
+  atr_pct                    0.350457
+  bb_width                   0.123484
+  daily_move_freq_20d        0.071709
+  time_of_day                0.067574
+  price_vs_ema9              0.050308
+  daily_range_pct_20d        0.044209
+  range_expansion            0.039996
+  volume_trend               0.034412
+  volume_ratio               0.033148
+  daily_move_freq_10d        0.016308
+  price_vs_sma20             0.013764
+  price_vs_vwap              0.012138
+  adx_proxy                  0.009920
+  fut_vol_ratio              0.008428
+  fut_oi_change_pct          0.008121
+  fut_basis_pct              0.006996
+  daily_dist_from_low        0.006648
+  bb_position                0.006611
+  day_return_pct             0.006499
+  roc_6                      0.005853
+  daily_dist_from_high       0.005741
+  fut_oi_5d_trend            0.005595
+  fut_oi_buildup             0.005595
+  daily_trend_strength       0.005010
+  daily_volume_regime        0.005002
+  rsi_7                      0.004983
+  daily_trend_direction      0.004819
+  rsi_14                     0.004696
+  ema_spread                 0.004602
+  daily_vol_regime           0.004499
+  daily_rsi_14               0.004398
+  ema9_slope                 0.004242
+  roc_12                     0.003839
+  momentum_atr_norm          0.003413
+  consec_up                  0.003246
+  obv_slope                  0.003164
+  body_ratio                 0.002894
+  upper_wick                 0.002755
+  lower_wick                 0.002637
+  consec_down                0.002291
+  oi_pcr                     0.000000
+  oi_pcr_change              0.000000
+  oi_buildup_strength        0.000000
+  oi_spot_vs_max_pain        0.000000
+  oi_iv_skew                 0.000000
+  oi_atm_iv                  0.000000
+  oi_atm_delta               0.000000
+  oi_call_resistance_dist    0.000000

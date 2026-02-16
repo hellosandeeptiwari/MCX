@@ -1,0 +1,115 @@
+{
+  "model_name": "move_predictor",
+  "model_type": "binary",
+  "timestamp": "20260214_125858",
+  "feature_names": [
+    "rsi_14",
+    "rsi_7",
+    "roc_6",
+    "roc_12",
+    "momentum_atr_norm",
+    "ema_spread",
+    "ema9_slope",
+    "price_vs_ema9",
+    "price_vs_sma20",
+    "adx_proxy",
+    "volume_ratio",
+    "volume_trend",
+    "obv_slope",
+    "atr_pct",
+    "range_expansion",
+    "bb_width",
+    "bb_position",
+    "price_vs_vwap",
+    "time_of_day",
+    "body_ratio",
+    "upper_wick",
+    "lower_wick",
+    "consec_up",
+    "consec_down",
+    "day_return_pct",
+    "daily_vol_regime",
+    "daily_trend_strength",
+    "daily_trend_direction",
+    "daily_dist_from_high",
+    "daily_dist_from_low",
+    "daily_range_pct_20d",
+    "daily_move_freq_10d",
+    "daily_move_freq_20d",
+    "daily_volume_regime",
+    "daily_rsi_14"
+  ],
+  "label_map": {
+    "0": 0,
+    "1": 1
+  },
+  "label_names": {
+    "0": "NO_MOVE",
+    "1": "MOVE"
+  },
+  "accuracy": 0.5828,
+  "move_f1": 0.5954,
+  "precision_per_class": {
+    "NO_MOVE": 0.8801,
+    "MOVE": 0.4471
+  },
+  "recall_per_class": {
+    "NO_MOVE": 0.4209,
+    "MOVE": 0.8909
+  },
+  "f1_per_class": {
+    "NO_MOVE": 0.5694,
+    "MOVE": 0.5954
+  },
+  "feature_importance": {
+    "bb_width": 0.228321,
+    "atr_pct": 0.19922,
+    "daily_move_freq_20d": 0.083638,
+    "ema_spread": 0.060458,
+    "time_of_day": 0.046209,
+    "daily_move_freq_10d": 0.045318,
+    "daily_range_pct_20d": 0.031825,
+    "ema9_slope": 0.027137,
+    "daily_dist_from_low": 0.026994,
+    "price_vs_ema9": 0.025111,
+    "price_vs_vwap": 0.024397,
+    "price_vs_sma20": 0.022831,
+    "volume_trend": 0.01981,
+    "range_expansion": 0.018976,
+    "day_return_pct": 0.0155,
+    "volume_ratio": 0.011824,
+    "roc_6": 0.011231,
+    "daily_trend_strength": 0.010163,
+    "roc_12": 0.009282,
+    "daily_volume_regime": 0.009096,
+    "daily_trend_direction": 0.008496,
+    "adx_proxy": 0.008152,
+    "bb_position": 0.007937,
+    "obv_slope": 0.006947,
+    "rsi_14": 0.006793,
+    "daily_rsi_14": 0.006768,
+    "daily_dist_from_high": 0.006543,
+    "lower_wick": 0.005915,
+    "daily_vol_regime": 0.005632,
+    "rsi_7": 0.005328,
+    "momentum_atr_norm": 0.004148,
+    "body_ratio": 0.0,
+    "upper_wick": 0.0,
+    "consec_up": 0.0,
+    "consec_down": 0.0
+  },
+  "train_samples": 157247,
+  "test_samples": 73140,
+  "best_iteration": 47,
+  "train_time_seconds": 4.1,
+  "confusion_matrix": [
+    [
+      20176,
+      27765
+    ],
+    [
+      2749,
+      22450
+    ]
+  ]
+}

@@ -94,6 +94,8 @@ class IntradayOptionDecision:
     microstructure_score: float = 0.0          # 0-15 points from microstructure
     microstructure_block: bool = False         # Hard block due to illiquidity
     microstructure_block_reason: str = ""
+    # Reversal zone trade (tight SL, flipped direction)
+    is_reversal_trade: bool = False
 
 
 class IntradayOptionScorer:
@@ -676,6 +678,53 @@ class IntradayOptionScorer:
         
         _audit_after_rsi = score
         
+        # === 8a. OI FLOW DIRECTIONAL SCORING (+/-8 points) ===
+        # Futures OI signal captures institutional direction (LONG_BUILDUP etc.)
+        # Pro traders ALWAYS check: are institutions on your side?
+        # This was the #1 missing signal — OI was captured but never scored.
+        oi_score = 0
+        if market_data:
+            oi_signal = market_data.get('oi_signal', 'NEUTRAL')
+            oi_change = abs(market_data.get('oi_change_pct', 0))
+            
+            if oi_signal not in ('NEUTRAL', 'NO_FUTURES', 'ERROR', ''):
+                # Scale bonus/penalty by OI change magnitude
+                oi_strength = min(1.5, oi_change / 5.0) if oi_change > 0 else 0.5  # 0.5-1.5x
+                
+                if direction in ('BUY', 'HOLD') and oi_signal == 'LONG_BUILDUP':
+                    oi_score = int(5 * oi_strength)
+                    bullish_points += oi_score
+                    reasons.append(f"OI: LONG_BUILDUP confirms BUY (OI+{oi_change:.1f}%) (+{oi_score})")
+                elif direction in ('BUY', 'HOLD') and oi_signal == 'SHORT_COVERING':
+                    oi_score = int(3 * oi_strength)
+                    bullish_points += oi_score
+                    reasons.append(f"OI: SHORT_COVERING supports BUY (OI-{oi_change:.1f}%) (+{oi_score})")
+                elif direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
+                    oi_score = -8
+                    warnings.append(f"OI CONFLICT: SHORT_BUILDUP vs BUY direction (OI+{oi_change:.1f}%) (-8) — institutions are SELLING")
+                elif direction == 'BUY' and oi_signal == 'LONG_UNWINDING':
+                    oi_score = -5
+                    warnings.append(f"OI CONFLICT: LONG_UNWINDING vs BUY (OI-{oi_change:.1f}%) (-5) — longs exiting")
+                    
+                elif direction in ('SELL', 'HOLD') and oi_signal == 'SHORT_BUILDUP':
+                    oi_score = int(5 * oi_strength)
+                    bearish_points += oi_score
+                    reasons.append(f"OI: SHORT_BUILDUP confirms SELL (OI+{oi_change:.1f}%) (+{oi_score})")
+                elif direction in ('SELL', 'HOLD') and oi_signal == 'LONG_UNWINDING':
+                    oi_score = int(3 * oi_strength)
+                    bearish_points += oi_score
+                    reasons.append(f"OI: LONG_UNWINDING supports SELL (OI-{oi_change:.1f}%) (+{oi_score})")
+                elif direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
+                    oi_score = -8
+                    warnings.append(f"OI CONFLICT: LONG_BUILDUP vs SELL direction (OI+{oi_change:.1f}%) (-8) — institutions are BUYING")
+                elif direction == 'SELL' and oi_signal == 'SHORT_COVERING':
+                    oi_score = -5
+                    warnings.append(f"OI CONFLICT: SHORT_COVERING vs SELL (OI-{oi_change:.1f}%) (-5) — shorts covering")
+                
+                score += oi_score
+        
+        _audit_after_oi = score
+        
         # === 8. MOMENTUM EXHAUSTION FILTER (graduated, overridable) ===
         # Prevents chasing moves that have already exhausted their run.
         # Checks BOTH gap (from prev close) AND intraday move (from today's open).
@@ -892,6 +941,52 @@ class IntradayOptionScorer:
                 warnings.append(f"🔄 VWAP RE-SCORED: direction {_pre_direction_trend_dir}→{direction}, VWAP {_old_vwap_contrib:+.0f}→{_new_vwap:+.0f} (Δ{_vwap_delta:+.0f})")
                 _audit_after_align = score  # Update for gate cap baseline
         
+        # === REVERSAL ZONE DETECTION (exhaustion → trade the pullback) ===
+        # Detects stocks that are exhausted at resistance/support and flips
+        # direction to trade the mean-reversion instead of chasing.
+        # ALL 3 conditions required: >2.5% move + near R/S + RSI extreme
+        # Uses tighter SL (18%) and smaller size (0.75x) for lower conviction.
+        is_reversal_trade = False
+        if market_data and direction in ("BUY", "SELL"):
+            _rv_ltp = market_data.get('ltp', 0)
+            _rv_open = market_data.get('open', _rv_ltp)
+            _rv_move = abs((_rv_ltp - _rv_open) / _rv_open * 100) if _rv_open > 0 else 0
+            _rv_rsi = signal.rsi
+            _rv_r1 = market_data.get('resistance_1', 0)
+            _rv_r2 = market_data.get('resistance_2', 0)
+            _rv_s1 = market_data.get('support_1', 0)
+            _rv_s2 = market_data.get('support_2', 0)
+
+            if direction == "BUY" and _rv_move >= 2.5:
+                # Bullish exhaustion: near resistance + overbought
+                _near_r1 = _rv_r1 > 0 and _rv_ltp > 0 and abs(_rv_ltp - _rv_r1) / _rv_r1 * 100 <= 1.0
+                _near_r2 = _rv_r2 > 0 and _rv_ltp > 0 and abs(_rv_ltp - _rv_r2) / _rv_r2 * 100 <= 1.0
+                _near_resistance = _near_r1 or _near_r2
+                _which_r = f"R1 ₹{_rv_r1:.0f}" if _near_r1 else f"R2 ₹{_rv_r2:.0f}"
+
+                if _near_resistance and _rv_rsi > 70:
+                    is_reversal_trade = True
+                    _old_dir = direction
+                    direction = "SELL"  # Flip → buy PUT
+                    score -= 5  # Small penalty for counter-trend risk
+                    warnings.append(f"🔄 REVERSAL ZONE: {_rv_move:.1f}% from open + near {_which_r} + RSI {_rv_rsi:.0f} → FLIPPED {_old_dir}→{direction} (PUT reversal)")
+                    reasons.append(f"🎯 REVERSAL TRADE: Bullish exhaustion at resistance — trading pullback")
+
+            elif direction == "SELL" and _rv_move >= 2.5:
+                # Bearish exhaustion: near support + oversold
+                _near_s1 = _rv_s1 > 0 and _rv_ltp > 0 and abs(_rv_ltp - _rv_s1) / _rv_s1 * 100 <= 1.0
+                _near_s2 = _rv_s2 > 0 and _rv_ltp > 0 and abs(_rv_ltp - _rv_s2) / _rv_s2 * 100 <= 1.0
+                _near_support = _near_s1 or _near_s2
+                _which_s = f"S1 ₹{_rv_s1:.0f}" if _near_s1 else f"S2 ₹{_rv_s2:.0f}"
+
+                if _near_support and _rv_rsi < 30:
+                    is_reversal_trade = True
+                    _old_dir = direction
+                    direction = "BUY"  # Flip → buy CALL
+                    score -= 5
+                    warnings.append(f"🔄 REVERSAL ZONE: {_rv_move:.1f}% from open + near {_which_s} + RSI {_rv_rsi:.0f} → FLIPPED {_old_dir}→{direction} (CALL reversal)")
+                    reasons.append(f"🎯 REVERSAL TRADE: Bearish exhaustion at support — trading bounce")
+
         # === DETERMINE STRIKE SELECTION (with OTM safety rules) ===
         strike_selection = self._recommend_strike(
             score=score, 
@@ -1007,6 +1102,29 @@ class IntradayOptionScorer:
         if should_trade and direction == "SELL" and trend_state_str in ('BULLISH', 'STRONG_BULLISH'):
             should_trade = False
             warnings.append(f"🚫 BLOCKED: SELL conflicts with {trend_state_str} trend — counter-trend")
+        
+        # Gate 6b: STALE BREAKOUT GATE — ORB broke but no follow-through
+        # 8 TIME_STOP losses with MaxR=0: breakout happened but price went nowhere.
+        # If ORB breakout occurred (orb_hold > 3 candles ago) and ZERO follow-through,
+        # the move is dead — don't enter.
+        if should_trade and market_data:
+            _ft = signal.follow_through_candles
+            _orb_hold = market_data.get('orb_hold_candles', 0)
+            _orb_sig = market_data.get('orb_signal', 'INSIDE_ORB')
+            _adx = market_data.get('adx', 20)
+            
+            if _orb_sig in ('BREAKOUT_UP', 'BREAKOUT_DOWN') and _ft == 0 and _orb_hold >= 4:
+                # Breakout happened 4+ candles ago but price hasn't followed through
+                score -= 10
+                warnings.append(f"⚠️ STALE BREAKOUT: ORB broke {_orb_hold} candles ago, 0 follow-through (-10)")
+                if score < self.BLOCK_THRESHOLD:
+                    should_trade = False
+                    warnings.append(f"🚫 BLOCKED: Stale breakout dropped score below {self.BLOCK_THRESHOLD}")
+            
+            # If not an ORB breakout but score is premium (>=70), still require some follow-through
+            if _ft == 0 and score >= self.PREMIUM_THRESHOLD and _adx < 30:
+                score -= 5
+                warnings.append(f"⚠️ NO FOLLOW-THROUGH: Score {score+5:.0f} premium but FT=0, ADX={_adx:.0f} (-5)")
         
         # Gate 7: UNIFIED LATE ENTRY CHECK — range position + RSI exhaustion
         # Consolidates old Gate 7 (range position) + Gate 7b (RSI exhaustion) into one.
@@ -1192,6 +1310,23 @@ class IntradayOptionScorer:
                     score -= 10
                     warnings.append(f"⚠️ RSI CONTRADICTION: Buying at RSI={signal.rsi:.0f} without explosive volume — pullback likely (-10)")
 
+        # Gate 14: OI HARD CONFLICT — institutions fighting your direction
+        # If OI says SHORT_BUILDUP and you're buying, or LONG_BUILDUP and you're selling,
+        # AND the score is borderline (<75), block the trade. Institutions usually win.
+        if should_trade and market_data:
+            _oi_sig = market_data.get('oi_signal', 'NEUTRAL')
+            _oi_chg = abs(market_data.get('oi_change_pct', 0))
+            if _oi_sig not in ('NEUTRAL', 'NO_FUTURES', 'ERROR', ''):
+                _oi_vs_dir = False
+                if direction == 'BUY' and _oi_sig in ('SHORT_BUILDUP', 'LONG_UNWINDING'):
+                    _oi_vs_dir = True
+                elif direction == 'SELL' and _oi_sig in ('LONG_BUILDUP', 'SHORT_COVERING'):
+                    _oi_vs_dir = True
+                
+                if _oi_vs_dir and _oi_chg >= 3 and score < 75:
+                    should_trade = False
+                    warnings.append(f"🚫 BLOCKED: OI hard conflict — {_oi_sig} (OI {_oi_chg:.1f}%) vs {direction} at score {score:.0f}<75 — institutions disagree")
+
         # S1/S7 FIX: GATE PENALTY CAP — prevent "death by a thousand cuts"
         # Total gate penalties cannot exceed 40% of pre-gate score.
         # A stock scoring 70 pre-gate can lose at most 28 points from gates (→ 42 minimum).
@@ -1235,6 +1370,10 @@ class IntradayOptionScorer:
         _score_audit_str = " | ".join(_audit_parts) + f" = {score:.0f}"
         self._last_score_audit = _score_audit_str
         
+        # Cap size for reversal trades (lower conviction)
+        if is_reversal_trade:
+            size_multiplier = min(size_multiplier, 0.75)
+
         decision = IntradayOptionDecision(
             should_trade=should_trade,
             confidence_score=min(100, max(0, score)),
@@ -1249,7 +1388,8 @@ class IntradayOptionScorer:
             warnings=warnings,
             microstructure_score=microstructure_score,
             microstructure_block=microstructure_block,
-            microstructure_block_reason=microstructure_block_reason
+            microstructure_block_reason=microstructure_block_reason,
+            is_reversal_trade=is_reversal_trade
         )
         
         self.last_decisions[signal.symbol] = decision
@@ -2658,7 +2798,7 @@ class OptionsPositionSizer:
         # Calculate target and stoploss — TIERED R:R
         # Premium: Target 80% gain, SL 28% loss → R:R = 2.86:1
         # Standard: Target 60% gain, SL 28% loss → R:R = 2.14:1
-        # Base: Target 50% gain, SL 30% loss → R:R = 1.67:1
+        # Base: Target 50% gain, SL 28% loss → R:R = 1.79:1
         if score_tier == "premium":
             target_premium = contract.ltp * 1.80   # +80% premium gain
             stoploss_premium = contract.ltp * 0.72  # -28% premium loss
@@ -2667,7 +2807,7 @@ class OptionsPositionSizer:
             stoploss_premium = contract.ltp * 0.72  # -28% premium loss
         else:
             target_premium = contract.ltp * 1.50   # +50% premium gain
-            stoploss_premium = contract.ltp * 0.70  # -30% premium loss
+            stoploss_premium = contract.ltp * 0.72  # -28% premium loss
         
         # Breakeven
         if contract.option_type == OptionType.CE:
@@ -2971,6 +3111,16 @@ class OptionsTrader:
                 scorer = get_intraday_scorer()
                 decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, option_data=micro_data, caller_direction=direction)
                 print(f"   🔄 CACHED score {cached_base_score:.0f} → re-scored WITH microstructure → {decision.confidence_score:.0f}")
+                
+                # === RE-SCORE GATE: Block if option score dropped hard from scan score ===
+                # KFINTECH scored 72 on scan but 57.5 on option → trade went through but lost.
+                # If score drops >12 from cached AND falls below 62, option quality is too poor.
+                _score_drop = cached_base_score - decision.confidence_score
+                if _score_drop > 12 and decision.confidence_score < 62:
+                    print(f"   🚫 RE-SCORE GATE: Score dropped {_score_drop:.0f} pts ({cached_base_score:.0f}→{decision.confidence_score:.0f}) — option quality too poor")
+                    self._last_rejected_score = decision.confidence_score
+                    self._last_rejected_symbol = underlying
+                    return None
             else:
                 print(f"   ✅ USING CACHED score {cached_base_score:.0f} for {underlying} (no microstructure change)")
         else:
@@ -3036,6 +3186,25 @@ class OptionsTrader:
         # Direction from intraday analysis takes precedence over passed direction
         final_direction = decision.recommended_direction if decision.recommended_direction != "HOLD" else direction
         
+        # === ML DIRECTION OVERRIDE (smart CE↔PE flip) ===
+        # When ML has HIGH confidence (BULLISH/BEARISH ≥60%) and disagrees with
+        # the technical direction, flip final_direction + opt_type.
+        # This is the last-mile override — all trade paths converge here.
+        # FAIL-SAFE: any error → keep original direction.
+        try:
+            if cached_decision and cached_decision.get('ml_prediction'):
+                _ml_hint = cached_decision['ml_prediction'].get('ml_direction_hint', 'NEUTRAL')
+                if _ml_hint == 'BULLISH' and final_direction == 'SELL':
+                    print(f"   🧠 ML OVERRIDE: {underlying} tech=SELL → ML=BULLISH (flipping to BUY/CE)")
+                    final_direction = 'BUY'
+                    opt_type = OptionType.CE
+                elif _ml_hint == 'BEARISH' and final_direction == 'BUY':
+                    print(f"   🧠 ML OVERRIDE: {underlying} tech=BUY → ML=BEARISH (flipping to SELL/PE)")
+                    final_direction = 'SELL'
+                    opt_type = OptionType.PE
+        except Exception:
+            pass  # ML unavailable — keep original direction
+        
         print(f"   Strike: {strike_sel.value} | Expiry: {expiry_sel.value} | Type: {opt_type.value}")
         
         try:
@@ -3079,7 +3248,20 @@ class OptionsTrader:
             
             # Apply intraday conviction multiplier — use round() not int() to avoid truncation
             # int(1 * 1.5) = 1, round(1 * 1.5) = 2 ← this was silently killing the multiplier
-            adjusted_lots = max(1, round(sizing['lots'] * decision.position_size_multiplier))
+            
+            # === ML SIZING FACTOR (fail-safe: defaults to 1.0 if ML unavailable) ===
+            # Reads ml_sizing_factor from cached ML prediction in cycle_decisions.
+            # If ML model is not loaded, prediction failed, or field is missing,
+            # _ml_sizing stays 1.0 and has ZERO effect on sizing.
+            _ml_sizing = 1.0
+            try:
+                if cached_decision and cached_decision.get('ml_prediction'):
+                    _ml_sizing = cached_decision['ml_prediction'].get('ml_sizing_factor', 1.0)
+                    _ml_sizing = max(0.5, min(2.0, _ml_sizing))  # Safety clamp (2.0x max for elite ML signals)
+            except Exception:
+                _ml_sizing = 1.0  # Any error → neutral (no sizing change)
+            
+            adjusted_lots = max(1, round(sizing['lots'] * decision.position_size_multiplier * _ml_sizing))
             adjusted_premium = adjusted_lots * sizing['premium_per_lot']
             
             # Tiered capital cap — premium trades get bigger allocation
@@ -3121,10 +3303,12 @@ class OptionsTrader:
                 'microstructure_score': round(decision.microstructure_score, 1),
                 'microstructure_block': decision.microstructure_block,
                 'position_size_multiplier': round(decision.position_size_multiplier, 2),
+                'ml_sizing_factor': round(_ml_sizing, 2),
                 'original_lots': sizing['lots'],
                 'adjusted_lots': adjusted_lots,
                 'cap_pct_used': cap_pct,
-                'strategy_type': 'NAKED_OPTION',
+                'strategy_type': 'REVERSAL_TRADE' if decision.is_reversal_trade else 'NAKED_OPTION',
+                'is_reversal_trade': decision.is_reversal_trade,
                 # Candle gate data
                 'follow_through_candles': ft_candles,
                 'adx': round(adx_val, 1),
@@ -3141,8 +3325,38 @@ class OptionsTrader:
                 'gates_passed': [r for r in decision.reasons if '✅' in r or 'PASS' in r.upper()],
                 'gates_warned': [w for w in decision.warnings],
                 'spot_price': chain.spot_price if chain else 0,
+                # ML prediction data (for post-trade analysis)
+                # Populated from cached_decision if ML was available; None otherwise
+                'ml_move_prob': None,
+                'ml_signal': None,
+                'ml_direction_hint': None,
+                # OI flow data (for post-trade analysis)
+                'oi_signal': market_data.get('oi_signal', 'UNKNOWN'),
+                'oi_change_pct': market_data.get('oi_change_pct', 0),
+                # Score audit trail
+                'score_audit': getattr(scorer if 'scorer' in dir() else None, '_last_score_audit', 'N/A'),
             }
+            # Populate ML fields from cached decision (fail-safe: stays None if unavailable)
+            try:
+                if cached_decision and cached_decision.get('ml_prediction'):
+                    _cached_ml = cached_decision['ml_prediction']
+                    entry_meta['ml_move_prob'] = _cached_ml.get('ml_move_prob')
+                    entry_meta['ml_signal'] = _cached_ml.get('ml_signal')
+                    entry_meta['ml_direction_hint'] = _cached_ml.get('ml_direction_hint')
+            except Exception:
+                pass  # ML data unavailable — fields stay None
             
+            # === REVERSAL TRADE: Override SL and target for tighter risk ===
+            _final_target = sizing['target_premium']
+            _final_sl = sizing['stoploss_premium']
+            if decision.is_reversal_trade:
+                # Tight SL: 18% loss (0.82 multiplier) instead of 28% (0.72)
+                # Modest target: 40% gain instead of 50-80%
+                _final_sl = contract.ltp * 0.82   # -18% premium loss
+                _final_target = contract.ltp * 1.40  # +40% premium gain
+                print(f"   🔄 REVERSAL TRADE: Tight SL ₹{_final_sl:.2f} (-18%) | Target ₹{_final_target:.2f} (+40%)")
+                entry_meta['strategy_type'] = 'REVERSAL_TRADE'
+
             plan = OptionOrderPlan(
                 underlying=underlying,
                 direction=final_direction,
@@ -3152,8 +3366,8 @@ class OptionsTrader:
                 total_premium=adjusted_premium,
                 max_loss=adjusted_premium,  # Max loss = premium for long options
                 breakeven=sizing['breakeven'],
-                target_premium=sizing['target_premium'],
-                stoploss_premium=sizing['stoploss_premium'],
+                target_premium=_final_target,
+                stoploss_premium=_final_sl,
                 rationale=f"{final_direction} {underlying} | {' | '.join(decision.reasons[:3])} | SCORE:{decision.confidence_score:.0f}",
                 greeks_summary=f"Δ:{contract.delta:.2f} Γ:{contract.gamma:.4f} Θ:{contract.theta:.2f} V:{contract.vega:.2f} IV:{contract.iv*100:.1f}%",
                 entry_metadata=entry_meta
@@ -3167,10 +3381,11 @@ class OptionsTrader:
                     f.write(f"   ✅ EXECUTED: {contract.symbol} | {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}\n")
                     f.write(f"      Trade ID: {trade_id}\n")
                     f.write(f"      Tier: {score_tier.upper()} | Score: {decision.confidence_score:.0f} | Trend: {decision.trend_state}\n")
-                    f.write(f"      Sizing: {sizing['lots']} lots × {decision.position_size_multiplier:.1f}x = {adjusted_lots} lots | Cap: {cap_pct*100:.0f}%\n")
+                    f.write(f"      Sizing: {sizing['lots']} lots × {decision.position_size_multiplier:.1f}x × ML:{_ml_sizing:.2f}x = {adjusted_lots} lots | Cap: {cap_pct*100:.0f}%\n")
                     f.write(f"      Candles: FT={ft_candles} ADX={adx_val:.1f} ORB={orb_strength_val:.0f}% RangeExp={range_exp_val:.2f}\n")
                     f.write(f"      Context: ORB={orb_signal_val} Vol={vol_regime_val}({vol_ratio_val:.1f}x) VWAP={vwap_pos} HTF={htf_align} RSI={rsi_val:.0f}\n")
                     f.write(f"      Micro: score={decision.microstructure_score:.0f} block={decision.microstructure_block} accel={decision.acceleration_score:.1f}\n")
+                    f.write(f"      ML: signal={entry_meta.get('ml_signal', 'N/A')} move_prob={entry_meta.get('ml_move_prob', 'N/A')} sizing={_ml_sizing:.2f}x\n")
                     f.write(f"      Greeks: {plan.greeks_summary}\n")
                     f.write(f"      Target: ₹{plan.target_premium:.2f} | SL: ₹{plan.stoploss_premium:.2f}\n")
                     f.write(f"{'='*70}\n")
@@ -3518,6 +3733,28 @@ class OptionsTrader:
             # Calculate lots: limited by risk and config
             lots_by_risk = max(1, int(max_risk_config / max_risk_per_lot)) if max_risk_per_lot > 0 else 1
             lots = min(lots_by_risk, max_lots_config)
+            
+            # === ML SIZING FACTOR (FAIL-SAFE) ===
+            # Credit spreads profit from NO_MOVE (theta decay), so ML NO_MOVE → bigger size
+            # ML MOVE → reduce size (breakout risk)
+            _cs_ml_sizing = 1.0
+            try:
+                if cached_decision and cached_decision.get('ml_prediction'):
+                    _cs_move_prob = cached_decision['ml_prediction'].get('ml_move_prob', 0.5)
+                    if _cs_move_prob < 0.15:
+                        _cs_ml_sizing = 1.2   # Very flat → size up (theta-friendly)
+                    elif _cs_move_prob < 0.25:
+                        _cs_ml_sizing = 1.1   # Likely flat
+                    elif _cs_move_prob >= 0.50:
+                        _cs_ml_sizing = 0.7   # MOVE predicted → reduce risk
+                    elif _cs_move_prob >= 0.40:
+                        _cs_ml_sizing = 0.85  # Moderate MOVE probability
+                    _cs_ml_sizing = max(0.5, min(1.5, _cs_ml_sizing))
+                    lots = max(1, round(lots * _cs_ml_sizing))
+                    if _cs_ml_sizing != 1.0:
+                        print(f"      🧠 ML Credit Spread Sizing: move_prob={_cs_move_prob:.0%} → {_cs_ml_sizing:.2f}x → {lots} lots")
+            except Exception:
+                pass  # ML crash → neutral sizing (1.0x)
             
             # Check total spread exposure across portfolio
             max_total_exposure = CREDIT_SPREAD_CONFIG.get('max_total_spread_exposure', 150000)
@@ -4724,6 +4961,28 @@ class OptionsTrader:
             lots_by_debit = max(1, round(max_debit_config / debit_per_lot)) if debit_per_lot > 0 else 1
             lots = min(lots_by_debit, max_lots_config)
             lots = max(lots, min_lots)  # Enforce minimum lots for tier
+            
+            # === ML SIZING FACTOR (FAIL-SAFE) ===
+            # Debit spreads profit from MOVE, so ML MOVE → bigger size
+            # ML NO_MOVE → reduce size (stock likely flat, debit decays)
+            _ds_ml_sizing = 1.0
+            try:
+                if cached_decision and cached_decision.get('ml_prediction'):
+                    _ds_move_prob = cached_decision['ml_prediction'].get('ml_move_prob', 0.5)
+                    if _ds_move_prob >= 0.60:
+                        _ds_ml_sizing = 1.2   # Strong MOVE → size up
+                    elif _ds_move_prob >= 0.45:
+                        _ds_ml_sizing = 1.1   # Moderate MOVE
+                    elif _ds_move_prob < 0.20:
+                        _ds_ml_sizing = 0.7   # Very flat → reduce exposure
+                    elif _ds_move_prob < 0.30:
+                        _ds_ml_sizing = 0.85  # Likely flat
+                    _ds_ml_sizing = max(0.5, min(1.5, _ds_ml_sizing))
+                    lots = max(1, round(lots * _ds_ml_sizing))
+                    if _ds_ml_sizing != 1.0:
+                        print(f"      🧠 ML Debit Spread Sizing: move_prob={_ds_move_prob:.0%} → {_ds_ml_sizing:.2f}x → {lots} lots")
+            except Exception:
+                pass  # ML crash → neutral sizing (1.0x)
             
             # Check total debit spread exposure
             max_total_exposure = DEBIT_SPREAD_CONFIG.get('max_total_debit_exposure', 75000)

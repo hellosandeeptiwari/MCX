@@ -1,0 +1,54 @@
+MOVE PREDICTOR TRAINING REPORT (BINARY)
+============================================================
+Date: 2026-02-14T12:58:58.759143
+Train samples: 157,247
+Test samples: 73,140
+Accuracy: 0.5828
+MOVE F1: 0.5954
+
+              precision    recall  f1-score   support
+
+     NO_MOVE       0.88      0.42      0.57     47941
+        MOVE       0.45      0.89      0.60     25199
+
+    accuracy                           0.58     73140
+   macro avg       0.66      0.66      0.58     73140
+weighted avg       0.73      0.58      0.58     73140
+
+
+Feature Importances:
+  bb_width                   0.228321
+  atr_pct                    0.199220
+  daily_move_freq_20d        0.083638
+  ema_spread                 0.060458
+  time_of_day                0.046209
+  daily_move_freq_10d        0.045318
+  daily_range_pct_20d        0.031825
+  ema9_slope                 0.027137
+  daily_dist_from_low        0.026994
+  price_vs_ema9              0.025111
+  price_vs_vwap              0.024397
+  price_vs_sma20             0.022831
+  volume_trend               0.019810
+  range_expansion            0.018976
+  day_return_pct             0.015500
+  volume_ratio               0.011824
+  roc_6                      0.011231
+  daily_trend_strength       0.010163
+  roc_12                     0.009282
+  daily_volume_regime        0.009096
+  daily_trend_direction      0.008496
+  adx_proxy                  0.008152
+  bb_position                0.007937
+  obv_slope                  0.006947
+  rsi_14                     0.006793
+  daily_rsi_14               0.006768
+  daily_dist_from_high       0.006543
+  lower_wick                 0.005915
+  daily_vol_regime           0.005632
+  rsi_7                      0.005328
+  momentum_atr_norm          0.004148
+  body_ratio                 0.000000
+  upper_wick                 0.000000
+  consec_up                  0.000000
+  consec_down                0.000000

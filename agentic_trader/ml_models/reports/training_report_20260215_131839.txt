@@ -1,0 +1,61 @@
+MOVE PREDICTOR TRAINING REPORT (3-CLASS: DOWN/FLAT/UP)
+============================================================
+Date: 2026-02-15T13:18:39.411279
+Train samples: 823,139
+Test samples: 73,140
+Accuracy: 0.4958
+Macro F1: 0.4434
+UP F1: 0.3257 | DOWN F1: 0.3697 | FLAT F1: 0.6347
+
+              precision    recall  f1-score   support
+
+        DOWN       0.29      0.50      0.37     12438
+        FLAT       0.87      0.50      0.63     47941
+          UP       0.25      0.47      0.33     12761
+
+    accuracy                           0.50     73140
+   macro avg       0.47      0.49      0.44     73140
+weighted avg       0.66      0.50      0.54     73140
+
+
+Feature Importances:
+  atr_pct                    0.222547
+  bb_width                   0.115377
+  fut_oi_buildup             0.101479
+  daily_move_freq_20d        0.044840
+  time_of_day                0.044008
+  daily_move_freq_10d        0.033082
+  price_vs_sma20             0.031433
+  daily_range_pct_20d        0.027858
+  price_vs_ema9              0.026903
+  ema_spread                 0.024022
+  day_return_pct             0.021489
+  range_expansion            0.018882
+  roc_6                      0.017636
+  volume_trend               0.017345
+  rsi_14                     0.016502
+  fut_vol_ratio              0.015552
+  volume_ratio               0.014433
+  price_vs_vwap              0.012883
+  adx_proxy                  0.011851
+  bb_position                0.011627
+  fut_oi_change_pct          0.011069
+  daily_vol_regime           0.010468
+  daily_dist_from_low        0.010224
+  roc_12                     0.010166
+  lower_wick                 0.009925
+  daily_trend_direction      0.009814
+  ema9_slope                 0.009580
+  fut_oi_5d_trend            0.009329
+  daily_dist_from_high       0.009113
+  rsi_7                      0.009003
+  daily_trend_strength       0.008862
+  daily_volume_regime        0.008364
+  fut_basis_pct              0.008264
+  momentum_atr_norm          0.008148
+  obv_slope                  0.008146
+  daily_rsi_14               0.007652
+  consec_down                0.007460
+  body_ratio                 0.005682
+  upper_wick                 0.005631
+  consec_up                  0.003352

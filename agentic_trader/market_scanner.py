@@ -28,7 +28,7 @@ from kiteconnect import KiteConnect
 
 SCANNER_CONFIG = {
     # How many wild-card stocks to surface per scan cycle
-    "max_wildcards": 25,
+    "max_wildcards": 10,
 
     # Minimum % change (absolute) to consider a stock as a mover
     "min_change_pct": 1.5,

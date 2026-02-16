@@ -1,0 +1,105 @@
+{
+  "model_name": "move_predictor",
+  "timestamp": "20260214_122145",
+  "feature_names": [
+    "rsi_14",
+    "rsi_7",
+    "roc_6",
+    "roc_12",
+    "momentum_atr_norm",
+    "ema_spread",
+    "ema9_slope",
+    "price_vs_ema9",
+    "price_vs_sma20",
+    "adx_proxy",
+    "volume_ratio",
+    "volume_trend",
+    "obv_slope",
+    "atr_pct",
+    "range_expansion",
+    "bb_width",
+    "bb_position",
+    "price_vs_vwap",
+    "time_of_day",
+    "body_ratio",
+    "upper_wick",
+    "lower_wick",
+    "consec_up",
+    "consec_down",
+    "day_return_pct"
+  ],
+  "label_map": {
+    "-1": 0,
+    "0": 1,
+    "1": 2
+  },
+  "label_names": {
+    "0": "BIG_DOWN",
+    "1": "NO_MOVE",
+    "2": "BIG_UP"
+  },
+  "accuracy": 0.5329,
+  "precision_per_class": {
+    "BIG_DOWN": 0.1033,
+    "NO_MOVE": 0.9846,
+    "BIG_UP": 0.0524
+  },
+  "recall_per_class": {
+    "BIG_DOWN": 0.5545,
+    "NO_MOVE": 0.5369,
+    "BIG_UP": 0.4143
+  },
+  "f1_per_class": {
+    "BIG_DOWN": 0.1742,
+    "NO_MOVE": 0.6949,
+    "BIG_UP": 0.093
+  },
+  "feature_importance": {
+    "atr_pct": 0.192113,
+    "bb_width": 0.102358,
+    "time_of_day": 0.06312,
+    "roc_6": 0.048749,
+    "price_vs_ema9": 0.047482,
+    "momentum_atr_norm": 0.04156,
+    "day_return_pct": 0.039747,
+    "range_expansion": 0.039277,
+    "price_vs_vwap": 0.036117,
+    "ema9_slope": 0.035024,
+    "adx_proxy": 0.033174,
+    "price_vs_sma20": 0.032744,
+    "volume_ratio": 0.029227,
+    "rsi_14": 0.026859,
+    "ema_spread": 0.026665,
+    "bb_position": 0.026356,
+    "volume_trend": 0.025757,
+    "rsi_7": 0.024627,
+    "roc_12": 0.023486,
+    "obv_slope": 0.023328,
+    "lower_wick": 0.01901,
+    "body_ratio": 0.018469,
+    "consec_up": 0.017236,
+    "upper_wick": 0.016582,
+    "consec_down": 0.010933
+  },
+  "train_samples": 157247,
+  "test_samples": 73140,
+  "best_iteration": 47,
+  "train_time_seconds": 9.4,
+  "confusion_matrix": [
+    [
+      1510,
+      238,
+      975
+    ],
+    [
+      11833,
+      36336,
+      19513
+    ],
+    [
+      1273,
+      329,
+      1133
+    ]
+  ]
+}

@@ -1,0 +1,82 @@
+MOVE PREDICTOR TRAINING REPORT (3-CLASS: DOWN/FLAT/UP)
+============================================================
+Date: 2026-02-15T14:43:53.992237
+Train samples: 785,880
+Test samples: 73,140
+Accuracy: 0.6769
+Macro F1: 0.3035
+UP F1: 0.0579 | DOWN F1: 0.0448 | FLAT F1: 0.8078
+
+              precision    recall  f1-score   support
+
+        DOWN       0.46      0.02      0.04     11641
+        FLAT       0.68      0.99      0.81     49427
+          UP       0.37      0.03      0.06     12072
+
+    accuracy                           0.68     73140
+   macro avg       0.51      0.35      0.30     73140
+weighted avg       0.60      0.68      0.56     73140
+
+
+Feature Importances:
+  fut_oi_buildup             0.140858
+  session_bucket             0.052431
+  time_of_day                0.038744
+  nifty_daily_rsi            0.025601
+  nifty_daily_trend          0.025285
+  dow_cos                    0.023491
+  nifty_atr_pct              0.022738
+  dow_sin                    0.022209
+  atr_pct                    0.021146
+  day_return_pct             0.020343
+  nifty_rsi_14               0.019691
+  nifty_bb_position          0.019658
+  nifty_roc_6                0.018968
+  nifty_ema9_slope           0.018866
+  gap_open_pct               0.018776
+  range_expansion            0.018007
+  volume_ratio               0.017902
+  volume_trend               0.016253
+  atr_change_pct             0.015942
+  rsi_14                     0.015094
+  fut_oi_change_pct          0.014699
+  fut_oi_5d_trend            0.014563
+  bb_position                0.014285
+  rsi_7                      0.014004
+  day_position               0.013502
+  fut_basis_pct              0.013038
+  daily_vol_regime           0.012898
+  bb_width                   0.012874
+  daily_move_freq_20d        0.012720
+  daily_range_pct_20d        0.012597
+  fut_vol_ratio              0.012567
+  daily_dist_from_low        0.012326
+  daily_dist_from_high       0.012215
+  daily_volume_regime        0.012128
+  daily_move_freq_10d        0.012080
+  ema_spread                 0.011930
+  daily_trend_strength       0.011904
+  daily_trend_direction      0.011854
+  daily_rsi_14               0.011802
+  adx_proxy                  0.011411
+  price_vs_vwap              0.011257
+  return_skew_20             0.010626
+  price_vs_sma20             0.010588
+  ema9_slope                 0.010187
+  volume_momentum            0.010117
+  roc_12                     0.009948
+  price_vs_ema9              0.009890
+  return_kurtosis_20         0.009755
+  roc_6                      0.009482
+  lower_wick                 0.009391
+  momentum_atr_norm          0.009195
+  relative_strength          0.008986
+  obv_slope                  0.008625
+  consec_up                  0.008526
+  price_acceleration         0.008183
+  upper_wick                 0.008043
+  consec_down                0.007163
+  body_ratio                 0.007093
+  vol_price_divergence       0.005548
+  macd_hist_pct              0.000000
+  macd_hist_slope            0.000000

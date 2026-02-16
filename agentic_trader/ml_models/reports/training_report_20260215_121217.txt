@@ -1,0 +1,62 @@
+MOVE PREDICTOR TRAINING REPORT (BINARY)
+============================================================
+Date: 2026-02-15T12:12:17.560226
+Train samples: 157,247
+Test samples: 73,140
+Accuracy: 0.7463
+MOVE F1: 0.5493
+
+              precision    recall  f1-score   support
+
+     NO_MOVE       0.76      0.90      0.82     47941
+        MOVE       0.71      0.45      0.55     25199
+
+    accuracy                           0.75     73140
+   macro avg       0.73      0.68      0.69     73140
+weighted avg       0.74      0.75      0.73     73140
+
+
+Feature Importances:
+  atr_pct                    0.346796
+  bb_width                   0.117862
+  daily_move_freq_20d        0.054483
+  time_of_day                0.051225
+  range_expansion            0.030116
+  volume_trend               0.029849
+  daily_move_freq_10d        0.026755
+  price_vs_ema9              0.026194
+  daily_range_pct_20d        0.022443
+  volume_ratio               0.020787
+  price_vs_vwap              0.018293
+  daily_dist_from_low        0.016122
+  day_return_pct             0.015217
+  price_vs_sma20             0.014970
+  ema_spread                 0.014957
+  bb_position                0.014650
+  roc_12                     0.013548
+  roc_6                      0.012572
+  ema9_slope                 0.012225
+  rsi_14                     0.011553
+  daily_trend_strength       0.011483
+  daily_dist_from_high       0.011482
+  daily_trend_direction      0.011151
+  daily_rsi_14               0.010057
+  daily_volume_regime        0.009752
+  rsi_7                      0.009221
+  adx_proxy                  0.009071
+  momentum_atr_norm          0.008698
+  daily_vol_regime           0.008634
+  obv_slope                  0.008334
+  consec_up                  0.007181
+  lower_wick                 0.006644
+  upper_wick                 0.006177
+  consec_down                0.005942
+  body_ratio                 0.005559
+  oi_pcr                     0.000000
+  oi_pcr_change              0.000000
+  oi_buildup_strength        0.000000
+  oi_spot_vs_max_pain        0.000000
+  oi_iv_skew                 0.000000
+  oi_atm_iv                  0.000000
+  oi_atm_delta               0.000000
+  oi_call_resistance_dist    0.000000

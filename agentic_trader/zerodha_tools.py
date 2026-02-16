@@ -18,7 +18,7 @@ from config import (
     ZERODHA_API_KEY, ZERODHA_API_SECRET, 
     HARD_RULES, TRADING_HOURS, APPROVED_UNIVERSE, FNO_CONFIG
 )
-from config import GTT_CONFIG, AUTOSLICE_ENABLED
+from config import GTT_CONFIG, AUTOSLICE_ENABLED, calc_brokerage
 from execution_guard import get_execution_guard
 from idempotent_order_engine import get_idempotent_engine
 from correlation_guard import get_correlation_guard
@@ -625,10 +625,19 @@ class ZerodhaTools:
                         self.paper_pnl += pnl
                     
                     # Save to history and remove from active
-                    if status in ['TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
-                                  'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
-                                  'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT',
-                                  'IC_TARGET_HIT', 'IC_SL_HIT', 'IC_TIME_EXIT', 'IC_BREAKOUT_EXIT', 'IC_EOD_EXIT']:
+                    # ROBUST: Archive ANY trade with exit_price+pnl (no whitelist gaps)
+                    _known_exit_statuses = {
+                        'TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
+                        'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
+                        'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT',
+                        'IC_TARGET_HIT', 'IC_SL_HIT', 'IC_TIME_EXIT', 'IC_BREAKOUT_EXIT', 'IC_EOD_EXIT',
+                        'SPREAD_TRAIL_SL', 'THETA_DECAY_WARNING',
+                        'DEBIT_SPREAD_SL', 'DEBIT_SPREAD_TARGET', 'DEBIT_SPREAD_TIME_EXIT',
+                        'DEBIT_SPREAD_TRAIL_SL', 'DEBIT_SPREAD_MAX_PROFIT',
+                    }
+                    # Catch-all: if exit_price and pnl are set, treat as closed even for unknown statuses
+                    is_closed = status in _known_exit_statuses or (exit_price is not None and pnl is not None)
+                    if is_closed:
                         self._save_to_history(trade, status, pnl or 0, exit_detail=exit_detail)
                         if status != 'PARTIAL_PROFIT':
                             # === CANCEL GTT SAFETY NET ON TRADE EXIT ===
@@ -717,9 +726,10 @@ class ZerodhaTools:
                     qty = trade['quantity']
                     side = trade['side']
                     
-                    # Calculate P&L
+                    # Calculate P&L (with 0.6% brokerage on total turnover)
+                    brokerage = calc_brokerage(entry, ltp, qty)
                     if side == 'BUY':
-                        pnl = (ltp - entry) * qty
+                        pnl = (ltp - entry) * qty - brokerage
                         # Check target hit (price went above target)
                         if ltp >= target:
                             self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
@@ -741,7 +751,7 @@ class ZerodhaTools:
                                 'exit': ltp
                             })
                     else:  # SHORT
-                        pnl = (entry - ltp) * qty
+                        pnl = (entry - ltp) * qty - brokerage
                         # Check target hit (price went below target for shorts)
                         if ltp <= target:
                             self.update_trade_status(symbol, 'TARGET_HIT', ltp, pnl)
@@ -1597,9 +1607,9 @@ class ZerodhaTools:
             if not token:
                 return {}
             
-            # Get DAILY historical data (for trend, SMA, RSI, ATR)
+            # Get DAILY historical data (for trend, SMA, RSI, ATR + ML features need >=50 candles)
             to_date = datetime.now()
-            from_date = to_date - timedelta(days=60)
+            from_date = to_date - timedelta(days=120)
             
             data = None
             for attempt in range(3):
@@ -1667,10 +1677,19 @@ class ZerodhaTools:
                             raise
                 if intraday_data and len(intraday_data) >= 2:
                     intraday_df = pd.DataFrame(intraday_data)
+                    # Cache intraday candles for ML predictor (separate from indicator cache)
+                    if not hasattr(self, '_candle_cache'):
+                        self._candle_cache = {}
+                    self._candle_cache[symbol] = intraday_df.copy()
             except Exception:
                 pass  # Fall back to daily-based calculations
             
             df = pd.DataFrame(data)
+            
+            # Cache daily candles for ML predictor (so ML can run even when intraday < 50)
+            if not hasattr(self, '_daily_cache'):
+                self._daily_cache = {}
+            self._daily_cache[symbol] = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
             close = df['close']
             high = df['high']
             low = df['low']
@@ -2227,6 +2246,20 @@ class ZerodhaTools:
                 # === MOMENTUM ===
                 'momentum_15m': round(momentum_15m, 4),
             }
+            
+            # === FUTURES OI SIGNAL (zero API calls — WebSocket cache) ===
+            # Pro traders check OI flow for institutional direction confirmation
+            try:
+                _oi_quick = self._get_futures_oi_quick(symbol)
+                if _oi_quick.get('has_futures'):
+                    _ind_result['oi_signal'] = _oi_quick.get('oi_signal', 'NEUTRAL')
+                    _ind_result['oi_change_pct'] = _oi_quick.get('oi_change_pct', 0)
+                else:
+                    _ind_result['oi_signal'] = 'NO_FUTURES'
+                    _ind_result['oi_change_pct'] = 0
+            except Exception:
+                _ind_result['oi_signal'] = 'ERROR'
+                _ind_result['oi_change_pct'] = 0
             
             # Store in cache for TTL reuse
             self._ind_cache[symbol] = (time.time(), _ind_result)
@@ -3244,7 +3277,7 @@ class ZerodhaTools:
                 max_ic_score = IRON_CONDOR_CONFIG.get('max_directional_score', 45)
                 min_ic_score = IRON_CONDOR_CONFIG.get('min_directional_score', 15)
                 if min_ic_score <= rejected_score <= max_ic_score:
-                    # DTE pre-check: skip IC if no eligible expiry today (0-1 DTE only)
+                    # DTE pre-check: skip IC if no eligible expiry today (0DTE only)
                     ic_dte_ok = getattr(self, '_ic_dte_eligible', None)
                     if ic_dte_ok is None:
                         # Compute once per session
@@ -3505,6 +3538,22 @@ class ZerodhaTools:
             self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
             return {"success": False, "error": f"Credit spread rejected for {underlying}"}
         
+        # === DhanHQ MARGIN PRE-CHECK (advisory) ===
+        try:
+            from dhan_risk_tools import get_dhan_risk_tools
+            drt = get_dhan_risk_tools()
+            if drt.ready:
+                fund = drt.get_fund_limit()
+                avail = float(fund.get('availabelBalance', 0))
+                if avail > 0 and plan.max_risk > 0:
+                    margin_ratio = plan.max_risk / avail if avail else 999
+                    if margin_ratio > 0.5:
+                        print(f"   ⚠️ DhanHQ: Spread max_risk ₹{plan.max_risk:,.0f} = {margin_ratio:.0%} of available ₹{avail:,.0f}")
+                    else:
+                        print(f"   ✅ DhanHQ: Margin OK — risk ₹{plan.max_risk:,.0f} / available ₹{avail:,.0f}")
+        except Exception:
+            pass  # Non-blocking advisory
+        
         # === EXECUTE THE SPREAD ===
         result = options_trader.execute_credit_spread(plan)
         
@@ -3672,6 +3721,22 @@ class ZerodhaTools:
         if plan is None:
             return {"success": False, "error": f"Debit spread not viable for {underlying} (check move%, score, liquidity)"}
         
+        # === DhanHQ MARGIN PRE-CHECK (advisory) ===
+        try:
+            from dhan_risk_tools import get_dhan_risk_tools
+            drt = get_dhan_risk_tools()
+            if drt.ready and hasattr(plan, 'net_debit_total') and plan.net_debit_total > 0:
+                fund = drt.get_fund_limit()
+                avail = float(fund.get('availabelBalance', 0))
+                if avail > 0:
+                    cost_ratio = plan.net_debit_total / avail if avail else 999
+                    if cost_ratio > 0.3:
+                        print(f"   ⚠️ DhanHQ: Debit ₹{plan.net_debit_total:,.0f} = {cost_ratio:.0%} of available ₹{avail:,.0f}")
+                    else:
+                        print(f"   ✅ DhanHQ: Margin OK — debit ₹{plan.net_debit_total:,.0f} / available ₹{avail:,.0f}")
+        except Exception:
+            pass  # Non-blocking advisory
+        
         # === EXECUTE ===
         result = options_trader.execute_debit_spread(plan)
         
@@ -3823,6 +3888,22 @@ class ZerodhaTools:
         
         if plan is None:
             return {"success": False, "error": f"Iron Condor not viable for {underlying}"}
+        
+        # === DhanHQ MARGIN PRE-CHECK (advisory) ===
+        try:
+            from dhan_risk_tools import get_dhan_risk_tools
+            drt = get_dhan_risk_tools()
+            if drt.ready:
+                fund = drt.get_fund_limit()
+                avail = float(fund.get('availabelBalance', 0))
+                if avail > 0 and plan.max_risk > 0:
+                    margin_ratio = plan.max_risk / avail if avail else 999
+                    if margin_ratio > 0.5:
+                        print(f"   ⚠️ DhanHQ: IC max_risk ₹{plan.max_risk:,.0f} = {margin_ratio:.0%} of available ₹{avail:,.0f}")
+                    else:
+                        print(f"   ✅ DhanHQ: Margin OK — risk ₹{plan.max_risk:,.0f} / available ₹{avail:,.0f}")
+        except Exception:
+            pass  # Non-blocking advisory
         
         # === EXECUTE ===
         result = options_trader.execute_iron_condor(plan)

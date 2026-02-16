@@ -31,10 +31,22 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ZERODHA_API_KEY = os.environ.get("ZERODHA_API_KEY", "")
 ZERODHA_API_SECRET = os.environ.get("ZERODHA_API_SECRET", "")
 
+# ========== BROKERAGE CONFIG ==========
+BROKERAGE_PCT = 0.006  # 0.6% of total turnover (entry + exit value)
+
+def calc_brokerage(entry_price, exit_price, quantity):
+    """Calculate brokerage as 0.6% of total turnover (entry + exit).
+    
+    Applied to all trade P&L calculations for realistic paper trading.
+    Covers: brokerage + STT + exchange charges + GST + slippage estimate.
+    """
+    turnover = abs(entry_price * quantity) + abs(exit_price * quantity)
+    return round(turnover * BROKERAGE_PCT, 2)
+
 # ========== HARD RULES (NEVER VIOLATE) ==========
 HARD_RULES = {
     "RISK_PER_TRADE": 0.035,        # 3.5% base risk per trade (tiered: 5% premium, 3.5% std, 2% base)
-    "MAX_DAILY_LOSS": 0.05,         # 5% max daily loss (was 3% — too tight for bigger positions)
+    "MAX_DAILY_LOSS": 0.15,         # 15% max daily loss
     "MAX_POSITIONS": 20,            # Max simultaneous positions (spreads count as 1)
     "STALE_DATA_SECONDS": 60,       # Data older than this is stale
     "API_RATE_LIMIT_MS": 350,       # Min ms between API calls (Kite allows ~3/s, 350ms is safe)
@@ -83,7 +95,7 @@ AUTOSLICE_ENABLED = True
 # This happens BEFORE the GPT prompt is built, so GPT only sees remaining setups.
 ELITE_AUTO_FIRE = {
     "enabled": True,
-    "elite_threshold": 78,            # Score ≥ this → auto-fire (78+ = 80% WR historically)
+    "elite_threshold": 70,            # Score ≥ this → auto-fire
     "max_auto_fires_per_cycle": 3,    # Max auto-fired trades per scan cycle
     "require_setup": True,            # Must have a valid setup (ORB/VWAP/MOMENTUM), not just high score
     "log_all": True,                  # Log every auto-fire decision to scan_decisions.json
@@ -217,7 +229,7 @@ CREDIT_SPREAD_CONFIG = {
     "min_credit_pct": 20,            # Minimum credit as % of spread width (lower for deeper OTM)
     "preferred_credit_pct": 30,      # Preferred credit >= 30% of max risk
     "min_iv_percentile": 30,         # Sell options when IV is above 30th percentile
-    "min_score_threshold": 57,       # Minimum intraday score to enter spread (lowered from 62 for more entries)
+    "min_score_threshold": 70,       # Minimum intraday score to enter spread
     # --- Risk Management ---
     "sl_multiplier": 2.0,            # Exit if loss reaches 2× credit received
     "target_pct": 65,                # Exit when 65% of max credit is captured (time decay)
@@ -254,7 +266,7 @@ DEBIT_SPREAD_CONFIG = {
     # --- Entry Filters (SMART — candle-data driven) ---
     "min_move_pct": 1.2,             # Stock must have moved >1.2% today (was 2.5% — too strict, zero triggers)
     "min_volume_ratio": 1.3,         # Volume must be 1.3× normal (was 1.5 — slightly relaxed)
-    "min_score_threshold": 62,       # Standard+ tier (lowered from 65 for more entries)
+    "min_score_threshold": 70,       # Minimum intraday score for debit spread entry
     # --- Candle-Smart Gates (mirrors naked buy gates 8-12) ---
     "min_follow_through_candles": 2, # Must have ≥2 follow-through candles (strongest winner signal)
     "min_adx": 28,                   # ADX ≥28 confirms trend strength (winners avg 37)
@@ -290,7 +302,7 @@ DEBIT_SPREAD_CONFIG = {
     "min_oi": 500,                   # Minimum OI on both legs
     # --- Proactive Scanning ---
     "proactive_scan": True,          # Actively scan for debit spread opportunities (not just fallback)
-    "proactive_scan_min_score": 68,  # Minimum score for proactive debit spread (slightly higher)
+    "proactive_scan_min_score": 70,  # Minimum score for proactive debit spread
     "proactive_scan_min_move_pct": 1.5,  # Proactive scan needs slightly stronger move
 }
 
@@ -354,7 +366,7 @@ IRON_CONDOR_CONFIG = {
         "symbols": ["NSE:NIFTY 50"],              # Only NIFTY has weekly expiry (Tuesday) after SEBI Nov 2024 rule
         "prefer_expiry": "CURRENT_WEEK",  # Tuesday weekly expiry
         "min_dte": 0,
-        "max_dte": 1,                     # Only 0DTE and 1DTE (expiry day + day before)
+        "max_dte": 0,                     # Only 0DTE (expiry day only)
         "prefer_0dte": True,
         "target_pct": 50,                 # Target: 50% of credit (was 25% — leaving money!)
         "max_target_pct": 70,             # Up to 70% capture on strong theta crush (was 40%)
@@ -364,7 +376,7 @@ IRON_CONDOR_CONFIG = {
     "stock_mode": {
         "prefer_expiry": "CURRENT_MONTH",
         "min_dte": 0,                     # Allow 0DTE
-        "max_dte": 1,                     # Only 0DTE and 1DTE (expiry day + day before)
+        "max_dte": 0,                     # Only 0DTE (expiry day only)
         "prefer_0dte": True,              # Prefer expiry day for max theta crush
         "target_pct": 20,                 # Target: 20% of credit (was 10% — too pathetic!)
         "max_target_pct": 30,             # Up to 30% on stocks (was 15%)
