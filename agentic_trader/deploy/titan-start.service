@@ -1,0 +1,6 @@
+[Unit]
+Description=Start Titan trading bot (triggered by timer)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl start titan

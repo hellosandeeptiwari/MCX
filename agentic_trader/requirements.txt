@@ -1,0 +1,27 @@
+# Titan Autonomous Trader - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core trading
+kiteconnect>=5.0.0
+python-dotenv>=1.0.0
+schedule>=1.2.0
+requests>=2.31.0
+
+# Data & ML
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# LLM
+openai>=1.0.0
+
+# Dashboard (optional)
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Auto-auth (optional, for cloud deployment)
+# selenium>=4.15.0
+# pyotp>=2.9.0

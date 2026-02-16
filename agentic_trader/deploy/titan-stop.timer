@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop Titan at 3:45 PM IST on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri 15:45
+Persistent=true
+
+[Install]
+WantedBy=timers.target

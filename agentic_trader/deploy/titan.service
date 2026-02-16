@@ -1,0 +1,23 @@
+[Unit]
+Description=Titan Autonomous Trading Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/titan/agentic_trader
+Environment="PATH=/opt/titan/venv/bin:/usr/bin:/bin"
+ExecStartPre=/opt/titan/venv/bin/python /opt/titan/agentic_trader/deploy/auto_auth.py
+ExecStart=/opt/titan/venv/bin/python /opt/titan/agentic_trader/autonomous_trader.py --capital 500000 --interval 3
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Auto-start at 9:00 AM IST, stop at 3:45 PM IST (via titan-scheduler.timer)
+# Or run manually: sudo systemctl start titan
+
+[Install]
+WantedBy=multi-user.target

@@ -34,9 +34,11 @@ ZERODHA_API_SECRET = os.environ.get("ZERODHA_API_SECRET", "")
 # ========== BROKERAGE CONFIG ==========
 BROKERAGE_PCT = 0.006  # 0.6% of total turnover (paper trading estimate)
 
-# Runtime flag — set by autonomous_trader on startup
-# When True, uses simplified 0.6% estimate. When False, uses exact Zerodha fees.
-PAPER_MODE = True  # Default paper, overridden by --live flag
+# ========== TRADING MODE (from .env) ==========
+# Read TRADING_MODE from .env: "PAPER" (default) or "LIVE"
+# CLI --live flag overrides this. autonomous_trader sets final value at startup.
+_env_trading_mode = os.environ.get("TRADING_MODE", "PAPER").strip().upper()
+PAPER_MODE = (_env_trading_mode != "LIVE")  # True=paper, False=live
 
 # Zerodha actual charges for LIVE trading:
 # - Brokerage: ₹20/order (flat, per executed order)

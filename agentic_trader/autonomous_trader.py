@@ -4070,14 +4070,27 @@ def main():
     
     parser = argparse.ArgumentParser(description='Autonomous Trading Bot')
     parser.add_argument('--capital', type=float, default=200000, help='Starting capital')
-    parser.add_argument('--live', action='store_true', help='Enable live trading (default: paper)')
+    parser.add_argument('--live', action='store_true', default=None, help='Enable live trading (overrides .env TRADING_MODE)')
+    parser.add_argument('--paper', action='store_true', default=None, help='Force paper trading (overrides .env TRADING_MODE)')
     parser.add_argument('--interval', type=int, default=5, help='Scan interval in minutes')
     
     args = parser.parse_args()
     
+    # Priority: CLI flags > .env TRADING_MODE > default (paper)
+    if args.live:
+        paper_mode = False
+    elif args.paper:
+        paper_mode = True
+    else:
+        # Read from .env / config
+        import config as _cfg_main
+        paper_mode = _cfg_main.PAPER_MODE  # Already parsed from TRADING_MODE env var
+        _source = os.environ.get('TRADING_MODE', 'PAPER').strip().upper()
+        print(f"  📋 Mode from .env TRADING_MODE={_source} → {'PAPER' if paper_mode else 'LIVE'}")
+    
     bot = AutonomousTrader(
         capital=args.capital,
-        paper_mode=not args.live
+        paper_mode=paper_mode
     )
     
     bot.run(scan_interval_minutes=args.interval)

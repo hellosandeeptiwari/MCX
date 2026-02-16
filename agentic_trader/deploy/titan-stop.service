@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop Titan trading bot (triggered by timer)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl stop titan
