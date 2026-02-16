@@ -606,8 +606,170 @@ class ZerodhaTools:
                 return trade
         return None
     
+    def _execute_live_exit(self, trade: Dict, exit_qty: int = None):
+        """Place real exit order(s) on Zerodha to close a live position.
+        
+        Handles single legs (options/equity) AND multi-leg spreads/condors.
+        Also cancels pending SL-M orders placed at entry.
+        Called by update_trade_status and partial_exit_trade in LIVE mode.
+        
+        Args:
+            trade: The trade dict with symbol, quantity, side, order_id, sl_order_id
+            exit_qty: Quantity to exit (None = full quantity)
+        """
+        if self.paper_mode:
+            return  # Paper mode doesn't need real orders
+        
+        symbol = trade.get('symbol', '')
+        qty = exit_qty or trade.get('quantity', 0)
+        side = trade.get('side', 'BUY')
+        
+        if qty <= 0:
+            print(f"   ⚠️ Live exit skipped for {symbol}: qty=0")
+            return
+        
+        # === MULTI-LEG SPREAD/CONDOR EXIT ===
+        if '|' in symbol:
+            self._execute_live_spread_exit(trade, exit_qty)
+            return
+        
+        try:
+            exchange, tradingsymbol = symbol.split(':')
+            
+            # 1. Cancel pending SL-M order (placed at entry)
+            sl_order_id = trade.get('sl_order_id')
+            if sl_order_id and not str(sl_order_id).startswith('PAPER_'):
+                try:
+                    self.kite.cancel_order(
+                        variety=self.kite.VARIETY_REGULAR,
+                        order_id=sl_order_id
+                    )
+                    print(f"   🛑 Cancelled SL order {sl_order_id} for {symbol}")
+                except Exception as e:
+                    print(f"   ⚠️ SL cancel failed for {symbol} (may have triggered): {e}")
+            
+            # 2. Place market exit order (opposite side)
+            exit_side = self.kite.TRANSACTION_TYPE_SELL if side == 'BUY' else self.kite.TRANSACTION_TYPE_BUY
+            
+            exit_order_id = self._place_order_autoslice(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=exit_side,
+                quantity=qty,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                validity=self.kite.VALIDITY_DAY,
+                market_protection=-1,
+                tag='TITAN_EXIT'
+            )
+            
+            print(f"   ✅ Live EXIT order placed: {exit_side} {qty} {symbol} (order_id: {exit_order_id})")
+            
+        except Exception as e:
+            # CRITICAL FAILURE: Position still open at broker!
+            print(f"   🚨🚨 CRITICAL: Live exit order FAILED for {symbol}: {e}")
+            print(f"   🚨 MANUAL ACTION REQUIRED: Close {qty} {symbol} on Kite app/web!")
+            try:
+                import json as _json
+                critical_log = os.path.join(os.path.dirname(__file__), 'critical_failures.json')
+                failures = []
+                if os.path.exists(critical_log):
+                    with open(critical_log, 'r') as f:
+                        failures = _json.load(f)
+                failures.append({
+                    'timestamp': datetime.now().isoformat(),
+                    'event': 'LIVE_EXIT_FAILED',
+                    'symbol': symbol,
+                    'quantity': qty,
+                    'side': side,
+                    'error': str(e)
+                })
+                with open(critical_log, 'w') as f:
+                    _json.dump(failures, f, indent=2)
+            except:
+                pass
+
+    def _execute_live_spread_exit(self, trade: Dict, exit_qty: int = None):
+        """Close all legs of a credit spread or iron condor on Zerodha.
+        
+        Credit spread: BUY back sold option + SELL the hedge option.
+        Iron condor: BUY back both sold options + SELL both hedge options.
+        """
+        qty = exit_qty or trade.get('quantity', 0)
+        
+        legs = []
+        
+        if trade.get('is_iron_condor'):
+            # 4 legs: BUY back sold CE/PE, SELL the hedge CE/PE
+            for prefix, action in [('sold_ce', 'BUY'), ('sold_pe', 'BUY'), 
+                                     ('hedge_ce', 'SELL'), ('hedge_pe', 'SELL')]:
+                sym = trade.get(f'{prefix}_symbol')
+                if sym:
+                    legs.append((sym, action))
+        elif trade.get('is_credit_spread'):
+            # 2 legs: BUY back sold option, SELL the hedge option
+            sold_sym = trade.get('sold_symbol')
+            hedge_sym = trade.get('hedge_symbol')
+            if sold_sym:
+                legs.append((sold_sym, 'BUY'))  # Buy back the short leg
+            if hedge_sym:
+                legs.append((hedge_sym, 'SELL'))  # Sell the hedge
+        elif trade.get('is_debit_spread'):
+            # 2 legs: SELL the bought option, BUY back the sold option
+            # For debit spreads, we need to check which leg is which
+            symbols = trade.get('symbol', '').split('|')
+            if len(symbols) == 2:
+                legs.append((symbols[0], 'SELL'))  # Sell bought leg
+                legs.append((symbols[1], 'BUY'))   # Buy back sold leg
+        
+        for leg_symbol, leg_action in legs:
+            try:
+                exchange, tradingsymbol = leg_symbol.split(':')
+                tx_type = self.kite.TRANSACTION_TYPE_BUY if leg_action == 'BUY' else self.kite.TRANSACTION_TYPE_SELL
+                
+                order_id = self._place_order_autoslice(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=tx_type,
+                    quantity=qty,
+                    product=self.kite.PRODUCT_MIS,
+                    order_type=self.kite.ORDER_TYPE_MARKET,
+                    validity=self.kite.VALIDITY_DAY,
+                    market_protection=-1,
+                    tag='TITAN_SPRD_EXIT'
+                )
+                print(f"   ✅ Spread leg exit: {leg_action} {qty} {leg_symbol} (order: {order_id})")
+            except Exception as e:
+                print(f"   🚨 CRITICAL: Spread leg exit FAILED: {leg_action} {qty} {leg_symbol}: {e}")
+                print(f"   🚨 MANUAL ACTION: Close this leg on Kite app/web!")
+                try:
+                    import json as _json
+                    critical_log = os.path.join(os.path.dirname(__file__), 'critical_failures.json')
+                    failures = []
+                    if os.path.exists(critical_log):
+                        with open(critical_log, 'r') as f:
+                            failures = _json.load(f)
+                    failures.append({
+                        'timestamp': datetime.now().isoformat(),
+                        'event': 'LIVE_SPREAD_EXIT_FAILED',
+                        'symbol': leg_symbol,
+                        'action': leg_action,
+                        'quantity': qty,
+                        'spread_symbol': trade.get('symbol', ''),
+                        'error': str(e)
+                    })
+                    with open(critical_log, 'w') as f:
+                        _json.dump(failures, f, indent=2)
+                except:
+                    pass
+
     def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None, exit_detail: Dict = None):
         """Update trade status and move to history if closed.
+        
+        In LIVE mode, also places a real SELL order on Zerodha to close the position
+        and cancels the pending SL order.
         
         Args:
             exit_detail: Optional dict with exit context from ExitManager:
@@ -634,10 +796,16 @@ class ZerodhaTools:
                         'SPREAD_TRAIL_SL', 'THETA_DECAY_WARNING',
                         'DEBIT_SPREAD_SL', 'DEBIT_SPREAD_TARGET', 'DEBIT_SPREAD_TIME_EXIT',
                         'DEBIT_SPREAD_TRAIL_SL', 'DEBIT_SPREAD_MAX_PROFIT',
+                        'SNIPE_TRAILING_SL', 'SNIPE_TIME_GUARD', 'CONVICTION_REVERSAL',
                     }
                     # Catch-all: if exit_price and pnl are set, treat as closed even for unknown statuses
                     is_closed = status in _known_exit_statuses or (exit_price is not None and pnl is not None)
                     if is_closed:
+                        # === LIVE MODE: Place real exit order on Zerodha ===
+                        if not self.paper_mode and status != 'STOPLOSS_HIT' and status != 'SL_HIT':
+                            # Don't place exit for SL_HIT — the SL-M order already triggered at broker
+                            self._execute_live_exit(trade)
+                        
                         self._save_to_history(trade, status, pnl or 0, exit_detail=exit_detail)
                         if status != 'PARTIAL_PROFIT':
                             # === CANCEL GTT SAFETY NET ON TRADE EXIT ===
@@ -651,12 +819,32 @@ class ZerodhaTools:
         return False
     
     def partial_exit_trade(self, symbol: str, exit_qty: int, exit_price: float, partial_pnl: float):
-        """Partially exit a trade — reduce quantity and record partial P&L"""
+        """Partially exit a trade — reduce quantity and record partial P&L.
+        
+        In LIVE mode, places a real partial sell order and updates the broker SL order
+        to reflect the remaining quantity.
+        """
         with self._positions_lock:
             for trade in self.paper_positions:
                 if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
                     original_qty = trade['quantity']
                     remaining_qty = original_qty - exit_qty
+                    
+                    # === LIVE MODE: Place real partial exit order ===
+                    if not self.paper_mode:
+                        self._execute_live_exit(trade, exit_qty=exit_qty)
+                        # Update SL order to remaining quantity
+                        sl_order_id = trade.get('sl_order_id')
+                        if sl_order_id and not str(sl_order_id).startswith('PAPER_'):
+                            try:
+                                self.kite.modify_order(
+                                    variety=self.kite.VARIETY_REGULAR,
+                                    order_id=sl_order_id,
+                                    quantity=remaining_qty
+                                )
+                                print(f"   📊 Updated SL order qty to {remaining_qty} for {symbol}")
+                            except Exception as e:
+                                print(f"   ⚠️ Failed to modify SL order for {symbol}: {e}")
                     
                     # Save partial exit to history
                     partial_record = dict(trade)
@@ -3001,6 +3189,43 @@ class ZerodhaTools:
                 tag='TITAN_SL'
             )
             
+            # Get fill price from broker
+            try:
+                import time as _time
+                _time.sleep(0.5)  # Wait for order to fill
+                broker_orders = self.kite.orders()
+                fill_price = current_ltp
+                for bo in broker_orders:
+                    if str(bo.get('order_id')) == str(order_id) and bo.get('status') == 'COMPLETE':
+                        fill_price = bo.get('average_price', current_ltp)
+                        break
+            except:
+                fill_price = current_ltp
+            
+            # === STORE LIVE POSITION IN TRACKING (same structure as paper) ===
+            stop_loss = order.get('stop_loss', fill_price * 0.94)
+            target = order.get('target', fill_price * 1.10)
+            
+            live_position = {
+                'symbol': symbol,
+                'quantity': order['quantity'],
+                'avg_price': fill_price,
+                'side': order['side'],
+                'stop_loss': stop_loss,
+                'target': target,
+                'order_id': str(order_id),
+                'sl_order_id': str(sl_order_id),
+                'timestamp': datetime.now().isoformat(),
+                'status': 'OPEN',
+                'rationale': order.get('rationale', ''),
+                'volume_regime': order.get('volume_regime', 'NORMAL'),
+                'expected_entry': order.get('expected_entry', fill_price),
+                'is_live': True,
+            }
+            with self._positions_lock:
+                self.paper_positions.append(live_position)
+                self._save_active_trades()
+            
             # === GTT SAFETY NET (server-side backup SL + target) ===
             gtt_trigger_id = None
             if GTT_CONFIG.get('equity_gtt', True):
@@ -3008,7 +3233,7 @@ class ZerodhaTools:
                     symbol=symbol,
                     side=order['side'],
                     quantity=order['quantity'],
-                    entry_price=current_ltp,
+                    entry_price=fill_price,
                     sl_price=stop_loss,
                     target_price=target,
                     product="MIS",
@@ -3030,16 +3255,21 @@ class ZerodhaTools:
                     intent=order_intent,
                     broker_order_id=str(order_id),
                     quantity=order['quantity'],
-                    price=order.get('entry_price', 0),
+                    price=fill_price,
                     status="OPEN"
                 )
+            
+            print(f"   ✅ LIVE {order['side']} {order['quantity']} {symbol} @ ₹{fill_price:.2f}")
+            print(f"      SL: ₹{stop_loss:.2f} | Target: ₹{target:.2f}")
+            print(f"      Order ID: {order_id} | SL Order: {sl_order_id}")
             
             return {
                 "success": True,
                 "order_id": order_id,
                 "sl_order_id": sl_order_id,
                 "gtt_trigger_id": gtt_trigger_id,
-                "message": f"Order placed: {order['side']} {order['quantity']} {symbol}",
+                "entry_price": fill_price,
+                "message": f"LIVE Order placed: {order['side']} {order['quantity']} {symbol} @ ₹{fill_price:.2f}",
                 "client_order_id": order_intent.generate_client_order_id() if order_intent else None,
                 "details": order
             }
@@ -3374,7 +3604,7 @@ class ZerodhaTools:
             print(f"      Greeks: {plan.greeks_summary}")
             print(f"      Target: ₹{plan.target_premium:.2f} | SL: ₹{plan.stoploss_premium:.2f}")
             
-            # Add to paper positions if paper mode
+            # Add to positions tracking (both paper and live mode)
             if self.paper_mode:
                 # Options are always BOUGHT (BUY CE for bullish, BUY PE for bearish)
                 # The direction (BUY/SELL) indicates the market view, not the option transaction
@@ -3413,6 +3643,93 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
                     self._save_active_trades()
+            else:
+                # LIVE MODE: Track option position + get fill price
+                option_side = 'BUY'
+                try:
+                    import time as _time
+                    _time.sleep(0.5)
+                    broker_orders = self.kite.orders()
+                    fill_price = plan.contract.ltp
+                    for bo in broker_orders:
+                        if str(bo.get('order_id')) == str(result.get('order_id')) and bo.get('status') == 'COMPLETE':
+                            fill_price = bo.get('average_price', plan.contract.ltp)
+                            break
+                except:
+                    fill_price = plan.contract.ltp
+                
+                option_position = {
+                    'symbol': plan.contract.symbol,
+                    'underlying': plan.underlying,
+                    'quantity': plan.quantity * plan.contract.lot_size,
+                    'lots': plan.quantity,
+                    'avg_price': fill_price,
+                    'side': option_side,
+                    'direction': plan.direction,
+                    'option_type': plan.contract.option_type.value,
+                    'strike': plan.contract.strike,
+                    'expiry': plan.contract.expiry.isoformat() if plan.contract.expiry else None,
+                    'stop_loss': plan.stoploss_premium,
+                    'target': plan.target_premium,
+                    'order_id': result.get('order_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'is_option': True,
+                    'is_live': True,
+                    'total_premium': fill_price * plan.quantity * plan.contract.lot_size,
+                    'max_loss': plan.max_loss,
+                    'breakeven': plan.breakeven,
+                    'delta': plan.contract.delta,
+                    'theta': plan.contract.theta,
+                    'iv': plan.contract.iv,
+                    'rationale': rationale or plan.rationale,
+                    'entry_metadata': getattr(plan, 'entry_metadata', {}),
+                    'trade_id': getattr(plan, 'entry_metadata', {}).get('trade_id', ''),
+                    'entry_score': getattr(plan, 'entry_metadata', {}).get('entry_score', 0),
+                    'score_tier': getattr(plan, 'entry_metadata', {}).get('score_tier', 'unknown'),
+                    'strategy_type': getattr(plan, 'entry_metadata', {}).get('strategy_type', 'NAKED_OPTION'),
+                }
+                
+                # Place SL-M order for the option
+                try:
+                    exchange, tradingsymbol = plan.contract.symbol.split(':')
+                    sl_trigger = plan.stoploss_premium * 0.999  # Slightly wider
+                    sl_order_id = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR,
+                        exchange=exchange,
+                        tradingsymbol=tradingsymbol,
+                        transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                        quantity=plan.quantity * plan.contract.lot_size,
+                        product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_SLM,
+                        trigger_price=sl_trigger,
+                        validity=self.kite.VALIDITY_DAY,
+                        tag='TITAN_OPT_SL'
+                    )
+                    option_position['sl_order_id'] = str(sl_order_id)
+                    print(f"      🛡️ Live SL order placed: trigger ₹{sl_trigger:.2f} (order: {sl_order_id})")
+                except Exception as e:
+                    print(f"      ⚠️ Failed to place SL order for option: {e}")
+                
+                # Place GTT safety net for option
+                gtt_trigger_id = self._place_gtt_safety_net(
+                    symbol=plan.contract.symbol,
+                    side=option_side,
+                    quantity=plan.quantity * plan.contract.lot_size,
+                    entry_price=fill_price,
+                    sl_price=plan.stoploss_premium,
+                    target_price=plan.target_premium,
+                    product="MIS",
+                    tag='TITAN_OPT'
+                )
+                if gtt_trigger_id:
+                    option_position['gtt_trigger_id'] = gtt_trigger_id
+                
+                with self._positions_lock:
+                    self.paper_positions.append(option_position)
+                    self._save_active_trades()
+                
+                print(f"   ✅ LIVE OPTION: {option_side} {plan.quantity * plan.contract.lot_size} {plan.contract.symbol} @ ₹{fill_price:.2f}")
         
         return result
     
@@ -3564,7 +3881,7 @@ class ZerodhaTools:
             print(f"      Credit: ₹{plan.net_credit_total:,.0f} | Max Risk: ₹{plan.max_risk:,.0f}")
             print(f"      NetΘ: {plan.net_theta:+.2f}/day | DTE: {plan.dte}")
             
-            # Add to paper positions
+            # Add to positions tracking (paper AND live mode)
             if self.paper_mode:
                 spread_position = {
                     'symbol': f"{plan.sold_contract.symbol}|{plan.hedge_contract.symbol}",
@@ -3606,6 +3923,52 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(spread_position)
                     self._save_active_trades()
+            else:
+                # LIVE MODE: Track credit spread position
+                spread_position = {
+                    'symbol': f"{plan.sold_contract.symbol}|{plan.hedge_contract.symbol}",
+                    'underlying': plan.underlying,
+                    'is_credit_spread': True,
+                    'is_live': True,
+                    'spread_type': plan.spread_type,
+                    'direction': plan.direction,
+                    'sold_symbol': plan.sold_contract.symbol,
+                    'sold_strike': plan.sold_contract.strike,
+                    'sold_premium': plan.sold_contract.ltp,
+                    'hedge_symbol': plan.hedge_contract.symbol,
+                    'hedge_strike': plan.hedge_contract.strike,
+                    'hedge_premium': plan.hedge_contract.ltp,
+                    'quantity': plan.quantity * plan.lot_size,
+                    'lots': plan.quantity,
+                    'lot_size': plan.lot_size,
+                    'avg_price': plan.net_credit,
+                    'side': 'SELL',
+                    'net_credit': plan.net_credit,
+                    'net_credit_total': plan.net_credit_total,
+                    'max_risk': plan.max_risk,
+                    'spread_width': plan.spread_width,
+                    'stop_loss': plan.stop_loss_debit,
+                    'target': plan.target_credit,
+                    'breakeven': plan.breakeven,
+                    'net_delta': plan.net_delta,
+                    'net_theta': plan.net_theta,
+                    'net_vega': plan.net_vega,
+                    'credit_pct': plan.credit_pct,
+                    'dte': plan.dte,
+                    'is_option': True,
+                    'order_id': result.get('spread_id', result.get('sold_order_id')),
+                    'sold_order_id': result.get('sold_order_id'),
+                    'hedge_order_id': result.get('hedge_order_id'),
+                    'spread_id': result.get('spread_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': rationale or plan.rationale,
+                    'total_premium': 0,
+                }
+                with self._positions_lock:
+                    self.paper_positions.append(spread_position)
+                    self._save_active_trades()
+                print(f"   ✅ LIVE credit spread tracked: {plan.spread_type}")
         
         return result
     
@@ -3801,6 +4164,64 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(debit_position)
                     self._save_active_trades()
+            else:
+                # LIVE MODE: Track debit spread position
+                debit_position = {
+                    'symbol': f"{plan.buy_contract.symbol}|{plan.sell_contract.symbol}",
+                    'underlying': plan.underlying,
+                    'is_debit_spread': True,
+                    'is_live': True,
+                    'is_credit_spread': False,
+                    'spread_type': plan.spread_type,
+                    'direction': plan.direction,
+                    'buy_symbol': plan.buy_contract.symbol,
+                    'buy_strike': plan.buy_contract.strike,
+                    'buy_premium': plan.buy_contract.ltp,
+                    'sell_symbol': plan.sell_contract.symbol,
+                    'sell_strike': plan.sell_contract.strike,
+                    'sell_premium': plan.sell_contract.ltp,
+                    'quantity': plan.quantity * plan.lot_size,
+                    'lots': plan.quantity,
+                    'lot_size': plan.lot_size,
+                    'avg_price': plan.net_debit,
+                    'side': 'BUY',
+                    'net_debit': plan.net_debit,
+                    'net_debit_total': plan.net_debit_total,
+                    'max_profit': plan.max_profit,
+                    'max_loss': plan.max_loss,
+                    'spread_width': plan.spread_width,
+                    'stop_loss': plan.stop_loss_value,
+                    'target': plan.target_value,
+                    'breakeven': plan.breakeven,
+                    'net_delta': plan.net_delta,
+                    'net_theta': plan.net_theta,
+                    'net_vega': plan.net_vega,
+                    'move_pct': plan.move_pct,
+                    'dte': plan.dte,
+                    'is_option': True,
+                    'order_id': result.get('spread_id', result.get('buy_order_id')),
+                    'buy_order_id': result.get('buy_order_id'),
+                    'sell_order_id': result.get('sell_order_id'),
+                    'spread_id': result.get('spread_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': rationale or plan.rationale,
+                    'total_premium': plan.net_debit_total,
+                    'strategy_type': 'DEBIT_SPREAD',
+                    'trade_id': f"DS_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'entry_score': getattr(plan, '_score', 0),
+                    'score_tier': 'premium' if getattr(plan, '_score', 0) >= 70 else 'standard',
+                    'entry_metadata': {
+                        'strategy_type': 'DEBIT_SPREAD',
+                        'proactive': 'proactive' in (rationale or '').lower(),
+                        'move_pct': plan.move_pct,
+                        'dte': plan.dte,
+                    },
+                }
+                with self._positions_lock:
+                    self.paper_positions.append(debit_position)
+                    self._save_active_trades()
+                print(f"   ✅ LIVE debit spread tracked: {plan.spread_type}")
         
         return result
     
@@ -3976,6 +4397,67 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(ic_position)
                     self._save_active_trades()
+            else:
+                # LIVE MODE: Track iron condor position
+                ic_position = {
+                    'symbol': f"{plan.sold_pe_contract.symbol}|{plan.sold_ce_contract.symbol}|{plan.hedge_pe_contract.symbol}|{plan.hedge_ce_contract.symbol}",
+                    'underlying': plan.underlying,
+                    'is_iron_condor': True,
+                    'is_live': True,
+                    'is_credit_spread': False,
+                    'is_debit_spread': False,
+                    'strategy_type': 'IRON_CONDOR',
+                    'direction': 'NEUTRAL',
+                    'sold_ce_symbol': plan.sold_ce_contract.symbol,
+                    'sold_ce_strike': plan.sold_ce_contract.strike,
+                    'sold_ce_premium': plan.sold_ce_contract.ltp,
+                    'hedge_ce_symbol': plan.hedge_ce_contract.symbol,
+                    'hedge_ce_strike': plan.hedge_ce_contract.strike,
+                    'hedge_ce_premium': plan.hedge_ce_contract.ltp,
+                    'sold_pe_symbol': plan.sold_pe_contract.symbol,
+                    'sold_pe_strike': plan.sold_pe_contract.strike,
+                    'sold_pe_premium': plan.sold_pe_contract.ltp,
+                    'hedge_pe_symbol': plan.hedge_pe_contract.symbol,
+                    'hedge_pe_strike': plan.hedge_pe_contract.strike,
+                    'hedge_pe_premium': plan.hedge_pe_contract.ltp,
+                    'quantity': plan.quantity * plan.lot_size,
+                    'lots': plan.quantity,
+                    'lot_size': plan.lot_size,
+                    'avg_price': plan.total_credit,
+                    'side': 'SELL',
+                    'total_credit': plan.total_credit,
+                    'total_credit_amount': plan.total_credit_amount,
+                    'max_risk': plan.max_risk,
+                    'ce_wing_width': plan.ce_wing_width,
+                    'pe_wing_width': plan.pe_wing_width,
+                    'upper_breakeven': plan.upper_breakeven,
+                    'lower_breakeven': plan.lower_breakeven,
+                    'profit_zone_width': plan.profit_zone_width,
+                    'stop_loss': plan.stop_loss_debit,
+                    'target': plan.target_buyback,
+                    'net_delta': plan.net_delta,
+                    'net_theta': plan.net_theta,
+                    'net_vega': plan.net_vega,
+                    'credit_pct': plan.credit_pct,
+                    'dte': plan.dte,
+                    'directional_score': plan.directional_score,
+                    'is_option': True,
+                    'order_id': result.get('condor_id'),
+                    'condor_id': result.get('condor_id'),
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'OPEN',
+                    'rationale': rationale or plan.rationale,
+                    'total_premium': 0,
+                    'entry_metadata': {
+                        'strategy_type': 'IRON_CONDOR',
+                        'directional_score': plan.directional_score,
+                        'profit_zone': f"₹{plan.lower_breakeven:.0f}-₹{plan.upper_breakeven:.0f}",
+                    },
+                }
+                with self._positions_lock:
+                    self.paper_positions.append(ic_position)
+                    self._save_active_trades()
+                print(f"   ✅ LIVE iron condor tracked: {plan.underlying}")
         
         return result
 

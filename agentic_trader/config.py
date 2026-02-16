@@ -32,16 +32,58 @@ ZERODHA_API_KEY = os.environ.get("ZERODHA_API_KEY", "")
 ZERODHA_API_SECRET = os.environ.get("ZERODHA_API_SECRET", "")
 
 # ========== BROKERAGE CONFIG ==========
-BROKERAGE_PCT = 0.006  # 0.6% of total turnover (entry + exit value)
+BROKERAGE_PCT = 0.006  # 0.6% of total turnover (paper trading estimate)
+
+# Runtime flag — set by autonomous_trader on startup
+# When True, uses simplified 0.6% estimate. When False, uses exact Zerodha fees.
+PAPER_MODE = True  # Default paper, overridden by --live flag
+
+# Zerodha actual charges for LIVE trading:
+# - Brokerage: ₹20/order (flat, per executed order)
+# - STT: 0.0625% on sell side (options buy: NIL, options sell: 0.0625% on premium)
+# - Exchange txn charges: ~0.053% (NSE F&O)
+# - GST: 18% on (brokerage + exchange charges)
+# - SEBI charges: ₹10 per crore
+# - Stamp duty: 0.003% on buy side
 
 def calc_brokerage(entry_price, exit_price, quantity):
-    """Calculate brokerage as 0.6% of total turnover (entry + exit).
+    """Calculate all-in trading costs.
     
-    Applied to all trade P&L calculations for realistic paper trading.
-    Covers: brokerage + STT + exchange charges + GST + slippage estimate.
+    Paper mode: 0.6% of turnover (conservative estimate).
+    Live mode:  Zerodha actual fee structure (significantly cheaper).
+    
+    Uses module-level PAPER_MODE flag (set at startup).
     """
-    turnover = abs(entry_price * quantity) + abs(exit_price * quantity)
-    return round(turnover * BROKERAGE_PCT, 2)
+    if PAPER_MODE:
+        turnover = abs(entry_price * quantity) + abs(exit_price * quantity)
+        return round(turnover * BROKERAGE_PCT, 2)
+    
+    # === LIVE MODE: Zerodha exact fee calculation ===
+    buy_value = abs(entry_price * quantity)
+    sell_value = abs(exit_price * quantity)
+    turnover = buy_value + sell_value
+    
+    # 1. Brokerage: ₹20 per order × 2 (entry + exit), or 0.03% whichever is lower
+    brokerage_per_leg = min(20, turnover * 0.0003)
+    brokerage = brokerage_per_leg * 2  # Entry + Exit
+    
+    # 2. STT: Options sell = 0.0625% on premium
+    stt = sell_value * 0.000625
+    
+    # 3. Exchange charges: ~0.053% of turnover
+    exchange_charges = turnover * 0.00053
+    
+    # 4. GST: 18% on (brokerage + exchange charges)
+    gst = (brokerage + exchange_charges) * 0.18
+    
+    # 5. SEBI charges: ₹10 per crore
+    sebi = turnover * 0.000001
+    
+    # 6. Stamp duty: 0.003% on buy side
+    stamp = buy_value * 0.00003
+    
+    total = brokerage + stt + exchange_charges + gst + sebi + stamp
+    return round(total, 2)
 
 # ========== HARD RULES (NEVER VIOLATE) ==========
 HARD_RULES = {

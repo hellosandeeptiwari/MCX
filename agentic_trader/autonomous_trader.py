@@ -58,6 +58,10 @@ class AutonomousTrader:
         self.paper_mode = paper_mode
         self.start_capital = capital
         self.daily_pnl = 0
+        
+        # Set module-level PAPER_MODE in config for brokerage calculation
+        import config as _cfg
+        _cfg.PAPER_MODE = paper_mode
         self._pnl_lock = threading.Lock()  # Thread-safe P&L updates
         self.trades_today = []
         self.positions = []
@@ -1691,6 +1695,10 @@ class AutonomousTrader:
                 with self._pnl_lock:
                     self.daily_pnl += update['pnl']
                     self.capital += update['pnl']  # Also update capital (was missing)
+        
+        # === LIVE MODE: Sync with broker positions ===
+        if not self.paper_mode:
+            self._sync_broker_positions()
         
         # Show current active positions
         active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
@@ -3682,6 +3690,89 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         
         self.positions.remove(pos)
     
+    def _sync_broker_positions(self):
+        """LIVE MODE ONLY: Check if any SL-M orders triggered at Zerodha that Titan missed.
+        
+        Compares Kite's actual open positions against Titan's tracked positions.
+        If a position was closed by the broker SL order, update Titan's state.
+        """
+        if self.paper_mode:
+            return
+        
+        try:
+            # Get actual positions from Zerodha
+            broker_positions = self.tools.kite.positions()
+            day_positions = broker_positions.get('day', [])
+            
+            # Get broker's open positions (non-zero quantity)
+            broker_open = {}
+            for bp in day_positions:
+                symbol = f"{bp['exchange']}:{bp['tradingsymbol']}"
+                if bp['quantity'] != 0:
+                    broker_open[symbol] = bp
+            
+            # Get Titan's tracked open positions
+            with self.tools._positions_lock:
+                titan_open = [t for t in self.tools.paper_positions 
+                            if t.get('status', 'OPEN') == 'OPEN']
+            
+            # Check each Titan position — if broker has ZERO qty, SL triggered
+            for trade in titan_open:
+                symbol = trade.get('symbol', '')
+                if symbol not in broker_open:
+                    # Position closed at broker (SL triggered or manual close)
+                    entry = trade.get('avg_price', 0)
+                    qty = trade.get('quantity', 0)
+                    side = trade.get('side', 'BUY')
+                    
+                    # Get execution price from broker's filled SL order
+                    exit_price = 0
+                    try:
+                        orders = self.tools.kite.orders()
+                        sl_order_id = trade.get('sl_order_id', '')
+                        for o in orders:
+                            if str(o.get('order_id')) == str(sl_order_id) and o.get('status') == 'COMPLETE':
+                                exit_price = o.get('average_price', 0)
+                                break
+                        # If SL order not found, check for any SELL order for this symbol
+                        if not exit_price:
+                            for o in orders:
+                                if (o.get('tradingsymbol') in symbol and 
+                                    o.get('status') == 'COMPLETE' and 
+                                    o.get('transaction_type') in ('SELL', 'BUY')):
+                                    exit_price = o.get('average_price', 0)
+                    except:
+                        pass
+                    
+                    if not exit_price:
+                        # Fallback: use LTP
+                        try:
+                            q = self.tools.kite.ltp([symbol])
+                            exit_price = q[symbol]['last_price']
+                        except:
+                            exit_price = entry  # Last resort
+                    
+                    # Calculate P&L
+                    from config import calc_brokerage
+                    if side == 'BUY':
+                        pnl = (exit_price - entry) * qty
+                    else:
+                        pnl = (entry - exit_price) * qty
+                    pnl -= calc_brokerage(entry, exit_price, qty)
+                    
+                    print(f"\n🔄 BROKER SYNC: {symbol} position closed by broker")
+                    print(f"   Entry: ₹{entry:.2f} → Exit: ₹{exit_price:.2f} | P&L: ₹{pnl:+,.2f}")
+                    
+                    # Update Titan's state
+                    self.tools.update_trade_status(symbol, 'STOPLOSS_HIT', exit_price, pnl, 
+                        exit_detail={'exit_reason': 'BROKER_SL_TRIGGERED', 'exit_type': 'SL_HIT'})
+                    with self._pnl_lock:
+                        self.daily_pnl += pnl
+                        self.capital += pnl
+                    
+        except Exception as e:
+            print(f"   ⚠️ Broker position sync failed: {e}")
+
     def run(self, scan_interval_minutes: int = 5):
         """Run the autonomous trader with dynamic scan intervals.
         
