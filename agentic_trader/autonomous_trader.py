@@ -232,6 +232,170 @@ class AutonomousTrader:
         except Exception as e:
             print(f"  🧠 ML Move Predictor: DISABLED ({e})")
         
+        # === ML HISTORICAL 5-MIN CANDLE BASE ===
+        # Load stored 5-min parquets so ML always has proper intraday features,
+        # even at 9:15-9:30 when live intraday cache has only a few candles.
+        self._hist_5min_cache = {}  # symbol (e.g. 'RELIANCE') -> DataFrame
+        self._nifty_5min_df = None
+        self._nifty_daily_df = None
+        try:
+            import pandas as _pd_hist
+            _ml_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data')
+            _5m_dir = os.path.join(_ml_data_dir, 'candles_5min')
+            _daily_dir = os.path.join(_ml_data_dir, 'candles_daily')
+            if os.path.isdir(_5m_dir):
+                for _f in os.listdir(_5m_dir):
+                    if _f.endswith('.parquet') and not _f.startswith('SECTOR_'):
+                        _sym_name = _f.replace('.parquet', '')
+                        try:
+                            _df = _pd_hist.read_parquet(os.path.join(_5m_dir, _f))
+                            _df['date'] = _pd_hist.to_datetime(_df['date'])
+                            if _sym_name == 'NIFTY50':
+                                self._nifty_5min_df = _df
+                            else:
+                                self._hist_5min_cache[_sym_name] = _df
+                        except Exception:
+                            pass
+                print(f"  📊 Historical 5-min candles: {len(self._hist_5min_cache)} stocks + {'✓' if self._nifty_5min_df is not None else '✗'} NIFTY50")
+            # Load NIFTY50 daily candles
+            _nifty_daily_path = os.path.join(_daily_dir, 'NIFTY50.parquet')
+            if os.path.exists(_nifty_daily_path):
+                self._nifty_daily_df = _pd_hist.read_parquet(_nifty_daily_path)
+                self._nifty_daily_df['date'] = _pd_hist.to_datetime(self._nifty_daily_df['date'])
+                print(f"  📊 NIFTY50 daily context: ✓ ({len(self._nifty_daily_df)} days)")
+        except Exception as _hist_e:
+            print(f"  ⚠ Historical 5-min load: {_hist_e}")
+        
+        # === AUTO-REFRESH STALE 5-MIN PARQUETS ===
+        # If the historical 5-min parquets are >3 calendar days old, incrementally
+        # update them using Kite historical data API. This prevents the gap between
+        # stored data and live intraday candles from biasing ML features.
+        try:
+            import pandas as _pd_5m_refresh
+            _5m_dir_refresh = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'candles_5min')
+            if self._hist_5min_cache:
+                # Check staleness from any cached DataFrame
+                _sample_sym = next(iter(self._hist_5min_cache))
+                _sample_df = self._hist_5min_cache[_sample_sym]
+                _last_date = _sample_df['date'].max()
+                if hasattr(_last_date, 'tz') and _last_date.tz is not None:
+                    _last_date = _last_date.tz_localize(None)
+                _now_ts = _pd_5m_refresh.Timestamp.now()
+                _gap = (_now_ts - _last_date).days
+                if _gap > 3:
+                    print(f"  ⚠️ 5-min parquets stale ({_gap}d old: last={_last_date.date()}) — auto-refreshing...")
+                    try:
+                        from ml_models.data_fetcher import fetch_candles, get_instrument_token
+                        _kite = self.tools.kite
+                        _refreshed = 0
+                        _all_syms = list(self._hist_5min_cache.keys())
+                        if self._nifty_5min_df is not None:
+                            _all_syms.append('NIFTY50')
+                        for _rs in _all_syms:
+                            try:
+                                _existing = self._hist_5min_cache.get(_rs) if _rs != 'NIFTY50' else self._nifty_5min_df
+                                if _existing is None:
+                                    continue
+                                _ex_last = _existing['date'].max()
+                                if hasattr(_ex_last, 'tz') and _ex_last.tz is not None:
+                                    _ex_last = _ex_last.tz_localize(None)
+                                _days_to_fetch = (_now_ts - _ex_last).days + 1
+                                if _days_to_fetch <= 1:
+                                    continue
+                                # Fetch only the missing days (cap at 30 to be safe)
+                                _kite_sym = 'NIFTY 50' if _rs == 'NIFTY50' else _rs
+                                _new_df = fetch_candles(_kite, _kite_sym, days=min(_days_to_fetch, 30), interval='5minute')
+                                if len(_new_df) > 0:
+                                    _new_df['date'] = _pd_5m_refresh.to_datetime(_new_df['date'])
+                                    # Merge: keep existing + append new non-overlapping
+                                    _ex_copy = _existing.copy()
+                                    if _ex_copy['date'].dt.tz is not None:
+                                        _ex_copy['date'] = _ex_copy['date'].dt.tz_localize(None)
+                                    if _new_df['date'].dt.tz is not None:
+                                        _new_df['date'] = _new_df['date'].dt.tz_localize(None)
+                                    _combined = _pd_5m_refresh.concat([_ex_copy, _new_df], ignore_index=True)
+                                    _combined = _combined.drop_duplicates(subset='date').sort_values('date').reset_index(drop=True)
+                                    # Save updated parquet
+                                    _pq_path = os.path.join(_5m_dir_refresh, f'{_rs}.parquet')
+                                    _combined.to_parquet(_pq_path, index=False)
+                                    # Update in-memory cache
+                                    if _rs == 'NIFTY50':
+                                        self._nifty_5min_df = _combined
+                                    else:
+                                        self._hist_5min_cache[_rs] = _combined
+                                    _refreshed += 1
+                            except Exception as _rs_err:
+                                if _rs == 'NIFTY50':
+                                    print(f"  ⚠️ NIFTY50 5-min refresh failed: {_rs_err}")
+                        if _refreshed > 0:
+                            _new_last = next(iter(self._hist_5min_cache.values()))['date'].max()
+                            print(f"  ✅ 5-min parquets refreshed: {_refreshed}/{len(_all_syms)} stocks (now up to {str(_new_last)[:10]})")
+                        else:
+                            print(f"  ⚠️ 5-min parquet refresh: 0 stocks updated (Kite API may be unavailable)")
+                        
+                        # Also refresh NIFTY50 daily parquet
+                        try:
+                            _nifty_daily_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'candles_daily', 'NIFTY50.parquet')
+                            if self._nifty_daily_df is not None:
+                                _nd_last = self._nifty_daily_df['date'].max()
+                                if hasattr(_nd_last, 'tz') and _nd_last.tz is not None:
+                                    _nd_last = _nd_last.tz_localize(None)
+                                _nd_gap = (_now_ts - _nd_last).days
+                                if _nd_gap > 1:
+                                    _new_daily = fetch_candles(_kite, 'NIFTY 50', days=min(_nd_gap + 1, 60), interval='day')
+                                    if len(_new_daily) > 0:
+                                        _new_daily['date'] = _pd_5m_refresh.to_datetime(_new_daily['date'])
+                                        _nd_copy = self._nifty_daily_df.copy()
+                                        if _nd_copy['date'].dt.tz is not None:
+                                            _nd_copy['date'] = _nd_copy['date'].dt.tz_localize(None)
+                                        if _new_daily['date'].dt.tz is not None:
+                                            _new_daily['date'] = _new_daily['date'].dt.tz_localize(None)
+                                        _nd_combined = _pd_5m_refresh.concat([_nd_copy, _new_daily], ignore_index=True)
+                                        _nd_combined = _nd_combined.drop_duplicates(subset='date').sort_values('date').reset_index(drop=True)
+                                        _nd_combined.to_parquet(_nifty_daily_path, index=False)
+                                        self._nifty_daily_df = _nd_combined
+                                        print(f"  ✅ NIFTY daily refreshed: {len(_nd_combined)} days (last={_nd_combined['date'].max()})")
+                        except Exception as _nd_err:
+                            print(f"  ⚠️ NIFTY daily refresh: {_nd_err}")
+                    except ImportError:
+                        print("  ⚠️ data_fetcher not available — 5-min refresh skipped")
+                    except Exception as _5m_err:
+                        print(f"  ⚠️ 5-min parquet refresh error: {_5m_err}")
+                else:
+                    print(f"  ✅ 5-min parquets: fresh (last={_last_date.date()}, {_gap}d ago)")
+        except Exception as _5m_chk_e:
+            print(f"  ⚠ 5-min freshness check: {_5m_chk_e}")
+        
+        # === AUTO-REFRESH STALE OI DATA ===
+        # If futures OI parquets are >3 days old, refresh them proactively.
+        try:
+            import pandas as _pd_oi_chk
+            _oi_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'futures_oi')
+            _sample_files = [f for f in os.listdir(_oi_dir) if f.endswith('_futures_oi.parquet')][:3]
+            _oi_stale = False
+            if not _sample_files:
+                _oi_stale = True
+            else:
+                for _sf in _sample_files:
+                    _sdf = _pd_oi_chk.read_parquet(os.path.join(_oi_dir, _sf))
+                    _last = _pd_oi_chk.Timestamp(_sdf['date'].max())
+                    if (_pd_oi_chk.Timestamp.now() - _last).days > 3:
+                        _oi_stale = True
+                        break
+            if _oi_stale:
+                print("  ⚠️ Futures OI data stale (>3 days) — auto-refreshing...")
+                from dhan_futures_oi import FuturesOIFetcher
+                _oi_fetcher = FuturesOIFetcher()
+                if _oi_fetcher.ready:
+                    _oi_fetcher.backfill_all(months_back=1)
+                    print("  ✅ OI data refreshed")
+                else:
+                    print("  ⚠️ DhanHQ not ready — OI refresh skipped (check DHAN_ACCESS_TOKEN in .env)")
+            else:
+                print("  ✅ Futures OI data: fresh")
+        except Exception as _oi_chk_e:
+            print(f"  ⚠ OI freshness check: {_oi_chk_e}")
+        
         # === OI FLOW ANALYZER (post-ML overlay using live options chain) ===
         self._oi_analyzer = None
         try:
@@ -417,9 +581,17 @@ class AutonomousTrader:
         # Execute top N elite candidates
         auto_fired = []
         for sym, score, direction, data in elite_candidates[:max_fires]:
-            # Check position limits
+            # Check position limits (regime-aware: fewer positions in MIXED market)
             active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
-            if len(active_positions) >= HARD_RULES['MAX_POSITIONS']:
+            _elite_breadth = data.get('market_breadth', 'MIXED') if isinstance(data, dict) else 'MIXED'
+            if _elite_breadth == 'MIXED':
+                _max_pos = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
+            elif _elite_breadth in ('BULLISH', 'BEARISH'):
+                _max_pos = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
+            else:
+                _max_pos = HARD_RULES['MAX_POSITIONS']
+            if len(active_positions) >= _max_pos:
+                print(f"   ⛔ POSITION LIMIT: {len(active_positions)} >= {_max_pos} ({_elite_breadth} regime)")
                 break
             
             # === ML DIRECTION OVERRIDE for elite auto-fire ===
@@ -1178,6 +1350,7 @@ class AutonomousTrader:
                     emoji = {
                         'SL_HIT': '❌',
                         'TARGET_HIT': '🎯',
+                        'QUICK_PROFIT': '💰',
                         'SESSION_CUTOFF': '⏰',
                         'TIME_STOP': '⏱️',
                         'TRAILING_SL': '📈',
@@ -1737,30 +1910,118 @@ class AutonomousTrader:
             _full_scan_mode = FULL_FNO_SCAN.get('enabled', False)
             
             if _full_scan_mode:
-                # === FULL F&O UNIVERSE SCAN ===
+                # === FULL F&O UNIVERSE SCAN (NO FIXED LIST BIAS) ===
+                # All F&O stocks compete equally — top N by composite rank are scanned
                 try:
                     _all_fo = self.market_scanner.get_all_fo_symbols()
                     _all_fo_syms = set(_all_fo)
                     
                     # Pre-filter: use scanner results to only include stocks with meaningful movement
-                    _min_change = FULL_FNO_SCAN.get('min_change_pct_filter', 0.5)
-                    _max_indicator_stocks = FULL_FNO_SCAN.get('max_indicator_stocks', 80)
+                    _min_change = FULL_FNO_SCAN.get('min_change_pct_filter', 0.3)
+                    _max_indicator_stocks = FULL_FNO_SCAN.get('max_indicator_stocks', 50)
                     
-                    # Start with all curated stocks (always scan these)
-                    _full_universe = set(APPROVED_UNIVERSE)
+                    # ALL F&O stocks compete equally — no curated set gets guaranteed inclusion
+                    _full_universe = set()
                     
-                    # Add all scanner results that pass the pre-filter
+                    # === QUALITY GATE: Only pass stocks with scorer-relevant signals ===
+                    # Scanner's _all_results has ~50-60 stocks above 0.5% change, but most
+                    # are mid-range with no setups and score 20-35. This gate keeps only stocks
+                    # that match what the scorer actually rewards (trend/ORB/volume).
+                    # NOTE: Gate D (scanner category) was REMOVED — it passed everything since
+                    # scanner assigns score>0 to all categorized stocks, defeating the gate.
                     if scan_result and hasattr(self.market_scanner, '_all_results'):
-                        _moving_stocks = sorted(
-                            self.market_scanner._all_results,
-                            key=lambda r: abs(r.change_pct),
-                            reverse=True
-                        )
-                        for _r in _moving_stocks:
-                            if abs(_r.change_pct) >= _min_change or _r.volume > 0:
+                        _quality_candidates = []
+                        _all_raw = self.market_scanner._all_results
+                        _gate_a_count = 0  # strong movers (≥1.0%)
+                        _gate_b_count = 0  # near day extreme
+                        _gate_c_count = 0  # volume top 25%
+                        _below_min_change = 0  # filtered by min_change
+                        
+                        # First: compute volume percentile for relative volume check
+                        _all_vols = sorted([r.volume for r in _all_raw if r.volume > 0])
+                        _vol_p75 = _all_vols[int(len(_all_vols) * 0.75)] if _all_vols else 0
+                        
+                        print(f"   🔍 Quality gate input: {len(_all_raw)} raw stocks, min_change={_min_change}%, vol_p75={_vol_p75:,.0f}")
+                        
+                        for r in _all_raw:
+                            if abs(r.change_pct) < _min_change:
+                                _below_min_change += 1
+                                continue
+                            
+                            # Day extremity: is price in top/bottom 15% of day range?
+                            _dr = r.day_high - r.day_low
+                            _near_extreme = False
+                            if _dr > 0 and r.ltp > 0:
+                                _pos = (r.ltp - r.day_low) / _dr  # 0=day low, 1=day high
+                                _near_extreme = _pos >= 0.85 or _pos <= 0.15
+                            
+                            # Volume surge: top 25% of all scanned stocks
+                            _vol_surge = r.volume >= _vol_p75 if _vol_p75 > 0 else False
+                            
+                            # ---- QUALITY GATE: must pass at least ONE of A/B/C ----
+                            # A) Strong mover:  ≥1.0% change = likely has trend + ORB signal
+                            # B) Day extreme:   near high/low = likely ORB breakout (scorer +20)
+                            # C) Volume surge:  top 25% volume = likely HIGH/EXPLOSIVE vol (scorer +12-15)
+                            _is_a = abs(r.change_pct) >= 1.0
+                            _is_b = _near_extreme
+                            _is_c = _vol_surge
+                            
+                            if _is_a: _gate_a_count += 1
+                            if _is_b: _gate_b_count += 1
+                            if _is_c: _gate_c_count += 1
+                            
+                            if _is_a or _is_b or _is_c:
+                                _quality_candidates.append(r)
+                        
+                        _after_min = len(_all_raw) - _below_min_change
+                        _dropped = _after_min - len(_quality_candidates)
+                        
+                        # ALWAYS print gate stats for diagnostics
+                        print(f"   🔍 Quality gate: {_after_min} above min_change → {len(_quality_candidates)} passed, {_dropped} dropped")
+                        print(f"      Gate A (≥1.0% chg): {_gate_a_count} | Gate B (day extreme): {_gate_b_count} | Gate C (vol top25): {_gate_c_count}")
+                        
+                        if _quality_candidates:
+                            # Rank by scorer-aligned composite (matters when >50 quality candidates)
+                            _vols = sorted(set(c.volume for c in _quality_candidates))
+                            _vol_rank = {v: i / max(len(_vols) - 1, 1) for i, v in enumerate(_vols)}
+                            
+                            def _rank(r):
+                                chg_score = min(abs(r.change_pct) / 3.0, 1.0)
+                                vol_score = _vol_rank.get(r.volume, 0)
+                                scan_score = min(r.score / 200.0, 1.0) if r.score else 0
+                                _dr = r.day_high - r.day_low
+                                if _dr > 0 and r.ltp > 0:
+                                    _pos = (r.ltp - r.day_low) / _dr
+                                    extremity = abs(_pos - 0.5) * 2
+                                else:
+                                    extremity = 0
+                                _total_qty = (r.buy_qty or 0) + (r.sell_qty or 0)
+                                imbalance = abs((r.buy_qty or 0) - (r.sell_qty or 0)) / _total_qty if _total_qty > 0 else 0
+                                return (chg_score * 0.25 + vol_score * 0.20 + scan_score * 0.10
+                                        + extremity * 0.30 + imbalance * 0.15)
+                            
+                            _quality_candidates.sort(key=_rank, reverse=True)
+                            _selected = _quality_candidates[:_max_indicator_stocks]
+                            for _r in _selected:
                                 _full_universe.add(_r.nse_symbol)
-                            if len(_full_universe) >= _max_indicator_stocks:
-                                break
+                            
+                            # Show top 5 selected with reasons
+                            print(f"      Top 5 selected:")
+                            for _i, _r in enumerate(_selected[:5]):
+                                _dr2 = _r.day_high - _r.day_low
+                                _pos2 = ((_r.ltp - _r.day_low) / _dr2 * 100) if _dr2 > 0 else 50
+                                _gates = []
+                                if abs(_r.change_pct) >= 1.0: _gates.append("A:chg")
+                                if _dr2 > 0 and (_pos2 >= 85 or _pos2 <= 15): _gates.append("B:ext")
+                                if _r.volume >= _vol_p75 and _vol_p75 > 0: _gates.append("C:vol")
+                                print(f"        {_i+1}. {_r.symbol} chg={_r.change_pct:+.1f}% dayPos={_pos2:.0f}% vol={_r.volume:,.0f} gates=[{','.join(_gates)}]")
+                    
+                    # Always include stocks we already hold (need exit monitoring)
+                    for _t in self.tools.paper_positions:
+                        if _t.get('status', 'OPEN') == 'OPEN':
+                            _held_sym = _t.get('symbol', '')
+                            if _held_sym:
+                                _full_universe.add(_held_sym)
                     
                     scan_universe = list(_full_universe)
                     _skipped = len(_all_fo) - len(scan_universe)
@@ -1769,6 +2030,7 @@ class AutonomousTrader:
                 except Exception as _e:
                     _all_fo_syms = set()
                     print(f"   ⚠️ Full scan fallback to curated: {_e}")
+                    scan_universe = list(APPROVED_UNIVERSE)
                     for ws in self._wildcard_symbols:
                         if ws not in scan_universe:
                             scan_universe.append(ws)
@@ -1829,12 +2091,20 @@ class AutonomousTrader:
             # DON'T re-score. Only microstructure (bid-ask/OI) is fetched at trade time.
             _pre_scores = {}       # symbol → score (for display / GPT prompt)
             _cycle_decisions = {}  # symbol → {decision, direction, market_data}
+            
+            # Compute market breadth early so scorer can use it for regime-aware ORB weighting
+            _pre_up = sum(1 for s, d in sorted_data if isinstance(d, dict) and d.get('change_pct', 0) > 0.5)
+            _pre_down = sum(1 for s, d in sorted_data if isinstance(d, dict) and d.get('change_pct', 0) < -0.5)
+            _pre_breadth = "BULLISH" if _pre_up > _pre_down * 1.5 else "BEARISH" if _pre_down > _pre_up * 1.5 else "MIXED"
+            
             try:
                 from options_trader import get_intraday_scorer, IntradaySignal
                 _scorer = get_intraday_scorer()
                 for _sym, _d in sorted_data:
                     if not isinstance(_d, dict) or 'ltp' not in _d:
                         continue
+                    # Inject market breadth into market_data for regime-aware ORB scoring
+                    _d['market_breadth'] = _pre_breadth
                     try:
                         _sig = IntradaySignal(
                             symbol=_sym,
@@ -1863,6 +2133,7 @@ class AutonomousTrader:
                             'decision': _dec,
                             'direction': _dir,
                             'score': _dec.confidence_score,
+                            'raw_score': _dec.confidence_score,  # Pre-ML baseline for fair re-score comparison
                         }
                     except Exception:
                         pass
@@ -1892,9 +2163,10 @@ class AutonomousTrader:
                         # Load futures OI data once per cycle (FAIL-SAFE)
                         _futures_oi_cache = {}
                         try:
-                            if not hasattr(self, '_futures_oi_data'):
-                                from dhan_futures_oi import load_all_futures_oi_daily
-                                self._futures_oi_data = load_all_futures_oi_daily()
+                            # Reload OI data once per cycle (files may be
+                            # refreshed by a background backfill job)
+                            from dhan_futures_oi import load_all_futures_oi_daily
+                            self._futures_oi_data = load_all_futures_oi_daily()
                             _futures_oi_cache = self._futures_oi_data or {}
                         except Exception:
                             pass
@@ -1902,45 +2174,153 @@ class AutonomousTrader:
                         _ml_boosted = 0
                         _candle_cache = getattr(self.tools, '_candle_cache', {})
                         _daily_cache = getattr(self.tools, '_daily_cache', {})
-                        for _sym in list(_pre_scores.keys()):
-                            _candles = _candle_cache.get(_sym)
-                            _daily_df = _daily_cache.get(_sym)
-                            # Use intraday candles if >=50, otherwise fall back to daily candles
-                            if _candles is not None and len(_candles) >= 50:
-                                _ml_candles = _candles
-                            elif _daily_df is not None and len(_daily_df) >= 50:
-                                _ml_candles = _daily_df
-                            else:
-                                _ml_candles = None
-                            if _ml_candles is not None:
-                                try:
-                                    _sym_clean = _sym.replace('NSE:', '')
-                                    _fut_oi = _futures_oi_cache.get(_sym_clean)
-                                    _ml_pred = self._ml_predictor.get_titan_signals(
-                                        _ml_candles, futures_oi_df=_fut_oi,
-                                        nifty_5min_df=getattr(self, '_nifty_5min_df', None),
-                                        nifty_daily_df=getattr(self, '_nifty_daily_df', None)
-                                    )
-                                    if _ml_pred.get('ml_score_boost', 0) != 0:
-                                        _boost = _ml_pred['ml_score_boost']
-                                        _pre_scores[_sym] += _boost
-                                        _ml_boosted += 1
-                                    # Store ALL predictions (even zero-boost) for GPT/sizing/gating
-                                    if _ml_pred.get('ml_signal') != 'UNKNOWN':
-                                        _ml_results[_sym] = _ml_pred
-                                        if _sym in _cycle_decisions:
-                                            _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
-                                            _cycle_decisions[_sym]['ml_prediction'] = _ml_pred
-                                except Exception as _ml_stock_err:
-                                    if _ml_boosted == 0 and len(_ml_results) == 0:
-                                        # Print first error for debugging
-                                        print(f"   ⚠️ ML stock error ({_sym}): {_ml_stock_err}")
+                        
+                        # === PARALLEL ML PREDICTIONS ===
+                        # Each stock's prediction is independent (no shared mutable state).
+                        # Feature engineering + XGBoost inference is CPU-bound (~20-50ms/stock).
+                        # Parallelising across threads overlaps pandas/numpy GIL-releasing ops.
+                        _nifty_5min = getattr(self, '_nifty_5min_df', None)
+                        _nifty_daily = getattr(self, '_nifty_daily_df', None)
+                        
+                        # Load sector index candles (cached, load once per session)
+                        if not hasattr(self, '_sector_5min_cache'):
+                            self._sector_5min_cache = {}
+                            self._sector_daily_cache = {}
+                            try:
+                                import os
+                                _ml_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data')
+                                _sec_names = ['METAL', 'IT', 'BANK', 'AUTO', 'PHARMA', 'ENERGY', 'FMCG', 'REALTY', 'INFRA']
+                                import pandas as _pd_sector
+                                for _sn in _sec_names:
+                                    _s5_path = os.path.join(_ml_data_dir, 'candles_5min', f'SECTOR_{_sn}.parquet')
+                                    _sd_path = os.path.join(_ml_data_dir, 'candles_daily', f'SECTOR_{_sn}.parquet')
+                                    if os.path.exists(_s5_path):
+                                        _sdf = _pd_sector.read_parquet(_s5_path)
+                                        _sdf['date'] = _pd_sector.to_datetime(_sdf['date'])
+                                        self._sector_5min_cache[_sn] = _sdf
+                                    if os.path.exists(_sd_path):
+                                        _sdd = _pd_sector.read_parquet(_sd_path)
+                                        _sdd['date'] = _pd_sector.to_datetime(_sdd['date'])
+                                        self._sector_daily_cache[_sn] = _sdd
+                                if self._sector_5min_cache:
+                                    print(f"   📊 Sector indices loaded: {', '.join(sorted(self._sector_5min_cache.keys()))}")
+                            except Exception as _sec_e:
+                                print(f"   ⚠ Sector index load: {_sec_e}")
+                        
+                        # Import sector mapping
+                        try:
+                            from ml_models.feature_engineering import get_sector_for_symbol as _get_sector
+                        except ImportError:
+                            _get_sector = lambda s: ''
+                        
+                        def _predict_one(_sym):
+                            """Run ML prediction for a single stock (thread-safe).
+                            
+                            Data strategy:
+                            1. 5-min candles: historical parquet + today's live intraday (preferred)
+                            2. daily_df: passed separately for daily context features
+                            3. Falls back gracefully if no data available
+                            """
+                            import pandas as _pd_ml
+                            _sym_clean = _sym.replace('NSE:', '')
+                            _live_intraday = _candle_cache.get(_sym)  # Today's 5-min bars
+                            _daily_df = _daily_cache.get(_sym)        # Historical daily bars
+                            _hist_5min = self._hist_5min_cache.get(_sym_clean)  # Stored 5-min parquet
+                            
+                            # Build best possible 5-min candle series
+                            _ml_candles = None
+                            if _hist_5min is not None:
+                                # Use historical 5-min as base
+                                if _live_intraday is not None and len(_live_intraday) >= 2:
+                                    # Append today's live candles to historical
+                                    try:
+                                        _live_copy = _live_intraday.copy()
+                                        _live_copy['date'] = _pd_ml.to_datetime(_live_copy['date'])
+                                        # Strip timezone if present
+                                        if _live_copy['date'].dt.tz is not None:
+                                            _live_copy['date'] = _live_copy['date'].dt.tz_localize(None)
+                                        _hist_copy = _hist_5min.copy()
+                                        if _hist_copy['date'].dt.tz is not None:
+                                            _hist_copy['date'] = _hist_copy['date'].dt.tz_localize(None)
+                                        # ── GAP CHECK: Don't concat if historical data is too old ──
+                                        # If there's a multi-day gap between hist and live data,
+                                        # concatenation creates feature artifacts (huge returns,
+                                        # distorted momentum) that bias the direction model.
+                                        _hist_last_date = _hist_copy['date'].max()
+                                        _live_first_date = _live_copy['date'].min()
+                                        _gap_days = (_live_first_date - _hist_last_date).days
+                                        if _gap_days > 3:
+                                            # Gap too large — use hist alone (contiguous features)
+                                            _ml_candles = _hist_5min.tail(500)
+                                        else:
+                                            # Small gap (yesterday/weekend) — safe to concat
+                                            _hist_tail = _hist_copy.tail(500)
+                                            # Deduplicate: drop historical rows that overlap with live
+                                            _live_start = _live_copy['date'].min()
+                                            _hist_tail = _hist_tail[_hist_tail['date'] < _live_start]
+                                            _common_cols = [c for c in ['date','open','high','low','close','volume'] if c in _hist_tail.columns and c in _live_copy.columns]
+                                            _ml_candles = _pd_ml.concat([_hist_tail[_common_cols], _live_copy[_common_cols]], ignore_index=True)
+                                    except Exception:
+                                        _ml_candles = _hist_5min.tail(500)
+                                else:
+                                    _ml_candles = _hist_5min.tail(500)
+                            elif _live_intraday is not None and len(_live_intraday) >= 50:
+                                _ml_candles = _live_intraday
+                            
+                            if _ml_candles is None or len(_ml_candles) < 50:
+                                return _sym, None
+                            
+                            try:
+                                _fut_oi = _futures_oi_cache.get(_sym_clean)
+                                _sec_name = _get_sector(_sym_clean)
+                                _sec_5m = self._sector_5min_cache.get(_sec_name) if _sec_name else None
+                                _sec_dl = self._sector_daily_cache.get(_sec_name) if _sec_name else None
+                                _pred = self._ml_predictor.get_titan_signals(
+                                    _ml_candles,
+                                    daily_df=_daily_df,
+                                    futures_oi_df=_fut_oi,
+                                    nifty_5min_df=_nifty_5min,
+                                    nifty_daily_df=_nifty_daily,
+                                    sector_5min_df=_sec_5m,
+                                    sector_daily_df=_sec_dl
+                                )
+                                return _sym, _pred
+                            except Exception:
+                                return _sym, None
+                        
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        _ml_predictions = {}  # symbol -> prediction dict
+                        # === PERF: Only run ML for stocks with score >= 40 ===
+                        # Max ML boost is +10, pass threshold is 52. Score 40 + boost 10 = 50 (close).
+                        # Stocks below 40 won't trade regardless of ML result.
+                        _ML_SCORE_THRESHOLD = 40
+                        _ml_eligible = [s for s in list(_pre_scores.keys()) if _pre_scores.get(s, 0) >= _ML_SCORE_THRESHOLD]
+                        _ml_skipped = len(_pre_scores) - len(_ml_eligible)
+                        with ThreadPoolExecutor(max_workers=8) as _ml_executor:
+                            _ml_futures = {_ml_executor.submit(_predict_one, s): s for s in _ml_eligible}
+                            for _fut in as_completed(_ml_futures):
+                                _sym, _pred = _fut.result()
+                                if _pred:
+                                    _ml_predictions[_sym] = _pred
+                        
+                        # Merge predictions into scores (single-threaded — modifies shared state)
+                        for _sym, _ml_pred in _ml_predictions.items():
+                            if _ml_pred.get('ml_score_boost', 0) != 0:
+                                _boost = _ml_pred['ml_score_boost']
+                                _pre_scores[_sym] += _boost
+                                _ml_boosted += 1
+                            if _ml_pred.get('ml_signal') != 'UNKNOWN':
+                                _ml_results[_sym] = _ml_pred
+                                if _sym in _cycle_decisions:
+                                    _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                                    _cycle_decisions[_sym]['ml_prediction'] = _ml_pred
                         if _ml_boosted > 0 or _ml_results:
                             _ml_up = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'UP')
                             _ml_down = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'DOWN')
                             _ml_flat = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'FLAT')
                             _ml_caution = sum(1 for r in _ml_results.values() if r.get('ml_entry_caution'))
-                            print(f"   🧠 ML: {len(_ml_results)} analyzed | {_ml_boosted} score-adjusted | {_ml_up} UP | {_ml_down} DOWN | {_ml_flat} FLAT | {_ml_caution} CAUTION")
+                            _skip_note = f" | {_ml_skipped} skipped(score<{_ML_SCORE_THRESHOLD})" if _ml_skipped > 0 else ""
+                            print(f"   🧠 ML: {len(_ml_results)} analyzed | {_ml_boosted} score-adjusted | {_ml_up} UP | {_ml_down} DOWN | {_ml_flat} FLAT | {_ml_caution} CAUTION{_skip_note}")
                         else:
                             _eligible = sum(1 for s in _pre_scores if (_candle_cache.get(s) is not None and len(_candle_cache.get(s, [])) >= 50) or (_daily_cache.get(s) is not None and len(_daily_cache.get(s, [])) >= 50))
                             print(f"   🧠 ML: NO predictions (candle_cache={_candle_count}, daily_cache={_daily_count}, eligible={_eligible}/{len(_pre_scores)})")
@@ -1966,17 +2346,36 @@ class AutonomousTrader:
                         _oi_candidates = _oi_candidates[:15]
                         
                         _oi_adjusted_count = 0
-                        for _oi_sym in _oi_candidates:
+                        
+                        # === PARALLEL OI ANALYSIS ===
+                        # Each stock's option chain fetch is independent network I/O.
+                        # Parallelising overlaps network latency (~200-500ms/stock).
+                        def _analyze_oi_one(_oi_sym):
+                            """Fetch & analyze OI for one stock (thread-safe)."""
                             try:
                                 _oi_data = self._oi_analyzer.analyze(_oi_sym)
-                                if _oi_data and _oi_data.get('flow_bias') != 'NEUTRAL':
+                                return _oi_sym, _oi_data
+                            except Exception:
+                                return _oi_sym, None
+                        
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        _oi_raw = {}
+                        with ThreadPoolExecutor(max_workers=5) as _oi_executor:
+                            _oi_futures = {_oi_executor.submit(_analyze_oi_one, s): s for s in _oi_candidates}
+                            for _fut in as_completed(_oi_futures):
+                                _sym, _data = _fut.result()
+                                if _data:
+                                    _oi_raw[_sym] = _data
+                        
+                        # Apply OI overlay to ML predictions (single-threaded — modifies shared dicts)
+                        for _oi_sym, _oi_data in _oi_raw.items():
+                            try:
+                                if _oi_data.get('flow_bias') != 'NEUTRAL':
                                     _oi_results[_oi_sym] = _oi_data
-                                # Apply overlay to ML prediction (modifies _ml_results in-place)
-                                if self._ml_predictor:
+                                if self._ml_predictor and _oi_sym in _ml_results:
                                     self._ml_predictor.apply_oi_overlay(_ml_results[_oi_sym], _oi_data)
                                     if _ml_results[_oi_sym].get('oi_adjusted'):
                                         _oi_adjusted_count += 1
-                                        # Update cycle decisions too
                                         if _oi_sym in _cycle_decisions:
                                             _cycle_decisions[_oi_sym]['ml_prediction'] = _ml_results[_oi_sym]
                             except Exception:
@@ -1987,6 +2386,184 @@ class AutonomousTrader:
                 except Exception as _oi_err:
                     print(f"   ⚠️ OI analyzer error (non-fatal): {_oi_err}")
                 
+                # === OI CROSS-VALIDATION ON SCORES ===
+                # If OI says BEARISH but scored direction is BUY (or vice versa),
+                # penalize score. OI flow (PCR, IV skew, MaxPain, buildup) reflects
+                # institutional positioning — conflicting with it is risky.
+                # JINDALSTEL lesson: scored BUY 62, OI was BEARISH — stock reversed.
+                _oi_score_adjusted = 0
+                for _oi_sym, _oi_data in _oi_results.items():
+                    try:
+                        _oi_bias = _oi_data.get('flow_bias', 'NEUTRAL')
+                        _oi_conf = _oi_data.get('flow_confidence', 0.0)
+                        if _oi_bias == 'NEUTRAL' or _oi_conf < 0.55:
+                            continue
+                        # Get scored direction from cycle decision
+                        _cd = _cycle_decisions.get(_oi_sym)
+                        if not _cd or not _cd.get('decision'):
+                            continue
+                        _scored_dir = _cd['decision'].recommended_direction
+                        if _scored_dir == 'HOLD':
+                            continue
+                        # Cross-validate: OI direction vs scored direction
+                        _oi_dir = 'BUY' if _oi_bias == 'BULLISH' else 'SELL'
+                        if _scored_dir != _oi_dir:
+                            # OI conflicts with scored direction → penalize
+                            _oi_penalty = -5 if _oi_conf >= 0.70 else -3
+                            _pre_scores[_oi_sym] += _oi_penalty
+                            if _oi_sym in _cycle_decisions:
+                                _cycle_decisions[_oi_sym]['score'] = _pre_scores[_oi_sym]
+                            _oi_score_adjusted += 1
+                    except Exception:
+                        pass
+                if _oi_score_adjusted > 0:
+                    print(f"   📊 OI CROSS-VAL: {_oi_score_adjusted} stocks penalized for direction conflict")
+
+                # === SECTOR INDEX CROSS-VALIDATION ON SCORES ===
+                # If sector index (NIFTY METAL, NIFTY IT, etc.) is bearish but stock
+                # is scored as BUY (CE), penalize. A single stock rarely sustains a
+                # rally when its entire sector is falling.
+                # Exception: if stock is outperforming sector by 2x+, skip penalty
+                # (genuine rotation/divergence).
+                _sector_stock_map = {
+                    'METALS': {
+                        'index': 'NSE:NIFTY METAL',
+                        'stocks': {'TATASTEEL', 'JSWSTEEL', 'HINDALCO', 'VEDL', 'JINDALSTEL',
+                                   'NMDC', 'NATIONALUM', 'HINDZINC', 'SAIL', 'HINDCOPPER',
+                                   'APLAPOLLO', 'RATNAMANI', 'WELCORP', 'COALINDIA'},
+                    },
+                    'IT': {
+                        'index': 'NSE:NIFTY IT',
+                        'stocks': {'INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM',
+                                   'KPITTECH', 'COFORGE', 'MPHASIS', 'PERSISTENT'},
+                    },
+                    'BANKS': {
+                        'index': 'NSE:NIFTY BANK',
+                        'stocks': {'SBIN', 'HDFCBANK', 'ICICIBANK', 'AXISBANK', 'KOTAKBANK',
+                                   'BANKBARODA', 'PNB', 'IDFCFIRSTB', 'INDUSINDBK', 'FEDERALBNK',
+                                   'RBLBANK', 'UNIONBANK', 'CANBK', 'AUBANK'},
+                    },
+                    'AUTO': {
+                        'index': 'NSE:NIFTY AUTO',
+                        'stocks': {'MARUTI', 'TATAMOTORS', 'M&M', 'BAJAJ-AUTO', 'HEROMOTOCO',
+                                   'EICHERMOT', 'ASHOKLEY', 'BHARATFORG', 'MOTHERSON', 'BALKRISIND'},
+                    },
+                    'PHARMA': {
+                        'index': 'NSE:NIFTY PHARMA',
+                        'stocks': {'SUNPHARMA', 'CIPLA', 'DRREDDY', 'DIVISLAB', 'AUROPHARMA',
+                                   'BIOCON', 'LUPIN', 'APOLLOHOSP', 'MAXHEALTH', 'LALPATHLAB'},
+                    },
+                    'ENERGY': {
+                        'index': 'NSE:NIFTY ENERGY',
+                        'stocks': {'RELIANCE', 'ONGC', 'NTPC', 'POWERGRID', 'ADANIGREEN',
+                                   'TATAPOWER', 'ADANIENT', 'BPCL', 'IOC', 'GAIL'},
+                    },
+                    'FMCG': {
+                        'index': 'NSE:NIFTY FMCG',
+                        'stocks': {'ITC', 'HINDUNILVR', 'NESTLEIND', 'BRITANNIA', 'DABUR',
+                                   'GODREJCP', 'MARICO', 'COLPAL', 'TATACONSUM', 'VBL'},
+                    },
+                    'REALTY': {
+                        'index': 'NSE:NIFTY REALTY',
+                        'stocks': {'DLF', 'GODREJPROP', 'OBEROIRLTY', 'PRESTIGE', 'PHOENIXLTD',
+                                   'BRIGADE', 'LODHA', 'SOBHA'},
+                    },
+                    'INFRA': {
+                        'index': 'NSE:NIFTY INFRA',
+                        'stocks': {'LT', 'ADANIPORTS', 'ULTRACEMCO', 'GRASIM', 'SHREECEM',
+                                   'AMBUJACEM', 'ACC', 'SIEMENS', 'ABB', 'BEL', 'HAL',
+                                   'BHEL', 'INOXWIND'},
+                    },
+                }
+                # Build reverse lookup: stock_name → sector info
+                _stock_to_sector = {}
+                for _sec_name, _sec_info in _sector_stock_map.items():
+                    for _stk in _sec_info['stocks']:
+                        _stock_to_sector[_stk] = (_sec_name, _sec_info['index'])
+
+                # Fetch sector index change% from ticker
+                _sector_index_changes = {}
+                try:
+                    _sec_idx_symbols = [v['index'] for v in _sector_stock_map.values()]
+                    _sec_quotes = self.tools.ticker.get_quote_batch(_sec_idx_symbols) if self.tools.ticker else {}
+                    for _sec_sym, _sec_q in _sec_quotes.items():
+                        if _sec_q:
+                            _sec_ohlc = _sec_q.get('ohlc', {})
+                            _sec_prev = _sec_ohlc.get('close', 0)
+                            _sec_ltp = _sec_q.get('last_price', 0)
+                            if _sec_prev > 0 and _sec_ltp > 0:
+                                _sector_index_changes[_sec_sym] = ((_sec_ltp - _sec_prev) / _sec_prev) * 100
+                except Exception:
+                    pass
+
+                _sector_score_adjusted = 0
+                _sector_penalized_details = []
+                for _sym, _score in list(_pre_scores.items()):
+                    try:
+                        _stock_name = _sym.replace('NSE:', '')
+                        _sec_match = _stock_to_sector.get(_stock_name)
+                        if not _sec_match:
+                            continue
+                        _sec_name, _sec_index = _sec_match
+                        _sec_chg = _sector_index_changes.get(_sec_index)
+                        if _sec_chg is None:
+                            continue
+
+                        # Get scored direction
+                        _cd = _cycle_decisions.get(_sym)
+                        if not _cd or not _cd.get('decision'):
+                            continue
+                        _scored_dir = _cd['decision'].recommended_direction
+                        if _scored_dir == 'HOLD':
+                            continue
+
+                        # Get stock's own change%
+                        _stk_data = market_data.get(_sym, {})
+                        _stk_chg = 0
+                        if isinstance(_stk_data, dict):
+                            _stk_chg = _stk_data.get('change_pct', 0)
+                            if not _stk_chg:
+                                _stk_ohlc = _stk_data.get('ohlc', {})
+                                _stk_prev = _stk_ohlc.get('close', 0)
+                                _stk_ltp = _stk_data.get('last_price', 0)
+                                if _stk_prev > 0 and _stk_ltp > 0:
+                                    _stk_chg = ((_stk_ltp - _stk_prev) / _stk_prev) * 100
+
+                        # Sector BEARISH + stock scored BUY (CE)
+                        if _sec_chg <= -1.0 and _scored_dir == 'BUY':
+                            # Exception: stock outperforming sector by 2x+ → genuine divergence
+                            if _stk_chg > 0 and abs(_stk_chg) >= abs(_sec_chg) * 2:
+                                continue
+                            _sec_penalty = -5 if _sec_chg <= -2.0 else -3
+                            _pre_scores[_sym] += _sec_penalty
+                            if _sym in _cycle_decisions:
+                                _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                            _sector_score_adjusted += 1
+                            _sector_penalized_details.append(f"{_stock_name}({_sec_name}:{_sec_chg:+.1f}%→{_sec_penalty})")
+
+                        # Sector BULLISH + stock scored SELL (PE)
+                        elif _sec_chg >= 1.0 and _scored_dir == 'SELL':
+                            if _stk_chg < 0 and abs(_stk_chg) >= abs(_sec_chg) * 2:
+                                continue
+                            _sec_penalty = -5 if _sec_chg >= 2.0 else -3
+                            _pre_scores[_sym] += _sec_penalty
+                            if _sym in _cycle_decisions:
+                                _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                            _sector_score_adjusted += 1
+                            _sector_penalized_details.append(f"{_stock_name}({_sec_name}:{_sec_chg:+.1f}%→{_sec_penalty})")
+                    except Exception:
+                        pass
+
+                if _sector_score_adjusted > 0:
+                    print(f"   🏭 SECTOR CROSS-VAL: {_sector_score_adjusted} stocks penalized — {', '.join(_sector_penalized_details[:5])}")
+                elif _sector_index_changes:
+                    _bearish_secs = [f"{k.replace('NSE:NIFTY ', '')}:{v:+.1f}%" for k, v in _sector_index_changes.items() if v <= -1.0]
+                    if _bearish_secs:
+                        print(f"   🏭 SECTOR INDEX: Bearish sectors: {', '.join(_bearish_secs)} (no scored stocks conflicting)")
+
+                # Cache sector index changes for GPT prompt section
+                self._sector_index_changes_cache = _sector_index_changes
+
                 # Store OI results for GPT prompt
                 self._cycle_oi_results = _oi_results
                 
@@ -2111,7 +2688,7 @@ class AutonomousTrader:
                     snipe_pnl_pct = ((snipe_ltp - snipe_entry_price) / snipe_entry_price) * 100
                     
                     # === TRAILING SL: Lock in profits as price moves up ===
-                    # Activates at +4% gain, then trails at 50% of gains from high watermark.
+                    # Activates at +6% gain, then trails giving back 60% of gains from high watermark.
                     # Example: entry ₹100, HWM reaches ₹108 (+8%) → trailing SL = ₹108 - (8*0.5)% = ₹104 (+4%)
                     # This ensures minimum +4% profit once trailing kicks in.
                     _hwm = snipe.get('snipe_high_watermark', snipe_entry_price)
@@ -2124,7 +2701,7 @@ class AutonomousTrader:
                     _hwm_gain_pct = ((_hwm - snipe_entry_price) / snipe_entry_price) * 100
                     
                     # Activate trailing once gain reaches 4%
-                    if _hwm_gain_pct >= 4.0 and not snipe.get('snipe_trailing_active'):
+                    if _hwm_gain_pct >= 6.0 and not snipe.get('snipe_trailing_active'):
                         with self.tools._positions_lock:
                             snipe['snipe_trailing_active'] = True
                         underlying_snipe = snipe.get('underlying', '')
@@ -2133,7 +2710,7 @@ class AutonomousTrader:
                     if snipe.get('snipe_trailing_active'):
                         # Trail at 50% of gains from high watermark
                         # i.e., give back half of peak profit before exiting
-                        _trail_give_back = _hwm_gain_pct * 0.50
+                        _trail_give_back = _hwm_gain_pct * 0.60  # Give back 60% — wider room (was 50%)
                         _trailing_sl_price = snipe_entry_price * (1 + (_hwm_gain_pct - _trail_give_back) / 100)
                         
                         # Trailing SL should never be below original SL (entry * 0.94)
@@ -2346,7 +2923,7 @@ class AutonomousTrader:
                                 print(f"      ✅ REVERSAL SNIPE FIRED: {underlying} {new_direction} @ ₹{snipe_entry:.2f}")
                                 
                                 # Override SL/target for aggressive quick scalp
-                                # Target: +10%  |  SL: -6%  |  Trailing SL activates at +4%
+                                # Target: +10%  |  SL: -6%  |  Trailing SL activates at +6%
                                 snipe_target = snipe_entry * 1.10  # 10% profit target
                                 snipe_sl = snipe_entry * 0.94       # 6% SL
                                 
@@ -2362,9 +2939,9 @@ class AutonomousTrader:
                                             pos['snipe_original_direction'] = trade_direction
                                             pos['snipe_trigger_score'] = new_score
                                             pos['snipe_high_watermark'] = snipe_entry  # For trailing SL
-                                            pos['snipe_trailing_active'] = False        # Activates at +4%
+                                            pos['snipe_trailing_active'] = False        # Activates at +6%
                                             print(f"      📐 Snipe overrides: Target ₹{snipe_target:.2f} (+10%) | SL ₹{snipe_sl:.2f} (-6%)")
-                                            print(f"      📈 Trailing SL: activates at +4%, trails at 50% of gains")
+                                            print(f"      📈 Trailing SL: activates at +6%, trails giving back 60% of gains")
                                             print(f"      ⏱️ Time guard: auto-exit in 12 min if < 3% profit")
                                             break
                                 
@@ -2522,7 +3099,7 @@ class AutonomousTrader:
                     _score_tag = ""
                     if symbol in _pre_scores:
                         _s = _pre_scores[symbol]
-                        _score_tag = f" S:{_s:.0f}" + ("🔥" if _s >= 70 else "✅" if _s >= 56 else "⚠️" if _s >= 45 else "❌")
+                        _score_tag = f" S:{_s:.0f}" + ("🔥" if _s >= 65 else "✅" if _s >= 52 else "⚠️" if _s >= 45 else "❌")
                     quick_scan.append(f"{symbol}{fno_tag}: {chg:+.2f}% RSI:{rsi:.0f} {trend} ORB:{orb_signal} Vol:{volume_regime} HTF:{htf_icon}{_score_tag} {setup}")
             
             # Print regime signals
@@ -2592,33 +3169,10 @@ class AutonomousTrader:
                     if data.get('chop_zone', False):
                         continue
                     
-                    # Tier-2 / wild-card gate: only trade when stock shows clear directional trend
-                    is_tier2 = symbol in TIER_2_OPTIONS
+                    # All stocks that passed the scanner rank filter are eligible
+                    # The intraday scorer handles quality gating (score threshold, microstructure, etc.)
+                    # No separate Tier-2/wildcard gate needed — scorer is the single source of truth
                     is_wildcard = symbol in self._wildcard_symbols
-                    if is_tier2 or is_wildcard:
-                        trend_state = data.get('trend', 'SIDEWAYS')
-                        orb = data.get('orb_signal', 'INSIDE_ORB')
-                        vol = data.get('volume_regime', 'NORMAL')
-                        chg_pct = abs(data.get('change_pct', 0))
-                        # Tier-2 requires: clear trend OR ORB breakout with volume
-                        tier2_trending = trend_state in ('BULLISH', 'STRONG_BULLISH', 'BEARISH', 'STRONG_BEARISH')
-                        tier2_orb = orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') and vol in ('HIGH', 'EXPLOSIVE')
-                        
-                        # WILDCARD SCANNER TRUST: if scanner scored this highly, 
-                        # trust the momentum signal even without clear trend on 5min candles
-                        # Strong scanner score (≥25) OR big move (≥2.5%) with volume = let it through
-                        wc_score = self._wildcard_scores.get(symbol, 0)
-                        wc_change = abs(self._wildcard_change.get(symbol, 0))
-                        scanner_trust = is_wildcard and (
-                            wc_score >= 25 or  # High scanner composite score
-                            (wc_change >= 2.5 and vol in ('HIGH', 'EXPLOSIVE')) or  # Big move + volume
-                            (chg_pct >= 3.0)  # 3%+ intraday move = real momentum
-                        )
-                        
-                        if not (tier2_trending or tier2_orb or scanner_trust):
-                            if is_wildcard:
-                                print(f"   ⭐ WILDCARD FILTERED: {symbol} — trend={trend_state} orb={orb} vol={vol} scanner_score={wc_score:.0f} chg={wc_change:+.1f}% (need trend/ORB/score≥25/chg≥2.5%)")
-                            continue  # Skip Tier-2 stocks without clear trend/breakout
                     
                     setup_type = None
                     direction = None
@@ -2705,7 +3259,9 @@ class AutonomousTrader:
                         # by 12 (average micro contribution for liquid F&O stocks) to avoid
                         # filtering out stocks that would pass at trade time.
                         _micro_absent_offset = 12
-                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 40:
+                        # GPT-selected minimum: score + micro offset must reach 55
+                        # (raw score ~43+ since micro adds ~12)
+                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 55:
                             continue
                         # Append ML signal tag if available (fail-safe: empty string if not)
                         _ml_tag = ""
@@ -3105,20 +3661,20 @@ class AutonomousTrader:
                                 if is_chop:
                                     ic_quality += 10; ic_reasons.append("CHOP_CONFIRMED")
                                 
-                                # FACTOR 9: ML MOVE PREDICTION (0-15 pts bonus for NO_MOVE, -10 penalty for MOVE)
-                                # ML NO_MOVE = ideal for IC (stock predicted flat)
-                                # ML MOVE = dangerous for IC (breakout could blow through wings)
+                                # FACTOR 9: ML MOVE PREDICTION (0-15 pts bonus for FLAT, -10 penalty for UP/DOWN)
+                                # ML FLAT = ideal for IC (stock predicted flat)
+                                # ML UP/DOWN = dangerous for IC (breakout could blow through wings)
                                 try:
                                     _ic_ml = getattr(self, '_cycle_ml_results', {}).get(symbol, {})
                                     _ic_move_prob = _ic_ml.get('ml_move_prob', 0.5)
                                     _ic_ml_signal = _ic_ml.get('ml_signal', 'UNKNOWN')
-                                    if _ic_ml_signal == 'NO_MOVE' and _ic_move_prob < 0.15:
+                                    if _ic_ml_signal == 'FLAT' and _ic_move_prob < 0.30:
                                         ic_quality += 15; ic_reasons.append(f"ML_FLAT({_ic_move_prob:.0%})")
-                                    elif _ic_ml_signal == 'NO_MOVE':
-                                        ic_quality += 8; ic_reasons.append(f"ML_NO_MOVE({_ic_move_prob:.0%})")
-                                    elif _ic_ml_signal == 'MOVE' and _ic_move_prob >= 0.50:
+                                    elif _ic_ml_signal == 'FLAT':
+                                        ic_quality += 8; ic_reasons.append(f"ML_FLAT_MILD({_ic_move_prob:.0%})")
+                                    elif _ic_ml_signal in ('UP', 'DOWN') and _ic_move_prob >= 0.60:
                                         ic_quality -= 15; ic_reasons.append(f"ML_MOVE_DANGER({_ic_move_prob:.0%})")
-                                    elif _ic_ml_signal == 'MOVE':
+                                    elif _ic_ml_signal in ('UP', 'DOWN'):
                                         ic_quality -= 8; ic_reasons.append(f"ML_MOVE_WARN({_ic_move_prob:.0%})")
                                 except Exception:
                                     pass  # ML crash → no impact on IC quality
@@ -3195,7 +3751,13 @@ class AutonomousTrader:
             _flat_count = len(sorted_data) - _up_count - _down_count
             _breadth = "BULLISH" if _up_count > _down_count * 1.5 else "BEARISH" if _down_count > _up_count * 1.5 else "MIXED"
             
-            # Compute sector summary
+            # Compute sector summary — prefer real sector index data, fallback to stock-average
+            _sector_perf = []
+            _sector_idx_map = {
+                'IT': 'NSE:NIFTY IT', 'BANKS': 'NSE:NIFTY BANK', 'METALS': 'NSE:NIFTY METAL',
+                'PHARMA': 'NSE:NIFTY PHARMA', 'AUTO': 'NSE:NIFTY AUTO',
+                'ENERGY': 'NSE:NIFTY ENERGY', 'FMCG': 'NSE:NIFTY FMCG',
+            }
             _sector_map = {
                 'IT': ['INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM', 'KPITTECH', 'COFORGE', 'MPHASIS', 'PERSISTENT'],
                 'BANKS': ['SBIN', 'HDFCBANK', 'ICICIBANK', 'AXISBANK', 'KOTAKBANK', 'BANKBARODA', 'PNB', 'IDFCFIRSTB', 'INDUSINDBK', 'FEDERALBNK'],
@@ -3205,12 +3767,18 @@ class AutonomousTrader:
                 'ENERGY': ['RELIANCE', 'ONGC', 'NTPC', 'POWERGRID', 'ADANIGREEN', 'TATAPOWER', 'ADANIENT'],
                 'FMCG': ['ITC', 'HINDUNILVR', 'NESTLEIND', 'BRITANNIA', 'DABUR', 'GODREJCP', 'MARICO']
             }
-            _sector_perf = []
+            # Use _sector_index_changes computed in cross-val block if available
+            _sec_idx_chg = getattr(self, '_sector_index_changes_cache', {})
             for _sec, _syms in _sector_map.items():
-                _changes = [market_data.get(f"NSE:{s}", {}).get('change_pct', 0) for s in _syms if isinstance(market_data.get(f"NSE:{s}", {}), dict)]
-                if _changes:
-                    _avg = sum(_changes) / len(_changes)
-                    _sector_perf.append(f"  {_sec}: {_avg:+.2f}% avg ({len([c for c in _changes if c > 0])}/{len(_changes)} ↑)")
+                _idx_sym = _sector_idx_map.get(_sec, '')
+                _idx_val = _sec_idx_chg.get(_idx_sym)
+                if _idx_val is not None:
+                    _sector_perf.append(f"  {_sec}: {_idx_val:+.2f}% (NIFTY {_sec} index)")
+                else:
+                    _changes = [market_data.get(f"NSE:{s}", {}).get('change_pct', 0) for s in _syms if isinstance(market_data.get(f"NSE:{s}", {}), dict)]
+                    if _changes:
+                        _avg = sum(_changes) / len(_changes)
+                        _sector_perf.append(f"  {_sec}: {_avg:+.2f}% avg ({len([c for c in _changes if c > 0])}/{len(_changes)} ↑)")
             
             # === DYNAMIC MAX PICKS: Scale GPT picks with signal quality ===
             _dynamic_max = self._compute_max_picks(_pre_scores, _breadth)
@@ -3427,6 +3995,8 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         # Search within 200 chars of the symbol mention
                         patterns = [
                             rf'{symbol}[^{{}}]{{0,200}}(?:direction|side|action)[:\s]*["\']?(SELL|BUY|BEARISH|BULLISH)',
+                            rf'{symbol}[^{{}}]{{0,200}}direction["\s:=]*["\']?(BUY|SELL)',
+                            rf'{symbol}[^{{}}]{{0,100}}\]\s*\[?(CE|PE)\b',
                             rf'{symbol}[^{{}}]{{0,200}}(SELL|SHORT|BEARISH|PUT|Breakdown|breakdown|fade)',
                             rf'{symbol}[^{{}}]{{0,200}}(BUY|LONG|BULLISH|CALL|Breakout|breakout|momentum up)',
                             rf'(SELL|SHORT|BEARISH)[^{{}}]{{0,100}}{symbol}',
@@ -3436,14 +4006,22 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                             match = re.search(pattern, text, re.IGNORECASE)
                             if match:
                                 found = match.group(1) if i > 0 else match.group(1)
-                                if found.upper() in ('SELL', 'SHORT', 'BEARISH', 'PUT', 'BREAKDOWN', 'FADE'):
+                                if found.upper() in ('SELL', 'SHORT', 'BEARISH', 'PUT', 'BREAKDOWN', 'FADE', 'PE'):
                                     return 'SELL'
-                                elif found.upper() in ('BUY', 'LONG', 'BULLISH', 'CALL', 'BREAKOUT', 'MOMENTUM UP'):
+                                elif found.upper() in ('BUY', 'LONG', 'BULLISH', 'CALL', 'BREAKOUT', 'MOMENTUM UP', 'CE'):
                                     return 'BUY'
                         return None
                     
                     for sym in unplaced[:3]:  # Max 3 retries
                         direction = _parse_direction_from_response(response, sym)
+                        # Fallback: use scored direction from cycle decisions
+                        if not direction:
+                            _cd = _cycle_decisions.get(f'NSE:{sym}')
+                            if _cd and _cd.get('decision'):
+                                _scored_dir = _cd['decision'].recommended_direction
+                                if _scored_dir in ('BUY', 'SELL'):
+                                    direction = _scored_dir
+                                    print(f"   🔄 Using scored direction for {sym}: {direction} (GPT text unparseable)")
                         if not direction:
                             print(f"   ⚠️ Could not parse direction for {sym} from GPT response, skipping")
                             continue
@@ -3518,10 +4096,10 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             
             if _d_scores:
                 _top5 = sorted(_d_scores.items(), key=lambda x: x[1], reverse=True)[:5]
-                _passed = sum(1 for s in _d_scores.values() if s >= 56)
+                _passed = sum(1 for s in _d_scores.values() if s >= 52)
                 _fno_count = len(_d_fno)
                 _scan_mode = "FULL F&O" if _full_scan_mode else "CURATED+WC"
-                print(f"📊 Scored: {len(_d_scores)} stocks [{_scan_mode}] | Passed(≥56): {_passed} | F&O Ready: {_fno_count}")
+                print(f"📊 Scored: {len(_d_scores)} stocks [{_scan_mode}] | Passed(≥52): {_passed} | F&O Ready: {_fno_count}")
                 _top5_str = " | ".join(f"{s.replace('NSE:','')}={v:.0f}" for s, v in _top5)
                 print(f"🏆 Top 5: {_top5_str}")
             
@@ -4069,7 +4647,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Autonomous Trading Bot')
-    parser.add_argument('--capital', type=float, default=200000, help='Starting capital')
+    parser.add_argument('--capital', type=float, default=500000, help='Starting capital')
     parser.add_argument('--live', action='store_true', default=None, help='Enable live trading (overrides .env TRADING_MODE)')
     parser.add_argument('--paper', action='store_true', default=None, help='Force paper trading (overrides .env TRADING_MODE)')
     parser.add_argument('--interval', type=int, default=5, help='Scan interval in minutes')

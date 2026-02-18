@@ -31,7 +31,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold
 from sklearn.isotonic import IsotonicRegression
 
-from .feature_engineering import compute_features, get_feature_names
+from .feature_engineering import compute_features, get_feature_names, get_sector_for_symbol
 from .label_creator import create_labels, label_distribution
 
 
@@ -72,12 +72,13 @@ DEFAULT_THRESHOLD = 0.5
 
 def load_and_prepare_data(
     symbols: Optional[list] = None,
-    lookahead_candles: int = 6,
+    lookahead_candles: int = 8,
     threshold_pct: float = 0.5,
     test_days: int = 20,
     val_days: int = 10,
     use_atr_threshold: bool = True,
-    atr_factor: float = 1.0,
+    atr_factor: float = 2.0,
+    label_method: str = 'net_return',
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list]:
     """Load candles, compute features, create labels, split train/val/test.
     
@@ -92,7 +93,8 @@ def load_and_prepare_data(
     
     # Exclude index symbols from training (they contaminate stock models)
     _index_symbols = {'NIFTY50', 'NIFTY_50', 'NIFTY 50', 'BANKNIFTY', 'FINNIFTY'}
-    symbols = [s for s in symbols if s not in _index_symbols]
+    # Also exclude sector index parquets (SECTOR_METAL, SECTOR_IT, etc.)
+    symbols = [s for s in symbols if s not in _index_symbols and not s.startswith('SECTOR_')]
     
     if not symbols:
         raise ValueError("No symbols found. Run data_fetcher first.")
@@ -155,6 +157,29 @@ def load_and_prepare_data(
     except Exception as e:
         print(f"   NIFTY50 context: Load failed ({e})")
     
+    # Load sector index candles (shared — each stock maps to its sector)
+    sector_5min_data = {}   # {sector_name: DataFrame}
+    sector_daily_data = {}  # {sector_name: DataFrame}
+    try:
+        sector_names = ['METAL', 'IT', 'BANK', 'AUTO', 'PHARMA', 'ENERGY', 'FMCG', 'REALTY', 'INFRA']
+        for sec in sector_names:
+            sec_5min_path = DATA_DIR / f"SECTOR_{sec}.parquet"
+            sec_daily_path = DATA_DIR.parent / "candles_daily" / f"SECTOR_{sec}.parquet"
+            if sec_5min_path.exists():
+                sdf = pd.read_parquet(sec_5min_path)
+                sdf['date'] = pd.to_datetime(sdf['date'])
+                sector_5min_data[sec] = sdf
+            if sec_daily_path.exists():
+                sdd = pd.read_parquet(sec_daily_path)
+                sdd['date'] = pd.to_datetime(sdd['date'])
+                sector_daily_data[sec] = sdd
+        if sector_5min_data:
+            print(f"   Sector indices: {len(sector_5min_data)} sectors loaded ({', '.join(sorted(sector_5min_data.keys()))})")
+        else:
+            print(f"   Sector indices: No data yet (run fetch_sector_indices.py)")
+    except Exception as e:
+        print(f"   Sector indices: Load failed ({e})")
+    
     all_dfs = []
     
     for sym in symbols:
@@ -168,12 +193,19 @@ def load_and_prepare_data(
             print(f"  ⚠ {sym}: only {len(df)} candles, skipping")
             continue
         
-        # Compute features (with daily + OI + futures OI + NIFTY context if available)
+        # Compute features (with daily + OI + futures OI + NIFTY + sector context if available)
         daily_df = daily_data.get(sym)
         oi_df = oi_data.get(sym)
         futures_oi_df = futures_oi_data.get(sym)
+        
+        # Resolve sector index data for this stock
+        sector_name = get_sector_for_symbol(sym)
+        sector_5min_df = sector_5min_data.get(sector_name) if sector_name else None
+        sector_daily_df = sector_daily_data.get(sector_name) if sector_name else None
+        
         df = compute_features(df, symbol=sym, daily_df=daily_df, oi_df=oi_df, futures_oi_df=futures_oi_df,
-                              nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df)
+                              nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df,
+                              sector_5min_df=sector_5min_df, sector_daily_df=sector_daily_df)
         if df.empty:
             continue
         
@@ -181,7 +213,8 @@ def load_and_prepare_data(
         # ATR-normalized threshold: each stock's threshold adapts to its volatility
         df = create_labels(df, lookahead_candles=lookahead_candles, threshold_pct=threshold_pct,
                            use_directional=True,
-                           use_atr_threshold=use_atr_threshold, atr_factor=atr_factor)
+                           use_atr_threshold=use_atr_threshold, atr_factor=atr_factor,
+                           label_method=label_method)
         
         # Add symbol column
         df['symbol'] = sym
@@ -506,12 +539,13 @@ def train_model(
 
 def quick_train(
     symbols: Optional[list] = None,
-    lookahead: int = 6,
+    lookahead: int = 8,
     threshold: float = 0.5,
     test_days: int = 20,
     val_days: int = 10,
     use_atr_threshold: bool = True,
-    atr_factor: float = 1.0,
+    atr_factor: float = 2.0,
+    label_method: str = 'net_return',
 ) -> dict:
     """One-liner to load data → train → evaluate → save."""
     train_df, val_df, test_df, features = load_and_prepare_data(
@@ -522,6 +556,7 @@ def quick_train(
         val_days=val_days,
         use_atr_threshold=use_atr_threshold,
         atr_factor=atr_factor,
+        label_method=label_method,
     )
     return train_model(train_df, val_df, test_df, features)
 
@@ -531,12 +566,14 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='Train Move Predictor model')
     parser.add_argument('--symbols', nargs='+', help='Specific symbols to train on')
-    parser.add_argument('--lookahead', type=int, default=6, help='Lookahead candles (default: 6)')
+    parser.add_argument('--lookahead', type=int, default=8, help='Lookahead candles (default: 8 = 40 min)')
     parser.add_argument('--threshold', type=float, default=0.5, help='Move threshold %% (fallback when no ATR)')
     parser.add_argument('--test-days', type=int, default=20, help='Test period days (default: 20)')
     parser.add_argument('--val-days', type=int, default=10, help='Validation period days (default: 10)')
-    parser.add_argument('--atr-factor', type=float, default=1.0, help='ATR multiplier for threshold (default: 1.0)')
+    parser.add_argument('--atr-factor', type=float, default=2.0, help='ATR multiplier for threshold (default: 2.0)')
     parser.add_argument('--fixed-threshold', action='store_true', help='Use fixed threshold instead of ATR-normalized')
+    parser.add_argument('--label-method', type=str, default='net_return', choices=['net_return', 'first_to_break'],
+                        help='Labeling method (default: net_return)')
     
     args = parser.parse_args()
     
@@ -548,6 +585,7 @@ if __name__ == '__main__':
         val_days=args.val_days,
         use_atr_threshold=not args.fixed_threshold,
         atr_factor=args.atr_factor,
+        label_method=args.label_method,
     )
     
     print(f"\n🎯 Final accuracy: {result['accuracy']:.1%}")

@@ -61,6 +61,9 @@ import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / '.env')
 
 logger = logging.getLogger("dhan_oi_fetcher")
 
@@ -137,31 +140,16 @@ DHAN_SCRIP_MAP = {
 
 
 # ─── Credentials ───────────────────────────────────────────────────
-# Read from dhan_config.json alongside this file
-_CONFIG_FILE = Path(__file__).parent / "dhan_config.json"
+# Read from .env only
 
 
 def _load_credentials() -> dict:
-    """Load DhanHQ credentials from config file."""
-    try:
-        if _CONFIG_FILE.exists():
-            with open(_CONFIG_FILE, 'r') as f:
-                return json.load(f)
-    except Exception:
-        pass
+    """Load DhanHQ credentials from .env."""
+    env_client = os.environ.get('DHAN_CLIENT_ID', '')
+    env_token = os.environ.get('DHAN_ACCESS_TOKEN', '')
+    if env_client and env_token:
+        return {'client_id': env_client, 'access_token': env_token}
     return {}
-
-
-def save_credentials(client_id: str, access_token: str):
-    """Save DhanHQ credentials to config file."""
-    config = {
-        'client_id': client_id,
-        'access_token': access_token,
-        'saved_at': datetime.now().isoformat(),
-    }
-    with open(_CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
-    logger.info(f"DhanHQ credentials saved to {_CONFIG_FILE}")
 
 
 class DhanOIFetcher:
@@ -196,8 +184,8 @@ class DhanOIFetcher:
     def __init__(self, client_id: str = None, access_token: str = None):
         """
         Args:
-            client_id: DhanHQ client ID. Reads from dhan_config.json if not given.
-            access_token: JWT access token. Reads from dhan_config.json if not given.
+            client_id: DhanHQ client ID. Reads from .env if not given.
+            access_token: JWT access token. Reads from .env if not given.
         """
         # Load from config if not provided
         if not client_id or not access_token:
@@ -352,8 +340,7 @@ class DhanOIFetcher:
                 new_token = data.get('accessToken', '')
                 if new_token:
                     self.access_token = new_token
-                    save_credentials(self.client_id, new_token)
-                    logger.info(f"DhanOI: Token renewed, expires {data.get('expiryTime', '?')}")
+                    logger.info(f"DhanOI: Token renewed in-memory, expires {data.get('expiryTime', '?')}")
                     return True
             else:
                 logger.warning(f"DhanOI: Token renewal failed: {r.status_code} {r.text[:200]}")

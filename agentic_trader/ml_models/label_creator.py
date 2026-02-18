@@ -6,11 +6,19 @@ For each candle at time T, looks ahead N candles to determine:
   - Label -1 (BIG DOWN) →  price drops ≥ threshold within lookahead
   - Label  0 (NO MOVE)  →  stays within ± threshold
 
+Supported labeling methods:
+  1. "first_to_break" (legacy):
+     Scans forward candle-by-candle; first direction to exceed threshold wins.
+     Pro: captures intrabar momentum. Con: noisy in choppy markets.
+
+  2. "net_return" (recommended, default):
+     Labels based on close[t+N] vs close[t]. If net return ≥ +threshold → UP,
+     ≤ -threshold → DOWN, else FLAT. Simpler, less noisy, aligns with actual
+     hold-period P&L.
+
 Key design decisions:
-  - Default lookahead: 6 candles (30 min on 5-min data)
-  - Default threshold: 1.0% move (or ATR-normalized per candle)
-  - "First-to-break" method: scans forward chronologically, first direction
-    to exceed threshold wins → eliminates label noise when both sides hit
+  - Default lookahead: 8 candles (40 min on 5-min data)
+  - Default threshold: ATR × 2.0 (only labels clear moves)
   - ATR-normalized threshold: each candle's threshold = atr_factor × ATR%,
     so every stock contributes balanced UP/DOWN/FLAT regardless of volatility
   - Labels are applied to the CURRENT candle row (not the future one)
@@ -43,30 +51,35 @@ def _compute_atr(high, low, close, period=14):
 
 def create_labels(
     df: pd.DataFrame,
-    lookahead_candles: int = 6,
+    lookahead_candles: int = 8,
     threshold_pct: float = 1.0,
     use_directional: bool = True,
     use_atr_threshold: bool = True,
-    atr_factor: float = 1.0,
+    atr_factor: float = 2.0,
+    label_method: str = 'net_return',
 ) -> pd.DataFrame:
     """Add target labels to feature DataFrame.
     
     Args:
         df: DataFrame with at minimum: date, high, low, close
-        lookahead_candles: How many candles to look ahead (default 6 = 30 min)
+        lookahead_candles: How many candles to look ahead (default 8 = 40 min)
         threshold_pct: Fixed minimum % move (used when use_atr_threshold=False)
         use_directional: If True, label is +1/-1/0. If False, label is 1/0
         use_atr_threshold: If True, threshold = atr_factor × ATR% per candle
             This normalizes across stocks so volatile and non-volatile stocks
             contribute balanced directional labels.
-        atr_factor: Multiplier for ATR-based threshold (default 1.0).
-            Higher = harder to trigger = more FLAT labels.
+        atr_factor: Multiplier for ATR-based threshold (default 2.0).
+            Higher = harder to trigger = more FLAT labels but cleaner signals.
+        label_method: 'net_return' (recommended) or 'first_to_break' (legacy).
+            net_return: label = sign(close[t+N] - close[t]) if |ret| >= threshold
+            first_to_break: first direction to breach threshold within N candles
             
     Returns:
         DataFrame with added columns:
           - label: Target label (+1, -1, or 0)
           - max_up_pct: Max upside % within lookahead
-          - max_down_pct: Max downside % within lookahead  
+          - max_down_pct: Max downside % within lookahead
+          - net_return_pct: Net close-to-close return over lookahead (net_return mode)
           - label_quality: 'clean' or 'boundary'
     """
     df = df.copy().sort_values('date').reset_index(drop=True)
@@ -95,49 +108,78 @@ def create_labels(
     
     # === LABELING ===
     label = np.full(n, np.nan)
+    net_ret = np.full(n, np.nan)
     
     if use_directional:
-        # "First-to-break" method: scan forward candle by candle
-        # First direction to exceed threshold wins
-        # If both trigger on same candle → use larger magnitude
-        # If neither triggers → FLAT
-        for i in range(n - lookahead_candles):
-            if np.isnan(atr_pct[i]):
-                continue
-            
-            # Determine threshold for this candle
-            if use_atr_threshold and not np.isnan(atr[i]) and atr_pct[i] > 0:
-                thresh = max(0.10, atr_factor * atr_pct[i])
-            else:
-                thresh = threshold_pct
-            
-            up_level = close[i] * (1 + thresh / 100)
-            down_level = close[i] * (1 - thresh / 100)
-            
-            found = False
-            for j in range(1, lookahead_candles + 1):
-                idx = i + j
-                hit_up = high[idx] >= up_level
-                hit_down = low[idx] <= down_level
+        if label_method == 'net_return':
+            # ── NET RETURN METHOD (recommended) ──
+            # Label based on where price IS after N candles (close-to-close)
+            # Simpler, less noisy, aligns with actual hold-period P&L
+            for i in range(n - lookahead_candles):
+                if np.isnan(atr_pct[i]):
+                    continue
                 
-                if hit_up and hit_down:
-                    # Both triggered on same candle — use larger magnitude
-                    up_mag = high[idx] - close[i]
-                    down_mag = close[i] - low[idx]
-                    label[i] = 1 if up_mag >= down_mag else -1
-                    found = True
-                    break
-                elif hit_up:
-                    label[i] = 1
-                    found = True
-                    break
-                elif hit_down:
-                    label[i] = -1
-                    found = True
-                    break
+                # Determine threshold for this candle
+                if use_atr_threshold and not np.isnan(atr[i]) and atr_pct[i] > 0:
+                    thresh = max(0.10, atr_factor * atr_pct[i])
+                else:
+                    thresh = threshold_pct
+                
+                # Net return = close[t+N] vs close[t]
+                future_close = close[i + lookahead_candles]
+                ret_pct = (future_close - close[i]) / close[i] * 100
+                net_ret[i] = ret_pct
+                
+                if ret_pct >= thresh:
+                    label[i] = 1    # UP
+                elif ret_pct <= -thresh:
+                    label[i] = -1   # DOWN
+                else:
+                    label[i] = 0    # FLAT
             
-            if not found:
-                label[i] = 0
+            df['net_return_pct'] = net_ret
+        
+        elif label_method == 'first_to_break':
+            # ── FIRST-TO-BREAK METHOD (legacy) ──
+            # Scan forward candle by candle; first direction to exceed threshold wins
+            for i in range(n - lookahead_candles):
+                if np.isnan(atr_pct[i]):
+                    continue
+                
+                if use_atr_threshold and not np.isnan(atr[i]) and atr_pct[i] > 0:
+                    thresh = max(0.10, atr_factor * atr_pct[i])
+                else:
+                    thresh = threshold_pct
+                
+                up_level = close[i] * (1 + thresh / 100)
+                down_level = close[i] * (1 - thresh / 100)
+                
+                found = False
+                for j in range(1, lookahead_candles + 1):
+                    idx = i + j
+                    hit_up = high[idx] >= up_level
+                    hit_down = low[idx] <= down_level
+                    
+                    if hit_up and hit_down:
+                        up_mag = high[idx] - close[i]
+                        down_mag = close[i] - low[idx]
+                        label[i] = 1 if up_mag >= down_mag else -1
+                        found = True
+                        break
+                    elif hit_up:
+                        label[i] = 1
+                        found = True
+                        break
+                    elif hit_down:
+                        label[i] = -1
+                        found = True
+                        break
+                
+                if not found:
+                    label[i] = 0
+        
+        else:
+            raise ValueError(f"Unknown label_method: {label_method}. Use 'net_return' or 'first_to_break'")
         
         df['label'] = label
     else:
@@ -201,6 +243,13 @@ def label_distribution(df: pd.DataFrame) -> dict:
         'avg_max_down': round(labeled['max_down_pct'].mean(), 3),
     }
     
+    # Add net return stats if available
+    if 'net_return_pct' in labeled.columns:
+        net_valid = labeled['net_return_pct'].dropna()
+        if len(net_valid) > 0:
+            stats['avg_net_return'] = round(net_valid.mean(), 4)
+            stats['std_net_return'] = round(net_valid.std(), 4)
+    
     print(f"\n{'='*50}")
     print(f"LABEL DISTRIBUTION")
     print(f"{'='*50}")
@@ -211,6 +260,9 @@ def label_distribution(df: pd.DataFrame) -> dict:
     print(f"  Boundary excluded: {stats['boundary_excluded']:,}")
     print(f"  Avg max up:   {stats['avg_max_up']:+.3f}%")
     print(f"  Avg max down: {stats['avg_max_down']:+.3f}%")
+    if 'avg_net_return' in stats:
+        print(f"  Avg net return: {stats['avg_net_return']:+.4f}%")
+        print(f"  Std net return: {stats['std_net_return']:.4f}%")
     print(f"{'='*50}\n")
     
     return stats
@@ -232,5 +284,6 @@ if __name__ == '__main__':
         'volume': np.random.randint(10000, 500000, n)
     })
     
-    result = create_labels(test_df, lookahead_candles=6, threshold_pct=1.0)
+    result = create_labels(test_df, lookahead_candles=8, threshold_pct=1.0,
+                           label_method='net_return', atr_factor=2.0)
     label_distribution(result)

@@ -35,14 +35,16 @@ import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / '.env')
 
 logger = logging.getLogger('dhan_risk')
 
 # DhanHQ API base
 DHAN_API = "https://api.dhan.co/v2"
 
-# Load config
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dhan_config.json')
+# Load config — credentials from .env only
 
 # Instrument segment codes
 SEGMENTS = {
@@ -56,10 +58,11 @@ SEGMENTS = {
 
 
 def _load_config() -> dict:
-    """Load DhanHQ credentials from config file."""
-    if os.path.exists(_CONFIG_PATH):
-        with open(_CONFIG_PATH, 'r') as f:
-            return json.load(f)
+    """Load DhanHQ credentials from .env."""
+    env_client = os.environ.get('DHAN_CLIENT_ID', '')
+    env_token = os.environ.get('DHAN_ACCESS_TOKEN', '')
+    if env_client and env_token:
+        return {'client_id': env_client, 'access_token': env_token}
     return {}
 
 
@@ -73,7 +76,7 @@ class DhanRiskTools:
         self.ready = bool(self.client_id and self.access_token)
         
         if not self.ready:
-            logger.warning("DhanRiskTools: No credentials found in dhan_config.json")
+            logger.warning("DhanRiskTools: No credentials found in .env (DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)")
         
         self._headers = {
             'Content-Type': 'application/json',
@@ -677,7 +680,7 @@ if __name__ == '__main__':
     drt = DhanRiskTools()
     
     if not drt.ready:
-        print("❌ DhanHQ not configured. Check dhan_config.json")
+        print("❌ DhanHQ not configured. Check DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN in .env")
         exit(1)
     
     print("=== DhanHQ Risk Tools Test ===\n")

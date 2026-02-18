@@ -132,6 +132,12 @@ class MarketData:
     pullback_depth_pct: float = 0.0    # Most recent pullback depth % from swing high/low
     pullback_candles: int = 0          # Candles in last pullback
 
+    # === BOS / SWEEP (STRUCTURE) FIELDS ===
+    bos_signal: str = 'NONE'           # BOS_HIGH, BOS_LOW, NONE — price closed beyond swing level
+    sweep_signal: str = 'NONE'         # SWEEP_HIGH, SWEEP_LOW, NONE — wicked beyond but closed inside
+    swing_high_level: float = 0.0      # Prior swing high used for BOS/sweep detection
+    swing_low_level: float = 0.0       # Prior swing low used for BOS/sweep detection
+
 
 @dataclass 
 class TradePlan:
@@ -184,6 +190,7 @@ class ZerodhaTools:
         self.paper_pnl = 0
         self._positions_lock = threading.RLock()  # Thread safety for paper_positions (reentrant)
         self._scorer_rejected_symbols = set()  # Track scorer rejections for retry filtering
+        self._exit_cooldowns: dict = {}  # underlying -> datetime of last exit (20-min re-entry cooldown)
         
         # Load saved token
         self._load_token()
@@ -199,6 +206,14 @@ class ZerodhaTools:
                 all_symbols = TIER_1_OPTIONS + TIER_2_OPTIONS
                 # Add NIFTY 50 index
                 all_symbols.append("NSE:NIFTY 50")
+                # Add sectoral indices for sector cross-validation
+                _sector_indices = [
+                    "NSE:NIFTY METAL", "NSE:NIFTY IT", "NSE:NIFTY BANK",
+                    "NSE:NIFTY AUTO", "NSE:NIFTY PHARMA", "NSE:NIFTY ENERGY",
+                    "NSE:NIFTY FMCG", "NSE:NIFTY REALTY", "NSE:NIFTY PSU BANK",
+                    "NSE:NIFTY INFRA", "NSE:NIFTY COMMODITIES",
+                ]
+                all_symbols.extend(_sector_indices)
                 self.ticker.subscribe_symbols(all_symbols, mode='quote')
                 # Subscribe ALL near-month F&O futures for real-time OI data
                 # This eliminates per-stock REST calls in _get_futures_oi_quick()
@@ -222,6 +237,8 @@ class ZerodhaTools:
         
         # Load active trades from file
         self._load_active_trades()
+        # Subscribe option contract tokens for existing positions to WebSocket
+        self._subscribe_position_symbols()
     
     def _load_active_trades(self):
         """Load active trades from JSON file"""
@@ -248,6 +265,38 @@ class ZerodhaTools:
             self.paper_positions = []
             self.paper_pnl = 0
     
+    def _subscribe_position_symbols(self):
+        """Subscribe all option contract tokens from active positions to WebSocket.
+        This enables real-time LTP streaming for PnL dashboard instead of REST fallback."""
+        if not self.ticker:
+            return
+        option_syms = set()
+        for t in self.paper_positions:
+            if t.get('status', 'OPEN') != 'OPEN':
+                continue
+            if t.get('is_iron_condor'):
+                for k in ('sold_ce_symbol', 'hedge_ce_symbol', 'sold_pe_symbol', 'hedge_pe_symbol'):
+                    s = t.get(k, '')
+                    if s:
+                        option_syms.add(s)
+            elif t.get('is_credit_spread'):
+                for k in ('sold_symbol', 'hedge_symbol'):
+                    s = t.get(k, '')
+                    if s:
+                        option_syms.add(s)
+            elif t.get('is_debit_spread'):
+                for k in ('buy_symbol', 'sell_symbol'):
+                    s = t.get(k, '')
+                    if s:
+                        option_syms.add(s)
+            elif t.get('is_option'):
+                s = t.get('symbol', '')
+                if s and ':' in s:
+                    option_syms.add(s)
+        if option_syms:
+            self.ticker.subscribe_symbols(list(option_syms), mode='quote')
+            print(f"🔌 Ticker: Subscribed {len(option_syms)} option contracts for live PnL")
+
     def _save_active_trades(self):
         """Save active trades to JSON file (caller must hold _positions_lock)"""
         try:
@@ -801,6 +850,14 @@ class ZerodhaTools:
                     # Catch-all: if exit_price and pnl are set, treat as closed even for unknown statuses
                     is_closed = status in _known_exit_statuses or (exit_price is not None and pnl is not None)
                     if is_closed:
+                        # === RECORD RE-ENTRY COOLDOWN (20-min block on same underlying) ===
+                        _cooldown_underlying = trade.get('underlying', '')
+                        if _cooldown_underlying:
+                            from config import HARD_RULES as _HR
+                            _cd_mins = _HR.get('REENTRY_COOLDOWN_MINUTES', 20)
+                            self._exit_cooldowns[_cooldown_underlying] = datetime.now()
+                            print(f"   ⏳ Cooldown: {_cooldown_underlying} blocked for {_cd_mins} min re-entry")
+                        
                         # === LIVE MODE: Place real exit order on Zerodha ===
                         if not self.paper_mode and status != 'STOPLOSS_HIT' and status != 'SL_HIT':
                             # Don't place exit for SL_HIT — the SL-M order already triggered at broker
@@ -1048,16 +1105,42 @@ class ZerodhaTools:
             return False
     
     def _rate_limit(self):
-        """Enforce API rate limiting (thread-safe)"""
+        """Enforce API rate limiting using a token-bucket approach (thread-safe).
+        
+        Kite allows ~3 requests/second. Instead of serialising all threads through
+        a single 350ms sleep, we keep a deque of recent call timestamps and only
+        sleep when the bucket is full (3 calls in the last 1.05s window).
+        This lets multiple threads fire concurrently up to the rate cap.
+        """
         if not hasattr(self, '_rate_lock'):
             self._rate_lock = threading.Lock()
-        with self._rate_lock:
-            min_interval = HARD_RULES["API_RATE_LIMIT_MS"] / 1000
-            elapsed = time.time() - self.last_api_call
-            if elapsed < min_interval:
-                time.sleep(min_interval - elapsed)
-            self.last_api_call = time.time()
-            self.api_call_count += 1
+        if not hasattr(self, '_api_call_times'):
+            from collections import deque
+            self._api_call_times = deque()  # timestamps of recent API calls
+        
+        MAX_CALLS_PER_WINDOW = 3
+        WINDOW_SEC = 1.05  # slightly above 1s for safety margin
+        
+        while True:
+            with self._rate_lock:
+                now = time.time()
+                # Purge timestamps older than the window
+                while self._api_call_times and (now - self._api_call_times[0]) > WINDOW_SEC:
+                    self._api_call_times.popleft()
+                
+                if len(self._api_call_times) < MAX_CALLS_PER_WINDOW:
+                    # Bucket has room — register this call and proceed
+                    self._api_call_times.append(now)
+                    self.last_api_call = now
+                    self.api_call_count += 1
+                    return  # Done — thread can fire its API call
+                else:
+                    # Bucket full — compute how long until a slot opens
+                    sleep_time = WINDOW_SEC - (now - self._api_call_times[0])
+            
+            # Sleep OUTSIDE the lock so other threads aren't blocked
+            if sleep_time > 0:
+                time.sleep(sleep_time)
     
     def _is_trading_hours(self) -> tuple[bool, str]:
         """Check if within trading hours"""
@@ -1633,7 +1716,9 @@ class ZerodhaTools:
                     print(f"   ⚠️ Indicator error {sym}: {e}")
                     return sym, None
             
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            from config import FULL_FNO_SCAN
+            _nworkers = FULL_FNO_SCAN.get('indicator_threads', 8)
+            with ThreadPoolExecutor(max_workers=_nworkers) as executor:
                 futures = {executor.submit(_calc_one, s): s for s in _symbols_to_calc}
                 for future in as_completed(futures):
                     sym, ind = future.result()
@@ -1642,7 +1727,9 @@ class ZerodhaTools:
             
             _elapsed = time.time() - _t0
             _cached = sum(1 for s in _symbols_to_calc if hasattr(self, '_ind_cache') and s in self._ind_cache and (time.time() - self._ind_cache[s][0]) < 300)
-            print(f"   ⚡ Indicators: {len(_indicators_map)}/{len(_symbols_to_calc)} stocks in {_elapsed:.1f}s ({_cached} cached)")
+            _today_str = datetime.now().strftime('%Y-%m-%d')
+            _daily_cached = sum(1 for s in _symbols_to_calc if hasattr(self, '_daily_data_cache') and s in self._daily_data_cache and self._daily_data_cache[s][0] == _today_str)
+            print(f"   ⚡ Indicators: {len(_indicators_map)}/{len(_symbols_to_calc)} stocks in {_elapsed:.1f}s ({_cached} ind-cached, {_daily_cached} daily-cached)")
             
             # === REBUILD RESULT with indicators ===
             final_result = {}
@@ -1675,15 +1762,21 @@ class ZerodhaTools:
                 # Use health gate stale check instead of simple is_stale
                 is_stale = not health_result.can_trade or is_stale
                 
+                # Compute change% properly: (LTP - prev_close) / prev_close * 100
+                # Kite q['change'] is ABSOLUTE rupee change, NOT percentage!
+                _ltp = q.get('last_price', 0)
+                _prev_close = ohlc.get('close', 0)
+                _change_pct = ((_ltp - _prev_close) / _prev_close * 100) if _prev_close > 0 and _ltp > 0 else 0
+
                 data = MarketData(
                     symbol=symbol,
-                    ltp=q.get('last_price', 0),
+                    ltp=_ltp,
                     open=ohlc.get('open', 0),
                     high=ohlc.get('high', 0),
                     low=ohlc.get('low', 0),
                     close=ohlc.get('close', 0),
                     volume=q.get('volume', 0),
-                    change_pct=q.get('change', 0),
+                    change_pct=round(_change_pct, 2),
                     timestamp=str(datetime.now()),
                     is_stale=is_stale,
                     sma_20=indicators.get('sma_20', 0),
@@ -1785,38 +1878,62 @@ class ZerodhaTools:
                     if exchange not in self._instrument_cache:  # double-check after lock
                         self._instrument_cache[exchange] = self.kite.instruments(exchange)
             
-            instruments = self._instrument_cache[exchange]
-            token = None
-            for inst in instruments:
-                if inst['tradingsymbol'] == tradingsymbol:
-                    token = inst['instrument_token']
-                    break
+            # O(1) token lookup via dict (built once per exchange, thread-safe)
+            if not hasattr(self, '_token_dict'):
+                self._token_dict = {}
+            if exchange not in self._token_dict:
+                with self._inst_lock:
+                    if exchange not in self._token_dict:
+                        self._token_dict[exchange] = {
+                            inst['tradingsymbol']: inst['instrument_token']
+                            for inst in self._instrument_cache[exchange]
+                        }
+            
+            token = self._token_dict.get(exchange, {}).get(tradingsymbol)
             
             if not token:
                 return {}
             
             # Get DAILY historical data (for trend, SMA, RSI, ATR + ML features need >=50 candles)
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=120)
+            # Daily data is cached for the entire trading day — it doesn't change intraday.
+            # This eliminates ~50% of API calls on subsequent scan cycles.
+            if not hasattr(self, '_daily_data_cache'):
+                self._daily_data_cache = {}  # symbol -> (date_str, data_list)
+            if not hasattr(self, '_daily_data_lock'):
+                self._daily_data_lock = threading.Lock()
             
-            data = None
-            for attempt in range(3):
-                try:
-                    self._rate_limit()
-                    data = self.kite.historical_data(
-                        instrument_token=token,
-                        from_date=from_date,
-                        to_date=to_date,
-                        interval="day"
-                    )
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        wait = (attempt + 1) * 2  # 2s, 4s
-                        print(f"   ⏳ {symbol} daily data retry {attempt+1}/2 (waiting {wait}s)")
-                        time.sleep(wait)
-                    else:
-                        raise
+            _today_str = datetime.now().strftime('%Y-%m-%d')
+            _daily_hit = False
+            _cached_daily = self._daily_data_cache.get(symbol)
+            if _cached_daily and _cached_daily[0] == _today_str:
+                data = _cached_daily[1]
+                _daily_hit = True
+            else:
+                to_date = datetime.now()
+                from_date = to_date - timedelta(days=120)
+                
+                data = None
+                for attempt in range(3):
+                    try:
+                        self._rate_limit()
+                        data = self.kite.historical_data(
+                            instrument_token=token,
+                            from_date=from_date,
+                            to_date=to_date,
+                            interval="day"
+                        )
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            wait = (attempt + 1) * 2  # 2s, 4s
+                            print(f"   ⏳ {symbol} daily data retry {attempt+1}/2 (waiting {wait}s)")
+                            time.sleep(wait)
+                        else:
+                            raise
+                
+                if data:
+                    with self._daily_data_lock:
+                        self._daily_data_cache[symbol] = (_today_str, data)
             
             if not data:
                 return {}
@@ -2370,6 +2487,69 @@ class ZerodhaTools:
                 if close_back > 0:
                     momentum_15m = ((close_now - close_back) / close_back) * 100
             
+            # === BOS / SWEEP (STRUCTURE) DETECTION ===
+            # BOS: Did price break AND close beyond the last swing high/low?
+            #      → Confirms real breakout (structural break).
+            # Sweep: Did price wick beyond swing level but close back inside?
+            #      → Classic liquidity grab / stop-hunt / fake breakout.
+            # Lookback: 10-15 candles (30-45 min on 3-min chart) for swing detection.
+            # Uses a simple fractal approach: swing high = candle whose high is
+            # higher than the N candles on each side (left-confirmed only, right=1).
+            bos_signal = 'NONE'
+            sweep_signal = 'NONE'
+            _struct_swing_high = 0.0
+            _struct_swing_low = 0.0
+            
+            if intraday_df is not None and len(intraday_df) >= 8:
+                _s_highs = intraday_df['high'].values
+                _s_lows = intraday_df['low'].values
+                _s_closes = intraday_df['close'].values
+                _s_n = len(_s_highs)
+                _swing_lookback = min(15, _s_n - 2)  # 15 candles max, leave room for current
+                
+                # --- Find most recent SWING HIGH (fractal: high > 3 bars left & 1 bar right) ---
+                # Scan backwards from second-to-last candle (last candle is current/forming)
+                for _si in range(_s_n - 2, max(2, _s_n - _swing_lookback - 1), -1):
+                    if (_s_highs[_si] > _s_highs[_si - 1] and 
+                        _s_highs[_si] > _s_highs[_si - 2] and
+                        _s_highs[_si] > _s_highs[_si - 3] if _si >= 3 else _s_highs[_si] > _s_highs[_si - 1]):
+                        # Confirm it's also higher than the bar after it (right side)
+                        if _si + 1 < _s_n and _s_highs[_si] > _s_highs[_si + 1]:
+                            _struct_swing_high = float(_s_highs[_si])
+                            break
+                
+                # --- Find most recent SWING LOW (fractal: low < 3 bars left & 1 bar right) ---
+                for _si in range(_s_n - 2, max(2, _s_n - _swing_lookback - 1), -1):
+                    if (_s_lows[_si] < _s_lows[_si - 1] and 
+                        _s_lows[_si] < _s_lows[_si - 2] and
+                        _s_lows[_si] < _s_lows[_si - 3] if _si >= 3 else _s_lows[_si] < _s_lows[_si - 1]):
+                        if _si + 1 < _s_n and _s_lows[_si] < _s_lows[_si + 1]:
+                            _struct_swing_low = float(_s_lows[_si])
+                            break
+                
+                # --- Current candle (last bar) ---
+                _cur_high = float(_s_highs[-1])
+                _cur_low = float(_s_lows[-1])
+                _cur_close = float(_s_closes[-1])
+                
+                # --- SWEEP vs BOS detection on SWING HIGH ---
+                if _struct_swing_high > 0 and _cur_high > _struct_swing_high:
+                    if _cur_close > _struct_swing_high:
+                        # Closed above swing high → BOS (real breakout)
+                        bos_signal = 'BOS_HIGH'
+                    else:
+                        # Wicked above but closed back below → SWEEP (liquidity grab)
+                        sweep_signal = 'SWEEP_HIGH'
+                
+                # --- SWEEP vs BOS detection on SWING LOW ---
+                if _struct_swing_low > 0 and _cur_low < _struct_swing_low:
+                    if _cur_close < _struct_swing_low:
+                        # Closed below swing low → BOS (real breakdown)
+                        bos_signal = 'BOS_LOW'
+                    else:
+                        # Wicked below but closed back above → SWEEP (stop hunt)
+                        sweep_signal = 'SWEEP_LOW'
+            
             _ind_result = {
                 'sma_20': round(sma_20, 2),
                 'sma_50': round(sma_50, 2),
@@ -2433,6 +2613,11 @@ class ZerodhaTools:
                 'pullback_candles': pullback_candles,
                 # === MOMENTUM ===
                 'momentum_15m': round(momentum_15m, 4),
+                # === BOS / SWEEP (STRUCTURE) ===
+                'bos_signal': bos_signal,
+                'sweep_signal': sweep_signal,
+                'swing_high_level': round(_struct_swing_high, 2),
+                'swing_low_level': round(_struct_swing_low, 2),
             }
             
             # === FUTURES OI SIGNAL (zero API calls — WebSocket cache) ===
@@ -3352,6 +3537,26 @@ class ZerodhaTools:
                 "action": "Risk limit reached - no new trades"
             }
         
+        # 2b. Regime-aware position limit (fewer positions in MIXED market)
+        _open_count = len([t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN'])
+        _regime_max = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)  # Default to MIXED (conservative)
+        # If market_breadth was injected into market_data, use it
+        try:
+            _md_check = self.get_market_data([underlying])
+            _breadth_check = _md_check.get(underlying, {}).get('market_breadth', 'MIXED') if isinstance(_md_check.get(underlying), dict) else 'MIXED'
+            if _breadth_check in ('BULLISH', 'BEARISH'):
+                _regime_max = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
+            else:
+                _regime_max = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
+        except Exception:
+            pass  # Use conservative default
+        if _open_count >= _regime_max:
+            return {
+                "success": False,
+                "error": f"REGIME POSITION LIMIT: {_open_count} open >= {_regime_max} max (market regime limit)",
+                "action": "Too many positions for current market regime"
+            }
+        
         # 3. Position reconciliation check
         recon = get_position_reconciliation(kite=self.kite, paper_mode=self.paper_mode)
         recon_can_trade, recon_reason = recon.can_trade()
@@ -3399,6 +3604,23 @@ class ZerodhaTools:
                     "error": f"DUPLICATE BLOCKED: Already have option position on {underlying} ({pos['symbol']})",
                     "action": "Skip - already holding option on this underlying"
                 }
+        
+        # === RE-ENTRY COOLDOWN CHECK (20-min block after exit on same underlying) ===
+        _cd_time = self._exit_cooldowns.get(underlying)
+        if _cd_time:
+            from config import HARD_RULES as _HR
+            _cd_mins = _HR.get('REENTRY_COOLDOWN_MINUTES', 20)
+            _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
+            if _elapsed < _cd_mins:
+                _remaining = round(_cd_mins - _elapsed, 1)
+                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                return {
+                    "success": False,
+                    "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left of {_cd_mins}-min cooldown)",
+                    "action": "Skip - re-entry cooldown active"
+                }
+            else:
+                del self._exit_cooldowns[underlying]  # Cooldown expired, clean up
         
         # === GET INTRADAY MARKET DATA ===
         market_data = {}
@@ -3731,6 +3953,8 @@ class ZerodhaTools:
                 
                 print(f"   ✅ LIVE OPTION: {option_side} {plan.quantity * plan.contract.lot_size} {plan.contract.symbol} @ ₹{fill_price:.2f}")
         
+        # Subscribe the new option contract to WebSocket for real-time PnL
+        self._subscribe_position_symbols()
         return result
     
     def place_credit_spread(self, underlying: str, direction: str,
@@ -3796,6 +4020,19 @@ class ZerodhaTools:
                 return {"success": False, "error": f"Already have credit spread on {underlying}"}
             if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_option') and pos.get('underlying') == underlying:
                 return {"success": False, "error": f"Already have option position on {underlying}"}
+        
+        # 5b. Re-entry cooldown check (20-min block after exit)
+        _cd_time = self._exit_cooldowns.get(underlying)
+        if _cd_time:
+            from config import HARD_RULES as _HR
+            _cd_mins = _HR.get('REENTRY_COOLDOWN_MINUTES', 20)
+            _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
+            if _elapsed < _cd_mins:
+                _remaining = round(_cd_mins - _elapsed, 1)
+                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                return {"success": False, "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left)"}
+            else:
+                del self._exit_cooldowns[underlying]
         
         # 6. Get market data for scoring (use pre-fetched if available)
         market_data = {}
@@ -3970,6 +4207,8 @@ class ZerodhaTools:
                     self._save_active_trades()
                 print(f"   ✅ LIVE credit spread tracked: {plan.spread_type}")
         
+        # Subscribe spread leg contracts to WebSocket for real-time PnL
+        self._subscribe_position_symbols()
         return result
     
     def place_debit_spread(self, underlying: str, direction: str,
@@ -4041,6 +4280,19 @@ class ZerodhaTools:
         for pos in self.paper_positions:
             if pos.get('status', 'OPEN') == 'OPEN' and pos.get('underlying') == underlying:
                 return {"success": False, "error": f"Already have position on {underlying}"}
+        
+        # 5b. Re-entry cooldown check (20-min block after exit)
+        _cd_time = self._exit_cooldowns.get(underlying)
+        if _cd_time:
+            from config import HARD_RULES as _HR
+            _cd_mins = _HR.get('REENTRY_COOLDOWN_MINUTES', 20)
+            _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
+            if _elapsed < _cd_mins:
+                _remaining = round(_cd_mins - _elapsed, 1)
+                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                return {"success": False, "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left)"}
+            else:
+                del self._exit_cooldowns[underlying]
         
         # 6. Get market data
         market_data = {}
@@ -4223,6 +4475,8 @@ class ZerodhaTools:
                     self._save_active_trades()
                 print(f"   ✅ LIVE debit spread tracked: {plan.spread_type}")
         
+        # Subscribe spread leg contracts to WebSocket for real-time PnL
+        self._subscribe_position_symbols()
         return result
     
     # =================================================================
@@ -4279,6 +4533,19 @@ class ZerodhaTools:
         for pos in self.paper_positions:
             if pos.get('status', 'OPEN') == 'OPEN' and pos.get('underlying') == underlying:
                 return {"success": False, "error": f"Already have position on {underlying}"}
+        
+        # Re-entry cooldown check (20-min block after exit)
+        _cd_time = self._exit_cooldowns.get(underlying)
+        if _cd_time:
+            from config import HARD_RULES as _HR
+            _cd_mins = _HR.get('REENTRY_COOLDOWN_MINUTES', 20)
+            _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
+            if _elapsed < _cd_mins:
+                _remaining = round(_cd_mins - _elapsed, 1)
+                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                return {"success": False, "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left)"}
+            else:
+                del self._exit_cooldowns[underlying]
         
         # Get market data
         market_data = {}
@@ -4459,6 +4726,8 @@ class ZerodhaTools:
                     self._save_active_trades()
                 print(f"   ✅ LIVE iron condor tracked: {plan.underlying}")
         
+        # Subscribe IC leg contracts to WebSocket for real-time PnL
+        self._subscribe_position_symbols()
         return result
 
     def get_option_greeks_update(self, symbol: str = None) -> Dict:
@@ -4869,7 +5138,7 @@ if __name__ == "__main__":
     sizing = tools.calculate_position_size(
         entry_price=2500,
         stop_loss=2450,
-        capital=200000,
+        capital=500000,
         lot_size=1
     )
     print(f"   Entry: ₹2500, SL: ₹2450")

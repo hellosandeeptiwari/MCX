@@ -92,9 +92,12 @@ HARD_RULES = {
     "RISK_PER_TRADE": 0.035,        # 3.5% base risk per trade (tiered: 5% premium, 3.5% std, 2% base)
     "MAX_DAILY_LOSS": 0.15,         # 15% max daily loss
     "MAX_POSITIONS": 20,            # Max simultaneous positions (spreads count as 1)
+    "MAX_POSITIONS_MIXED": 6,        # Max positions in MIXED regime (fakeout-heavy)
+    "MAX_POSITIONS_TRENDING": 12,    # Max positions in BULLISH/BEARISH regime
     "STALE_DATA_SECONDS": 60,       # Data older than this is stale
     "API_RATE_LIMIT_MS": 350,       # Min ms between API calls (Kite allows ~3/s, 350ms is safe)
     "CAPITAL": 500000,              # Starting capital ₹5,00,000
+    "REENTRY_COOLDOWN_MINUTES": 20, # Skip same underlying for 20 min after any exit
 }
 
 # === FULL F&O UNIVERSE SCAN ===
@@ -104,9 +107,9 @@ HARD_RULES = {
 # First cold cycle: ~45-60s, subsequent cached cycles: ~15-25s.
 FULL_FNO_SCAN = {
     "enabled": True,               # True = scan ALL F&O stocks, False = curated + wildcards only
-    "max_indicator_stocks": 80,     # Max stocks sent through expensive indicator pipeline
-    "min_change_pct_filter": 0.5,   # Only run indicators on stocks moving > this % (pre-filter)
-    "indicator_threads": 8,         # Thread pool size for parallel historical_data fetches
+    "max_indicator_stocks": 50,     # Top 50 F&O stocks by composite rank (no fixed list bias)
+    "min_change_pct_filter": 0.5,   # Minimum change% to even consider (dead stocks filtered)
+    "indicator_threads": 12,        # Thread pool size for parallel historical_data fetches
     "prefer_ws_quotes": True,       # Use WebSocket quote cache for initial screen (skip REST batch)
 }
 
@@ -139,7 +142,7 @@ AUTOSLICE_ENABLED = True
 # This happens BEFORE the GPT prompt is built, so GPT only sees remaining setups.
 ELITE_AUTO_FIRE = {
     "enabled": True,
-    "elite_threshold": 70,            # Score ≥ this → auto-fire
+    "elite_threshold": 65,            # Score ≥ this → auto-fire
     "max_auto_fires_per_cycle": 3,    # Max auto-fired trades per scan cycle
     "require_setup": True,            # Must have a valid setup (ORB/VWAP/MOMENTUM), not just high score
     "log_all": True,                  # Log every auto-fire decision to scan_decisions.json
@@ -151,8 +154,8 @@ ELITE_AUTO_FIRE = {
 DYNAMIC_MAX_PICKS = {
     "enabled": True,
     "default_max": 3,                 # Standard max picks per GPT call
-    "elite_bonus_max": 5,             # If ≥3 stocks score 70+, allow up to 5 picks
-    "min_score_for_bonus": 70,        # Threshold to count toward bonus check
+    "elite_bonus_max": 5,             # If ≥3 stocks score 65+, allow up to 5 picks
+    "min_score_for_bonus": 65,        # Threshold to count toward bonus check
     "min_count_for_bonus": 3,         # Need this many stocks above threshold
     "choppy_max": 2,                  # If breadth is MIXED and <3 setups score 60+, restrict to 2
 }
@@ -273,7 +276,7 @@ CREDIT_SPREAD_CONFIG = {
     "min_credit_pct": 20,            # Minimum credit as % of spread width (lower for deeper OTM)
     "preferred_credit_pct": 30,      # Preferred credit >= 30% of max risk
     "min_iv_percentile": 30,         # Sell options when IV is above 30th percentile
-    "min_score_threshold": 70,       # Minimum intraday score to enter spread
+    "min_score_threshold": 62,       # Minimum intraday score to enter spread
     # --- Risk Management ---
     "sl_multiplier": 2.0,            # Exit if loss reaches 2× credit received
     "target_pct": 65,                # Exit when 65% of max credit is captured (time decay)
@@ -286,7 +289,7 @@ CREDIT_SPREAD_CONFIG = {
     "rollover_at_dte": 1,            # Roll or close when 1 DTE remaining
     # --- Fallback to Naked Buys ---
     "fallback_to_buy": True,         # If spread not viable, fall back to buying options
-    "buy_only_score_threshold": 70,  # Only buy naked if score >= 70 (high conviction)
+    "buy_only_score_threshold": 62,  # Only buy naked if score >= 62 (high conviction)
 }
 
 # === CASH EQUITY INTRADAY SCORING CONFIG ===
@@ -310,7 +313,7 @@ DEBIT_SPREAD_CONFIG = {
     # --- Entry Filters (SMART — candle-data driven) ---
     "min_move_pct": 1.2,             # Stock must have moved >1.2% today (was 2.5% — too strict, zero triggers)
     "min_volume_ratio": 1.3,         # Volume must be 1.3× normal (was 1.5 — slightly relaxed)
-    "min_score_threshold": 70,       # Minimum intraday score for debit spread entry
+    "min_score_threshold": 62,       # Minimum intraday score for debit spread entry
     # --- Candle-Smart Gates (mirrors naked buy gates 8-12) ---
     "min_follow_through_candles": 2, # Must have ≥2 follow-through candles (strongest winner signal)
     "min_adx": 28,                   # ADX ≥28 confirms trend strength (winners avg 37)
@@ -330,8 +333,8 @@ DEBIT_SPREAD_CONFIG = {
     "stop_loss_pct": 30,             # Exit if spread value drops 30% (was 40% — tighter SL)
     "target_pct": 80,                # Target 80% gain on net debit (was 50% — bigger upside)
     "max_target_pct": 90,            # Take profit at 90% of max profit (was 80%)
-    "trail_activation_pct": 25,      # Activate trailing after 25% profit (was 30%)
-    "trail_giveback_pct": 30,        # Allow 30% giveback of peak profit (was 40% — tighter trail)
+    "trail_activation_pct": 40,      # Activate trailing after 40% profit (was 25% — too early)
+    "trail_giveback_pct": 45,        # Allow 45% giveback of peak profit (was 30% — too tight, choking winners)
     # --- Intraday Rules ---
     "auto_exit_time": "15:05",       # Auto-exit all debit spreads by 3:05 PM (no overnight)
     "no_entry_after": "15:10",       # Aligned with credit spread / general no_new_after cutoff
@@ -346,7 +349,7 @@ DEBIT_SPREAD_CONFIG = {
     "min_oi": 500,                   # Minimum OI on both legs
     # --- Proactive Scanning ---
     "proactive_scan": True,          # Actively scan for debit spread opportunities (not just fallback)
-    "proactive_scan_min_score": 70,  # Minimum score for proactive debit spread
+    "proactive_scan_min_score": 62,  # Minimum score for proactive debit spread
     "proactive_scan_min_move_pct": 1.5,  # Proactive scan needs slightly stronger move
 }
 

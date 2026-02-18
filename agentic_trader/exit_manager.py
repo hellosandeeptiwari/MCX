@@ -103,18 +103,31 @@ class ExitManager:
         self.session_cutoff = time(15, 15)  # 3:15 PM — aligned with TRADING_HOURS['no_new_after'] and EOD exit
         self.time_stop_candles = 10  # Exit if no progress in 10 candles (50 min) — was 7
         self.time_stop_min_r = 0.3  # Must make at least 0.3R to stay — was 0.5R (too aggressive)
-        self.breakeven_trigger_r = 0.8  # Move SL to entry at 0.8R
-        self.trailing_start_r = 0.5  # Start trailing at 0.5R (was 1.0R)
-        self.trailing_pct = 0.6  # Trail retaining 60% of max profit (was 50%)
+        self.breakeven_trigger_r = 1.0  # Move SL to entry at 1.0R (was 0.8R — too early)
+        
+        # === PHASED TRAILING: Build → Run → Harvest ===
+        # Build zone (0 → 1.0R): No trailing, let trade establish
+        # Run zone (1.0R → 2.0R): Wide trail, let momentum continue
+        # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
+        self.trailing_start_r = 1.0    # Don't trail until 1.0R (was 0.5R — too early!)
+        self.trailing_run_pct = 0.40   # Run zone: retain 40% of peak (give back 60%)
+        self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
+        self.trailing_harvest_pct = 0.55  # Harvest zone: retain 55% of peak (give back 45%)
+        self.trailing_pct = 0.40  # Default (used as fallback) — was 0.60 (too tight!)
         
         # Scaled profit booking (options only)
-        self.partial_profit_pct = 15.0       # Book 50% at +15% premium gain
+        self.partial_profit_pct = 30.0       # Book 50% at +30% premium gain (was 15% — too early!)
         self.partial_exit_fraction = 0.5     # Exit 50% of position
         
         # Early speed gate (options only) — RELAXED: was killing 91% of trades
         self.option_speed_gate_candles = 12  # Check after 12 candles (60 min) — was 6
         self.option_speed_gate_pct = 3.0     # Need +3% premium gain — was 5%
         self.option_speed_gate_max_r = 0.10  # OR need +0.10R — was 0.15
+        
+        # === QUICK PROFIT TARGET: Book full position at +18% gain ===
+        # Applies to ALL position types (naked options, debit spreads, credit spreads).
+        # Raised from 16% → 18% to let winners run slightly longer (spreads need room).
+        self.quick_profit_pct = 18.0
         
         # Track trades
         self.trade_states: Dict[str, TradeState] = {}
@@ -236,6 +249,23 @@ class ExitManager:
         exit_signal = self._check_session_cutoff(state, current_price)
         if exit_signal:
             return exit_signal
+        
+        # 2.5 QUICK PROFIT TARGET: Book at +18% gain (before trailing/target)
+        # Stocks oscillate a lot intraday — grab 18% and move on.
+        if state.entry_price > 0:
+            if state.side == "BUY":
+                _qp_pnl_pct = (current_price - state.entry_price) / state.entry_price * 100
+            else:
+                _qp_pnl_pct = (state.entry_price - current_price) / state.entry_price * 100
+            if _qp_pnl_pct >= self.quick_profit_pct:
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="QUICK_PROFIT",
+                    exit_price=current_price,
+                    reason=f"Quick profit target hit: +{_qp_pnl_pct:.1f}% (target: {self.quick_profit_pct}%)",
+                    urgency="NORMAL"
+                )
         
         # 3. TARGET HIT CHECK
         exit_signal = self._check_target(state, current_price)
@@ -376,18 +406,14 @@ class ExitManager:
                     partial_pct=self.partial_exit_fraction,
                 )
             else:
-                # === SINGLE LOT: Can't split, protect with tight trail ===
+                # === SINGLE LOT: Can't split, move to breakeven + let phased trail handle it ===
                 state.partial_booked = True  # Don't re-check
                 state.current_sl = state.entry_price  # Breakeven
                 state.breakeven_applied = True
-                state.trailing_active = True
-                # Tight trail: retain 70% of current profit
-                profit = current_price - state.entry_price
-                tight_sl = current_price - profit * 0.30  # Keep 70%
-                if tight_sl > state.current_sl:
-                    state.current_sl = round(tight_sl, 2)
+                # Don't force trailing_active — let phased trailing engage naturally
+                # The Run/Harvest zones will handle trailing from here
                 self._persist_state()
-                print(f"🔒 {state.symbol}: +{premium_pct:.1f}% gain (1 lot) — can't split, tight trail SL→₹{state.current_sl:.2f} (lock 70%)")
+                print(f"🔒 {state.symbol}: +{premium_pct:.1f}% gain (1 lot) — can't split, SL→breakeven (phased trail will manage)")
                 return None  # No exit signal, just tightened SL
         
         return None
@@ -510,6 +536,17 @@ class ExitManager:
                 urgency="IMMEDIATE"
             )
         
+        # 2.5 QUICK PROFIT TARGET: Book at +18% profit (before trailing/target)
+        if profit_pct >= self.quick_profit_pct:
+            return ExitSignal(
+                symbol=state.symbol,
+                should_exit=True,
+                exit_type="QUICK_PROFIT",
+                exit_price=current_debit,
+                reason=f"Credit spread quick profit: +{profit_pct:.1f}% of credit (target: {self.quick_profit_pct}%) | Profit: ₹{profit_per_share:+.2f}/share",
+                urgency="NORMAL"
+            )
+        
         # 3. TARGET: captured enough of the credit
         if current_debit <= state.target:
             return ExitSignal(
@@ -618,6 +655,17 @@ class ExitManager:
                 urgency="IMMEDIATE"
             )
         
+        # 2.5 QUICK PROFIT TARGET: Book at +18% profit (before trailing/target)
+        if profit_pct >= self.quick_profit_pct:
+            return ExitSignal(
+                symbol=state.symbol,
+                should_exit=True,
+                exit_type="QUICK_PROFIT",
+                exit_price=current_value,
+                reason=f"Debit spread quick profit: +{profit_pct:.1f}% on debit (target: {self.quick_profit_pct}%) | Profit: ₹{profit_per_share:+.2f}/share",
+                urgency="NORMAL"
+            )
+        
         # 3. TARGET: spread value rose enough
         if current_value >= state.target:
             return ExitSignal(
@@ -687,9 +735,9 @@ class ExitManager:
                     urgency="NORMAL"
                 )
             
-            # GAVE-BACK CHECK: Trade had some R but faded back to near zero
-            # If MaxR was decent but current R is < 0.1, the move has stalled/reversed
-            if state.max_favorable_move >= self.time_stop_min_r and r_multiple < 0.1:
+            # GAVE-BACK CHECK: Trade had good R but faded to near breakeven
+            # Only kill if R dropped well below the initial trailing threshold
+            if state.max_favorable_move >= 0.5 and r_multiple < 0.15:
                 return ExitSignal(
                     symbol=state.symbol,
                     should_exit=True,
@@ -712,16 +760,30 @@ class ExitManager:
             print(f"🔒 {state.symbol}: Break-even applied (SL moved to {state.entry_price})")
     
     def _apply_trailing_stop(self, state: TradeState, current_price: float, r_multiple: float):
-        """Apply trailing stop after +0.5R, retaining 60% of max profit"""
+        """Phased trailing stop: Build → Run → Harvest.
+        
+        Build zone (0 → 1.0R): No trailing. Let trade breathe and establish.
+        Run zone (1.0R → 2.0R): Wide trail retaining 40% of peak profit (60% giveback).
+            Options pull back 10-15% routinely mid-move — this gives room.
+        Harvest zone (2.0R+): Tighter trail retaining 55% of peak profit (45% giveback).
+            By 2R the trade has delivered meaningful profit — protect it.
+        """
         if r_multiple < self.trailing_start_r:
             return
+        
+        # Select retention % based on zone
+        if r_multiple >= self.trailing_harvest_r:
+            retain_pct = self.trailing_harvest_pct  # 55% — tighter
+            zone = "HARVEST"
+        else:
+            retain_pct = self.trailing_run_pct  # 40% — wide
+            zone = "RUN"
         
         risk = abs(state.entry_price - state.initial_sl)
         
         if state.side == "BUY":
-            # Trail retaining 60% of max profit from entry
             profit = state.highest_price - state.entry_price
-            trail_distance = profit * (1 - self.trailing_pct)
+            trail_distance = profit * (1 - retain_pct)
             new_sl = state.highest_price - trail_distance
             
             rounded_new_sl = round(new_sl, 2)
@@ -730,11 +792,10 @@ class ExitManager:
                 state.current_sl = rounded_new_sl
                 state.trailing_active = True
                 self._persist_state()
-                print(f"📈 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
+                print(f"📈 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
         else:  # SELL
-            # Trail retaining 60% of max profit from entry
             profit = state.entry_price - state.lowest_price
-            trail_distance = profit * (1 - self.trailing_pct)
+            trail_distance = profit * (1 - retain_pct)
             new_sl = state.lowest_price + trail_distance
             
             rounded_new_sl = round(new_sl, 2)
@@ -743,7 +804,7 @@ class ExitManager:
                 state.current_sl = rounded_new_sl
                 state.trailing_active = True
                 self._persist_state()
-                print(f"📉 {state.symbol}: Trailing SL updated {old_sl} → {state.current_sl}")
+                print(f"📉 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
     
     def remove_trade(self, symbol: str):
         """Remove a trade from tracking (after exit) and reset hysteresis"""

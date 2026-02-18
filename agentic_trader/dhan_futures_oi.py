@@ -32,8 +32,9 @@ DHAN_API = "https://api.dhan.co/v2"
 INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'futures_oi')
 
-# Config
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dhan_config.json')
+# Config — credentials from .env only
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # Stocks we need futures data for (matches APPROVED_UNIVERSE)
 UNIVERSE_STOCKS = [
@@ -72,9 +73,11 @@ EQUITY_SCRIP_MAP = {
 
 
 def _load_config() -> dict:
-    if os.path.exists(_CONFIG_PATH):
-        with open(_CONFIG_PATH, 'r') as f:
-            return json.load(f)
+    """Load DhanHQ credentials from .env."""
+    client_id = os.environ.get('DHAN_CLIENT_ID', '')
+    access_token = os.environ.get('DHAN_ACCESS_TOKEN', '')
+    if client_id and access_token:
+        return {'client_id': client_id, 'access_token': access_token}
     return {}
 
 
@@ -605,7 +608,7 @@ if __name__ == '__main__':
     fetcher = FuturesOIFetcher()
     
     if not fetcher.ready:
-        print("❌ DhanHQ not configured. Check dhan_config.json")
+        print("❌ DhanHQ not configured. Check DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN in .env")
         sys.exit(1)
     
     # Parse args

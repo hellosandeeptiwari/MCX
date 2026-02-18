@@ -191,10 +191,10 @@ class IntradayOptionScorer:
     PARTIAL_FILL_PENALTY_RATE = 0.3   # > 30% partials = penalty
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
-    # === TRADE THRESHOLDS (Simplified to 2 tiers) ===
-    BLOCK_THRESHOLD = 56         # < 56 = BLOCK (lowered from 60 for more entries)
-    STANDARD_THRESHOLD = 65      # 65-69 = Standard (ATM/ITM, 1x size)
-    PREMIUM_THRESHOLD = 70       # >= 70 = Premium (ATM/ITM, up to 1.5x)
+    # === TRADE THRESHOLDS (Recalibrated Feb 17 after cross-validation fixes) ===
+    BLOCK_THRESHOLD = 52         # < 52 = BLOCK (naked option buy minimum)
+    STANDARD_THRESHOLD = 58      # 58-61 = Standard (ATM/ITM, 1x size)
+    PREMIUM_THRESHOLD = 62       # >= 62 = Premium (ATM/ITM, up to 1.5x)
     CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
     # === AGGRESSIVE SIZING REQUIREMENTS (Risk of ruin protection) ===
@@ -223,6 +223,44 @@ class IntradayOptionScorer:
     ORB_STRENGTH_OVEREXTENDED = 100     # ORB strength > 100 = already moved too far
     RANGE_EXPANSION_OVEREXTENDED = 0.60 # Range > 0.6 ATR already = late entry
     
+    # === INDICATOR CROSS-VALIDATION CONSTANTS (Feb 17) ===
+    # Fix 3: Acceleration volume/ADX caps
+    ACCEL_LOW_VOL_CAP = 3          # Max accel points when volume is LOW
+    ACCEL_WEAK_ADX_CAP = 5         # Max accel points when ADX < 25
+    # Fix 4: BOS volume validation
+    BOS_LOW_VOL_POINTS = 2         # BOS on LOW volume → only +2 (was +5)
+    BOS_EXPLOSIVE_BONUS = 2        # BOS on EXPLOSIVE → +7 total (5+2)
+    # Fix 5: OI+VWAP cross-check discount
+    OI_VWAP_CONFLICT_DISCOUNT = 0.50  # OI aligned but VWAP misaligned → 50% OI credit
+    
+    # === ORB + VOLUME SMART CONSUMPTION (Feb 17 improvements) ===
+    # 1. ORB-Volume Combo Gate: ORB breakout score scales by volume regime
+    ORB_VOL_COMBO = {
+        'EXPLOSIVE': 1.0,    # Full ORB credit
+        'HIGH': 0.75,        # 75% ORB credit
+        'NORMAL': 0.25,      # 25% ORB credit — low conviction breakout
+        'LOW': 0.0,          # Zero ORB credit — fake breakout on no volume
+    }
+    # 2. ORB Re-entry Penalty: multiple re-entries = whipsaw
+    ORB_REENTRY_BLOCK_THRESHOLD = 2      # >= 2 re-entries = zero ORB points + chop penalty
+    ORB_REENTRY_WARN_THRESHOLD = 1       # 1 re-entry = halve ORB points
+    ORB_REENTRY_CHOP_PENALTY = -5        # Extra penalty for whipsaw
+    # 3. Regime-Aware ORB Weight: ORB less reliable in choppy/mixed markets
+    ORB_REGIME_WEIGHT = {
+        'BULLISH': 1.0,      # Trending up → ORB full weight
+        'BEARISH': 1.0,      # Trending down → ORB full weight
+        'MIXED': 0.50,       # Mixed → ORB half weight (fakeouts 2-3x more likely)
+    }
+    # 4. ORB Range Width Filter: wide ORB = already extended, tight ORB = compressed spring
+    ORB_WIDTH_TIGHT_PCT = 0.5        # < 0.5% = tight coil, bonus +3
+    ORB_WIDTH_WIDE_PCT = 1.5         # > 1.5% = overextended opening, penalty -5
+    # 5. Volume Inside ORB Discount: high volume inside ORB = possible absorption
+    VOL_INSIDE_ORB_DISCOUNT = 0.50   # 50% credit for HIGH/EXPLOSIVE volume when INSIDE_ORB
+    # 6. Volume+ORB Timing Synergy: fresh breakout + accelerating volume = best setup
+    ORB_VOL_SYNERGY_BONUS = 3        # Bonus points for fresh BO + current vol acceleration
+    ORB_VOL_SYNERGY_MAX_HOLD = 3     # Fresh = hold_candles < 3
+    ORB_VOL_SYNERGY_MIN_RATE = 1.2   # recent_vol_rate > 1.2 = accelerating
+    
     # Re-entry prevention: don't trade same underlying if it already lost today
     MAX_LOSSES_SAME_SYMBOL = 1          # Max 1 loss per symbol per day, then skip
     
@@ -239,8 +277,13 @@ class IntradayOptionScorer:
             from trend_following import get_trend_engine, build_trend_signal_from_market_data, TrendState
             self.trend_engine = get_trend_engine()
             self._trend_available = True
+            # Cache module functions as instance attributes (avoid per-stock import)
+            self._build_trend_signal = build_trend_signal_from_market_data
+            self._TrendState = TrendState
         except ImportError:
             self._trend_available = False
+            self._build_trend_signal = None
+            self._TrendState = None
             print("⚠️ Trend Following module not available")
         
         # History tracking for time-to-fill risk
@@ -272,6 +315,33 @@ class IntradayOptionScorer:
         bullish_points = 0
         bearish_points = 0
         
+        # === PRE-EXTRACT: Pull all market_data fields once (avoid repeated dict.get()) ===
+        _md = market_data or {}
+        _md_ltp = _md.get('ltp', 0)
+        _md_open = _md.get('open', _md_ltp)
+        _md_high = _md.get('high', 0)
+        _md_low = _md.get('low', 0)
+        _md_vwap = _md.get('vwap', 0)
+        _md_volume_regime = _md.get('volume_regime', 'NORMAL')
+        _md_adx = _md.get('adx', 0)
+        _md_change_pct = _md.get('change_pct', 0)
+        _md_oi_signal = _md.get('oi_signal', 'NEUTRAL')
+        _md_oi_change_pct = _md.get('oi_change_pct', 0)
+        _md_orb_strength = abs(_md.get('orb_strength', 0))
+        _md_orb_hold_candles = _md.get('orb_hold_candles', 0)
+        _md_orb_reentries = _md.get('orb_reentries', 0)
+        _md_recent_vol_rate = _md.get('recent_vol_rate', 1.0)
+        _md_market_breadth = _md.get('market_breadth', 'MIXED')
+        _md_ema_9 = _md.get('ema_9', 0)
+        _md_bos_signal = _md.get('bos_signal', 'NONE')
+        _md_sweep_signal = _md.get('sweep_signal', 'NONE')
+        _md_swing_high_level = _md.get('swing_high_level', 0)
+        _md_swing_low_level = _md.get('swing_low_level', 0)
+        _md_resistance_1 = _md.get('resistance_1', 0)
+        _md_resistance_2 = _md.get('resistance_2', 0)
+        _md_support_1 = _md.get('support_1', 0)
+        _md_support_2 = _md.get('support_2', 0)
+        
         # Tracking for decision
         microstructure_score = 0.0
         microstructure_block = False
@@ -288,8 +358,8 @@ class IntradayOptionScorer:
         
         if self._trend_available and market_data:
             try:
-                from trend_following import build_trend_signal_from_market_data, TrendState
-                trend_signal = build_trend_signal_from_market_data(signal.symbol, market_data)
+                # Use cached class-level imports (avoid per-stock import overhead)
+                trend_signal = self._build_trend_signal(signal.symbol, market_data)
                 trend_decision = self.trend_engine.analyze_trend(trend_signal)
                 
                 raw_trend_score = trend_decision.trend_score
@@ -300,22 +370,23 @@ class IntradayOptionScorer:
                 # === NEUTRAL TREND: Score penalty instead of hard block ===
                 # TrendFollowing data is often incomplete (ADX, ORB hold not flowing)
                 # Strong intraday signals (ORB breakout, volume surge) should still trade
-                if trend_decision.trend_state == TrendState.NEUTRAL:
+                _TrendState = self._TrendState
+                if trend_decision.trend_state == _TrendState.NEUTRAL:
                     score -= 5
                     warnings.append("⚠️ NEUTRAL trend penalty (-5) - need strong intraday signals")
-                elif trend_decision.trend_state == TrendState.STRONG_BULLISH:
+                elif trend_decision.trend_state == _TrendState.STRONG_BULLISH:
                     bullish_points += trend_score
                     trend_direction = "BUY"
                     reasons.append(f"📈 STRONG TREND BULLISH ({trend_decision.trend_score:.0f}/100) (+{trend_score:.0f})")
-                elif trend_decision.trend_state == TrendState.BULLISH:
+                elif trend_decision.trend_state == _TrendState.BULLISH:
                     bullish_points += trend_score * 0.8
                     trend_direction = "BUY"
                     reasons.append(f"📈 TREND BULLISH ({trend_decision.trend_score:.0f}/100) (+{trend_score:.0f})")
-                elif trend_decision.trend_state == TrendState.STRONG_BEARISH:
+                elif trend_decision.trend_state == _TrendState.STRONG_BEARISH:
                     bearish_points += trend_score
                     trend_direction = "SELL"
                     reasons.append(f"📉 STRONG TREND BEARISH ({trend_decision.trend_score:.0f}/100) (+{trend_score:.0f})")
-                elif trend_decision.trend_state == TrendState.BEARISH:
+                elif trend_decision.trend_state == _TrendState.BEARISH:
                     bearish_points += trend_score * 0.8
                     trend_direction = "SELL"
                     reasons.append(f"📉 TREND BEARISH ({trend_decision.trend_score:.0f}/100) (+{trend_score:.0f})")
@@ -350,6 +421,43 @@ class IntradayOptionScorer:
             cap_reason = f" [capped: same {signal.orb_window_minutes}min window]"
         else:
             cap_reason = ""
+        
+        # === FIX 3: REGIME-AWARE ORB WEIGHT ===
+        # In MIXED markets, ORB fakeouts are 2-3x more likely. Scale down.
+        _orb_market_breadth = market_data.get('market_breadth', 'MIXED') if market_data else 'MIXED'
+        _orb_regime_mult = self.ORB_REGIME_WEIGHT.get(_orb_market_breadth, 0.50)
+        if _orb_regime_mult < 1.0:
+            orb_max_points = int(orb_max_points * _orb_regime_mult)
+            cap_reason += f" [REGIME:{_orb_market_breadth} → {_orb_regime_mult:.0%} weight]"
+        
+        # === FIX 5: ORB RANGE WIDTH FILTER ===
+        # Wide ORB = stock already moved a lot in first 15 min. Breaking out less meaningful.
+        # Tight ORB = compressed spring, breakout is meaningful.
+        _orb_width_adj = 0
+        if market_data:
+            _orb_h = market_data.get('orb_high', 0)
+            _orb_l = market_data.get('orb_low', 0)
+            _orb_mid = (_orb_h + _orb_l) / 2 if (_orb_h + _orb_l) > 0 else 1
+            _orb_width_pct = ((_orb_h - _orb_l) / _orb_mid * 100) if _orb_mid > 0 else 0
+            if _orb_width_pct > 0 and _orb_width_pct < self.ORB_WIDTH_TIGHT_PCT:
+                _orb_width_adj = 3   # Tight coil bonus
+                cap_reason += f" [TIGHT ORB: {_orb_width_pct:.2f}% < {self.ORB_WIDTH_TIGHT_PCT}% → +3 bonus]"
+            elif _orb_width_pct > self.ORB_WIDTH_WIDE_PCT:
+                _orb_width_adj = -5  # Overextended opening penalty
+                cap_reason += f" [WIDE ORB: {_orb_width_pct:.2f}% > {self.ORB_WIDTH_WIDE_PCT}% → -5 penalty]"
+        
+        # === FIX 2: ORB RE-ENTRY PENALTY ===
+        # Multiple re-entries into ORB range = whipsaw/chop. Penalize or block.
+        _orb_reentries = market_data.get('orb_reentries', 0) if market_data else 0
+        _orb_reentry_mult = 1.0
+        _orb_reentry_penalty = 0
+        if _orb_reentries >= self.ORB_REENTRY_BLOCK_THRESHOLD:
+            _orb_reentry_mult = 0.0   # Zero out ORB points entirely
+            _orb_reentry_penalty = self.ORB_REENTRY_CHOP_PENALTY  # Extra -5 penalty
+            cap_reason += f" [ORB WHIPSAW: {_orb_reentries} re-entries ≥ {self.ORB_REENTRY_BLOCK_THRESHOLD} → BLOCKED + {_orb_reentry_penalty}]"
+        elif _orb_reentries >= self.ORB_REENTRY_WARN_THRESHOLD:
+            _orb_reentry_mult = 0.50  # Halve ORB points
+            cap_reason += f" [ORB RE-ENTRY: {_orb_reentries}x → 50% credit]"
         
         # === ORB STALENESS DECAY (DISTANCE + TIME) ===
         # Two independent decay factors, take the LOWER one:
@@ -397,29 +505,48 @@ class IntradayOptionScorer:
         elif orb_strength < 5:
             orb_strength_filter = 0.5  # Weak breakout — half credit
             cap_reason += f" [WEAK: {orb_strength:.1f}% < 5%]"
+        
+        # === FIX 1: ORB + VOLUME COMBO GATE ===
+        # ORB breakout on low volume = fake. Scale ORB points by volume regime.
+        _vol_regime_for_orb = signal.volume_regime if hasattr(signal, 'volume_regime') else (market_data.get('volume_regime', 'NORMAL') if market_data else 'NORMAL')
+        _orb_vol_combo_mult = self.ORB_VOL_COMBO.get(_vol_regime_for_orb, 0.25)
 
         if signal.orb_signal == "BREAKOUT_UP":
-            orb_points = int(orb_max_points * orb_decay * orb_strength_filter)
+            orb_points = int(orb_max_points * orb_decay * orb_strength_filter * _orb_vol_combo_mult * _orb_reentry_mult)
             # ORB hold check — need at least 2 candles holding above ORB to confirm
             orb_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
             if orb_hold < 2:
                 orb_points = max(2, orb_points // 2) if orb_points > 0 else 0  # Halve points for unconfirmed breakout
                 cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 2]"
+            # Apply ORB range width adjustment
+            orb_points = max(0, orb_points + _orb_width_adj)
+            # Apply ORB re-entry chop penalty to score directly
+            if _orb_reentry_penalty != 0:
+                score += _orb_reentry_penalty
+                warnings.append(f"⚠️ ORB WHIPSAW: {_orb_reentries} re-entries → chop penalty ({_orb_reentry_penalty})")
             score += orb_points
             bullish_points += orb_points
-            reasons.append(f"🚀 ORB BREAKOUT UP (+{orb_points}){cap_reason}")
+            _vol_combo_note = f" [vol:{_vol_regime_for_orb}→{_orb_vol_combo_mult:.0%}]" if _orb_vol_combo_mult < 1.0 else ""
+            reasons.append(f"🚀 ORB BREAKOUT UP (+{orb_points}){_vol_combo_note}{cap_reason}")
             if direction == "HOLD":
                 direction = "BUY"
         elif signal.orb_signal == "BREAKOUT_DOWN":
-            orb_points = int(orb_max_points * orb_decay * orb_strength_filter)
+            orb_points = int(orb_max_points * orb_decay * orb_strength_filter * _orb_vol_combo_mult * _orb_reentry_mult)
             # ORB hold check — need at least 2 candles holding below ORB to confirm
             orb_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
             if orb_hold < 2:
                 orb_points = max(2, orb_points // 2) if orb_points > 0 else 0
                 cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 2]"
+            # Apply ORB range width adjustment
+            orb_points = max(0, orb_points + _orb_width_adj)
+            # Apply ORB re-entry chop penalty to score directly
+            if _orb_reentry_penalty != 0:
+                score += _orb_reentry_penalty
+                warnings.append(f"⚠️ ORB WHIPSAW: {_orb_reentries} re-entries → chop penalty ({_orb_reentry_penalty})")
             score += orb_points
             bearish_points += orb_points
-            reasons.append(f"📉 ORB BREAKOUT DOWN (+{orb_points}){cap_reason}")
+            _vol_combo_note = f" [vol:{_vol_regime_for_orb}→{_orb_vol_combo_mult:.0%}]" if _orb_vol_combo_mult < 1.0 else ""
+            reasons.append(f"📉 ORB BREAKOUT DOWN (+{orb_points}){_vol_combo_note}{cap_reason}")
             if direction == "HOLD":
                 direction = "SELL"
         elif signal.orb_signal == "INSIDE_ORB":
@@ -482,24 +609,62 @@ class IntradayOptionScorer:
             vol_recency_discount = 0.65   # Volume fading
             vol_recency_note = f" [fading: recent rate {recent_vol_rate:.1f}x, 65% credit]"
         
+        # === FIX 4: VOLUME INSIDE ORB DISCOUNT ===
+        # High volume + INSIDE_ORB often = institutional absorption, not conviction
+        # Discount volume score when ORB hasn't broken out (unless VWAP grind detected)
+        _vol_inside_orb_discount = 1.0
+        _vol_inside_orb_note = ""
+        if signal.orb_signal == "INSIDE_ORB" and vwap_grind_points == 0:
+            if signal.volume_regime in ('HIGH', 'EXPLOSIVE'):
+                _vol_inside_orb_discount = self.VOL_INSIDE_ORB_DISCOUNT
+                _vol_inside_orb_note = f" [⚠️ INSIDE ORB absorption: {_vol_inside_orb_discount:.0%} credit]"
+        
+        # FIX 8: Volume points added to directional tracking
+        # Volume IS directional — EXPLOSIVE on BREAKOUT_UP is bullish confirmation
+        vol_points = 0
         if signal.volume_regime == "EXPLOSIVE":
-            vol_points = int(15 * volume_multiplier * vol_recency_discount)
+            vol_points = int(15 * volume_multiplier * vol_recency_discount * _vol_inside_orb_discount)
             score += vol_points
             cap_note = f" [capped from 15]" if volume_multiplier < 1.0 else ""
-            reasons.append(f"💥 EXPLOSIVE volume (+{vol_points}){cap_note}{vol_recency_note}")
+            reasons.append(f"💥 EXPLOSIVE volume (+{vol_points}){cap_note}{vol_recency_note}{_vol_inside_orb_note}")
         elif signal.volume_regime == "HIGH":
-            vol_points = int(12 * volume_multiplier * vol_recency_discount)
+            vol_points = int(12 * volume_multiplier * vol_recency_discount * _vol_inside_orb_discount)
             score += vol_points
             cap_note = f" [capped from 12]" if volume_multiplier < 1.0 else ""
-            reasons.append(f"📊 HIGH volume (+{vol_points}){cap_note}{vol_recency_note}")
+            reasons.append(f"📊 HIGH volume (+{vol_points}){cap_note}{vol_recency_note}{_vol_inside_orb_note}")
         elif signal.volume_regime == "NORMAL":
             vol_points = int(6 * volume_multiplier)
             score += vol_points
             cap_note = f" [capped from 6]" if volume_multiplier < 1.0 else ""
             reasons.append(f"📊 Normal volume (+{vol_points}){cap_note}")
         elif signal.volume_regime == "LOW":
-            score += 2  # No cap on penalty
+            vol_points = 2
+            score += vol_points  # No cap on penalty
             warnings.append("⚠️ LOW volume - weak conviction (+2)")
+        
+        # Add volume to directional bucket (volume confirms direction)
+        if vol_points > 0:
+            _vol_dir = trend_direction if trend_direction in ('BUY', 'SELL') else direction
+            if _vol_dir == 'BUY':
+                bullish_points += vol_points
+            elif _vol_dir == 'SELL':
+                bearish_points += vol_points
+        
+        # === FIX 6: VOLUME + ORB TIMING SYNERGY BONUS ===
+        # Fresh ORB breakout + accelerating volume NOW = highest conviction setup
+        _synergy_bonus = 0
+        if signal.orb_signal in ("BREAKOUT_UP", "BREAKOUT_DOWN"):
+            _syn_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
+            if (_syn_hold < self.ORB_VOL_SYNERGY_MAX_HOLD 
+                and recent_vol_rate >= self.ORB_VOL_SYNERGY_MIN_RATE
+                and signal.volume_regime in ('HIGH', 'EXPLOSIVE')):
+                _synergy_bonus = self.ORB_VOL_SYNERGY_BONUS
+                score += _synergy_bonus
+                if signal.orb_signal == "BREAKOUT_UP":
+                    bullish_points += _synergy_bonus
+                else:
+                    bearish_points += _synergy_bonus
+                reasons.append(f"🔥 ORB+VOL SYNERGY: Fresh breakout ({_syn_hold} candles) + accelerating vol ({recent_vol_rate:.1f}x) (+{_synergy_bonus})")
         
         _audit_after_vol = score
         
@@ -579,37 +744,62 @@ class IntradayOptionScorer:
         
         _audit_after_vwap = score
         
-        # === 5. EMA REGIME (5 points — reduced from 10) ===
-        # TrendFollowing already gives up to 20 pts for EMA expansion.
-        # This is a COMPLEMENTARY check for EMA structure, not a duplicate.
+        # === 5. EMA REGIME (cross-validated, 0-5 pts) ===
+        # FIX 1: EMA cross-validation — no more free points without confirmation
+        # FIX 6: Trend+EMA double-dip — if trend_score already captured EMA expansion,
+        #         reduce local EMA weight to avoid double-counting same signal.
+        _ema_trend_dedup = 0.4 if raw_trend_score >= 60 else 1.0  # 60% discount if trend already strong
+        _vol_regime_for_ema = market_data.get('volume_regime', 'NORMAL') if market_data else 'NORMAL'
+        _adx_for_ema = market_data.get('adx', 0) if market_data else 0
+        
         if signal.ema_regime == "EXPANDING":
-            score += 5
-            reasons.append("📊 EMA EXPANDING - strong trend (+5)")
+            # EXPANDING in NEUTRAL trend (no direction) = noise, not trend
+            if trend_state_str == "NEUTRAL":
+                _ema_pts = 1  # Was +5, now +1 — expanding but no trend context
+                reasons.append(f"📊 EMA EXPANDING but trend NEUTRAL (+{_ema_pts})")
+            else:
+                _ema_pts = max(1, int(5 * _ema_trend_dedup))  # Full or deduped
+                reasons.append(f"📊 EMA EXPANDING (+{_ema_pts}){' [dedup]' if _ema_trend_dedup < 1 else ''}")
+            score += _ema_pts
         elif signal.ema_regime == "COMPRESSED":
-            score += 4
-            reasons.append("⚡ EMA COMPRESSED - breakout imminent (+4)")
+            # COMPRESSED + LOW volume = nothing is about to happen
+            if _vol_regime_for_ema == 'LOW':
+                _ema_pts = 0
+                reasons.append("⚡ EMA COMPRESSED but LOW volume — no energy (+0)")
+            elif _adx_for_ema > 0 and _adx_for_ema < 20:
+                _ema_pts = 1  # Compressed in choppy market = unreliable
+                reasons.append(f"⚡ EMA COMPRESSED but ADX {_adx_for_ema:.0f}<20 (+1)")
+            else:
+                _ema_pts = max(1, int(4 * _ema_trend_dedup))
+                reasons.append(f"⚡ EMA COMPRESSED - breakout imminent (+{_ema_pts}){' [dedup]' if _ema_trend_dedup < 1 else ''}")
+            score += _ema_pts
         else:
-            score += 1
-            reasons.append("EMA normal (+1)")
+            # Normal/unknown EMA = 0 points (was +1)
+            _ema_pts = 0
+            reasons.append("EMA normal (+0)")
         
         _audit_after_ema = score
         
-        # === 5. HTF ALIGNMENT (5 points) ===
-        # Fix: zerodha_tools produces "BULLISH_ALIGNED"/"BEARISH_ALIGNED", so match both forms
+        # === 5b. HTF ALIGNMENT (0-5 points, cross-validated) ===
+        # FIX 2: MIXED/neutral no longer give free points — they're warnings, not bonuses
+        # FIX 7: HTF direction opposing trend direction → penalty (applied post-direction below)
+        _htf_direction = None  # Track for post-direction conflict check
         if signal.htf_alignment in ("BULLISH", "BULLISH_ALIGNED"):
             score += 5
             bullish_points += 5
+            _htf_direction = "BUY"
             reasons.append("🎯 HTF BULLISH alignment (+5)")
         elif signal.htf_alignment in ("BEARISH", "BEARISH_ALIGNED"):
             score += 5
             bearish_points += 5
+            _htf_direction = "SELL"
             reasons.append("🎯 HTF BEARISH alignment (+5)")
         elif signal.htf_alignment == "MIXED":
-            score += 3
-            warnings.append("HTF mixed signals (+3)")
+            score += 0  # Was +3 — MIXED means timeframes disagree, that's not a plus
+            warnings.append("⚠️ HTF MIXED: higher timeframes conflict (+0)")
         else:
-            score += 2
-            warnings.append("HTF neutral - watch for direction (+2)")
+            score += 0  # Was +2 — neutral/unknown = no information
+            warnings.append("HTF neutral (+0)")
         
         _audit_after_htf = score
         
@@ -617,16 +807,29 @@ class IntradayOptionScorer:
         # Options require SPEED - this captures "does the move have legs?"
         accel_score = 0
         
-        # 7a. Follow-through check (4 pts): After breakout, does price continue?
-        if signal.follow_through_candles >= 3:
+        # 7a. Follow-through check: After breakout, does price continue?
+        # FT 3-4 = sweet spot (+4). FT 5 = diminishing (+2). FT ≥6 = exhaustion risk.
+        # After 6+ consecutive candles in one direction, mean-reversion probability
+        # jumps from ~30% to ~60%. The move is "spent" — entering late = SL magnet.
+        _ft = signal.follow_through_candles
+        if _ft >= 7:
+            accel_score -= 5
+            warnings.append(f"🔄 FT EXHAUSTION: {_ft} consecutive candles — mean reversion imminent (-5)")
+        elif _ft >= 6:
+            accel_score -= 3
+            warnings.append(f"🔄 FT EXHAUSTION: {_ft} consecutive candles — bounce risk high (-3)")
+        elif _ft >= 5:
+            accel_score += 2
+            reasons.append(f"📈 Extended follow-through ({_ft} candles) — diminishing returns (+2)")
+        elif _ft >= 3:
             accel_score += 4
-            reasons.append(f"🚀 Strong follow-through ({signal.follow_through_candles} candles) (+4)")
-        elif signal.follow_through_candles >= 2:
+            reasons.append(f"🚀 Strong follow-through ({_ft} candles) (+4)")
+        elif _ft >= 2:
             accel_score += 3
-            reasons.append(f"📈 Good follow-through ({signal.follow_through_candles} candles) (+3)")
-        elif signal.follow_through_candles >= 1:
+            reasons.append(f"📈 Good follow-through ({_ft} candles) (+3)")
+        elif _ft >= 1:
             accel_score += 1
-            reasons.append(f"➡️ Some follow-through ({signal.follow_through_candles} candle) (+1)")
+            reasons.append(f"➡️ Some follow-through ({_ft} candle) (+1)")
         
         # 7b. Range expansion (3 pts): Candle body / ATR ratio
         if signal.range_expansion_ratio >= 1.5:
@@ -644,6 +847,18 @@ class IntradayOptionScorer:
             accel_score += 3
             reasons.append("⚡ VWAP slope steepening (+3)")
         
+        # FIX 3: Acceleration volume/ADX cross-validation
+        # Follow-through on LOW volume = fakeout. Range expansion with weak ADX = noise.
+        _accel_vol_regime = market_data.get('volume_regime', 'NORMAL') if market_data else 'NORMAL'
+        _accel_adx = market_data.get('adx', 50) if market_data else 50
+        _accel_raw = accel_score
+        if _accel_vol_regime == 'LOW' and accel_score > self.ACCEL_LOW_VOL_CAP:
+            accel_score = self.ACCEL_LOW_VOL_CAP
+            warnings.append(f"⚠️ ACCEL CAPPED: {_accel_raw}→{accel_score} (LOW volume — follow-through unconfirmed)")
+        elif _accel_adx > 0 and _accel_adx < 25 and accel_score > self.ACCEL_WEAK_ADX_CAP:
+            accel_score = self.ACCEL_WEAK_ADX_CAP
+            warnings.append(f"⚠️ ACCEL CAPPED: {_accel_raw}→{accel_score} (ADX {_accel_adx:.0f}<25 — weak trend)")
+        
         # Store acceleration score for aggressive sizing check
         acceleration_score = accel_score
         
@@ -656,25 +871,46 @@ class IntradayOptionScorer:
         
         _audit_after_accel = score
         
-        # === RSI OVEREXTENSION PENALTY ONLY (max -3 pts) ===
-        # RSI is redundant with trend + EMA, only use for extreme overextension
-        if signal.rsi < 20:
-            # Extremely oversold - potential bounce risk for shorts
-            if direction == "SELL" or trend_direction == "SELL":
-                score -= 2
-                warnings.append(f"⚠️ RSI extremely oversold ({signal.rsi:.0f}) - bounce risk (-2)")
-        elif signal.rsi > 80:
-            # Extremely overbought - potential reversal risk for longs
-            if direction == "BUY" or trend_direction == "BUY":
-                score -= 2
-                warnings.append(f"⚠️ RSI extremely overbought ({signal.rsi:.0f}) - reversal risk (-2)")
-        elif signal.rsi < 25 and (direction == "SELL" or trend_direction == "SELL"):
-            score -= 1
-            warnings.append(f"⚠️ RSI low ({signal.rsi:.0f}) - caution on shorts (-1)")
-        elif signal.rsi > 75 and (direction == "BUY" or trend_direction == "BUY"):
-            score -= 1
-            warnings.append(f"⚠️ RSI high ({signal.rsi:.0f}) - caution on longs (-1)")
-        # Note: RSI 30-70 = no impact (neutral)
+        # === RSI OVEREXTENSION PENALTY (tightened thresholds) ===
+        # RSI < 30 on shorts or > 70 on longs = bounce/reversal zone.
+        # Tightened from 20/80 → catches more mean-reversion setups.
+        _rsi = signal.rsi
+        _is_selling = (direction == "SELL" or trend_direction == "SELL")
+        _is_buying = (direction == "BUY" or trend_direction == "BUY")
+        if _rsi < 20 and _is_selling:
+            score -= 4
+            warnings.append(f"🔴 RSI EXTREME OVERSOLD ({_rsi:.0f}) — strong bounce risk (-4)")
+        elif _rsi < 25 and _is_selling:
+            score -= 3
+            warnings.append(f"⚠️ RSI oversold ({_rsi:.0f}) — bounce risk on shorts (-3)")
+        elif _rsi < 30 and _is_selling:
+            score -= 2
+            warnings.append(f"⚠️ RSI low ({_rsi:.0f}) — caution on shorts (-2)")
+        elif _rsi > 80 and _is_buying:
+            score -= 4
+            warnings.append(f"🔴 RSI EXTREME OVERBOUGHT ({_rsi:.0f}) — strong reversal risk (-4)")
+        elif _rsi > 75 and _is_buying:
+            score -= 3
+            warnings.append(f"⚠️ RSI overbought ({_rsi:.0f}) — reversal risk on longs (-3)")
+        elif _rsi > 70 and _is_buying:
+            score -= 2
+            warnings.append(f"⚠️ RSI high ({_rsi:.0f}) — caution on longs (-2)")
+        # RSI 30-70 = neutral (no impact)
+        
+        # === FT + RSI MEAN REVERSION COMBO PENALTY ===
+        # When BOTH FT is extended (≥5) AND RSI is in bounce zone, the probability
+        # of mean reversion is very high. Apply additional combo penalty.
+        # DABUR example: FT=7 + RSI~35 on short → bounced immediately = -₹31K loss.
+        _ft_rsi_combo = False
+        if _ft >= 5:
+            if _is_selling and _rsi < 35:
+                score -= 5
+                _ft_rsi_combo = True
+                warnings.append(f"🔄 MEAN REVERSION COMBO: FT={_ft} + RSI={_rsi:.0f}<35 on SHORT — high bounce risk (-5)")
+            elif _is_buying and _rsi > 65:
+                score -= 5
+                _ft_rsi_combo = True
+                warnings.append(f"🔄 MEAN REVERSION COMBO: FT={_ft} + RSI={_rsi:.0f}>65 on LONG — high pullback risk (-5)")
         
         _audit_after_rsi = score
         
@@ -691,14 +927,22 @@ class IntradayOptionScorer:
                 # Scale bonus/penalty by OI change magnitude
                 oi_strength = min(1.5, oi_change / 5.0) if oi_change > 0 else 0.5  # 0.5-1.5x
                 
+                # FIX 5: OI+VWAP cross-validation — if OI aligns but VWAP misaligns,
+                # discount OI by 50% (two institutional-flow indicators disagreeing)
+                _oi_vwap_mult = 1.0
+                if vwap_misaligned:
+                    _oi_vwap_mult = self.OI_VWAP_CONFLICT_DISCOUNT
+                
                 if direction in ('BUY', 'HOLD') and oi_signal == 'LONG_BUILDUP':
-                    oi_score = int(5 * oi_strength)
+                    oi_score = int(5 * oi_strength * _oi_vwap_mult)
                     bullish_points += oi_score
-                    reasons.append(f"OI: LONG_BUILDUP confirms BUY (OI+{oi_change:.1f}%) (+{oi_score})")
+                    _vwap_note = f" [VWAP conflict: {_oi_vwap_mult:.0%}]" if _oi_vwap_mult < 1 else ""
+                    reasons.append(f"OI: LONG_BUILDUP confirms BUY (OI+{oi_change:.1f}%) (+{oi_score}){_vwap_note}")
                 elif direction in ('BUY', 'HOLD') and oi_signal == 'SHORT_COVERING':
-                    oi_score = int(3 * oi_strength)
+                    oi_score = int(3 * oi_strength * _oi_vwap_mult)
                     bullish_points += oi_score
-                    reasons.append(f"OI: SHORT_COVERING supports BUY (OI-{oi_change:.1f}%) (+{oi_score})")
+                    _vwap_note = f" [VWAP conflict: {_oi_vwap_mult:.0%}]" if _oi_vwap_mult < 1 else ""
+                    reasons.append(f"OI: SHORT_COVERING supports BUY (OI-{oi_change:.1f}%) (+{oi_score}){_vwap_note}")
                 elif direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
                     oi_score = -8
                     warnings.append(f"OI CONFLICT: SHORT_BUILDUP vs BUY direction (OI+{oi_change:.1f}%) (-8) — institutions are SELLING")
@@ -707,13 +951,15 @@ class IntradayOptionScorer:
                     warnings.append(f"OI CONFLICT: LONG_UNWINDING vs BUY (OI-{oi_change:.1f}%) (-5) — longs exiting")
                     
                 elif direction in ('SELL', 'HOLD') and oi_signal == 'SHORT_BUILDUP':
-                    oi_score = int(5 * oi_strength)
+                    oi_score = int(5 * oi_strength * _oi_vwap_mult)
                     bearish_points += oi_score
-                    reasons.append(f"OI: SHORT_BUILDUP confirms SELL (OI+{oi_change:.1f}%) (+{oi_score})")
+                    _vwap_note = f" [VWAP conflict: {_oi_vwap_mult:.0%}]" if _oi_vwap_mult < 1 else ""
+                    reasons.append(f"OI: SHORT_BUILDUP confirms SELL (OI+{oi_change:.1f}%) (+{oi_score}){_vwap_note}")
                 elif direction in ('SELL', 'HOLD') and oi_signal == 'LONG_UNWINDING':
-                    oi_score = int(3 * oi_strength)
+                    oi_score = int(3 * oi_strength * _oi_vwap_mult)
                     bearish_points += oi_score
-                    reasons.append(f"OI: LONG_UNWINDING supports SELL (OI-{oi_change:.1f}%) (+{oi_score})")
+                    _vwap_note = f" [VWAP conflict: {_oi_vwap_mult:.0%}]" if _oi_vwap_mult < 1 else ""
+                    reasons.append(f"OI: LONG_UNWINDING supports SELL (OI-{oi_change:.1f}%) (+{oi_score}){_vwap_note}")
                 elif direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
                     oi_score = -8
                     warnings.append(f"OI CONFLICT: LONG_BUILDUP vs SELL direction (OI+{oi_change:.1f}%) (-8) — institutions are BUYING")
@@ -724,6 +970,115 @@ class IntradayOptionScorer:
                 score += oi_score
         
         _audit_after_oi = score
+        
+        # === 8b. BOS / SWEEP (STRUCTURE) SCORING ===
+        # BOS (Break of Structure): price closed beyond prior swing high/low
+        #   → Confirms real breakout → +5 directional confirmation
+        # Sweep (Liquidity Grab): price wicked beyond swing but closed back inside
+        #   → Fake breakout / stop-hunt → -8 penalty
+        #   → If sweep + close back below VWAP or EMA9, STRONG reversal bias
+        # This catches the GODREJCP-type pattern: wick above R1, close below → reversal
+        bos_sweep_score = 0
+        if market_data:
+            _bos_sig = market_data.get('bos_signal', 'NONE')
+            _sweep_sig = market_data.get('sweep_signal', 'NONE')
+            _sw_high = market_data.get('swing_high_level', 0)
+            _sw_low = market_data.get('swing_low_level', 0)
+            _md_vwap = market_data.get('vwap', 0)
+            _md_ema9 = market_data.get('ema_9', 0)
+            _md_ltp = market_data.get('ltp', 0)
+            
+            # --- BOS: Reward for confirmed structural breakout ---
+            # FIX 4: BOS volume validation — fake structural breaks on LOW volume get less credit
+            _bos_vol = market_data.get('volume_regime', 'NORMAL')
+            if _bos_sig == 'BOS_HIGH':
+                if direction in ('BUY', 'HOLD'):
+                    if _bos_vol == 'LOW':
+                        _bos_pts = self.BOS_LOW_VOL_POINTS  # +2 instead of +5
+                        bos_sweep_score += _bos_pts
+                        bullish_points += _bos_pts
+                        reasons.append(f"📈 BOS: Above swing ₹{_sw_high:.0f} but LOW vol — weak break (+{_bos_pts})")
+                    elif _bos_vol == 'EXPLOSIVE':
+                        _bos_pts = 5 + self.BOS_EXPLOSIVE_BONUS  # +7 for confirmed break
+                        bos_sweep_score += _bos_pts
+                        bullish_points += _bos_pts
+                        reasons.append(f"📈 BOS: Above swing ₹{_sw_high:.0f} + EXPLOSIVE vol — confirmed (+{_bos_pts})")
+                    else:
+                        bos_sweep_score += 5
+                        bullish_points += 5
+                        reasons.append(f"📈 BOS: Closed above swing high ₹{_sw_high:.0f} — confirmed breakout (+5)")
+                elif direction == 'SELL':
+                    bos_sweep_score -= 3
+                    warnings.append(f"⚠️ BOS CONFLICT: Highs breaking (₹{_sw_high:.0f}) on SELL direction (-3)")
+            elif _bos_sig == 'BOS_LOW':
+                if direction in ('SELL', 'HOLD'):
+                    if _bos_vol == 'LOW':
+                        _bos_pts = self.BOS_LOW_VOL_POINTS
+                        bos_sweep_score += _bos_pts
+                        bearish_points += _bos_pts
+                        reasons.append(f"📉 BOS: Below swing ₹{_sw_low:.0f} but LOW vol — weak break (+{_bos_pts})")
+                    elif _bos_vol == 'EXPLOSIVE':
+                        _bos_pts = 5 + self.BOS_EXPLOSIVE_BONUS
+                        bos_sweep_score += _bos_pts
+                        bearish_points += _bos_pts
+                        reasons.append(f"📉 BOS: Below swing ₹{_sw_low:.0f} + EXPLOSIVE vol — confirmed (+{_bos_pts})")
+                    else:
+                        bos_sweep_score += 5
+                        bearish_points += 5
+                        reasons.append(f"📉 BOS: Closed below swing low ₹{_sw_low:.0f} — confirmed breakdown (+5)")
+                elif direction == 'BUY':
+                    bos_sweep_score -= 3
+                    warnings.append(f"⚠️ BOS CONFLICT: Lows breaking (₹{_sw_low:.0f}) on BUY direction (-3)")
+            
+            # --- SWEEP: Penalty for liquidity grab / fake breakout ---
+            if _sweep_sig == 'SWEEP_HIGH':
+                # Wicked above swing high but closed back below → bears trapped longs
+                base_penalty = -4
+                # Amplify if close also below VWAP or EMA9 (confirms rejection)
+                below_vwap = _md_ltp < _md_vwap if _md_vwap > 0 else False
+                below_ema9 = _md_ltp < _md_ema9 if _md_ema9 > 0 else False
+                if below_vwap or below_ema9:
+                    base_penalty = -6
+                    _confirm = []
+                    if below_vwap: _confirm.append('below VWAP')
+                    if below_ema9: _confirm.append('below EMA9')
+                    warnings.append(f"🔻 SWEEP HIGH: Wicked above ₹{_sw_high:.0f} but rejected + {' & '.join(_confirm)} ({base_penalty})")
+                else:
+                    warnings.append(f"🔻 SWEEP HIGH: Wicked above swing ₹{_sw_high:.0f} but closed back below ({base_penalty})")
+                
+                bos_sweep_score += base_penalty
+                if direction == 'BUY':
+                    # BUY into a sweep of highs = the exact trap GODREJCP hit
+                    bearish_points += abs(base_penalty)
+                elif direction == 'SELL':
+                    # Sweep of highs confirms sellers have control
+                    bearish_points += 3
+            
+            elif _sweep_sig == 'SWEEP_LOW':
+                # Wicked below swing low but closed back above → bulls trapped shorts
+                base_penalty = -4
+                above_vwap = _md_ltp > _md_vwap if _md_vwap > 0 else False
+                above_ema9 = _md_ltp > _md_ema9 if _md_ema9 > 0 else False
+                if above_vwap or above_ema9:
+                    base_penalty = -6
+                    _confirm = []
+                    if above_vwap: _confirm.append('above VWAP')
+                    if above_ema9: _confirm.append('above EMA9')
+                    warnings.append(f"🔺 SWEEP LOW: Wicked below ₹{_sw_low:.0f} but reclaimed + {' & '.join(_confirm)} ({base_penalty})")
+                else:
+                    warnings.append(f"🔺 SWEEP LOW: Wicked below swing ₹{_sw_low:.0f} but closed back above ({base_penalty})")
+                
+                bos_sweep_score += base_penalty
+                if direction == 'SELL':
+                    # SELL into a sweep of lows = exact bearish trap
+                    bullish_points += abs(base_penalty)
+                elif direction == 'BUY':
+                    # Sweep of lows confirms buyers stepping in
+                    bullish_points += 3
+            
+            score += bos_sweep_score
+        
+        _audit_after_bos = score
         
         # === 8. MOMENTUM EXHAUSTION FILTER (graduated, overridable) ===
         # Prevents chasing moves that have already exhausted their run.
@@ -858,10 +1213,9 @@ class IntradayOptionScorer:
             warnings.append(f"⛔ CHOP ZONE - deducted {self.CHOP_PENALTY} points")
         _audit_after_chop = score
         
-        # === CALLER DIRECTION ALIGNMENT BONUS (2 pts max) ===
-        # Small bonus when GPT agent direction aligns with overall signal direction.
-        # DOES NOT re-check individual signals (VWAP, volume, EMA already scored).
-        # Only checks: does the determined direction match what GPT wants?
+        # === CALLER DIRECTION ALIGNMENT BONUS/PENALTY (enhanced) ===
+        # Bonus when GPT agent direction aligns with overall signal direction.
+        # PENALTY when GPT pushes a direction that conflicts with signal direction.
         if caller_direction and caller_direction in ('BUY', 'SELL'):
             if direction == caller_direction:
                 score += 2
@@ -871,8 +1225,19 @@ class IntradayOptionScorer:
                 score += 1
                 direction = caller_direction
                 reasons.append(f"🤖 Agent direction set (signals neutral) (+1)")
+            elif direction != caller_direction and direction in ('BUY', 'SELL'):
+                # GPT wants opposite of what signals determined — conflict penalty
+                score -= 5
+                warnings.append(f"⚠️ DIRECTION CONFLICT: Agent wants {caller_direction} but signals say {direction} (-5)")
         _audit_after_align = score
         _pre_direction_trend_dir = trend_direction  # Save for S2 VWAP reconciliation
+        
+        # FIX 7: HTF vs Final Direction Conflict
+        # If HTF says BULLISH but final direction is SELL (or vice versa),
+        # the +5 from HTF is inflating the score for the wrong direction.
+        # We saved _htf_direction above. After direction is finalized (below),
+        # we'll apply the correction. For now, save the HTF contribution.
+        _htf_contributed = _audit_after_htf - _audit_after_ema  # Points HTF added
         
         # === DETERMINE DIRECTION ===
         if direction == "HOLD":
@@ -941,10 +1306,28 @@ class IntradayOptionScorer:
                 warnings.append(f"🔄 VWAP RE-SCORED: direction {_pre_direction_trend_dir}→{direction}, VWAP {_old_vwap_contrib:+.0f}→{_new_vwap:+.0f} (Δ{_vwap_delta:+.0f})")
                 _audit_after_align = score  # Update for gate cap baseline
         
+        # FIX 7 (applied): HTF vs Final Direction Conflict
+        # Now that direction is finalized, check if HTF alignment added points
+        # for the WRONG direction. If HTF=BULLISH but direction=SELL (or vice versa),
+        # reverse the contribution: +5 becomes -3 (penalty for conflicting timeframe).
+        if direction in ('BUY', 'SELL') and _htf_direction is not None and _htf_direction != direction:
+            # HTF added +5 for a direction we're NOT trading → inflate reversal
+            _htf_correction = -(_htf_contributed) - 3  # Remove the +5 and add -3 penalty
+            score += _htf_correction
+            # Fix directional points too
+            if _htf_direction == 'BUY':
+                bullish_points -= _htf_contributed
+            else:
+                bearish_points -= _htf_contributed
+            warnings.append(f"🔄 HTF CONFLICT: HTF={_htf_direction} vs direction={direction} — reversed +{_htf_contributed}→-3 (Δ{_htf_correction:+.0f})")
+            _audit_after_align = score  # Update baseline
+        
         # === REVERSAL ZONE DETECTION (exhaustion → trade the pullback) ===
         # Detects stocks that are exhausted at resistance/support and flips
         # direction to trade the mean-reversion instead of chasing.
         # ALL 3 conditions required: >2.5% move + near R/S + RSI extreme
+        # FIX 9: Also requires volume ≥ NORMAL and OI not conflicting for direction flip.
+        #        Without vol/OI confirmation, apply penalty only (no flip).
         # Uses tighter SL (18%) and smaller size (0.75x) for lower conviction.
         is_reversal_trade = False
         if market_data and direction in ("BUY", "SELL"):
@@ -956,6 +1339,8 @@ class IntradayOptionScorer:
             _rv_r2 = market_data.get('resistance_2', 0)
             _rv_s1 = market_data.get('support_1', 0)
             _rv_s2 = market_data.get('support_2', 0)
+            _rv_vol = market_data.get('volume_regime', 'NORMAL')
+            _rv_oi = market_data.get('oi_signal', 'NEUTRAL')
 
             if direction == "BUY" and _rv_move >= 2.5:
                 # Bullish exhaustion: near resistance + overbought
@@ -965,12 +1350,21 @@ class IntradayOptionScorer:
                 _which_r = f"R1 ₹{_rv_r1:.0f}" if _near_r1 else f"R2 ₹{_rv_r2:.0f}"
 
                 if _near_resistance and _rv_rsi > 70:
-                    is_reversal_trade = True
-                    _old_dir = direction
-                    direction = "SELL"  # Flip → buy PUT
-                    score -= 5  # Small penalty for counter-trend risk
-                    warnings.append(f"🔄 REVERSAL ZONE: {_rv_move:.1f}% from open + near {_which_r} + RSI {_rv_rsi:.0f} → FLIPPED {_old_dir}→{direction} (PUT reversal)")
-                    reasons.append(f"🎯 REVERSAL TRADE: Bullish exhaustion at resistance — trading pullback")
+                    # FIX 9: Check volume + OI before flipping direction
+                    _rv_vol_ok = _rv_vol in ('NORMAL', 'HIGH', 'EXPLOSIVE')
+                    _rv_oi_conflict = _rv_oi == 'LONG_BUILDUP'  # Institutions pushing through
+                    if _rv_vol_ok and not _rv_oi_conflict:
+                        is_reversal_trade = True
+                        _old_dir = direction
+                        direction = "SELL"  # Flip → buy PUT
+                        score -= 5
+                        warnings.append(f"🔄 REVERSAL ZONE: {_rv_move:.1f}% from open + near {_which_r} + RSI {_rv_rsi:.0f} → FLIPPED {_old_dir}→{direction} (PUT reversal)")
+                        reasons.append(f"🎯 REVERSAL TRADE: Bullish exhaustion at resistance — trading pullback")
+                    else:
+                        # Conditions met but vol/OI don't confirm → penalty only, no flip
+                        score -= 5
+                        _rv_reason = f"LOW vol" if not _rv_vol_ok else f"OI={_rv_oi} opposing"
+                        warnings.append(f"⚠️ REVERSAL ZONE (no flip): near {_which_r} + RSI {_rv_rsi:.0f} but {_rv_reason} — penalty only (-5)")
 
             elif direction == "SELL" and _rv_move >= 2.5:
                 # Bearish exhaustion: near support + oversold
@@ -980,12 +1374,20 @@ class IntradayOptionScorer:
                 _which_s = f"S1 ₹{_rv_s1:.0f}" if _near_s1 else f"S2 ₹{_rv_s2:.0f}"
 
                 if _near_support and _rv_rsi < 30:
-                    is_reversal_trade = True
-                    _old_dir = direction
-                    direction = "BUY"  # Flip → buy CALL
-                    score -= 5
-                    warnings.append(f"🔄 REVERSAL ZONE: {_rv_move:.1f}% from open + near {_which_s} + RSI {_rv_rsi:.0f} → FLIPPED {_old_dir}→{direction} (CALL reversal)")
-                    reasons.append(f"🎯 REVERSAL TRADE: Bearish exhaustion at support — trading bounce")
+                    # FIX 9: Check volume + OI before flipping direction
+                    _rv_vol_ok = _rv_vol in ('NORMAL', 'HIGH', 'EXPLOSIVE')
+                    _rv_oi_conflict = _rv_oi == 'SHORT_BUILDUP'  # Institutions pushing down
+                    if _rv_vol_ok and not _rv_oi_conflict:
+                        is_reversal_trade = True
+                        _old_dir = direction
+                        direction = "BUY"  # Flip → buy CALL
+                        score -= 5
+                        warnings.append(f"🔄 REVERSAL ZONE: {_rv_move:.1f}% from open + near {_which_s} + RSI {_rv_rsi:.0f} → FLIPPED {_old_dir}→{direction} (CALL reversal)")
+                        reasons.append(f"🎯 REVERSAL TRADE: Bearish exhaustion at support — trading bounce")
+                    else:
+                        score -= 5
+                        _rv_reason = f"LOW vol" if not _rv_vol_ok else f"OI={_rv_oi} opposing"
+                        warnings.append(f"⚠️ REVERSAL ZONE (no flip): near {_which_s} + RSI {_rv_rsi:.0f} but {_rv_reason} — penalty only (-5)")
 
         # === DETERMINE STRIKE SELECTION (with OTM safety rules) ===
         strike_selection = self._recommend_strike(
@@ -1220,17 +1622,24 @@ class IntradayOptionScorer:
                 score -= 5
                 warnings.append(f"⚠️ NO FOLLOW-THROUGH: {ft_candles} candles — no confirmation after breakout (-5)")
         
-        # Gate 9: ADX TREND STRENGTH — penalty-only gate
+        # Gate 9: ADX TREND STRENGTH — HARD BLOCK for weak ADX
         # TrendFollowing already gives up to 10 pts for ADX strength.
-        # This gate ONLY penalizes critically weak ADX (no bonus to avoid double-counting).
+        # ADX < 22 = NO TREND = BLOCK (raised from 20; INOXWIND ADX=21.4 kept passing & losing)
+        # ADX 22-25 = weak trend = -5 penalty
         adx = market_data.get('adx', 0) if market_data else 0
         if should_trade and adx > 0:
-            if adx < 20:
+            if adx < 22:
+                should_trade = False
+                warnings.append(f"🚫 BLOCKED: ADX {adx:.0f} < 22 — no trend detected, directionless chop")
+            elif adx < 25:
                 score -= 5
-                warnings.append(f"⚠️ NO TREND: ADX {adx:.0f} < 20 — directionless chop (-5)")
+                warnings.append(f"⚠️ WEAK TREND: ADX {adx:.0f} < 25 — marginal trend strength (-5)")
             elif intended_tier == "premium" and adx < self.ADX_MIN_PREMIUM:
                 score -= 3
                 warnings.append(f"⚠️ WEAK ADX: {adx:.0f} < {self.ADX_MIN_PREMIUM} for premium tier (-3)")
+            elif adx >= 30:
+                score += 3
+                warnings.append(f"✅ STRONG TREND: ADX {adx:.0f} >= 30 — confirmed trend (+3)")
         
         # Gate 10: ORB STRENGTH OVEREXTENSION — winners entered at ORB_str 30, losers at 142
         # High ORB strength = price already moved far from ORB range = chasing the move
@@ -1363,11 +1772,25 @@ class IntradayOptionScorer:
         _audit_parts.append(f"HTF:{_audit_after_htf - _audit_after_ema:+.0f}")
         _audit_parts.append(f"Accel:{_audit_after_accel - _audit_after_htf:+.0f}")
         _audit_parts.append(f"RSI:{_audit_after_rsi - _audit_after_accel:+.0f}")
-        _audit_parts.append(f"Exhaust:{_audit_after_exhaust - _audit_after_rsi:+.0f}")
+        _audit_parts.append(f"BOS:{_audit_after_bos - _audit_after_oi:+.0f}")
+        _audit_parts.append(f"Exhaust:{_audit_after_exhaust - _audit_after_bos:+.0f}")
         _audit_parts.append(f"Chop:{_audit_after_chop - _audit_after_exhaust:+.0f}")
         _audit_parts.append(f"Align:{_audit_after_align - _audit_after_chop:+.0f}")
         _audit_parts.append(f"Gates:{_audit_after_gates - _audit_after_align:+.0f}")
-        _score_audit_str = " | ".join(_audit_parts) + f" = {score:.0f}"
+        # Append ORB+Vol smart notes for audit visibility
+        _orb_vol_notes = []
+        if _orb_vol_combo_mult < 1.0:
+            _orb_vol_notes.append(f"OV:{_vol_regime_for_orb}={_orb_vol_combo_mult:.0%}")
+        if _orb_reentries > 0:
+            _orb_vol_notes.append(f"RE:{_orb_reentries}")
+        if _orb_regime_mult < 1.0:
+            _orb_vol_notes.append(f"RG:{_orb_market_breadth}")
+        if _synergy_bonus > 0:
+            _orb_vol_notes.append(f"SYN:+{_synergy_bonus}")
+        if _orb_vol_notes:
+            _score_audit_str = " | ".join(_audit_parts) + f" [{','.join(_orb_vol_notes)}]" + f" = {score:.0f}"
+        else:
+            _score_audit_str = " | ".join(_audit_parts) + f" = {score:.0f}"
         self._last_score_audit = _score_audit_str
         
         # Cap size for reversal trades (lower conviction)
@@ -3105,19 +3528,23 @@ class OptionsTrader:
             # REUSE cached cycle-time score — add microstructure bonus if available
             decision = cached_decision['decision']
             cached_base_score = cached_decision.get('score', decision.confidence_score)
+            # Use raw pre-ML score for fair comparison (ML boost is NOT re-applied at trade time)
+            cached_raw_score = cached_decision.get('raw_score', cached_base_score)
             if micro_data:
                 # Cycle-time score was computed WITHOUT microstructure.
                 # Re-score WITH microstructure to unlock +15 bonus points.
                 scorer = get_intraday_scorer()
                 decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, option_data=micro_data, caller_direction=direction)
-                print(f"   🔄 CACHED score {cached_base_score:.0f} → re-scored WITH microstructure → {decision.confidence_score:.0f}")
+                print(f"   🔄 CACHED score {cached_base_score:.0f} (raw={cached_raw_score:.0f}) → re-scored WITH microstructure → {decision.confidence_score:.0f}")
                 
                 # === RE-SCORE GATE: Block if option score dropped hard from scan score ===
-                # KFINTECH scored 72 on scan but 57.5 on option → trade went through but lost.
-                # If score drops >12 from cached AND falls below 62, option quality is too poor.
-                _score_drop = cached_base_score - decision.confidence_score
-                if _score_drop > 12 and decision.confidence_score < 62:
-                    print(f"   🚫 RE-SCORE GATE: Score dropped {_score_drop:.0f} pts ({cached_base_score:.0f}→{decision.confidence_score:.0f}) — option quality too poor")
+                # Compare against raw_score (pre-ML) for fair apples-to-apples comparison.
+                # ML boost (+5 to +15) is only applied during scan cycle, not at trade time,
+                # so comparing against ML-boosted score inflates the apparent drop.
+                # Threshold aligned to BLOCK_THRESHOLD (52) after recalibration.
+                _score_drop = cached_raw_score - decision.confidence_score
+                if _score_drop > 15 and decision.confidence_score < self.BLOCK_THRESHOLD:
+                    print(f"   🚫 RE-SCORE GATE: Score dropped {_score_drop:.0f} pts (raw {cached_raw_score:.0f}→{decision.confidence_score:.0f}) — option quality too poor")
                     self._last_rejected_score = decision.confidence_score
                     self._last_rejected_symbol = underlying
                     return None
@@ -3733,6 +4160,25 @@ class OptionsTrader:
             # Calculate lots: limited by risk and config
             lots_by_risk = max(1, int(max_risk_config / max_risk_per_lot)) if max_risk_per_lot > 0 else 1
             lots = min(lots_by_risk, max_lots_config)
+            
+            # === SCORE-BASED SPREAD LOT SCALING ===
+            # Strong-scoring spreads deserve more capital (spreads are +₹13K today, proven edge)
+            _cs_score = cached_decision.get('score', 0) if cached_decision else 0
+            if _cs_score >= 75:
+                _cs_score_mult = 2.5   # Elite setup → 2.5x lots (max conviction)
+                lots = max(lots, 4)    # Floor: 4 lots minimum for elite
+            elif _cs_score >= 70:
+                _cs_score_mult = 1.8   # Premium setup → 1.8x lots
+                lots = max(lots, 3)    # Floor: 3 lots minimum for premium
+            elif _cs_score >= 62:
+                _cs_score_mult = 1.3   # Solid setup → 1.3x lots
+                lots = max(lots, 2)    # Floor: 2 lots minimum
+            else:
+                _cs_score_mult = 1.0   # Base
+            lots = max(1, round(lots * _cs_score_mult))
+            lots = min(lots, max_lots_config)  # Re-cap after score scaling
+            if _cs_score_mult > 1.0:
+                print(f"      💪 Score-based Credit Spread Sizing: score={_cs_score:.0f} → {_cs_score_mult:.2f}x → {lots} lots")
             
             # === ML SIZING FACTOR (FAIL-SAFE) ===
             # Credit spreads profit from NO_MOVE (theta decay), so ML NO_MOVE → bigger size
@@ -4961,6 +5407,24 @@ class OptionsTrader:
             lots_by_debit = max(1, round(max_debit_config / debit_per_lot)) if debit_per_lot > 0 else 1
             lots = min(lots_by_debit, max_lots_config)
             lots = max(lots, min_lots)  # Enforce minimum lots for tier
+            
+            # === SCORE-BASED SPREAD LOT SCALING ===
+            # Strong-scoring debit spreads deserve more capital (WAAREEENER +₹9,230 was debit spread)
+            if score >= 75:
+                _ds_score_mult = 2.5   # Elite momentum → 2.5x lots (max conviction)
+                lots = max(lots, 5)    # Floor: 5 lots minimum for elite
+            elif score >= 70:
+                _ds_score_mult = 1.8   # Premium momentum → 1.8x lots
+                lots = max(lots, 4)    # Floor: 4 lots minimum for premium
+            elif score >= 62:
+                _ds_score_mult = 1.3   # Solid setup → 1.3x lots
+                lots = max(lots, 3)    # Floor: 3 lots minimum
+            else:
+                _ds_score_mult = 1.0   # Base
+            lots = max(1, round(lots * _ds_score_mult))
+            lots = min(lots, max_lots_config)  # Re-cap after score scaling
+            if _ds_score_mult > 1.0:
+                print(f"      💪 Score-based Debit Spread Sizing: score={score:.0f} → {_ds_score_mult:.2f}x → {lots} lots")
             
             # === ML SIZING FACTOR (FAIL-SAFE) ===
             # Debit spreads profit from MOVE, so ML MOVE → bigger size

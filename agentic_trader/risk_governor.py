@@ -169,10 +169,15 @@ class RiskGovernor:
         
         # --- PRIMARY SOURCE: active_trades.json realized_pnl ---
         active_file = os.path.join(base_dir, 'active_trades.json')
+        today_str = str(datetime.now().date())
         if os.path.exists(active_file):
             try:
                 with open(active_file, 'r') as f:
                     active_data = json.load(f)
+                # Only reconcile if file is from today — skip stale data
+                if active_data.get('date') != today_str:
+                    print(f"📊 Risk Governor: Skipping stale active_trades.json (date={active_data.get('date')}, today={today_str})")
+                    return
                 active_pnl = active_data.get('realized_pnl', None)
                 if active_pnl is not None:
                     old_pnl = self.state.daily_pnl

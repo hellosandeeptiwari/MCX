@@ -1,0 +1,109 @@
+========================================================================
+  TITAN QUANTITATIVE PERFORMANCE REPORT
+  Period: 2026-02-18 → 2026-02-18  |  12 trades
+========================================================================
+
+┌─── PORTFOLIO OVERVIEW ──────────────────────────────────────┐
+│  Total P&L:        ₹     -29,450                          │
+│  Win Rate:           58.3%  (7W / 5L / 0BE)       │
+│  Profit Factor:      0.49    (>1.5 = good)                │
+│  Payoff Ratio:       0.35    (avg win / avg loss)          │
+│  Expectancy:       ₹    -2,454/trade                      │
+│  Sharpe Ratio:       3.18    (>1.0 = good, >2.0 = great) │
+│  Sortino Ratio:      5.15    (>1.5 = good)                │
+│  Max Drawdown:     ₹    42,772  (8.6%)             │
+│  Max Loss Streak:    2 trades                              │
+│  Avg Hold Time:       52 min  (median: 33 min)       │
+│  Avg R-Multiple:    0.28   (median: 0.18)           │
+│  Trades > 1R:        0    Trades > 2R:   0                │
+│  Largest Win:      ₹    +9,230                              │
+│  Largest Loss:     ₹   -31,104                              │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── SCORE → OUTCOME EDGE VALIDATION ────────────────────────┐
+│  Correlation (score ↔ P&L): -0.465                        │
+│  Verdict: SCORING SYSTEM IS INVERTED — FIX URGENTLY        │
+│  Sample: 7 scored trades                                │
+│                                                            │
+│  Band           Trades  Win%   Avg P&L    Total P&L       │
+│  ──────────────────────────────────────────────────────    │
+│  45-54 (Base)        1   100.0%  ₹  +4,472  ₹    +4,472   │
+│  55-64 (Standard)    3    33.3%  ₹ -10,276  ₹   -30,829   │
+│  65-74 (Premium)     2     0.0%  ₹  -6,234  ₹   -12,467   │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── P&L BY STRATEGY ────────────────────────────────────────┐
+│  Strategy         Trades  Win%    P&L        Avg R          │
+│  ──────────────────────────────────────────────────────────  │
+│  DEBIT_SPREAD          2   100.0%  ₹   +15,307  +0.54R       │
+│  EQUITY                3   100.0%  ₹    +4,451  +0.19R       │
+│  NAKED_OPTION          7    28.6%  ₹   -49,208  +0.25R       │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── P&L BY SCORE TIER ──────────────────────────────────────┐
+│  Tier            Trades  Win%    P&L        Avg Score       │
+│  ──────────────────────────────────────────────────────────  │
+│  standard             3    66.7%  ₹   +11,909    20.5         │
+│  base                 2   100.0%  ₹    +8,145    54.7         │
+│  unknown              3   100.0%  ₹    +4,451     0.0         │
+│  premium              4     0.0%  ₹   -53,956    66.2         │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── SECTOR MONEY FLOW ──────────────────────────────────────┐
+│  Sector         Trades  Win%    P&L        Stocks           │
+│  ──────────────────────────────────────────────────────────  │
+│  INSURANCE          1   100.0%  ₹    +3,673  HDFCLIFE       │
+│  OTHER              4    50.0%  ₹    -2,525  DIXON,INOXWIND,WAAREEENER│
+│  METALS             4    50.0%  ₹   -10,044  JINDALSTEL,TATASTEEL│
+│  FMCG               3    66.7%  ₹   -20,555  DABUR,MARICO   │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── TIME OF DAY ANALYSIS ───────────────────────────────────┐
+│  Hour         Trades  Win%    P&L        Avg P&L            │
+│  ──────────────────────────────────────────────────────────  │
+│  09:00-09:59      3    66.7%  ₹    +8,161  ₹ +2,720    │
+│  10:00-10:59      4    50.0%  ₹   -10,345  ₹ -2,586    │
+│  11:00-11:59      2    50.0%  ₹    -5,912  ₹ -2,956    │
+│  12:00-12:59      3    66.7%  ₹   -21,354  ₹ -7,118    │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── EXIT QUALITY ───────────────────────────────────────────┐
+│  MFE Capture (avg):  137.6%  (how much of the best move we keep) │
+│  MFE Capture (med):  100.0%                                    │
+│  Avg Candles Held:     6.0                                      │
+│  Avg R at Exit:      +0.37                                      │
+│                                                              │
+│  Exit Type           Count   P&L        Avg R               │
+│  ──────────────────────────────────────────────────────────  │
+│  QUICK_PROFIT             4   ₹   +23,452  +0.57R            │
+│  SPREAD_TRAIL_SL          3   ₹    +4,451  +0.19R            │
+│  THETA_DECAY_WARNING      2   ₹    -6,021  +0.00R            │
+│  TIME_STOP                1   ₹    -9,844  +0.12R            │
+│  SESSION_CUTOFF           1   ₹   -10,384  +0.40R            │
+│  STOPLOSS_HIT             1   ₹   -31,104  +0.00R            │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── DAILY EQUITY CURVE ─────────────────────────────────────┐
+│  Date        Trades  W/L   Day P&L      Cum Return         │
+│  ──────────────────────────────────────────────────────────  │
+│  🔴 2026-02-18     12   7/5   ₹   -29,450   -5.89%       │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── ROLLING EDGE (last 10-trade window) ────────────────────┐
+│  Trade #  4: WR  75.0%  R +0.31  P&L ₹  +9,648  │
+│  Trade #  8: WR  25.0%  R +0.18  P&L ₹ -22,217  │
+│  Trade # 12: WR  75.0%  R +0.35  P&L ₹ -16,882  │
+│  Win Rate Trend: STABLE →                                  │
+└────────────────────────────────────────────────────────────────┘
+
+┌─── QUANT INSIGHTS & RECOMMENDATIONS ───────────────────────┐
+│  ⚠️  CRITICAL: Score correlation is NEGATIVE — higher scores produce WORSE outcomes. Scoring system needs recalibration.│
+│  🔴 Profit Factor 0.49 < 1.0 — system is LOSING money. Fix before adding capital.│
+│  ✅ Best sector: INSURANCE (+₹3,673 from HDFCLIFE)            │
+│  🔴 Worst sector: FMCG (₹-20,555) — consider sector filters or reduced sizing│
+│  ✅ Best hour: 09:00-09:59 → ₹+8,161 (3 trades)               │
+│  🔴 Worst hour: 12:00-12:59 → ₹-21,354 — consider blocking this window│
+│  ✅ MFE capture 138% — excellent exit quality.                │
+│  ✅ Best strategy: DEBIT_SPREAD (₹+15,307, 100% WR)           │
+│  🔴 Worst strategy: NAKED_OPTION (₹-49,208) — review or disable│
+└────────────────────────────────────────────────────────────────┘

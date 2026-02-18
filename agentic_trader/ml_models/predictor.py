@@ -179,7 +179,8 @@ class MovePredictor:
     
     def predict(self, candles_df: pd.DataFrame, daily_df: pd.DataFrame = None,
                  oi_df: pd.DataFrame = None, futures_oi_df: pd.DataFrame = None,
-                 nifty_5min_df: pd.DataFrame = None, nifty_daily_df: pd.DataFrame = None) -> dict:
+                 nifty_5min_df: pd.DataFrame = None, nifty_daily_df: pd.DataFrame = None,
+                 sector_5min_df: pd.DataFrame = None, sector_daily_df: pd.DataFrame = None) -> dict:
         """Predict move probability for a single stock.
         
         Args:
@@ -190,6 +191,8 @@ class MovePredictor:
             futures_oi_df: Optional daily futures OI features DataFrame.
             nifty_5min_df: Optional NIFTY50 5-min candles for market context.
             nifty_daily_df: Optional NIFTY50 daily candles for market context.
+            sector_5min_df: Optional sector index 5-min candles for sector context.
+            sector_daily_df: Optional sector index daily candles for sector context.
         
         Returns:
             dict with prediction results, or empty dict if prediction fails.
@@ -200,7 +203,8 @@ class MovePredictor:
         try:
             # Compute features on the candles
             featured = compute_features(candles_df, daily_df=daily_df, oi_df=oi_df, futures_oi_df=futures_oi_df,
-                                        nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df)
+                                        nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df,
+                                        sector_5min_df=sector_5min_df, sector_daily_df=sector_daily_df)
             if featured.empty or len(featured) < 2:
                 return {}
             
@@ -236,13 +240,18 @@ class MovePredictor:
         - P(MOVE) from gate → determines if stock will move
         - P(UP|MOVE) from direction → if moving, which direction?
         - Thresholds are applied to EACH model separately
+        
+        Hybrid model (v7+) uses calibrated probabilities:
+        - Gate: calibrated P(MOVE) in 0-1 range, threshold = 0.50
+        - Direction: calibrated P(UP|MOVE) in 0-1 range, dead zone 0.48-0.52
         """
         # Gate model: P(MOVE) — uses full feature set
-        gate_raw = self.gate_model.predict_proba(X)[0, 1]  # P(MOVE)
-        if self.gate_cal:
+        gate_raw = float(self.gate_model.predict_proba(X)[0, 1])  # P(MOVE)
+        # Apply isotonic calibration if available
+        if self.gate_cal is not None:
             p_move = float(self.gate_cal.predict([gate_raw])[0])
         else:
-            p_move = float(gate_raw)
+            p_move = gate_raw
         
         # Direction model: P(UP|MOVE) — may use pruned feature subset
         if self.dir_feature_names != self.feature_names:
@@ -252,11 +261,11 @@ class MovePredictor:
         else:
             X_dir = X
         
-        dir_raw = self.dir_model.predict_proba(X_dir)[0, 1]  # P(UP|MOVE)
-        if self.dir_cal:
+        dir_raw = float(self.dir_model.predict_proba(X_dir)[0, 1])  # P(UP|MOVE)
+        if self.dir_cal is not None:
             p_up_given_move = float(self.dir_cal.predict([dir_raw])[0])
         else:
-            p_up_given_move = float(dir_raw)
+            p_up_given_move = dir_raw
         
         p_down_given_move = 1 - p_up_given_move
         
@@ -265,29 +274,29 @@ class MovePredictor:
         prob_down = p_move * p_down_given_move
         prob_flat = 1 - p_move
         
-        # ── Signal determination (based on raw model outputs) ──
-        # Step 1: Gate decides MOVE vs FLAT
-        # Step 2: Direction decides UP vs DOWN
-        # Thresholds calibrated to model's actual output distribution
-        # (gate calibrator compresses p_move to ~0.30-0.50 range)
+        # ── Signal determination (calibrated probabilities, 0-1 range) ──
+        # Gate:      calibrated P(MOVE), threshold 0.50
+        # Direction: calibrated P(UP|MOVE), dead zone 0.48-0.52 → coin-flip
+        #
+        # High-confidence thresholds from training analysis:
+        # Combined 50%+ → 52-53% precision (usable)
+        # Combined 60%+ → 58-68% precision (high quality)
+        #
+        # Only assign UP/DOWN when BOTH gate says likely move AND direction
+        # model shows genuine edge (outside dead zone).
         
-        if p_move >= 0.40:
-            # Gate says likely to move — now check direction
-            # Direction calibrator compresses to ~0.47-0.53 range, use tight thresholds
-            if p_up_given_move >= 0.53:
+        if p_move >= 0.50:
+            # Gate says move likely
+            if p_up_given_move >= 0.52:
                 signal = 'UP'
-                confidence = p_up_given_move  # Direction confidence
-            elif p_down_given_move >= 0.53:
+                confidence = prob_up
+            elif p_down_given_move >= 0.52:
                 signal = 'DOWN'
-                confidence = p_down_given_move
-            elif p_up_given_move >= 0.51:
-                signal = 'UP'
-                confidence = p_up_given_move
-            elif p_down_given_move >= 0.51:
-                signal = 'DOWN'
-                confidence = p_down_given_move
+                confidence = prob_down
             else:
-                signal = 'FLAT'  # Gate says move, but direction uncertain
+                # Direction model is ~50/50 — no real conviction.
+                # Still flag as MOVE but with neutral direction
+                signal = 'FLAT'
                 confidence = prob_flat
         else:
             signal = 'FLAT'
@@ -295,18 +304,38 @@ class MovePredictor:
         
         direction_bias = prob_up - prob_down
         
-        # Score boost — based on gate + direction conviction
-        # Thresholds calibrated to model's actual output range (~0.30-0.50)
+        # Score boost — calibrated probability thresholds
+        # Only boost when BOTH gate + direction have conviction.
+        # CRITICAL: FLAT signal → 0 or negative boost.
         score_boost = 0
-        if p_move >= 0.50 and max(p_up_given_move, p_down_given_move) >= 0.53:
-            score_boost = 10  # High-conviction directional
-        elif p_move >= 0.45 and max(p_up_given_move, p_down_given_move) >= 0.51:
-            score_boost = 8
-        elif p_move >= 0.40 and max(p_up_given_move, p_down_given_move) >= 0.50:
-            score_boost = 5
-        elif p_move <= 0.28:
-            score_boost = -8  # Very likely flat
-        elif p_move <= 0.33:
+        if signal != 'FLAT':
+            combined_prob = max(prob_up, prob_down)  # the winning direction's combined prob
+            if combined_prob >= 0.40:
+                score_boost = 10  # High-conviction directional (~68% precision)
+            elif combined_prob >= 0.35:
+                score_boost = 8   # Strong signal (~58% precision)
+            elif combined_prob >= 0.30:
+                score_boost = 5   # Moderate signal (~52% precision)
+            elif combined_prob >= 0.25:
+                score_boost = 3   # Weak-but-directional
+        # FLAT signal penalties
+        if signal == 'FLAT':
+            if p_move < 0.35:
+                # Gate model says stock unlikely to move → penalize
+                if prob_flat >= 0.75:
+                    score_boost = -5  # Strong FLAT conviction
+                elif prob_flat >= 0.65:
+                    score_boost = -3  # Moderate FLAT
+                elif prob_flat >= 0.55:
+                    score_boost = -2  # Mild FLAT
+                else:
+                    score_boost = 0
+            else:
+                # Gate says move possible, but direction is coin-flip → neutral
+                score_boost = 0
+        elif p_move <= 0.30:
+            score_boost = -8  # Very likely flat (bottom quartile)
+        elif p_move <= 0.40:
             score_boost = -5  # Likely flat
         
         return {
@@ -399,7 +428,8 @@ class MovePredictor:
         }
     
     def get_titan_signals(self, candles_df, daily_df=None, oi_df=None, futures_oi_df=None,
-                           nifty_5min_df=None, nifty_daily_df=None) -> dict:
+                           nifty_5min_df=None, nifty_daily_df=None,
+                           sector_5min_df=None, sector_daily_df=None) -> dict:
         """All-in-one Titan integration signals.
         
         FAIL-SAFE: Returns neutral defaults on ANY error.
@@ -412,6 +442,8 @@ class MovePredictor:
             futures_oi_df: Optional daily futures OI features DataFrame.
             nifty_5min_df: Optional NIFTY50 5-min candles for market context.
             nifty_daily_df: Optional NIFTY50 daily candles for market context.
+            sector_5min_df: Optional sector index 5-min candles for sector context.
+            sector_daily_df: Optional sector index daily candles for sector context.
         
         Returns:
             dict with all predict() fields PLUS:
@@ -423,9 +455,35 @@ class MovePredictor:
         """
         try:
             pred = self.predict(candles_df, daily_df, oi_df=oi_df, futures_oi_df=futures_oi_df,
-                               nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df)
+                               nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df,
+                               sector_5min_df=sector_5min_df, sector_daily_df=sector_daily_df)
             if not pred:
                 return self._titan_defaults()
+            
+            # ── Futures OI staleness check ──
+            # fut_oi_buildup + oi_price_confirm = ~30% of direction model importance.
+            # ONLY penalize when OI data EXISTS but is outdated (>3 days).
+            # Missing OI (None / not in universe) is NOT stale — just unavailable.
+            oi_stale = False
+            oi_available = False
+            if futures_oi_df is not None and not futures_oi_df.empty:
+                oi_available = True
+                try:
+                    last_oi_date = pd.Timestamp(futures_oi_df['date'].max())
+                    now = pd.Timestamp.now()
+                    # Allow for weekends: check if last date is > 3 calendar days ago
+                    if (now - last_oi_date).days > 3:
+                        oi_stale = True
+                except Exception:
+                    oi_stale = True
+            
+            if oi_stale:
+                original_boost = pred.get('ml_score_boost', 0)
+                # Halve the boost (toward 0) — keep sign, reduce magnitude
+                pred['ml_score_boost'] = int(original_boost / 2)
+                self._log(f"⚠️ Futures OI stale → score_boost halved: {original_boost} → {pred['ml_score_boost']}")
+            pred['ml_oi_stale'] = oi_stale
+            pred['ml_oi_available'] = oi_available
             
             prob_up = pred.get('ml_prob_up', 0)
             prob_down = pred.get('ml_prob_down', 0)
@@ -440,24 +498,24 @@ class MovePredictor:
             p_down_given_move = pred.get('ml_p_down_given_move', 0.5)
             is_meta = pred.get('ml_model_type') == 'meta_labeling'
             
-            # === Position sizing factor ===
+            # === Position sizing factor (calibrated probabilities, 0-1 range) ===
             if is_meta:
-                # Meta-labeling: base on gate + direction conviction
-                # Thresholds calibrated to model's actual output range (~0.30-0.50)
-                if p_move >= 0.55 and max(p_up_given_move, p_down_given_move) >= 0.55:
-                    sizing_factor = 2.0   # ELITE: rare high-conviction
-                elif p_move >= 0.50 and max(p_up_given_move, p_down_given_move) >= 0.53:
-                    sizing_factor = 1.5   # HIGH: strong move + direction
-                elif p_move >= 0.45 and max(p_up_given_move, p_down_given_move) >= 0.51:
-                    sizing_factor = 1.3
-                elif p_move >= 0.42 and max(p_up_given_move, p_down_given_move) >= 0.50:
-                    sizing_factor = 1.2
-                elif p_move >= 0.38:
-                    sizing_factor = 1.0
-                elif p_move <= 0.28:
-                    sizing_factor = 0.7
-                elif p_move <= 0.33:
-                    sizing_factor = 0.85
+                # Combined probability = max(prob_up, prob_down)
+                combined_dir = max(prob_up, prob_down)
+                if combined_dir >= 0.40:
+                    sizing_factor = 2.0   # ELITE: ~68% precision from training
+                elif combined_dir >= 0.35:
+                    sizing_factor = 1.5   # HIGH: ~58% precision
+                elif combined_dir >= 0.30:
+                    sizing_factor = 1.3   # Good: ~52% precision
+                elif combined_dir >= 0.25:
+                    sizing_factor = 1.2   # Moderate: ~47% precision
+                elif p_move >= 0.50:
+                    sizing_factor = 1.0   # Move likely but direction unclear
+                elif p_move <= 0.30:
+                    sizing_factor = 0.7   # Flat likely
+                elif p_move <= 0.40:
+                    sizing_factor = 0.85  # Slightly flat-leaning
                 else:
                     sizing_factor = 1.0
             else:
@@ -480,23 +538,30 @@ class MovePredictor:
                     sizing_factor = 1.0
             
             # === Entry caution (soft signal, NEVER blocks) ===
-            entry_caution = p_move <= 0.28 if is_meta else prob_flat >= 0.70
+            entry_caution = p_move <= 0.35 if is_meta else prob_flat >= 0.70
             
             # === Chop hint (stock is extremely flat) ===
-            chop_hint = p_move <= 0.25 if is_meta else prob_flat >= 0.75
+            chop_hint = p_move <= 0.30 if is_meta else prob_flat >= 0.75
             
             # === Elite auto-fire OK ===
-            elite_ok = p_move >= 0.38 if is_meta else prob_flat < 0.70
+            # Only allow elite auto-fire when combined directional prob >= 30%
+            # (52%+ precision from training data)
+            combined_dir_prob = max(prob_up, prob_down)
+            elite_ok = (combined_dir_prob >= 0.30) if is_meta else prob_flat < 0.70
             
-            # === Direction hint for strategy selection ===
+            # === Direction hint for strategy selection (calibrated thresholds) ===
             if is_meta:
-                if p_move >= 0.42 and p_up_given_move >= 0.53:
+                # Combined prob thresholds from training high-confidence analysis:
+                # 35%+ → ~58% precision (strong), 25%+ → ~47% (lean)
+                # CRITICAL: Compare which direction is stronger first to avoid
+                # always hitting BULLISH when both exceed threshold.
+                if prob_up >= 0.35 and prob_up > prob_down:
                     direction_hint = 'BULLISH'
-                elif p_move >= 0.42 and p_down_given_move >= 0.53:
+                elif prob_down >= 0.35 and prob_down > prob_up:
                     direction_hint = 'BEARISH'
-                elif p_move >= 0.38 and p_up_given_move >= 0.51:
+                elif prob_up >= 0.25 and prob_up >= prob_down:
                     direction_hint = 'BULLISH_LEAN'
-                elif p_move >= 0.38 and p_down_given_move >= 0.51:
+                elif prob_down >= 0.25 and prob_down > prob_up:
                     direction_hint = 'BEARISH_LEAN'
                 else:
                     direction_hint = 'NEUTRAL'
@@ -561,6 +626,8 @@ class MovePredictor:
             'ml_elite_ok': True,
             'ml_direction_hint': 'NEUTRAL',
             'ml_gpt_summary': '',
+            'ml_oi_stale': False,
+            'ml_oi_available': False,
         }
     
     def predict_batch(self, stock_candles: dict, stock_daily: dict = None,

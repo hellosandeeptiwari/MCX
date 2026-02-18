@@ -44,8 +44,8 @@ GATE_PARAMS = {
     'objective': 'binary:logistic',
     'eval_metric': 'logloss',
     'max_depth': 5,
-    'learning_rate': 0.05,           # Faster — simpler problem
-    'n_estimators': 1500,
+    'learning_rate': 0.03,           # Lower LR — needs more trees for 80/20 split
+    'n_estimators': 3000,            # More epochs for convergence
     'min_child_weight': 15,
     'subsample': 0.75,
     'colsample_bytree': 0.8,
@@ -53,51 +53,99 @@ GATE_PARAMS = {
     'reg_alpha': 0.5,
     'reg_lambda': 2.0,
     'random_state': 42,
-    'early_stopping_rounds': 60,
+    'early_stopping_rounds': 120,    # More patience with lower LR
     'verbosity': 1,
     'scale_pos_weight': 1.0,  # will be computed dynamically
 }
 
 # Direction model params — binary, harder problem, needs different tuning
-# Tuned: LR 0.015 (slower convergence), more trees + patience,
-# stronger regularization. Depth stays at 6 (7 hurt mid-confidence precision).
+# v2: Deeper tree + lighter regularization to let the model learn sector/direction
+# patterns. Previous version was over-regularized (gamma=2, lambda=3.5) which
+# compressed predictions to ~0.49-0.51 range, making DOWN nearly undetectable.
+# Key changes: depth 7 (was 6), lower gamma/lambda, higher colsample to let
+# sector features participate more in each tree.
 DIR_PARAMS = {
     'objective': 'binary:logistic',
     'eval_metric': 'logloss',
-    'max_depth': 6,                  # Depth 6 — 7 was tested, hurt precision
-    'learning_rate': 0.015,          # Slower — let XGB find subtle patterns
-    'n_estimators': 3000,            # More trees with lower LR
-    'min_child_weight': 22,          # Slightly more conservative
-    'subsample': 0.68,               # Slightly more stochastic
-    'colsample_bytree': 0.65,        # Force more feature diversity per tree
-    'gamma': 2.0,                    # Moderate pruning
-    'reg_alpha': 1.0,                # L1
-    'reg_lambda': 3.5,               # More L2 regularization
+    'max_depth': 7,                  # Deeper — more capacity for sector interactions
+    'learning_rate': 0.012,          # Slightly slower for better convergence
+    'n_estimators': 4000,            # More trees with lower LR
+    'min_child_weight': 18,          # Slightly less conservative (was 22)
+    'subsample': 0.72,               # Moderate row sampling
+    'colsample_bytree': 0.75,        # Higher — let sector features participate (was 0.65)
+    'gamma': 1.0,                    # Less aggressive pruning (was 2.0)
+    'reg_alpha': 0.5,                # Less L1 (was 1.0)
+    'reg_lambda': 2.0,               # Less L2 (was 3.5) — let model spread predictions
     'random_state': 42,
-    'early_stopping_rounds': 120,    # More patience with slower LR
+    'early_stopping_rounds': 150,    # More patience with lower LR
     'verbosity': 1,
     'scale_pos_weight': 1.0,  # will be computed dynamically
 }
 
 
 def train_meta_models(
-    atr_factor: float = 1.5,
+    atr_factor: float = 2.0,
     test_days: int = 20,
     val_days: int = 10,
     symbols: Optional[list] = None,
+    label_method: str = 'net_return',
+    hybrid: bool = False,
+    gate_atr_factor: float = 1.5,
+    gate_label_method: str = 'first_to_break',
+    dir_atr_factor: float = 1.0,
+    dir_label_method: str = 'net_return',
 ) -> dict:
     """Train both Gate and Direction models using meta-labeling.
+    
+    When hybrid=True, uses different labeling for gate vs direction:
+      - Gate:      gate_label_method + gate_atr_factor (default: first_to_break×1.5)
+      - Direction: dir_label_method + dir_atr_factor  (default: net_return×1.0)
+    This combines the gate's better MOVE/FLAT separation with the direction
+    model's more balanced UP/DOWN detection.
     
     Returns dict with both models, metrics, and paths.
     """
     
     # ── Step 1: Load data with 3-class labels ──
-    train_df, val_df, test_df, feature_names = load_and_prepare_data(
-        symbols=symbols,
-        atr_factor=atr_factor,
-        test_days=test_days,
-        val_days=val_days,
-    )
+    if hybrid:
+        print(f"\n🔀 HYBRID LABELING MODE")
+        print(f"   Gate:      {gate_label_method} × ATR {gate_atr_factor}")
+        print(f"   Direction: {dir_label_method} × ATR {dir_atr_factor}")
+        
+        # Load gate labels (first_to_break, ATR×1.5)
+        print(f"\n── Loading data for GATE model ({gate_label_method}, ATR×{gate_atr_factor}) ──")
+        train_df, val_df, test_df, feature_names = load_and_prepare_data(
+            symbols=symbols,
+            atr_factor=gate_atr_factor,
+            test_days=test_days,
+            val_days=val_days,
+            label_method=gate_label_method,
+        )
+        
+        # Load direction labels (net_return, ATR×1.0)
+        print(f"\n── Loading data for DIRECTION model ({dir_label_method}, ATR×{dir_atr_factor}) ──")
+        train_df_dir, val_df_dir, test_df_dir, feature_names_check = load_and_prepare_data(
+            symbols=symbols,
+            atr_factor=dir_atr_factor,
+            test_days=test_days,
+            val_days=val_days,
+            label_method=dir_label_method,
+        )
+        assert feature_names == feature_names_check, "Feature mismatch between gate and direction data loads!"
+        
+        # Effective label_method/atr_factor for metadata
+        label_method = f"hybrid({gate_label_method}+{dir_label_method})"
+        atr_factor_display = f"gate={gate_atr_factor}/dir={dir_atr_factor}"
+    else:
+        train_df, val_df, test_df, feature_names = load_and_prepare_data(
+            symbols=symbols,
+            atr_factor=atr_factor,
+            test_days=test_days,
+            val_days=val_days,
+            label_method=label_method,
+        )
+        train_df_dir = val_df_dir = test_df_dir = None  # not used
+        atr_factor_display = str(atr_factor)
     
     # ══════════════════════════════════════════════════════════════
     #  GATE MODEL: MOVE vs FLAT
@@ -186,19 +234,31 @@ def train_meta_models(
     print(f"{'='*70}")
     
     # Filter to only samples that actually moved (UP or DOWN)
+    # In hybrid mode, use direction-specific labels for the direction model
     # Original 3-class: DOWN=0, FLAT=1, UP=2
-    train_move_mask = train_df['label_idx'] != 1  # Not FLAT
-    val_move_mask = val_df['label_idx'] != 1
-    test_move_mask = test_df['label_idx'] != 1
+    if hybrid and train_df_dir is not None:
+        # Use net_return labels for direction training (more balanced UP/DOWN)
+        dir_src_train = train_df_dir
+        dir_src_val = val_df_dir
+        dir_src_test = test_df_dir
+        print(f"  (Using {dir_label_method} labels for direction training)")
+    else:
+        dir_src_train = train_df
+        dir_src_val = val_df
+        dir_src_test = test_df
     
-    X_train_dir = train_df.loc[train_move_mask, feature_names].values
-    X_val_dir = val_df.loc[val_move_mask, feature_names].values
-    X_test_dir = test_df.loc[test_move_mask, feature_names].values
+    train_move_mask = dir_src_train['label_idx'] != 1  # Not FLAT
+    val_move_mask = dir_src_val['label_idx'] != 1
+    test_move_mask = dir_src_test['label_idx'] != 1
+    
+    X_train_dir = dir_src_train.loc[train_move_mask, feature_names].values
+    X_val_dir = dir_src_val.loc[val_move_mask, feature_names].values
+    X_test_dir = dir_src_test.loc[test_move_mask, feature_names].values
     
     # Direction labels: DOWN(0)→0, UP(2)→1
-    train_dir_y = (train_df.loc[train_move_mask, 'label_idx'] == 2).astype(int).values
-    val_dir_y = (val_df.loc[val_move_mask, 'label_idx'] == 2).astype(int).values
-    test_dir_y = (test_df.loc[test_move_mask, 'label_idx'] == 2).astype(int).values
+    train_dir_y = (dir_src_train.loc[train_move_mask, 'label_idx'] == 2).astype(int).values
+    val_dir_y = (dir_src_val.loc[val_move_mask, 'label_idx'] == 2).astype(int).values
+    test_dir_y = (dir_src_test.loc[test_move_mask, 'label_idx'] == 2).astype(int).values
     
     n_down = (train_dir_y == 0).sum()
     n_up = (train_dir_y == 1).sum()
@@ -331,6 +391,8 @@ def train_meta_models(
     # ══════════════════════════════════════════════════════════════
     print(f"\n{'='*70}")
     print(f"  COMBINED META-LABELING SYSTEM EVALUATION")
+    if hybrid:
+        print(f"  (Ground truth: gate labels = {gate_label_method} × ATR {gate_atr_factor})")
     print(f"{'='*70}")
     
     # For all test samples, get P(MOVE) from gate (uses full feature set)
@@ -459,7 +521,11 @@ def train_meta_models(
     meta = {
         'model_type': 'meta_labeling',
         'timestamp': timestamp,
-        'atr_factor': atr_factor,
+        'atr_factor': atr_factor_display if hybrid else atr_factor,
+        'label_method': label_method,
+        'hybrid': hybrid,
+        'gate_config': {'label_method': gate_label_method, 'atr_factor': gate_atr_factor} if hybrid else None,
+        'dir_config': {'label_method': dir_label_method, 'atr_factor': dir_atr_factor} if hybrid else None,
         'feature_names': feature_names,
         'direction_feature_names': feature_names_dir,
         'features_pruned': int(n_pruned),
@@ -527,10 +593,20 @@ if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(description='Train Meta-Labeling models (Gate + Direction)')
-    parser.add_argument('--atr-factor', type=float, default=1.5, help='ATR multiplier for threshold (default: 1.5)')
+    parser.add_argument('--atr-factor', type=float, default=2.0, help='ATR multiplier for threshold (default: 2.0)')
     parser.add_argument('--test-days', type=int, default=20, help='Test period days (default: 20)')
     parser.add_argument('--val-days', type=int, default=10, help='Validation period days (default: 10)')
     parser.add_argument('--symbols', nargs='+', help='Specific symbols')
+    parser.add_argument('--label-method', type=str, default='net_return', choices=['net_return', 'first_to_break'],
+                        help='Labeling method when not using hybrid (default: net_return)')
+    parser.add_argument('--hybrid', action='store_true',
+                        help='Use hybrid labeling: first_to_break for gate, net_return for direction')
+    parser.add_argument('--gate-atr', type=float, default=1.5, help='Gate ATR factor in hybrid mode (default: 1.5)')
+    parser.add_argument('--gate-label', type=str, default='first_to_break', choices=['net_return', 'first_to_break'],
+                        help='Gate label method in hybrid mode (default: first_to_break)')
+    parser.add_argument('--dir-atr', type=float, default=1.0, help='Direction ATR factor in hybrid mode (default: 1.0)')
+    parser.add_argument('--dir-label', type=str, default='net_return', choices=['net_return', 'first_to_break'],
+                        help='Direction label method in hybrid mode (default: net_return)')
     
     args = parser.parse_args()
     
@@ -539,4 +615,10 @@ if __name__ == '__main__':
         test_days=args.test_days,
         val_days=args.val_days,
         symbols=args.symbols,
+        label_method=args.label_method,
+        hybrid=args.hybrid,
+        gate_atr_factor=args.gate_atr,
+        gate_label_method=args.gate_label,
+        dir_atr_factor=args.dir_atr,
+        dir_label_method=args.dir_label,
     )

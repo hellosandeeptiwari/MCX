@@ -25,7 +25,9 @@ def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame 
                       oi_df: pd.DataFrame = None,
                       futures_oi_df: pd.DataFrame = None,
                       nifty_5min_df: pd.DataFrame = None,
-                      nifty_daily_df: pd.DataFrame = None) -> pd.DataFrame:
+                      nifty_daily_df: pd.DataFrame = None,
+                      sector_5min_df: pd.DataFrame = None,
+                      sector_daily_df: pd.DataFrame = None) -> pd.DataFrame:
     """Compute all ML features from raw OHLCV candles.
     
     Args:
@@ -40,6 +42,8 @@ def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame 
                fut_oi_5d_trend, fut_vol_ratio
         nifty_5min_df: Optional NIFTY50 5-min candles for market context.
         nifty_daily_df: Optional NIFTY50 daily candles for market context.
+        sector_5min_df: Optional sector index 5-min candles for sector context.
+        sector_daily_df: Optional sector index daily candles for sector context.
         
     Returns:
         DataFrame with original columns + feature columns.
@@ -342,6 +346,92 @@ def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame 
     else:
         for col in _get_nifty_feature_names():
             df[col] = 0.0
+    
+    # === SECTOR INDEX CONTEXT FEATURES ===
+    # Sector-relative features: how is the stock doing vs its own sector?
+    # This is the #1 missing signal for directional prediction — a stock rarely
+    # sustains a rally when its entire sector is falling (e.g., JINDALSTEL CE on
+    # a NIFTY METAL -2% day).
+    if sector_5min_df is not None and len(sector_5min_df) > 50:
+        df = _add_sector_context(df, sector_5min_df, sector_daily_df)
+    else:
+        for col in _get_sector_feature_names():
+            df[col] = 0.0
+    
+    # === BOS / SWEEP STRUCTURAL FEATURES ===
+    # Break of Structure (BOS): price breaks AND closes beyond a swing level → continuation
+    # Liquidity Sweep: price wicks beyond a swing level but closes back inside → reversal trap
+    # Uses fractal swing detection: high/low that is higher/lower than 3 bars left + 1 bar right
+    # No existing feature captures "wick crossed a structural level" — wick ratios only measure shape.
+    df['bos_signal'] = 0.0   # +1 = break above swing high, -1 = break below swing low
+    df['sweep_signal'] = 0.0  # +1 = sweep of highs (fake breakout), -1 = sweep of lows (fake breakdown)
+    
+    lookback = 15  # candles to scan for swing points
+    left_bars = 3  # bars left of pivot that must be lower/higher
+    right_bars = 1  # bars right of pivot that must be lower/higher
+    
+    for i in range(lookback + 1, len(df)):
+        seg_h = h[max(0, i - lookback):i]
+        seg_l = l[max(0, i - lookback):i]
+        n_seg = len(seg_h)
+        
+        # Find most recent swing high (fractal)
+        swing_high = 0.0
+        for si in range(n_seg - 1 - right_bars, max(left_bars - 1, 0), -1):
+            is_pivot = True
+            for lb in range(1, left_bars + 1):
+                if si - lb >= 0 and seg_h[si] <= seg_h[si - lb]:
+                    is_pivot = False
+                    break
+            if is_pivot:
+                for rb in range(1, right_bars + 1):
+                    if si + rb < n_seg and seg_h[si] <= seg_h[si + rb]:
+                        is_pivot = False
+                        break
+            if is_pivot:
+                swing_high = seg_h[si]
+                break
+        
+        # Find most recent swing low (fractal)
+        swing_low = 0.0
+        for si in range(n_seg - 1 - right_bars, max(left_bars - 1, 0), -1):
+            is_pivot = True
+            for lb in range(1, left_bars + 1):
+                if si - lb >= 0 and seg_l[si] >= seg_l[si - lb]:
+                    is_pivot = False
+                    break
+            if is_pivot:
+                for rb in range(1, right_bars + 1):
+                    if si + rb < n_seg and seg_l[si] >= seg_l[si + rb]:
+                        is_pivot = False
+                        break
+            if is_pivot:
+                swing_low = seg_l[si]
+                break
+        
+        cur_high = h[i]
+        cur_low = l[i]
+        cur_close = c[i]
+        
+        # BOS / Sweep detection for highs
+        if swing_high > 0 and cur_high > swing_high:
+            if cur_close > swing_high:
+                df.iloc[i, df.columns.get_loc('bos_signal')] = 1.0   # confirmed breakout
+            else:
+                df.iloc[i, df.columns.get_loc('sweep_signal')] = 1.0  # fake breakout
+        
+        # BOS / Sweep detection for lows
+        if swing_low > 0 and cur_low < swing_low:
+            if cur_close < swing_low:
+                df.iloc[i, df.columns.get_loc('bos_signal')] = -1.0  # confirmed breakdown
+            else:
+                df.iloc[i, df.columns.get_loc('sweep_signal')] = -1.0  # fake breakdown
+    
+    # Interaction: sweep × upper_wick → sweep + big wick = stronger reversal signal
+    df['sweep_x_wick'] = df['sweep_signal'].values * np.where(
+        df['sweep_signal'].values > 0, df['upper_wick'].values,
+        np.where(df['sweep_signal'].values < 0, df['lower_wick'].values, 0)
+    )
     
     # === CLEAN UP ===
     
@@ -676,6 +766,84 @@ def _get_nifty_feature_names() -> list:
     ]
 
 
+# ══════════════════════════════════════════════════════════════
+#  STOCK-TO-SECTOR MAPPING
+# ══════════════════════════════════════════════════════════════
+# Maps each F&O stock to its NIFTY sector index.
+# The parquet filename convention is SECTOR_{NAME}.parquet
+# (e.g., SECTOR_METAL.parquet for NIFTY METAL index candles).
+# Stocks not in this map get zeros for all sector features.
+
+STOCK_SECTOR_MAP = {
+    # METALS
+    'TATASTEEL': 'METAL', 'JSWSTEEL': 'METAL', 'JINDALSTEL': 'METAL',
+    'HINDALCO': 'METAL', 'VEDL': 'METAL', 'NMDC': 'METAL',
+    'NATIONALUM': 'METAL', 'HINDZINC': 'METAL', 'SAIL': 'METAL',
+    'HINDCOPPER': 'METAL', 'COALINDIA': 'METAL',
+    # IT
+    'INFY': 'IT', 'TCS': 'IT', 'WIPRO': 'IT', 'HCLTECH': 'IT',
+    'TECHM': 'IT', 'LTIM': 'IT', 'KPITTECH': 'IT', 'COFORGE': 'IT',
+    'MPHASIS': 'IT', 'PERSISTENT': 'IT',
+    # BANKS
+    'SBIN': 'BANK', 'HDFCBANK': 'BANK', 'ICICIBANK': 'BANK',
+    'AXISBANK': 'BANK', 'KOTAKBANK': 'BANK', 'BANKBARODA': 'BANK',
+    'PNB': 'BANK', 'IDFCFIRSTB': 'BANK', 'INDUSINDBK': 'BANK',
+    'FEDERALBNK': 'BANK', 'RBLBANK': 'BANK', 'AUBANK': 'BANK',
+    'CANBK': 'BANK', 'UNIONBANK': 'BANK',
+    # AUTO
+    'MARUTI': 'AUTO', 'TATAMOTORS': 'AUTO', 'M&M': 'AUTO',
+    'BAJAJ-AUTO': 'AUTO', 'HEROMOTOCO': 'AUTO', 'EICHERMOT': 'AUTO',
+    'ASHOKLEY': 'AUTO', 'BHARATFORG': 'AUTO', 'MOTHERSON': 'AUTO',
+    'BALKRISIND': 'AUTO',
+    # PHARMA
+    'SUNPHARMA': 'PHARMA', 'CIPLA': 'PHARMA', 'DRREDDY': 'PHARMA',
+    'DIVISLAB': 'PHARMA', 'AUROPHARMA': 'PHARMA', 'BIOCON': 'PHARMA',
+    'LUPIN': 'PHARMA', 'APOLLOHOSP': 'PHARMA', 'MAXHEALTH': 'PHARMA',
+    'LALPATHLAB': 'PHARMA',
+    # ENERGY
+    'RELIANCE': 'ENERGY', 'ONGC': 'ENERGY', 'NTPC': 'ENERGY',
+    'POWERGRID': 'ENERGY', 'TATAPOWER': 'ENERGY', 'ADANIENT': 'ENERGY',
+    'ADANIGREEN': 'ENERGY', 'BPCL': 'ENERGY', 'IOC': 'ENERGY',
+    'GAIL': 'ENERGY',
+    # FMCG
+    'ITC': 'FMCG', 'HINDUNILVR': 'FMCG', 'NESTLEIND': 'FMCG',
+    'BRITANNIA': 'FMCG', 'DABUR': 'FMCG', 'GODREJCP': 'FMCG',
+    'MARICO': 'FMCG', 'COLPAL': 'FMCG', 'TATACONSUM': 'FMCG',
+    'VBL': 'FMCG',
+    # REALTY
+    'DLF': 'REALTY', 'GODREJPROP': 'REALTY', 'OBEROIRLTY': 'REALTY',
+    'PRESTIGE': 'REALTY', 'PHOENIXLTD': 'REALTY', 'BRIGADE': 'REALTY',
+    'LODHA': 'REALTY', 'SOBHA': 'REALTY',
+    # INFRA
+    'LT': 'INFRA', 'ADANIPORTS': 'INFRA', 'ULTRACEMCO': 'INFRA',
+    'GRASIM': 'INFRA', 'SHREECEM': 'INFRA', 'AMBUJACEM': 'INFRA',
+    'ACC': 'INFRA', 'SIEMENS': 'INFRA', 'ABB': 'INFRA',
+    'BEL': 'INFRA', 'HAL': 'INFRA', 'BHEL': 'INFRA',
+    # CONGLOMERATES (use ENERGY as proxy — Reliance/Adani)
+    'BAJFINANCE': 'BANK', 'TITAN': 'FMCG',
+    'IDEA': 'IT',  # Telecom — closest to IT
+}
+
+
+def get_sector_for_symbol(symbol: str) -> str:
+    """Get the sector name for a stock symbol. Returns empty string if unknown."""
+    return STOCK_SECTOR_MAP.get(symbol, '')
+
+
+def _get_sector_feature_names() -> list:
+    """Feature names derived from sector index context."""
+    return [
+        'sector_roc_6',           # Sector index 30-min momentum (%)
+        'sector_rsi_14',          # Sector index RSI-14
+        'sector_bb_position',     # Sector index Bollinger Band position (0-1)
+        'sector_ema9_slope',      # Sector index EMA-9 slope (trend direction)
+        'sector_atr_pct',         # Sector index ATR% (sector volatility)
+        'sector_relative',        # Stock roc_6 minus sector roc_6 (sector alpha)
+        'sector_daily_trend',     # Sector daily: price vs EMA-50 (%)
+        'sector_daily_rsi',       # Sector daily RSI-14
+    ]
+
+
 def _get_direction_feature_names() -> list:
     """Feature names that specifically discriminate UP from DOWN."""
     return [
@@ -689,6 +857,15 @@ def _get_direction_feature_names() -> list:
         'trend_consistency',       # Fraction of recent candles closing up (-1 to +1)
         'roc_3',                   # Short-term 15 min momentum
         'oi_price_confirm',        # Futures OI buildup × price direction
+    ]
+
+
+def _get_structure_feature_names() -> list:
+    """BOS/Sweep structural features — wick beyond swing level detection."""
+    return [
+        'bos_signal',              # +1=break above swing high, -1=break below swing low
+        'sweep_signal',            # +1=sweep of highs (trap), -1=sweep of lows (trap)
+        'sweep_x_wick',            # sweep signal × wick ratio (interaction)
     ]
 
 
@@ -729,7 +906,7 @@ def get_feature_names() -> list:
         'atr_change_pct',
         # Temporal microstructure
         'dow_sin', 'dow_cos', 'session_bucket',
-    ] + _get_direction_feature_names() + _get_interaction_feature_names() + _get_daily_feature_names() + _get_futures_oi_feature_names() + _get_nifty_feature_names()
+    ] + _get_direction_feature_names() + _get_interaction_feature_names() + _get_structure_feature_names() + _get_daily_feature_names() + _get_futures_oi_feature_names() + _get_nifty_feature_names() + _get_sector_feature_names()
 
 
 def _orb_direction(df: pd.DataFrame) -> np.ndarray:
@@ -1017,9 +1194,16 @@ def _add_oi_context(intraday_df: pd.DataFrame, oi_df: pd.DataFrame) -> pd.DataFr
     available_oi_cols = [c for c in oi_feature_cols if c in oi_merge.columns]
     
     if available_oi_cols:
+        # Normalize timezones to avoid merge_asof tz mismatch
+        _left = result[['date']].copy()
+        _right = oi_merge[['date'] + available_oi_cols].copy()
+        if _left['date'].dt.tz is not None:
+            _left['date'] = _left['date'].dt.tz_localize(None)
+        if _right['date'].dt.tz is not None:
+            _right['date'] = _right['date'].dt.tz_localize(None)
         merged = pd.merge_asof(
-            result[['date']],
-            oi_merge[['date'] + available_oi_cols],
+            _left,
+            _right,
             on='date',
             direction='backward',
         )
@@ -1103,16 +1287,31 @@ def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
     result = result.sort_values('date').reset_index(drop=True)
     
     # Time-aligned merge: each stock candle gets the NIFTY values at same timestamp
+    # Normalize timezones to avoid merge_asof tz mismatch
+    _left = result[['date']].copy()
+    _right = nf_merge.copy()
+    if _left['date'].dt.tz is not None:
+        _left['date'] = _left['date'].dt.tz_localize(None)
+    if _right['date'].dt.tz is not None:
+        _right['date'] = _right['date'].dt.tz_localize(None)
     merged = pd.merge_asof(
-        result[['date']],
-        nf_merge,
+        _left,
+        _right,
         on='date',
         direction='backward',  # Use most recent NIFTY data at or before stock candle
         tolerance=pd.Timedelta('10min'),  # Don't use stale data
     )
     
-    for col in ['nifty_roc_6', 'nifty_rsi_14', 'nifty_bb_position', 'nifty_ema9_slope', 'nifty_atr_pct']:
+    _nifty_5m_cols = ['nifty_roc_6', 'nifty_rsi_14', 'nifty_bb_position', 'nifty_ema9_slope', 'nifty_atr_pct']
+    for col in _nifty_5m_cols:
         result[col] = merged[col].values
+    
+    # ROBUSTNESS: If merge_asof left NaN tails (stock data extends beyond NIFTY data),
+    # forward-fill from previous valid values. This prevents 0.0 defaults that the
+    # direction model interprets as "extremely oversold index" → false UP bias.
+    for col in _nifty_5m_cols:
+        if result[col].isna().any():
+            result[col] = result[col].ffill()
     
     # relative_strength = stock momentum - NIFTY momentum (THE alpha signal)
     # If stock goes +0.5% while NIFTY goes +0.3%, relative_strength = +0.2%
@@ -1145,11 +1344,27 @@ def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
             }
         
         result['_date'] = result['date'].dt.date
+        # ROBUSTNESS: If stock candles include dates NOT in NIFTY daily
+        # (e.g., today's data before NIFTY daily is updated), use the most
+        # recent available NIFTY daily values instead of defaulting to 0.
+        # This prevents the direction model seeing 0=oversold → false UP bias.
+        _all_dates_sorted = sorted(daily_ctx.keys())
+        def _get_daily_ctx(d, key):
+            ctx = daily_ctx.get(d)
+            if ctx:
+                return ctx.get(key, 0.0)
+            # Date not in NIFTY daily → use most recent prior date
+            import bisect
+            idx = bisect.bisect_right(_all_dates_sorted, d) - 1
+            if idx >= 0:
+                return daily_ctx[_all_dates_sorted[idx]].get(key, 0.0)
+            return 0.0
+        
         result['nifty_daily_trend'] = result['_date'].map(
-            lambda d: daily_ctx.get(d, {}).get('nifty_daily_trend', 0.0)
+            lambda d: _get_daily_ctx(d, 'nifty_daily_trend')
         )
         result['nifty_daily_rsi'] = result['_date'].map(
-            lambda d: daily_ctx.get(d, {}).get('nifty_daily_rsi', 0.0)
+            lambda d: _get_daily_ctx(d, 'nifty_daily_rsi')
         )
         result.drop(columns=['_date'], inplace=True, errors='ignore')
     else:
@@ -1222,6 +1437,165 @@ def _add_futures_oi_context(intraday_df: pd.DataFrame, futures_oi_df: pd.DataFra
     
     # Replace inf/nan
     for col in fut_features:
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+#  SECTOR INDEX CONTEXT
+# ══════════════════════════════════════════════════════════════
+
+def _add_sector_context(intraday_df: pd.DataFrame, sector_5min_df: pd.DataFrame,
+                        sector_daily_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Merge sector index context features onto each 5-min candle.
+    
+    Exactly parallels _add_nifty_context() but uses the stock's specific sector
+    index instead of NIFTY50. This isolates sector-specific momentum vs broad
+    market moves.
+    
+    The killer feature: sector_relative = stock_roc_6 - sector_roc_6
+    If a metal stock rallies +1% but NIFTY METAL is -2%, sector_relative = +3%
+    which is extremely unusual and likely unsustainable → model learns to flag it.
+    
+    Args:
+        intraday_df: 5-min stock candles (with 'date', 'close', 'roc_6' columns)
+        sector_5min_df: Sector index 5-min OHLCV candles
+        sector_daily_df: Optional sector index daily candles for daily context
+    
+    Returns:
+        intraday_df with 8 new sector context columns
+    """
+    sector_feat_names = _get_sector_feature_names()
+    result = intraday_df.copy()
+    
+    # ── Compute sector 5-min features ──
+    sf = sector_5min_df.copy().sort_values('date').reset_index(drop=True)
+    sc = sf['close'].values
+    sh = sf['high'].values
+    sl = sf['low'].values
+    
+    # Sector momentum (% change over 6 candles = 30 min)
+    sector_roc_6 = np.zeros(len(sc))
+    sector_roc_6[6:] = (sc[6:] - sc[:-6]) / np.where(sc[:-6] > 0, sc[:-6], 1) * 100
+    sf['sector_roc_6'] = sector_roc_6
+    
+    # Sector RSI-14
+    sf['sector_rsi_14'] = _rsi(sc, 14)
+    
+    # Sector Bollinger position
+    sma20 = _sma(sc, 20)
+    std20 = pd.Series(sc).rolling(20).std().values
+    bb_upper = sma20 + 2 * std20
+    bb_lower = sma20 - 2 * std20
+    bb_range = np.maximum(bb_upper - bb_lower, 1e-8)
+    sf['sector_bb_position'] = np.clip((sc - bb_lower) / bb_range, 0, 1)
+    
+    # Sector EMA-9 slope
+    sector_ema9 = _ema(sc, 9)
+    sector_slope = np.zeros(len(sc))
+    sector_slope[3:] = np.where(
+        sector_ema9[:-3] > 0,
+        (sector_ema9[3:] - sector_ema9[:-3]) / sector_ema9[:-3] * 100,
+        0
+    )
+    sf['sector_ema9_slope'] = sector_slope
+    
+    # Sector ATR%
+    sector_atr14 = _atr(sh, sl, sc, 14)
+    sf['sector_atr_pct'] = np.where(sc > 0, sector_atr14 / sc * 100, 0)
+    
+    # Prepare for merge_asof
+    sector_merge_cols = ['date', 'sector_roc_6', 'sector_rsi_14', 'sector_bb_position',
+                         'sector_ema9_slope', 'sector_atr_pct']
+    sf_merge = sf[sector_merge_cols].copy()
+    sf_merge = sf_merge.sort_values('date')
+    
+    result = result.sort_values('date').reset_index(drop=True)
+    
+    # Time-aligned merge: each stock candle gets the sector values at same timestamp
+    # Normalize timezones to avoid merge_asof tz mismatch
+    _left = result[['date']].copy()
+    _right = sf_merge.copy()
+    if _left['date'].dt.tz is not None:
+        _left['date'] = _left['date'].dt.tz_localize(None)
+    if _right['date'].dt.tz is not None:
+        _right['date'] = _right['date'].dt.tz_localize(None)
+    merged = pd.merge_asof(
+        _left,
+        _right,
+        on='date',
+        direction='backward',
+        tolerance=pd.Timedelta('10min'),
+    )
+    
+    for col in ['sector_roc_6', 'sector_rsi_14', 'sector_bb_position', 'sector_ema9_slope', 'sector_atr_pct']:
+        result[col] = merged[col].values
+    
+    # ROBUSTNESS: Forward-fill NaN tails (stock data extends beyond sector data)
+    _sector_5m_cols = ['sector_roc_6', 'sector_rsi_14', 'sector_bb_position', 'sector_ema9_slope', 'sector_atr_pct']
+    for col in _sector_5m_cols:
+        if result[col].isna().any():
+            result[col] = result[col].ffill()
+    
+    # sector_relative = stock momentum - sector momentum (SECTOR ALPHA signal)
+    # If stock goes +0.5% while sector goes -1.0%, sector_relative = +1.5%
+    # This is even more specific than relative_strength (vs NIFTY50)
+    if 'roc_6' in result.columns:
+        result['sector_relative'] = result['roc_6'] - result['sector_roc_6'].fillna(0)
+    else:
+        result['sector_relative'] = 0.0
+    
+    # ── Sector daily context (previous day's values) ──
+    if sector_daily_df is not None and len(sector_daily_df) >= 60:
+        sd = sector_daily_df.copy().sort_values('date').reset_index(drop=True)
+        sdc = sd['close'].values
+        sd_ema50 = _ema(sdc, 50)
+        sd_rsi = _rsi(sdc, 14)
+        
+        sd['_date'] = sd['date'].dt.date if hasattr(sd['date'].dt, 'date') else sd['date'].apply(
+            lambda x: x.date() if hasattr(x, 'date') else x
+        )
+        
+        # Build lookup: date D → previous day's sector daily features
+        daily_ctx = {}
+        for i in range(51, len(sd)):
+            d = sd['_date'].iloc[i]
+            prev = i - 1
+            trend = (sdc[prev] - sd_ema50[prev]) / sd_ema50[prev] * 100 if sd_ema50[prev] > 0 else 0.0
+            daily_ctx[d] = {
+                'sector_daily_trend': float(trend),
+                'sector_daily_rsi': float(sd_rsi[prev]),
+            }
+        
+        result['_date'] = result['date'].dt.date
+        # ROBUSTNESS: Forward-fill for dates not in sector daily data
+        _all_sec_dates = sorted(daily_ctx.keys())
+        def _get_sec_daily_ctx(d, key):
+            ctx = daily_ctx.get(d)
+            if ctx:
+                return ctx.get(key, 0.0)
+            import bisect
+            idx = bisect.bisect_right(_all_sec_dates, d) - 1
+            if idx >= 0:
+                return daily_ctx[_all_sec_dates[idx]].get(key, 0.0)
+            return 0.0
+        
+        result['sector_daily_trend'] = result['_date'].map(
+            lambda d: _get_sec_daily_ctx(d, 'sector_daily_trend')
+        )
+        result['sector_daily_rsi'] = result['_date'].map(
+            lambda d: _get_sec_daily_ctx(d, 'sector_daily_rsi')
+        )
+        result.drop(columns=['_date'], inplace=True, errors='ignore')
+    else:
+        result['sector_daily_trend'] = 0.0
+        result['sector_daily_rsi'] = 0.0
+    
+    # Clean up
+    for col in sector_feat_names:
+        if col not in result.columns:
+            result[col] = 0.0
         result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
     
     return result
