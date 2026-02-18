@@ -122,6 +122,10 @@ class MovePredictor:
         self.model_type = 'meta_labeling'
         self.ready = True
         
+        # Down-risk detector (lazy-loaded on first use)
+        self._down_risk_detector = None
+        self._down_risk_loaded = False
+        
         self._log(f"✅ MovePredictor loaded: META-LABELING (Gate + Direction)")
         if self.metadata:
             gate_info = self.metadata.get('gate_model', {})
@@ -225,9 +229,13 @@ class MovePredictor:
             
             # ── Route to appropriate model architecture ──
             if self.model_type == 'meta_labeling':
-                return self._predict_meta(X)
+                result = self._predict_meta(X)
             else:
-                return self._predict_3class(X)
+                result = self._predict_3class(X)
+            
+            # Stash feature array for downstream use (down-risk detector)
+            result['_features_array'] = X
+            return result
         
         except Exception as e:
             self._log(f"❌ Prediction error: {e}")
@@ -597,7 +605,7 @@ class MovePredictor:
                 else:
                     gpt_line = f"\U0001f9e0ML:FLAT({prob_flat:.0%})"
             
-            return {
+            result = {
                 **pred,  # All existing fields (ml_score_boost, probabilities, etc.)
                 'ml_sizing_factor': sizing_factor,
                 'ml_entry_caution': entry_caution,
@@ -606,8 +614,57 @@ class MovePredictor:
                 'ml_direction_hint': direction_hint,
                 'ml_gpt_summary': gpt_line,
             }
+            
+            # ── Down-Risk Detector overlay (VAE+GMM) ──
+            # Only runs for UP/FLAT signals — flags hidden DOWN risk
+            result.update(self._get_down_risk(signal, pred))
+            
+            return result
         except Exception:
             return self._titan_defaults()
+    
+    def _get_down_risk(self, signal: str, pred: dict) -> dict:
+        """Run down-risk detector for UP/FLAT signals. Fail-safe: never blocks."""
+        defaults = {
+            'ml_down_risk_flag': False,
+            'ml_down_risk_score': 0.0,
+            'ml_down_risk_bucket': 'LOW',
+        }
+        
+        if signal not in ('UP', 'FLAT'):
+            return defaults
+        
+        try:
+            # Lazy-load detector on first call
+            if not self._down_risk_loaded:
+                self._down_risk_loaded = True
+                try:
+                    from .down_risk_detector import DownRiskDetector
+                    det = DownRiskDetector()
+                    if det.load():
+                        self._down_risk_detector = det
+                        self._log("🛡️ Down-Risk Detector: LOADED (VAE+GMM)")
+                    else:
+                        self._log("🛡️ Down-Risk Detector: Not trained yet (run down_risk_detector train)")
+                except Exception as e:
+                    self._log(f"🛡️ Down-Risk Detector: Load failed ({e})")
+            
+            if self._down_risk_detector is None:
+                return defaults
+            
+            # Extract feature vector from the prediction's raw features
+            features = pred.get('_features_array')  # set during predict()
+            if features is None:
+                return defaults
+            
+            result = self._down_risk_detector.predict_single(features, signal)
+            return {
+                'ml_down_risk_flag': bool(result['down_risk_flag'][0]),
+                'ml_down_risk_score': float(result['anomaly_score'][0]),
+                'ml_down_risk_bucket': str(result['confidence_bucket'][0]),
+            }
+        except Exception:
+            return defaults
     
     def _titan_defaults(self) -> dict:
         """Safe neutral defaults — Titan behaves exactly as if ML doesn't exist."""
@@ -628,6 +685,9 @@ class MovePredictor:
             'ml_gpt_summary': '',
             'ml_oi_stale': False,
             'ml_oi_available': False,
+            'ml_down_risk_flag': False,
+            'ml_down_risk_score': 0.0,
+            'ml_down_risk_bucket': 'LOW',
         }
     
     def predict_batch(self, stock_candles: dict, stock_daily: dict = None,

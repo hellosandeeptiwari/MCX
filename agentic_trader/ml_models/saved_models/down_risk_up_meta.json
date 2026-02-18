@@ -1,0 +1,30 @@
+{
+  "regime": "UP",
+  "threshold": 0.20900014735927186,
+  "base_down_rate": 0.2007929402736923,
+  "config": {
+    "input_dim": 84,
+    "latent_dim": 16,
+    "hidden_dims": [
+      64,
+      32
+    ],
+    "dropout": 0.1,
+    "vae_epochs": 80,
+    "vae_batch_size": 512,
+    "vae_lr": 0.001,
+    "vae_kl_weight": 0.5,
+    "vae_patience": 12,
+    "gmm_n_components": 8,
+    "gmm_covariance_type": "full",
+    "gmm_max_iter": 300,
+    "down_lookahead": 8,
+    "down_atr_factor": 3.0,
+    "down_fixed_pct": 0.5,
+    "target_flag_rate": 0.15,
+    "min_lift": 1.05,
+    "test_days": 20,
+    "val_days": 10
+  },
+  "timestamp": "2026-02-18 20:45:12"
+}
