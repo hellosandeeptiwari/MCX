@@ -27,16 +27,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CANDLE_DIR = os.path.join(DATA_DIR, 'candles_5min')
 
-# Top F&O stocks to download (sorted by liquidity/relevance)
-DEFAULT_SYMBOLS = [
-    # Tier-1 (most liquid)
+# Index symbols (need special exchange handling — skip for equity candles)
+_INDEX_SYMBOLS = {'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTY', 'NIFTYNXT50'}
+
+# Fallback list if NFO instrument fetch fails
+_FALLBACK_SYMBOLS = [
     "SBIN", "HDFCBANK", "ICICIBANK", "AXISBANK", "KOTAKBANK",
     "BAJFINANCE", "RELIANCE", "BHARTIARTL", "INFY", "TCS",
-    # Tier-2 (high beta)
     "TATASTEEL", "JSWSTEEL", "JINDALSTEL", "HINDALCO",
     "LT", "MARUTI", "TITAN", "SUNPHARMA",
     "ONGC", "NTPC", "ITC", "TATAMOTORS", "CIPLA", "IDEA",
-    # High-volume wildcards
     "M&M", "BAJAJ-AUTO", "HEROMOTOCO", "EICHERMOT", "ASHOKLEY",
     "DRREDDY", "DIVISLAB", "AUROPHARMA", "BIOCON", "LUPIN",
     "WIPRO", "HCLTECH", "TECHM", "LTIM",
@@ -45,6 +45,28 @@ DEFAULT_SYMBOLS = [
     "HINDUNILVR", "NESTLEIND", "BRITANNIA", "DABUR",
     "BANKBARODA", "PNB", "IDFCFIRSTB", "INDUSINDBK",
 ]
+
+
+def _get_all_fno_symbols(kite=None) -> list:
+    """Dynamically resolve ALL F&O stock symbols from NFO instruments.
+    Falls back to _FALLBACK_SYMBOLS if Kite is unavailable."""
+    if kite is None:
+        return _FALLBACK_SYMBOLS
+    try:
+        nfo = kite.instruments('NFO')
+        stock_map = {}
+        for inst in nfo:
+            if inst.get('instrument_type') == 'FUT' and inst.get('segment') == 'NFO-FUT':
+                name = inst['name']
+                if name not in _INDEX_SYMBOLS and name not in stock_map:
+                    stock_map[name] = name
+        symbols = sorted(stock_map.keys())
+        return symbols if symbols else _FALLBACK_SYMBOLS
+    except Exception:
+        return _FALLBACK_SYMBOLS
+
+# Default — will be replaced dynamically when kite is available
+DEFAULT_SYMBOLS = _FALLBACK_SYMBOLS
 
 
 def get_kite_client():
@@ -192,7 +214,7 @@ def fetch_and_save_all(symbols: list = None, days: int = 365):
         return False
     
     if symbols is None:
-        symbols = DEFAULT_SYMBOLS
+        symbols = _get_all_fno_symbols(kite)  # Dynamically resolve ALL F&O stocks
     
     os.makedirs(CANDLE_DIR, exist_ok=True)
     
@@ -327,7 +349,7 @@ def fetch_and_save_daily(symbols: list = None, days: int = 500):
         return False
     
     if symbols is None:
-        symbols = DEFAULT_SYMBOLS
+        symbols = _get_all_fno_symbols(kite)  # Dynamically resolve ALL F&O stocks
     
     os.makedirs(DAILY_DIR, exist_ok=True)
     
