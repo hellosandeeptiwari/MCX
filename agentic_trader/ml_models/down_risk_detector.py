@@ -1,26 +1,28 @@
 """
-DOWN-RISK DETECTOR — VAE + GMM anomaly detector for UP/FLAT regimes
+DOWN-RISK DETECTOR v3 — VAE + GMM + GBM anomaly detector for UP/FLAT regimes
 
 Detects hidden DOWN risk when the XGBoost meta-labeling model predicts UP or FLAT.
 Runs AFTER the main model, only on UP/FLAT predictions.
 
-Architecture:
-  1. Reuse existing feature pipeline (84 features from feature_engineering.py)
+Architecture (v3 improvements over v2):
+  1. Reuse existing feature pipeline (88 features from feature_engineering.py)
   2. Generate XGBoost regime predictions via cross-prediction (no leakage)
-  3. Train separate VAE+GMM for UP-regime and FLAT-regime on "clean normal" samples
-  4. Anomaly score = negative log-likelihood under GMM in VAE latent space
-  5. Calibrate threshold on validation set → down_risk_flag
+  3. Train separate VAE+GMM for UP and FLAT regimes on "clean normal" samples
+     - v3: Wider VAE [128,64,32]->32 latent (was [64,32]->16)
+     - v3: Beta warmup from 0.01 -> 0.5 over first 30% of epochs
+  4. Extract rich anomaly features (~52 dims) from VAE latent + GMM:
+     - Full 32-dim latent codes
+     - 12 GMM cluster responsibilities
+     - 7 summary stats (GMM NLL, recon MSE/std/max, KL div, latent norm, nearest dist)
+     (v2 used only 3 features: GMM NLL, recon MSE, KL div)
+  5. GBM calibrator (HistGradientBoosting) on 52 anomaly features
+     (v2 used LogisticRegression on 3 features)
+  6. Proper val split: 60% GBM training, 40% threshold calibration
+     (v2 used same val set for both => overfitting)
 
 Evaluation label (NOT a training target):
-  y_down8 = 1 if worst drawdown over next 8 candles > ATR × 3.0
+  y_down8 = 1 if worst drawdown over next 8 candles > ATR x 3.0
   Used only for metric computation (AUROC, lift, precision@flag)
-
-Training concept:
-  - "Clean normal UP"  = samples where XGB predicts UP  AND y_down8=0
-  - "Clean normal FLAT" = samples where XGB predicts FLAT AND y_down8=0
-  - VAE learns to reconstruct these normal patterns
-  - GMM in latent space measures density (low density = anomaly)
-  - At inference: high anomaly score within UP/FLAT → hidden DOWN risk
 
 Usage:
   python -m ml_models.down_risk_detector train
@@ -49,6 +51,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.mixture import GaussianMixture
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score, precision_recall_curve, average_precision_score
 
 # ── Paths ──
@@ -80,21 +83,28 @@ class DetectorConfig:
     """Configuration for the down-risk detector."""
     # VAE architecture
     input_dim: int = 84           # number of features (auto-detected)
-    latent_dim: int = 16          # latent space dimensionality
-    hidden_dims: list = field(default_factory=lambda: [64, 32])
+    latent_dim: int = 32          # v3: was 16 — more latent capacity
+    hidden_dims: list = field(default_factory=lambda: [128, 64, 32])  # v3: was [64, 32]
     dropout: float = 0.1
     
     # VAE training
-    vae_epochs: int = 80
+    vae_epochs: int = 100         # v3: was 80
     vae_batch_size: int = 512
-    vae_lr: float = 1e-3
-    vae_kl_weight: float = 0.5   # β in β-VAE (< 1 = more reconstruction focus)
-    vae_patience: int = 12       # early stopping patience
+    vae_lr: float = 2e-3          # v3: was 1e-3 (wider net needs slightly higher lr)
+    vae_kl_weight: float = 0.5   # final β target in β-VAE
+    vae_kl_warmup_frac: float = 0.3  # v3: β warmup over first 30% of epochs
+    vae_patience: int = 15       # v3: was 12
     
     # GMM
-    gmm_n_components: int = 8    # number of Gaussian components
+    gmm_n_components: int = 12   # v3: was 8 (more components for 32-dim latent)
     gmm_covariance_type: str = "full"
     gmm_max_iter: int = 300
+    
+    # Calibrator (v3: GBM replaces LR with richer feature set)
+    calibrator_n_estimators: int = 200
+    calibrator_max_depth: int = 3
+    calibrator_lr: float = 0.05
+    calibrator_val_split: float = 0.6  # fraction of val for GBM training (rest for threshold)
     
     # Down event label (evaluation only)
     down_lookahead: int = 8      # candles to look ahead
@@ -422,7 +432,8 @@ class RegimeDetector:
         self.scaler: Optional[StandardScaler] = None
         self.vae: Optional[VAE] = None
         self.gmm: Optional[GaussianMixture] = None
-        self.lr_calibrator: Optional[LogisticRegression] = None  # hybrid calibrator
+        self.gbm_calibrator: Optional[HistGradientBoostingClassifier] = None  # v3: GBM calibrator
+        self.lr_calibrator: Optional[LogisticRegression] = None  # v2 fallback
         self.threshold: float = 0.0
         self.base_down_rate: float = 0.0
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -484,21 +495,41 @@ class RegimeDetector:
         self.gmm.fit(latent_train)
         logger.info(f"  GMM converged: {self.gmm.converged_}")
         
-        # ── 5. Compute raw anomaly features on validation set ──
-        val_raw = self._raw_anomaly_features(X_val_all)
+        # ── 5. Split validation: cal set + threshold set (v3: prevents overfitting) ──
+        n_val = len(X_val_all)
+        cal_frac = getattr(self.config, 'calibrator_val_split', 0.6)
+        n_cal = int(n_val * cal_frac)
+        X_cal, X_thresh = X_val_all[:n_cal], X_val_all[n_cal:]
+        y_cal, y_thresh = y_val_down[:n_cal], y_val_down[n_cal:]
+        logger.info(f"  Val split: {n_cal} for calibrator, {n_val - n_cal} for threshold")
         
-        # ── 6. Fit logistic calibrator on validation set (supervised hybrid) ──
-        logger.info(f"  Fitting logistic calibrator on {len(y_val_down)} val samples...")
-        self.lr_calibrator = LogisticRegression(
-            C=1.0, max_iter=500, random_state=SEED, solver='lbfgs'
+        # ── 6. Compute rich anomaly features (v3: 51-dim instead of 3) ──
+        cal_feats = self._rich_anomaly_features(X_cal)
+        logger.info(f"  Rich anomaly features: {cal_feats.shape[1]} dims")
+        
+        # ── 7. Fit GBM calibrator (v3: replaces LR for nonlinear patterns) ──
+        n_est = getattr(self.config, 'calibrator_n_estimators', 200)
+        max_d = getattr(self.config, 'calibrator_max_depth', 3)
+        cal_lr = getattr(self.config, 'calibrator_lr', 0.05)
+        logger.info(f"  Fitting GBM calibrator ({n_est} trees, depth={max_d}) on {len(y_cal)} samples...")
+        self.gbm_calibrator = HistGradientBoostingClassifier(
+            max_iter=n_est,
+            max_depth=max_d,
+            learning_rate=cal_lr,
+            min_samples_leaf=20,
+            random_state=SEED,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=20,
         )
-        self.lr_calibrator.fit(val_raw, y_val_down)
+        self.gbm_calibrator.fit(cal_feats, y_cal)
         
-        # Use LR probability as the hybrid anomaly score
+        # ── 8. Calibrate threshold on held-out portion (v3: honest threshold) ──
+        thresh_scores = self.score(X_thresh)
+        self._calibrate_threshold(thresh_scores, y_thresh)
+        
+        # Full val scores for final eval
         val_scores = self.score(X_val_all)
-        
-        # ── 7. Calibrate threshold ──
-        self._calibrate_threshold(val_scores, y_val_down)
         metrics['threshold'] = self.threshold
         metrics['base_down_rate'] = self.base_down_rate
         
@@ -532,7 +563,19 @@ class RegimeDetector:
         
         logger.info(f"  Training VAE: {config.vae_epochs} epochs, batch={config.vae_batch_size}")
         
+        # v3: β warmup schedule (start with low KL, ramp up)
+        warmup_frac = getattr(config, 'vae_kl_warmup_frac', 0.3)
+        warmup_epochs = max(1, int(config.vae_epochs * warmup_frac))
+        kl_start = 0.01
+        logger.info(f"  β warmup: {kl_start:.3f} → {config.vae_kl_weight:.3f} over {warmup_epochs} epochs")
+        
         for epoch in range(config.vae_epochs):
+            # v3: compute current β (warmup then constant)
+            if epoch < warmup_epochs:
+                kl_w = kl_start + (config.vae_kl_weight - kl_start) * epoch / warmup_epochs
+            else:
+                kl_w = config.vae_kl_weight
+            
             # ── Train ──
             self.vae.train()
             epoch_loss = 0.0
@@ -540,7 +583,7 @@ class RegimeDetector:
             for (batch,) in train_loader:
                 batch = batch.to(self.device)
                 x_hat, mu, logvar = self.vae(batch)
-                loss, recon, kl = vae_loss(batch, x_hat, mu, logvar, config.vae_kl_weight)
+                loss, recon, kl = vae_loss(batch, x_hat, mu, logvar, kl_w)
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -557,7 +600,7 @@ class RegimeDetector:
             with torch.no_grad():
                 X_va_dev = X_va_t.to(self.device)
                 x_hat_v, mu_v, lv_v = self.vae(X_va_dev)
-                val_loss, _, _ = vae_loss(X_va_dev, x_hat_v, mu_v, lv_v, config.vae_kl_weight)
+                val_loss, _, _ = vae_loss(X_va_dev, x_hat_v, mu_v, lv_v, kl_w)
                 avg_val = val_loss.item()
             
             scheduler.step(avg_val)
@@ -566,17 +609,30 @@ class RegimeDetector:
             
             if epoch % 10 == 0 or epoch == config.vae_epochs - 1:
                 lr_now = optimizer.param_groups[0]['lr']
-                logger.info(f"    Epoch {epoch:3d}: train={avg_train:.4f}  val={avg_val:.4f}  lr={lr_now:.2e}")
+                logger.info(f"    Epoch {epoch:3d}: train={avg_train:.4f}  val={avg_val:.4f}  lr={lr_now:.2e}  β={kl_w:.3f}")
             
-            if avg_val < best_val_loss - 1e-5:
+            # v3: Don't start early-stopping until AFTER warmup completes
+            # During warmup, increasing β makes loss go up — not a real plateau
+            # We also need to reset best_val_loss at warmup end, otherwise
+            # the low-β loss will always "win" and we reload pre-warmup weights
+            if epoch < warmup_epochs:
+                pass  # Don't track best model during warmup (β is changing)
+            elif epoch == warmup_epochs:
+                # First post-warmup epoch: initialize tracking with full-β loss
                 best_val_loss = avg_val
-                patience_counter = 0
                 best_state = {k: v.cpu().clone() for k, v in self.vae.state_dict().items()}
+                patience_counter = 0
+                logger.info(f"    Post-warmup baseline: val={avg_val:.4f} at β={kl_w:.3f}")
             else:
-                patience_counter += 1
-                if patience_counter >= config.vae_patience:
-                    logger.info(f"    Early stopping at epoch {epoch} (patience={config.vae_patience})")
-                    break
+                if avg_val < best_val_loss - 1e-5:
+                    best_val_loss = avg_val
+                    patience_counter = 0
+                    best_state = {k: v.cpu().clone() for k, v in self.vae.state_dict().items()}
+                else:
+                    patience_counter += 1
+                    if patience_counter >= config.vae_patience:
+                        logger.info(f"    Early stopping at epoch {epoch} (patience={config.vae_patience}, post-warmup)")
+                        break
         
         # Restore best weights
         if best_state is not None:
@@ -621,23 +677,97 @@ class RegimeDetector:
         # Stack into feature matrix [n_samples, 3]
         return np.column_stack([gmm_nll, recon_mse, kl_per_sample])
     
+    def _rich_anomaly_features(self, X: np.ndarray) -> np.ndarray:
+        """Compute rich anomaly feature matrix for GBM calibrator (v3).
+        
+        Returns ~51-dim feature vector per sample:
+          - Full latent codes (latent_dim dims) — learned representations
+          - GMM NLL (1) — density anomaly
+          - GMM per-component responsibilities (n_components) — soft clustering
+          - Reconstruction MSE (1) — how well VAE reconstructs this sample
+          - Reconstruction error std across features (1) — localized anomaly
+          - Reconstruction error max (1) — worst-reconstructed feature
+          - KL divergence per sample (1) — how far latent from prior
+          - Latent L2 norm (1) — distance from origin in latent space
+          - Latent max abs (1) — most extreme latent dimension
+          - Distance to nearest GMM centroid (1) — cluster edge detection
+        
+        Much richer than v2's 3-feature [GMM NLL, recon MSE, KL div].
+        """
+        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        X_scaled = self.scaler.transform(X_clean)
+        X_t = torch.tensor(X_scaled, dtype=torch.float32).to(self.device)
+        
+        self.vae.eval()
+        with torch.no_grad():
+            mu, logvar = self.vae.encode(X_t)
+            z = mu  # deterministic for scoring
+            x_hat = self.vae.decode(z)
+            
+            # Per-sample per-feature reconstruction errors
+            recon_errors = ((X_t - x_hat) ** 2).cpu().numpy()  # [n, input_dim]
+            recon_mse = recon_errors.mean(axis=1)               # [n]
+            recon_std = recon_errors.std(axis=1)                 # [n]
+            recon_max = recon_errors.max(axis=1)                 # [n]
+            
+            # Per-sample KL divergence
+            kl_per_sample = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).sum(dim=1).cpu().numpy()
+        
+        latent = mu.cpu().numpy()  # [n, latent_dim]
+        
+        # GMM features
+        gmm_nll = -self.gmm.score_samples(latent)                # [n]
+        gmm_resp = self.gmm.predict_proba(latent)                # [n, n_components]
+        
+        # Latent space statistics
+        latent_norm = np.linalg.norm(latent, axis=1)             # [n]
+        latent_max_abs = np.abs(latent).max(axis=1)              # [n]
+        
+        # Distance to nearest GMM centroid
+        centroids = self.gmm.means_                              # [n_components, latent_dim]
+        nearest_dist = np.min(
+            np.stack([np.linalg.norm(latent - c, axis=1) for c in centroids], axis=1),
+            axis=1
+        )  # [n]
+        
+        # Stack all features
+        features = np.column_stack([
+            latent,                              # latent_dim dims
+            gmm_nll.reshape(-1, 1),              # 1
+            gmm_resp,                            # n_components dims
+            recon_mse.reshape(-1, 1),            # 1
+            recon_std.reshape(-1, 1),            # 1
+            recon_max.reshape(-1, 1),            # 1
+            kl_per_sample.reshape(-1, 1),        # 1
+            latent_norm.reshape(-1, 1),          # 1
+            latent_max_abs.reshape(-1, 1),       # 1
+            nearest_dist.reshape(-1, 1),         # 1
+        ])  # Total: latent_dim + 1 + n_components + 7 = 32 + 1 + 12 + 7 = 52
+        
+        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    
     def score(self, X: np.ndarray) -> np.ndarray:
         """Compute hybrid anomaly scores for raw (unscaled) feature matrix.
         
         Returns: array of anomaly scores (higher = more anomalous).
-        Hybrid: LR calibrated probability from [GMM NLL, recon MSE, KL divergence].
-        Falls back to GMM NLL if calibrator not fitted yet.
+        v3: GBM on 52 rich anomaly features (latent codes + GMM resp + stats).
+        v2 fallback: LR on 3 features [GMM NLL, recon MSE, KL div].
+        Final fallback: raw GMM NLL.
         """
         if not self._is_trained and self.scaler is None:
             raise RuntimeError("Detector not trained. Call train() first.")
         
-        raw_feats = self._raw_anomaly_features(X)
-        
-        if self.lr_calibrator is not None:
-            # Hybrid score: calibrated probability of DOWN event
+        if self.gbm_calibrator is not None:
+            # v3: GBM on rich features
+            rich_feats = self._rich_anomaly_features(X)
+            return self.gbm_calibrator.predict_proba(rich_feats)[:, 1]
+        elif self.lr_calibrator is not None:
+            # v2 fallback: LR on 3 basic features
+            raw_feats = self._raw_anomaly_features(X)
             return self.lr_calibrator.predict_proba(raw_feats)[:, 1]
         else:
-            # Fallback: just GMM NLL
+            # Final fallback: raw GMM NLL
+            raw_feats = self._raw_anomaly_features(X)
             return raw_feats[:, 0]
     
     def predict(self, X: np.ndarray) -> Dict[str, np.ndarray]:
@@ -775,7 +905,12 @@ class RegimeDetector:
         with open(path / f"{prefix}_gmm.pkl", 'wb') as f:
             pickle.dump(self.gmm, f)
         
-        # LR calibrator (hybrid scoring)
+        # GBM calibrator (v3)
+        if self.gbm_calibrator is not None:
+            with open(path / f"{prefix}_gbm_calibrator.pkl", 'wb') as f:
+                pickle.dump(self.gbm_calibrator, f)
+        
+        # LR calibrator (v2 fallback)
         if self.lr_calibrator is not None:
             with open(path / f"{prefix}_lr_calibrator.pkl", 'wb') as f:
                 pickle.dump(self.lr_calibrator, f)
@@ -822,9 +957,15 @@ class RegimeDetector:
             with open(path / f"{prefix}_gmm.pkl", 'rb') as f:
                 self.gmm = pickle.load(f)
             
-            # LR calibrator (optional, for hybrid scoring)
+            # GBM calibrator (v3, try first)
+            gbm_path = path / f"{prefix}_gbm_calibrator.pkl"
+            if gbm_path.exists():
+                with open(gbm_path, 'rb') as f:
+                    self.gbm_calibrator = pickle.load(f)
+            
+            # LR calibrator (v2 fallback — only if no GBM)
             lr_path = path / f"{prefix}_lr_calibrator.pkl"
-            if lr_path.exists():
+            if lr_path.exists() and self.gbm_calibrator is None:
                 with open(lr_path, 'rb') as f:
                     self.lr_calibrator = pickle.load(f)
             
@@ -974,25 +1115,24 @@ class DownRiskDetector:
             y_uf = y_test_down[up_flat_mask]
             regimes_uf = regime_test[up_flat_mask]
             
+            # v3: vectorized scoring by regime (much faster than per-sample loop)
             scores_uf = np.zeros(len(X_uf))
-            for i in range(len(X_uf)):
-                if regimes_uf[i] == 'UP' and self.up_detector._is_trained:
-                    scores_uf[i] = self.up_detector.score(X_uf[i:i+1])[0]
-                elif regimes_uf[i] == 'FLAT' and self.flat_detector._is_trained:
-                    scores_uf[i] = self.flat_detector.score(X_uf[i:i+1])[0]
+            flags = np.zeros(len(scores_uf), dtype=bool)
+            
+            up_mask = (regimes_uf == 'UP')
+            flat_mask = (regimes_uf == 'FLAT')
+            
+            if up_mask.sum() > 0 and self.up_detector._is_trained:
+                scores_uf[up_mask] = self.up_detector.score(X_uf[up_mask])
+                flags[up_mask] = scores_uf[up_mask] >= self.up_detector.threshold
+            if flat_mask.sum() > 0 and self.flat_detector._is_trained:
+                scores_uf[flat_mask] = self.flat_detector.score(X_uf[flat_mask])
+                flags[flat_mask] = scores_uf[flat_mask] >= self.flat_detector.threshold
             
             if len(np.unique(y_uf)) > 1:
                 combined_auroc = roc_auc_score(y_uf, scores_uf)
                 results['combined_auroc'] = round(combined_auroc, 4)
                 logger.info(f"\n  COMBINED TEST AUROC (UP+FLAT): {combined_auroc:.4f}")
-            
-            # Flag stats
-            flags = np.zeros(len(scores_uf), dtype=bool)
-            for i in range(len(scores_uf)):
-                if regimes_uf[i] == 'UP' and self.up_detector._is_trained:
-                    flags[i] = scores_uf[i] >= self.up_detector.threshold
-                elif regimes_uf[i] == 'FLAT' and self.flat_detector._is_trained:
-                    flags[i] = scores_uf[i] >= self.flat_detector.threshold
             
             if flags.sum() > 0:
                 base = y_uf.mean()
@@ -1147,14 +1287,14 @@ def main():
         datefmt='%H:%M:%S',
     )
     
-    parser = argparse.ArgumentParser(description='Down-Risk Detector (VAE + GMM)')
+    parser = argparse.ArgumentParser(description='Down-Risk Detector v3 (VAE + GMM + GBM)')
     subparsers = parser.add_subparsers(dest='command', required=True)
     
     # ── train ──
     p_train = subparsers.add_parser('train', help='Train the down-risk detector')
-    p_train.add_argument('--latent-dim', type=int, default=16)
-    p_train.add_argument('--gmm-components', type=int, default=8)
-    p_train.add_argument('--vae-epochs', type=int, default=80)
+    p_train.add_argument('--latent-dim', type=int, default=32)
+    p_train.add_argument('--gmm-components', type=int, default=12)
+    p_train.add_argument('--vae-epochs', type=int, default=100)
     p_train.add_argument('--vae-kl-weight', type=float, default=0.5)
     p_train.add_argument('--down-atr-factor', type=float, default=3.0)
     p_train.add_argument('--test-days', type=int, default=20)

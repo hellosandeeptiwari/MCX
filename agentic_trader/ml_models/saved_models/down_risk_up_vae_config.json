@@ -1,7 +1,8 @@
 {
   "input_dim": 88,
-  "latent_dim": 16,
+  "latent_dim": 32,
   "hidden_dims": [
+    128,
     64,
     32
   ],
