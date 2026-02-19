@@ -4790,6 +4790,7 @@ class ZerodhaTools:
             )
             if not already_tracked:
                 # Add to options_trader.positions with expected fields
+                # Include expiry + timestamp for DTE-aware theta decay checks
                 options_trader.positions.append({
                     'symbol': pos['symbol'],
                     'entry_premium': pos.get('avg_price', 0),
@@ -4799,7 +4800,8 @@ class ZerodhaTools:
                     'lot_size': pos.get('lot_size', 1),
                     'greeks': pos.get('greeks', {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'iv': 0}),
                     'status': 'OPEN',
-                    'timestamp': pos.get('timestamp', '')
+                    'timestamp': pos.get('timestamp', ''),
+                    'expiry': pos.get('expiry', ''),
                 })
         
         # Use the existing check_option_exits method that checks all positions
@@ -4807,14 +4809,18 @@ class ZerodhaTools:
         
         exit_signals = []
         for signal in all_exits:
-            if signal.get('signal') in ('TARGET_HIT', 'STOPLOSS_HIT', 'THETA_DECAY_WARNING'):
+            sig_type = signal.get('signal', '')
+            if sig_type in ('TARGET_HIT', 'STOPLOSS_HIT', 'THETA_DECAY_WARNING'):
                 exit_signals.append({
                     "symbol": signal['symbol'],
-                    "reason": signal['signal'],
-                    "exit_type": signal['signal'],
+                    "reason": sig_type,
+                    "exit_type": sig_type,
                     "current_pnl": signal.get('pnl_value', 0),
-                    "should_exit": signal['signal'] in ('TARGET_HIT', 'STOPLOSS_HIT')
+                    "should_exit": sig_type in ('TARGET_HIT', 'STOPLOSS_HIT', 'THETA_DECAY_WARNING'),
                 })
+            elif sig_type == 'THETA_DECAY_INFO':
+                # Informational only (2+ DTE) — log but don't exit
+                pass  # Silently skip — no action needed
         
         return exit_signals
 

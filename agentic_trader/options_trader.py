@@ -5786,8 +5786,15 @@ class OptionsTrader:
     
     def check_option_exits(self) -> List[Dict]:
         """
-        Check all open option positions for exit conditions
+        Check all open option positions for exit conditions.
+        
+        DTE-aware theta decay logic:
+        - 0 DTE (expiry day): Aggressive theta check — theta eating >15% of premium → EXIT
+        - 1 DTE: Moderate check — theta eating >30% of premium → EXIT
+        - 2+ DTE: Relaxed — only warn if theta eating >60% of premium (informational only)
+        - Grace period: Skip theta check entirely for first 15 minutes after entry
         """
+        from datetime import datetime, date
         exits = []
         
         for pos in self.positions:
@@ -5825,12 +5832,48 @@ class OptionsTrader:
                 elif current_premium <= stoploss:
                     exit_signal = 'STOPLOSS_HIT'
                 
-                # Theta decay - if theta is eating more than 30% of remaining premium
-                elif pos['greeks']['theta'] * 3 < -current_premium * 0.3:
-                    exit_signal = 'THETA_DECAY_WARNING'
-                
-                # IV crush - if IV dropped significantly
-                # (Would need current IV comparison)
+                # DTE-aware theta decay check
+                else:
+                    # Calculate DTE (days to expiry)
+                    dte = None
+                    expiry_str = pos.get('expiry', '')
+                    if expiry_str:
+                        try:
+                            expiry_date = datetime.fromisoformat(expiry_str).date() if 'T' in str(expiry_str) else date.fromisoformat(str(expiry_str))
+                            dte = (expiry_date - date.today()).days
+                        except (ValueError, TypeError):
+                            dte = None
+                    
+                    # Grace period: skip theta check for first 15 minutes
+                    entry_ts = pos.get('timestamp', '')
+                    minutes_held = 999  # Default: assume held long enough
+                    if entry_ts:
+                        try:
+                            entry_time = datetime.fromisoformat(entry_ts)
+                            minutes_held = (datetime.now() - entry_time).total_seconds() / 60.0
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    theta = pos['greeks'].get('theta', 0)
+                    
+                    if minutes_held >= 15 and theta < 0 and current_premium > 0:
+                        # DTE-based thresholds (% of premium that daily theta can eat)
+                        if dte is not None and dte <= 0:
+                            # EXPIRY DAY (0 DTE): Aggressive — theta accelerates massively
+                            # Exit if 3-candle theta > 15% of premium
+                            if theta * 3 < -current_premium * 0.15:
+                                exit_signal = 'THETA_DECAY_WARNING'
+                        elif dte is not None and dte == 1:
+                            # 1 DTE: Moderate — theta starting to accelerate
+                            # Exit if daily theta > 40% of premium
+                            if abs(theta) > current_premium * 0.40:
+                                exit_signal = 'THETA_DECAY_WARNING'
+                        else:
+                            # 2+ DTE or unknown DTE: Relaxed — theta is manageable
+                            # Only flag (not exit) if daily theta > 60% of premium
+                            # This is almost never hit for 2+ DTE — theta is small relative to premium
+                            if abs(theta) > current_premium * 0.60:
+                                exit_signal = 'THETA_DECAY_INFO'  # Informational only, won't trigger exit
                 
                 if exit_signal:
                     exits.append({

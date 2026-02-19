@@ -1409,6 +1409,9 @@ class AutonomousTrader:
                     # Skip credit spread symbols (contain '|')
                     if '|' in symbol:
                         continue
+                    # Only act on signals that actually require exit
+                    if not exit_signal.get('should_exit', False):
+                        continue
                     reason = exit_signal.get('reason', 'Greeks exit')
                     
                     # Find the option trade
