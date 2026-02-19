@@ -174,6 +174,19 @@ ADAPTIVE_SCAN = {
     "min_fast_interval_minutes": 2,   # Never scan faster than this (API limits)
 }
 
+# === DOWN-RISK GATING (VAE+GMM anomaly detector cap) ===
+# Limits total daily trades to N, ranked by lowest down-risk score.
+# The detector flags hidden crash risk in UP/FLAT XGBoost predictions.
+# Candidates are sorted by ml_down_risk_score (ascending = safest first).
+# Only the N safest candidates are allowed to trade across ALL execution paths
+# (elite auto-fire, proactive debit spreads, proactive ICs, GPT picks).
+DOWN_RISK_GATING = {
+    "enabled": True,
+    "max_trades_per_day": 3,          # Only allow 3 trades total per day
+    "prefer_unflagged": True,         # Prefer candidates where ml_down_risk_flag=False
+    "log_rejections": True,           # Log when a trade is blocked by down-risk budget
+}
+
 # === DECISION LOG (Full Scan Audit Trail) ===
 # Logs every stock evaluated each cycle with score, outcome, and reason.
 # Enables post-hoc analysis of missed opportunities.

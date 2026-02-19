@@ -205,7 +205,7 @@ class AutonomousTrader:
         print("  ⚡ IOC Validity: ACTIVE (spread legs)")
         
         # === NEW: Decision Log + Elite Auto-Fire + Adaptive Scan ===
-        from config import DECISION_LOG, ELITE_AUTO_FIRE, ADAPTIVE_SCAN, DYNAMIC_MAX_PICKS
+        from config import DECISION_LOG, ELITE_AUTO_FIRE, ADAPTIVE_SCAN, DYNAMIC_MAX_PICKS, DOWN_RISK_GATING
         self._decision_log_cfg = DECISION_LOG
         self._elite_auto_fire_cfg = ELITE_AUTO_FIRE
         self._adaptive_scan_cfg = ADAPTIVE_SCAN
@@ -218,6 +218,15 @@ class AutonomousTrader:
         if DYNAMIC_MAX_PICKS.get('enabled'): print(f"  📊 Dynamic Max Picks: ACTIVE (3→5 when signals are hot)")
         if ADAPTIVE_SCAN.get('enabled'): print(f"  ⏱️ Adaptive Scan: ACTIVE ({ADAPTIVE_SCAN['fast_interval_minutes']}min/{ADAPTIVE_SCAN['normal_interval_minutes']}min/{ADAPTIVE_SCAN['slow_interval_minutes']}min)")
         if DECISION_LOG.get('enabled'): print(f"  📝 Decision Log: ACTIVE ({DECISION_LOG['file']})")
+        
+        # === DOWN-RISK GATING: Limit trades to N safest per day ===
+        self._down_risk_cfg = DOWN_RISK_GATING
+        self._down_risk_trades_today = 0
+        self._down_risk_tracking_date = datetime.now().date()
+        self._down_risk_traded_symbols = set()  # Symbols traded via down-risk budget today
+        self._down_risk_ranked_candidates = []   # Per-cycle ranked list [(sym, score), ...]
+        if DOWN_RISK_GATING.get('enabled'):
+            print(f"  🛡️ Down-Risk Gating: ACTIVE (max {DOWN_RISK_GATING['max_trades_per_day']} trades/day, ranked by safety)")
         
         # === ML MOVE PREDICTOR ===
         self._ml_predictor = None
@@ -610,6 +619,15 @@ class AutonomousTrader:
                 pass  # ML unavailable — proceed with original direction
             
             print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}{_elite_ml_override}")
+            
+            # === DOWN-RISK GATE: Check if this trade is within budget ===
+            _dr_ok, _dr_reason = self._can_trade_down_risk(sym)
+            if not _dr_ok:
+                print(f"   🛡️ ELITE BLOCKED by down-risk: {_dr_reason}")
+                self._log_decision(cycle_time, sym, score, 'ELITE_DOWN_RISK_BLOCKED',
+                                  reason=f'Down-risk gate: {_dr_reason}', direction=direction)
+                continue
+            
             try:
                 result = self.tools.place_option_order(
                     underlying=sym,
@@ -621,6 +639,7 @@ class AutonomousTrader:
                     print(f"   ✅ ELITE AUTO-FIRED: {sym} ({direction}) score={score:.0f}")
                     auto_fired.append(sym)
                     self._auto_fired_this_session.add(sym)
+                    self._record_down_risk_trade(sym)  # Consume down-risk budget
                     self._log_decision(cycle_time, sym, score, 'AUTO_FIRED',
                                       reason=f'Elite score {score:.0f} ≥ {threshold}',
                                       direction=direction, setup='ELITE_AUTO')
@@ -666,6 +685,114 @@ class AutonomousTrader:
             return choppy_max
         
         return default_max
+    
+    # ========== DOWN-RISK GATING ==========
+    def _reset_down_risk_if_new_day(self):
+        """Reset down-risk trade counter at start of new trading day."""
+        today = datetime.now().date()
+        if today != self._down_risk_tracking_date:
+            self._down_risk_trades_today = 0
+            self._down_risk_tracking_date = today
+            self._down_risk_traded_symbols = set()
+            self._down_risk_ranked_candidates = []
+            print(f"📅 New trading day — down-risk trade counter reset")
+    
+    def _build_down_risk_ranking(self, ml_results: dict, pre_scores: dict):
+        """Rank all ML-predicted candidates by down-risk score (safest first).
+        
+        Called once per scan cycle after ML predictions are merged.
+        Populates self._down_risk_ranked_candidates with [(symbol, dr_score), ...]
+        sorted ascending (lowest risk first).
+        """
+        if not self._down_risk_cfg.get('enabled', False):
+            self._down_risk_ranked_candidates = []
+            return
+        
+        self._reset_down_risk_if_new_day()
+        
+        prefer_unflagged = self._down_risk_cfg.get('prefer_unflagged', True)
+        candidates = []
+        
+        for sym in pre_scores:
+            ml = ml_results.get(sym, {})
+            dr_score = ml.get('ml_down_risk_score', 0.0)
+            dr_flag = ml.get('ml_down_risk_flag', False)
+            
+            # Sort key: unflagged first (if prefer_unflagged), then by score ascending
+            sort_key = (1 if (prefer_unflagged and dr_flag) else 0, dr_score)
+            candidates.append((sym, dr_score, dr_flag, sort_key))
+        
+        # Sort: safest candidates first
+        candidates.sort(key=lambda x: x[3])
+        self._down_risk_ranked_candidates = [
+            (sym, dr_score, dr_flag) for sym, dr_score, dr_flag, _ in candidates
+        ]
+        
+        # Log the ranking
+        max_trades = self._down_risk_cfg.get('max_trades_per_day', 3)
+        budget_remaining = max(0, max_trades - self._down_risk_trades_today)
+        top_n = self._down_risk_ranked_candidates[:max_trades + 2]
+        if top_n:
+            lines = []
+            for i, (sym, dr_s, dr_f) in enumerate(top_n):
+                flag_icon = "🔴" if dr_f else "🟢"
+                budget_icon = "✅" if i < budget_remaining else "⛔"
+                lines.append(f"{budget_icon} {sym.replace('NSE:', '')} dr={dr_s:.3f} {flag_icon}")
+            print(f"   🛡️ DOWN-RISK RANKING (budget: {budget_remaining}/{max_trades}): {' | '.join(lines)}")
+    
+    def _can_trade_down_risk(self, symbol: str) -> tuple:
+        """Check if symbol is allowed to trade under down-risk budget.
+        
+        Returns (allowed: bool, reason: str).
+        Already-traded symbols are always allowed (re-entry check is separate).
+        """
+        cfg = self._down_risk_cfg
+        if not cfg.get('enabled', False):
+            return True, 'down-risk gating disabled'
+        
+        self._reset_down_risk_if_new_day()
+        
+        max_trades = cfg.get('max_trades_per_day', 3)
+        
+        # Already traded this symbol today — allow (e.g., re-entry after exit)
+        if symbol in self._down_risk_traded_symbols:
+            return True, 'already in down-risk budget'
+        
+        # Budget exhausted
+        if self._down_risk_trades_today >= max_trades:
+            return False, f'down-risk budget exhausted ({self._down_risk_trades_today}/{max_trades})'
+        
+        # Check if symbol is among the safest N candidates for this cycle
+        if self._down_risk_ranked_candidates:
+            budget_remaining = max_trades - self._down_risk_trades_today
+            # Get the top N safest symbols that haven't been traded yet
+            allowed_syms = set()
+            count = 0
+            for sym, dr_score, dr_flag in self._down_risk_ranked_candidates:
+                if sym in self._down_risk_traded_symbols:
+                    continue
+                allowed_syms.add(sym)
+                count += 1
+                if count >= budget_remaining:
+                    break
+            
+            if symbol not in allowed_syms:
+                # Find this symbol's rank and score
+                rank = next((i for i, (s, _, _) in enumerate(self._down_risk_ranked_candidates) if s == symbol), -1)
+                dr_s = next((s for sym_, s, _ in self._down_risk_ranked_candidates if sym_ == symbol), 0.0)
+                return False, f'not among {budget_remaining} safest (rank #{rank+1}, dr_score={dr_s:.3f})'
+        
+        return True, 'within down-risk budget'
+    
+    def _record_down_risk_trade(self, symbol: str):
+        """Record that a trade was placed, consuming one unit of down-risk budget."""
+        if not self._down_risk_cfg.get('enabled', False):
+            return
+        if symbol not in self._down_risk_traded_symbols:
+            self._down_risk_traded_symbols.add(symbol)
+            self._down_risk_trades_today += 1
+            max_t = self._down_risk_cfg.get('max_trades_per_day', 3)
+            print(f"   🛡️ DOWN-RISK BUDGET: {self._down_risk_trades_today}/{max_t} used (added {symbol.replace('NSE:', '')})")
     
     # ========== ADAPTIVE SCAN INTERVAL ==========
     def _adapt_scan_interval(self, pre_scores: dict):
@@ -2567,6 +2694,14 @@ class AutonomousTrader:
                 # Store OI results for GPT prompt
                 self._cycle_oi_results = _oi_results
                 
+                # === DOWN-RISK RANKING: Rank all candidates by anomaly score ===
+                # Must happen after ML predictions are merged so ml_down_risk_score is available.
+                # This populates _down_risk_ranked_candidates for all execution paths.
+                try:
+                    self._build_down_risk_ranking(_ml_results, _pre_scores)
+                except Exception as _dr_err:
+                    print(f"   ⚠️ Down-risk ranking error (non-fatal): {_dr_err}")
+                
                 # === OI SNAPSHOT LOGGER: Collect data for future model retraining ===
                 # Now includes NSE OI change data (richer than Kite-only snapshots)
                 try:
@@ -3279,6 +3414,15 @@ class AutonomousTrader:
                                 _oi_tag = f" {_oi_info['flow_gpt_line']}"
                         except Exception:
                             pass
+                        
+                        # === DOWN-RISK GATE: Only show GPT candidates within budget ===
+                        _dr_ok, _dr_reason = self._can_trade_down_risk(symbol)
+                        if not _dr_ok:
+                            if self._down_risk_cfg.get('log_rejections', True):
+                                self._log_decision(cycle_time, symbol, _fno_score, 'DOWN_RISK_FILTERED',
+                                                  reason=f'Down-risk: {_dr_reason}', direction=direction)
+                            continue
+                        
                         fno_opportunities.append(
                             f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]{_fno_score_tag}{_ml_tag}{_oi_tag}{wc_tag}{_ml_override_tag}"
                         )
@@ -3377,6 +3521,12 @@ class AutonomousTrader:
                             try:
                                 print(f"\n   🎯 PROACTIVE DEBIT SPREAD: Trying {symbol} ({direction}) — Priority: {priority:.0f}")
                                 
+                                # === DOWN-RISK GATE ===
+                                _dr_ok, _dr_reason = self._can_trade_down_risk(symbol)
+                                if not _dr_ok:
+                                    print(f"   🛡️ DEBIT SPREAD BLOCKED by down-risk: {_dr_reason}")
+                                    continue
+                                
                                 # === PRE-FLIGHT LIQUIDITY CHECK ===
                                 # Verify option chain has adequate OI + tight bid-ask BEFORE
                                 # spending API calls on full debit spread creation
@@ -3407,6 +3557,7 @@ class AutonomousTrader:
                                 )
                                 if result.get('success'):
                                     print(f"   ✅ PROACTIVE DEBIT SPREAD PLACED on {symbol}!")
+                                    self._record_down_risk_trade(symbol)  # Consume down-risk budget
                                     debit_spread_placed.append(symbol)
                                 else:
                                     print(f"   ℹ️ Debit spread not viable for {symbol}: {result.get('error', 'unknown')}")
@@ -3529,6 +3680,12 @@ class AutonomousTrader:
                                 
                                 print(f"\n   🦅 INDEX IC SCAN: {idx_symbol} | Chg: {idx_change:.2f}% | RSI: {idx_rsi:.0f} | IC Score: {ic_score}")
                                 
+                                # === DOWN-RISK GATE ===
+                                _dr_ok, _dr_reason = self._can_trade_down_risk(idx_symbol)
+                                if not _dr_ok:
+                                    print(f"   🛡️ INDEX IC BLOCKED by down-risk: {_dr_reason}")
+                                    continue
+                                
                                 exec_result = self.tools.place_iron_condor(
                                     underlying=idx_symbol,
                                     rationale=f"Proactive index IC: flat range {idx_change:.1f}%, RSI {idx_rsi:.0f}",
@@ -3538,6 +3695,7 @@ class AutonomousTrader:
                                 
                                 if exec_result and exec_result.get('success'):
                                     print(f"   ✅ INDEX IC PLACED on {idx_symbol}!")
+                                    self._record_down_risk_trade(idx_symbol)  # Consume down-risk budget
                                     ic_placed.append(idx_symbol)
                                 else:
                                     print(f"   ℹ️ Index IC not viable for {idx_symbol}: {exec_result.get('error', 'creation failed')}")
@@ -3699,6 +3857,13 @@ class AutonomousTrader:
                                     reasons_str = " | ".join(reasons[:5])
                                     print(f"\n   🦅 STOCK IC SCAN: {symbol} | Quality: {ic_quality}/100 | Chg: {abs(data.get('change_pct', 0)):.2f}% | RSI: {data.get('rsi_14', 50):.0f}")
                                     print(f"      IC Factors: {reasons_str}")
+                                    
+                                    # === DOWN-RISK GATE ===
+                                    _dr_ok, _dr_reason = self._can_trade_down_risk(symbol)
+                                    if not _dr_ok:
+                                        print(f"   🛡️ STOCK IC BLOCKED by down-risk: {_dr_reason}")
+                                        continue
+                                    
                                     exec_result = self.tools.place_iron_condor(
                                         underlying=symbol,
                                         rationale=f"IC Quality {ic_quality}/100: {reasons_str} | Move {abs(data.get('change_pct', 0)):.1f}% RSI {data.get('rsi_14', 50):.0f}",
@@ -3707,6 +3872,7 @@ class AutonomousTrader:
                                     )
                                     if exec_result and exec_result.get('success'):
                                         print(f"   ✅ STOCK IC PLACED on {symbol}! (Quality: {ic_quality})")
+                                        self._record_down_risk_trade(symbol)  # Consume down-risk budget
                                         ic_placed.append(symbol)
                                     else:
                                         print(f"   ℹ️ Stock IC not viable for {symbol}: {exec_result.get('error', 'creation failed')}")
@@ -3782,6 +3948,12 @@ class AutonomousTrader:
             
             # === DYNAMIC MAX PICKS: Scale GPT picks with signal quality ===
             _dynamic_max = self._compute_max_picks(_pre_scores, _breadth)
+            # Cap by down-risk budget remaining
+            if self._down_risk_cfg.get('enabled', False):
+                _dr_budget_left = max(0, self._down_risk_cfg.get('max_trades_per_day', 3) - self._down_risk_trades_today)
+                if _dr_budget_left < _dynamic_max:
+                    _dynamic_max = _dr_budget_left
+                    print(f"   🛡️ DOWN-RISK CAP: GPT limited to {_dynamic_max} picks (budget: {_dr_budget_left})")
             if _dynamic_max != 3:
                 print(f"   📊 DYNAMIC PICKS: GPT allowed up to {_dynamic_max} trades (signal quality {'HIGH' if _dynamic_max > 3 else 'LOW'})")
             
@@ -3904,6 +4076,7 @@ Data Health: {len(halted_symbols)} halted | {'Halted: ' + ', '.join(halted_symbo
 === 💰 ACCOUNT ===
 Capital: Rs{self.capital:,.0f} | Daily P&L: Rs{risk_status.daily_pnl:+,.0f} ({risk_status.daily_pnl_pct:+.2f}%)
 Trades: {risk_status.trades_today}/{self.risk_governor.limits.max_trades_per_day} (Remaining: {trades_remaining})
+Down-Risk Budget: {max(0, self._down_risk_cfg.get('max_trades_per_day', 3) - self._down_risk_trades_today)}/{self._down_risk_cfg.get('max_trades_per_day', 3)} remaining (STRICT LIMIT — only safest candidates shown above)
 W/L: {risk_status.wins_today}/{risk_status.losses_today} | Consec Losses: {risk_status.consecutive_losses}/{self.risk_governor.limits.max_consecutive_losses}
 
 === 🧠 YOUR TASK ===
@@ -4027,6 +4200,13 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                             continue
                         
                         print(f"   🔄 Direct-placing {sym} ({direction}) — parsed from GPT analysis")
+                        
+                        # === DOWN-RISK GATE ===
+                        _dr_ok, _dr_reason = self._can_trade_down_risk(f'NSE:{sym}')
+                        if not _dr_ok:
+                            print(f"   🛡️ GPT RETRY BLOCKED by down-risk: {sym} — {_dr_reason}")
+                            continue
+                        
                         try:
                             if sym in fno_prefer_set:
                                 result = self.tools.place_option_order(
@@ -4046,6 +4226,8 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                             if result:
                                 status = "PLACED" if result.get('success') else result.get('error', 'unknown')[:80]
                                 print(f"   ✅ Direct-place {sym}: {status}")
+                                if result.get('success'):
+                                    self._record_down_risk_trade(f'NSE:{sym}')  # Consume down-risk budget
                                 # If not F&O eligible, blacklist for this session
                                 if not result.get('success') and 'not F&O eligible' in result.get('error', ''):
                                     self._rejected_this_cycle.add(sym)
