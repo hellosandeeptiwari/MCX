@@ -183,7 +183,7 @@ DOWN_RISK_GATING = {
     "enabled": True,
     "safe_bonus": 5,                  # Score bonus for unflagged (safe) candidates
     "risk_penalty": 5,               # Score penalty for flagged (risky) candidates
-    "model_tracker_trades": 3,        # Exclusive model-only trades per day for tracking
+    "model_tracker_trades": 7,        # Exclusive model-only trades per day for tracking
     "log_rejections": True,           # Log score adjustments for diagnostics
 }
 

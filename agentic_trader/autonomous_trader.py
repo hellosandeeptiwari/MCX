@@ -725,27 +725,41 @@ class AutonomousTrader:
                 print(f"      ... and {len(adjustments) - 8} more")
     
     def _place_model_tracker_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
-        """Place up to N exclusive model-tracker trades for independent evaluation.
+        """Place up to N exclusive model-tracker trades using SMART multi-factor selection.
         
-        These are SEPARATE from the main trading workflow.  They pick the safest
-        candidates (lowest down-risk score, unflagged) that haven't already been
-        traded by the main flow, and place paper trades tagged for tracking.
+        These are SEPARATE from the main trading workflow. The smart selector
+        combines multiple signals into a composite score and enforces
+        diversification rules so the 7 picks are well-spread.
         
-        Purpose: independently measure whether the down-risk model's safety
-        ranking translates into real edge — without disturbing the main bot.
+        Smart Selection Criteria (composite score):
+          1. ML confidence × direction probability  (conviction)
+          2. Down-risk safety (lower dr_score = bonus)
+          3. Pre-score strength (technical quality)
+          4. ML score boost (model agreement signal)
+        
+        Diversification Rules:
+          - Max 2 stocks per sector (avoid sector concentration)
+          - Mix of BUY and SELL when available (directional balance)
+          - No FLAT signals (need directional conviction)
         """
         if not self._down_risk_cfg.get('enabled', False):
             return []
         
         self._reset_model_tracker_if_new_day()
         
-        max_tracker = self._down_risk_cfg.get('model_tracker_trades', 3)
+        max_tracker = self._down_risk_cfg.get('model_tracker_trades', 7)
         budget = max_tracker - self._model_tracker_trades_today
         if budget <= 0:
             return []
         
-        # Build ranked candidates: (sym, dr_score, dr_flag, pre_score, direction)
-        candidates = []
+        # Import sector mapping for diversification
+        try:
+            from ml_models.feature_engineering import get_sector_for_symbol as _get_sector_mt
+        except Exception:
+            _get_sector_mt = lambda s: ''
+        
+        # ── Step 1: Build candidate pool with all signals ──
+        raw_candidates = []
         for sym in pre_scores:
             ml = ml_results.get(sym, {})
             dr_score = ml.get('ml_down_risk_score', None)
@@ -753,47 +767,130 @@ class AutonomousTrader:
             if dr_score is None or dr_flag is None:
                 continue
             if dr_flag:
-                continue  # Only pick unflagged (safe) candidates for model tracker
+                continue  # Only pick unflagged (safe) candidates
             if sym in self._model_tracker_symbols:
                 continue  # Already tracked today
             
-            # Determine direction from ML signal or pre-score
-            direction = 'BUY'
+            # Direction from ML signal
             ml_signal = ml.get('ml_signal', 'UNKNOWN')
-            if ml_signal == 'DOWN':
+            if ml_signal == 'UP':
+                direction = 'BUY'
+            elif ml_signal == 'DOWN':
                 direction = 'SELL'
-            elif ml_signal == 'FLAT':
-                continue  # Don't take FLAT trades for directional tracking
+            else:
+                continue  # Skip FLAT / UNKNOWN — need directional conviction
             
-            candidates.append((sym, dr_score, pre_scores[sym], direction))
+            # Gather all available ML metrics
+            ml_confidence = ml.get('ml_confidence', 0.0)
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+            ml_score_boost = ml.get('ml_score_boost', 0)
+            p_score = pre_scores.get(sym, 0)
+            sym_clean = sym.replace('NSE:', '')
+            sector = _get_sector_mt(sym_clean)
+            
+            # Direction-specific probability
+            if direction == 'BUY':
+                dir_prob = ml.get('ml_prob_up', ml.get('ml_p_up_given_move', 0.0))
+            else:
+                dir_prob = ml.get('ml_prob_down', ml.get('ml_p_down_given_move', 0.0))
+            
+            # ── Composite smart score (higher = better pick) ──
+            # Weight 1: Conviction = confidence × direction probability (0-1 range → 0-40 pts)
+            conviction = ml_confidence * dir_prob * 40.0
+            
+            # Weight 2: Safety = inverted dr_score (lower risk → higher score, 0-20 pts)
+            # dr_score typically 0.0 - 1.0; safest = 0.0
+            safety = (1.0 - min(dr_score, 1.0)) * 20.0
+            
+            # Weight 3: Technical strength = pre_score normalized (0-100 → 0-20 pts)
+            technical = min(p_score, 100) * 0.20
+            
+            # Weight 4: Model agreement = score_boost (−8 to +10 → 0-15 pts)
+            agreement = max(0, (ml_score_boost + 8)) * (15.0 / 18.0)
+            
+            # Weight 5: Move probability bonus (0-1 → 0-5 pts)
+            move_bonus = ml_move_prob * 5.0
+            
+            smart_score = conviction + safety + technical + agreement + move_bonus
+            
+            raw_candidates.append({
+                'sym': sym,
+                'sym_clean': sym_clean,
+                'direction': direction,
+                'sector': sector or 'OTHER',
+                'smart_score': round(smart_score, 2),
+                'dr_score': dr_score,
+                'ml_confidence': ml_confidence,
+                'dir_prob': dir_prob,
+                'ml_move_prob': ml_move_prob,
+                'p_score': p_score,
+                'ml_score_boost': ml_score_boost,
+            })
         
-        # Sort by dr_score ascending (safest first), break ties by pre_score descending
-        candidates.sort(key=lambda x: (x[1], -x[2]))
+        if not raw_candidates:
+            return []
         
+        # ── Step 2: Sort by smart_score descending ──
+        raw_candidates.sort(key=lambda c: c['smart_score'], reverse=True)
+        
+        # ── Step 3: Diversified selection with sector cap ──
+        MAX_PER_SECTOR = 2
+        sector_counts = {}
+        selected = []
+        
+        for cand in raw_candidates:
+            if len(selected) >= budget:
+                break
+            sec = cand['sector']
+            if sector_counts.get(sec, 0) >= MAX_PER_SECTOR:
+                continue  # Sector full — skip to next
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            selected.append(cand)
+        
+        # Print selection summary
+        if selected:
+            buy_count = sum(1 for c in selected if c['direction'] == 'BUY')
+            sell_count = len(selected) - buy_count
+            sectors_used = set(c['sector'] for c in selected)
+            print(f"\n   🧠 MODEL-TRACKER SMART SELECT: {len(selected)} picks from {len(raw_candidates)} candidates")
+            print(f"      Direction mix: {buy_count} BUY / {sell_count} SELL | Sectors: {', '.join(sorted(sectors_used))}")
+            for i, c in enumerate(selected, 1):
+                print(f"      #{i} {c['sym_clean']:<12s} {c['direction']:<4s} smart={c['smart_score']:5.1f} "
+                      f"(conf={c['ml_confidence']:.2f}, dir={c['dir_prob']:.2f}, dr={c['dr_score']:.3f}, "
+                      f"tech={c['p_score']:.0f}, boost={c['ml_score_boost']:+d}) [{c['sector']}]")
+        
+        # ── Step 4: Place trades ──
         placed = []
-        for sym, dr_score, p_score, direction in candidates[:budget]:
+        for cand in selected:
+            sym = cand['sym']
+            direction = cand['direction']
             try:
-                print(f"\n   📊 MODEL-TRACKER TRADE: {sym} (dr={dr_score:.3f}, score={p_score:.0f}, dir={direction})")
+                print(f"\n   📊 MODEL-TRACKER TRADE: {cand['sym_clean']} ({direction}, smart={cand['smart_score']:.1f})")
                 result = self.tools.place_option_order(
                     underlying=sym,
                     direction=direction,
                     strike_selection="ATM",
                     use_intraday_scoring=False,  # Bypass scorer — model-tracker evaluates model independently
-                    rationale=f"MODEL-TRACKER: Down-risk model pick (dr_score={dr_score:.3f}, safety-ranked #{candidates.index((sym, dr_score, p_score, direction))+1})"
+                    rationale=(f"MODEL-TRACKER smart-pick #{selected.index(cand)+1}: "
+                              f"smart={cand['smart_score']:.1f}, dr={cand['dr_score']:.3f}, "
+                              f"conf={cand['ml_confidence']:.2f}, dir_p={cand['dir_prob']:.2f}, "
+                              f"sector={cand['sector']}")
                 )
                 if result and result.get('success'):
-                    print(f"   ✅ MODEL-TRACKER PLACED: {sym} ({direction})")
+                    print(f"   ✅ MODEL-TRACKER PLACED: {cand['sym_clean']} ({direction}) [smart={cand['smart_score']:.1f}]")
                     self._model_tracker_symbols.add(sym)
                     self._model_tracker_trades_today += 1
-                    placed.append(sym)
-                    self._log_decision(cycle_time, sym, p_score, 'MODEL_TRACKER_PLACED',
-                                      reason=f'Down-risk model pick: dr={dr_score:.3f}',
+                    placed.append(cand['sym_clean'])
+                    self._log_decision(cycle_time, sym, cand['p_score'], 'MODEL_TRACKER_PLACED',
+                                      reason=(f"Smart pick: score={cand['smart_score']:.1f}, "
+                                             f"dr={cand['dr_score']:.3f}, conf={cand['ml_confidence']:.2f}, "
+                                             f"sector={cand['sector']}"),
                                       direction=direction, setup='MODEL_TRACKER')
                 else:
                     error = result.get('error', 'unknown') if result else 'no result'
-                    print(f"   ⚠️ Model-tracker failed for {sym}: {error}")
+                    print(f"   ⚠️ Model-tracker failed for {cand['sym_clean']}: {error}")
             except Exception as e:
-                print(f"   ❌ Model-tracker error for {sym}: {e}")
+                print(f"   ❌ Model-tracker error for {cand['sym_clean']}: {e}")
         
         if placed:
             remaining = max_tracker - self._model_tracker_trades_today
@@ -2709,7 +2806,7 @@ class AutonomousTrader:
                 except Exception as _dr_err:
                     print(f"   ⚠️ Down-risk soft scoring error (non-fatal): {_dr_err}")
                 
-                # === MODEL-TRACKER TRADES: Place up to 3 exclusive model-only trades ===
+                # === MODEL-TRACKER TRADES: Place up to 7 smart-selected model-only trades ===
                 # Independent of main workflow — purely for evaluating down-risk model.
                 try:
                     _model_tracker_placed = self._place_model_tracker_trades(
