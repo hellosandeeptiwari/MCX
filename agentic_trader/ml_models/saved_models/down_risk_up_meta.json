@@ -1,27 +1,26 @@
 {
   "regime": "UP",
-  "threshold": 0.2212638327529074,
-  "base_down_rate": 0.2530018063967697,
+  "threshold": 0.18976783631248562,
+  "base_down_rate": 0.19973447411122586,
   "config": {
     "input_dim": 84,
-    "latent_dim": 32,
+    "latent_dim": 16,
     "hidden_dims": [
-      128,
       64,
       32
     ],
-    "dropout": 0.1,
+    "dropout": 0.2,
     "vae_epochs": 100,
     "vae_batch_size": 512,
     "vae_lr": 0.002,
     "vae_kl_weight": 0.5,
     "vae_kl_warmup_frac": 0.3,
     "vae_patience": 15,
-    "gmm_n_components": 12,
-    "gmm_covariance_type": "full",
+    "gmm_n_components": 6,
+    "gmm_covariance_type": "tied",
     "gmm_max_iter": 300,
-    "calibrator_n_estimators": 200,
-    "calibrator_max_depth": 3,
+    "calibrator_n_estimators": 100,
+    "calibrator_max_depth": 2,
     "calibrator_lr": 0.05,
     "calibrator_val_split": 0.6,
     "down_lookahead": 8,
@@ -31,7 +30,7 @@
     "target_flag_rate": 0.15,
     "min_lift": 1.05,
     "test_days": 20,
-    "val_days": 10
+    "val_days": 20
   },
-  "timestamp": "2026-02-19 23:50:52"
+  "timestamp": "2026-02-20 22:03:49"
 }

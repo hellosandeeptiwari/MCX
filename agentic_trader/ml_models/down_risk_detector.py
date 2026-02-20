@@ -1,5 +1,13 @@
 """
-DOWN-RISK DETECTOR v4 — VAE + GMM + GBM anomaly detector for UP/DOWN regimes
+DOWN-RISK DETECTOR v5 — VAE + GMM + GBM anomaly detector for UP/DOWN regimes
+
+v5 anti-overfitting changes (val-test gap was 0.13 AUROC):
+  - Latent dim: 32→16 (fewer parameters)
+  - VAE hidden: [128,64,32]→[64,32] (narrower network)
+  - Dropout: 0.1→0.2 (stronger regularization)
+  - GMM: 12 full-cov→6 tied-cov (massive param reduction)
+  - GBM calibrator: 200 trees depth 3→100 trees depth 2
+  - Val window: 10→20 days (more diverse calibration data)
 
 Detects hidden risks when the XGBoost meta-labeling model predicts UP or DOWN.
 UP regime: detects hidden DOWN risk (crash risk). DOWN regime: detects hidden UP risk (bear traps).
@@ -11,12 +19,12 @@ Architecture (v4 improvements over v3):
      - DOWN regime trains on confirmed-bearish (y_down8=1), detects hidden UP (y_up8)
      - v3: Wider VAE [128,64,32]->32 latent (was [64,32]->16)
      - v3: Beta warmup from 0.01 -> 0.5 over first 30% of epochs
-  4. Extract rich anomaly features (~52 dims) from VAE latent + GMM:
+  4. Extract rich anomaly features (~30 dims) from VAE latent + GMM:
      - Full 32-dim latent codes
      - 12 GMM cluster responsibilities
      - 7 summary stats (GMM NLL, recon MSE/std/max, KL div, latent norm, nearest dist)
      (v2 used only 3 features: GMM NLL, recon MSE, KL div)
-  5. GBM calibrator (HistGradientBoosting) on 52 anomaly features
+  5. GBM calibrator (HistGradientBoosting) on ~30 anomaly features
      (v2 used LogisticRegression on 3 features)
   6. Proper val split: 60% GBM training, 40% threshold calibration
      (v2 used same val set for both => overfitting)
@@ -85,9 +93,9 @@ class DetectorConfig:
     """Configuration for the down-risk detector."""
     # VAE architecture
     input_dim: int = 84           # number of features (auto-detected)
-    latent_dim: int = 32          # v3: was 16 — more latent capacity
-    hidden_dims: list = field(default_factory=lambda: [128, 64, 32])  # v3: was [64, 32]
-    dropout: float = 0.1
+    latent_dim: int = 16          # v5: 32→16 — reduce capacity to fight overfitting
+    hidden_dims: list = field(default_factory=lambda: [64, 32])  # v5: [128,64,32]→[64,32] — narrower
+    dropout: float = 0.2          # v5: 0.1→0.2 — stronger regularization
     
     # VAE training
     vae_epochs: int = 100         # v3: was 80
@@ -98,13 +106,13 @@ class DetectorConfig:
     vae_patience: int = 15       # v3: was 12
     
     # GMM
-    gmm_n_components: int = 12   # v3: was 8 (more components for 32-dim latent)
-    gmm_covariance_type: str = "full"
+    gmm_n_components: int = 6    # v5: 12→6 — fewer components to reduce memorization
+    gmm_covariance_type: str = "tied"  # v5: full→tied — shared covariance, far fewer params
     gmm_max_iter: int = 300
     
-    # Calibrator (v3: GBM replaces LR with richer feature set)
-    calibrator_n_estimators: int = 200
-    calibrator_max_depth: int = 3
+    # Calibrator (v5: reduced capacity to fight overfitting)
+    calibrator_n_estimators: int = 100  # v5: 200→100 — fewer trees
+    calibrator_max_depth: int = 2       # v5: 3→2 — shallower
     calibrator_lr: float = 0.05
     calibrator_val_split: float = 0.6  # fraction of val for GBM training (rest for threshold)
     
@@ -120,7 +128,7 @@ class DetectorConfig:
     
     # Data
     test_days: int = 20
-    val_days: int = 10
+    val_days: int = 20            # v5: 10→20 — wider val window for better threshold calibration
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -482,7 +490,7 @@ class RegimeDetector:
     DOWN: trained on confirmed-down samples (y_down8=1), calibrated against y_up8.
       → Detects hidden UP risk (bear traps). HIGH anomaly = rally likely.
     
-    Hybrid scoring: GBM on ~52 rich anomaly features from VAE latent + GMM.
+    Hybrid scoring: GBM on ~30 rich anomaly features from VAE latent + GMM.
     """
     
     def __init__(self, regime: str, config: DetectorConfig):
@@ -802,7 +810,7 @@ class RegimeDetector:
             latent_norm.reshape(-1, 1),          # 1
             latent_max_abs.reshape(-1, 1),       # 1
             nearest_dist.reshape(-1, 1),         # 1
-        ])  # Total: latent_dim + 1 + n_components + 7 = 32 + 1 + 12 + 7 = 52
+        ])  # Total: latent_dim + 1 + n_components + 7 = 16 + 1 + 6 + 7 = 30
         
         return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     
@@ -810,7 +818,7 @@ class RegimeDetector:
         """Compute hybrid anomaly scores for raw (unscaled) feature matrix.
         
         Returns: array of anomaly scores (higher = more anomalous).
-        v3: GBM on 52 rich anomaly features (latent codes + GMM resp + stats).
+        v5: GBM on ~30 rich anomaly features (latent codes + GMM resp + stats).
         v2 fallback: LR on 3 features [GMM NLL, recon MSE, KL div].
         Final fallback: raw GMM NLL.
         """
@@ -1376,13 +1384,13 @@ def main():
     
     # ── train ──
     p_train = subparsers.add_parser('train', help='Train the down-risk detector')
-    p_train.add_argument('--latent-dim', type=int, default=32)
-    p_train.add_argument('--gmm-components', type=int, default=12)
+    p_train.add_argument('--latent-dim', type=int, default=16)     # v5: 32→16
+    p_train.add_argument('--gmm-components', type=int, default=6)  # v5: 12→6
     p_train.add_argument('--vae-epochs', type=int, default=100)
     p_train.add_argument('--vae-kl-weight', type=float, default=0.5)
     p_train.add_argument('--down-atr-factor', type=float, default=3.0)
     p_train.add_argument('--test-days', type=int, default=20)
-    p_train.add_argument('--val-days', type=int, default=10)
+    p_train.add_argument('--val-days', type=int, default=20)       # v5: 10→20
     p_train.add_argument('--target-flag-rate', type=float, default=0.15)
     p_train.add_argument('--symbols', nargs='*', default=None)
     

@@ -1,0 +1,143 @@
+{
+  "config": {
+    "input_dim": 84,
+    "latent_dim": 32,
+    "hidden_dims": [
+      64,
+      32
+    ],
+    "dropout": 0.2,
+    "vae_epochs": 100,
+    "vae_batch_size": 512,
+    "vae_lr": 0.002,
+    "vae_kl_weight": 0.5,
+    "vae_kl_warmup_frac": 0.3,
+    "vae_patience": 15,
+    "gmm_n_components": 12,
+    "gmm_covariance_type": "tied",
+    "gmm_max_iter": 300,
+    "calibrator_n_estimators": 100,
+    "calibrator_max_depth": 2,
+    "calibrator_lr": 0.05,
+    "calibrator_val_split": 0.6,
+    "down_lookahead": 8,
+    "down_atr_factor": 3.0,
+    "down_fixed_pct": 0.5,
+    "up_atr_factor": 3.0,
+    "target_flag_rate": 0.15,
+    "min_lift": 1.05,
+    "test_days": 20,
+    "val_days": 10
+  },
+  "n_total": 3412272,
+  "n_features": 87,
+  "UP_metrics": {
+    "vae": {
+      "best_val_loss": 0.6239594221115112,
+      "final_epoch": 45,
+      "train_loss_final": 0.6339629589614562
+    },
+    "threshold": 0.21523681764369842,
+    "base_down_rate": 0.2530018063967697,
+    "val_auroc": 0.7228,
+    "val_avg_precision": 0.3662,
+    "val_flag_rate": 0.1615,
+    "val_down_if_flagged": 0.4017,
+    "val_down_if_not_flagged": 0.1486,
+    "val_lift": 2.12,
+    "val_risk_reduction_pct": 21.6,
+    "val_decile_down_rates": [
+      0.03484912877178071,
+      0.06544836379090523,
+      0.08928571428571429,
+      0.11772205694857629,
+      0.1445578231292517,
+      0.17757009345794392,
+      0.20799659719268396,
+      0.281767955801105,
+      0.3494897959183674,
+      0.4262643433914152
+    ]
+  },
+  "DOWN_metrics": {
+    "vae": {
+      "best_val_loss": 0.6392846703529358,
+      "final_epoch": 71,
+      "train_loss_final": 0.6452724667886893
+    },
+    "threshold": 0.2561909948685146,
+    "base_down_rate": 0.15496767383559837,
+    "val_auroc": 0.6612,
+    "val_avg_precision": 0.2765,
+    "val_flag_rate": 0.1812,
+    "val_down_if_flagged": 0.3105,
+    "val_down_if_not_flagged": 0.1361,
+    "val_lift": 1.85,
+    "val_risk_reduction_pct": 18.8,
+    "val_decile_down_rates": [
+      0.07678100263852243,
+      0.08759894459102903,
+      0.10271266789570714,
+      0.11637133033588998,
+      0.12747426761678543,
+      0.15518606492478226,
+      0.17176781002638522,
+      0.2314594879915545,
+      0.273542600896861,
+      0.3342133051742344
+    ]
+  },
+  "test": {
+    "UP": {
+      "test_up_auroc": 0.6174,
+      "test_up_avg_precision": 0.257,
+      "test_up_flag_rate": 0.1819,
+      "test_up_down_if_flagged": 0.2823,
+      "test_up_down_if_not_flagged": 0.1575,
+      "test_up_lift": 1.57,
+      "test_up_risk_reduction_pct": 12.6,
+      "test_up_decile_down_rates": [
+        0.08635097493036212,
+        0.11730114515629836,
+        0.12859795728876508,
+        0.15771552391270702,
+        0.1623336428350356,
+        0.19575982667904673,
+        0.20105246865810247,
+        0.20055710306406685,
+        0.23399319517476028,
+        0.31867451223288945
+      ]
+    },
+    "up_flag_rate": 0.1819,
+    "up_down_if_flagged": 0.2823,
+    "up_down_if_clean": 0.1575,
+    "up_lift": 1.57,
+    "DOWN": {
+      "test_down_auroc": 0.6294,
+      "test_down_avg_precision": 0.249,
+      "test_down_flag_rate": 0.2253,
+      "test_down_down_if_flagged": 0.2756,
+      "test_down_down_if_not_flagged": 0.1464,
+      "test_down_lift": 1.57,
+      "test_down_risk_reduction_pct": 16.6,
+      "test_down_decile_down_rates": [
+        0.10481845170130166,
+        0.10707762557077626,
+        0.10717550274223035,
+        0.11717679305619004,
+        0.14807209673739447,
+        0.17745254973702265,
+        0.20546697038724374,
+        0.22262940907008705,
+        0.27380680520666817,
+        0.29168570123343995
+      ]
+    },
+    "down_flag_rate": 0.2253,
+    "down_up_if_flagged": 0.2756,
+    "down_up_if_clean": 0.1464,
+    "down_lift": 1.57
+  },
+  "training_time_sec": 2671.2
+}
