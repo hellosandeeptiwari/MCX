@@ -1,19 +1,19 @@
 ========================================================================
   TITAN QUANTITATIVE PERFORMANCE REPORT
-  Period: 2026-02-06 → 2026-02-18  |  164 trades
+  Period: 2026-02-06 → 2026-02-19  |  173 trades
 ========================================================================
 
 ┌─── PORTFOLIO OVERVIEW ──────────────────────────────────────┐
-│  Total P&L:        ₹    +242,281                          │
-│  Win Rate:           59.1%  (97W / 63L / 4BE)       │
-│  Profit Factor:      1.62    (>1.5 = good)                │
-│  Payoff Ratio:       1.05    (avg win / avg loss)          │
-│  Expectancy:       ₹    +1,327/trade                      │
-│  Sharpe Ratio:       3.80    (>1.0 = good, >2.0 = great) │
-│  Sortino Ratio:      7.93    (>1.5 = good)                │
+│  Total P&L:        ₹    +213,290                          │
+│  Win Rate:           56.6%  (98W / 71L / 4BE)       │
+│  Profit Factor:      1.50    (>1.5 = good)                │
+│  Payoff Ratio:       1.09    (avg win / avg loss)          │
+│  Expectancy:       ₹    +1,095/trade                      │
+│  Sharpe Ratio:       3.45    (>1.0 = good, >2.0 = great) │
+│  Sortino Ratio:      7.22    (>1.5 = good)                │
 │  Max Drawdown:     ₹   108,256  (21.7%)             │
 │  Max Loss Streak:    8 trades                              │
-│  Avg Hold Time:       68 min  (median: 45 min)       │
+│  Avg Hold Time:       66 min  (median: 44 min)       │
 │  Avg R-Multiple:    0.13   (median: 0.00)           │
 │  Trades > 1R:        3    Trades > 2R:   0                │
 │  Largest Win:      ₹  +205,700                              │
@@ -21,15 +21,15 @@
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── SCORE → OUTCOME EDGE VALIDATION ────────────────────────┐
-│  Correlation (score ↔ P&L): +0.106                        │
+│  Correlation (score ↔ P&L): +0.117                        │
 │  Verdict: SCORING SYSTEM HAS EDGE                          │
-│  Sample: 81 scored trades                                │
+│  Sample: 85 scored trades                                │
 │                                                            │
 │  Band           Trades  Win%   Avg P&L    Total P&L       │
 │  ──────────────────────────────────────────────────────    │
 │  45-54 (Base)        5    80.0%  ₹  +1,937  ₹    +9,685   │
-│  55-64 (Standard)   24    54.2%  ₹    -656  ₹   -15,746   │
-│  65-74 (Premium)    23    60.9%  ₹     +32  ₹      +725   │
+│  55-64 (Standard)   27    48.1%  ₹    -974  ₹   -26,301   │
+│  65-74 (Premium)    24    58.3%  ₹     -83  ₹    -1,993   │
 │  75+ (Elite)        17    64.7%  ₹  +3,546  ₹   +60,283   │
 └────────────────────────────────────────────────────────────────┘
 
@@ -37,18 +37,18 @@
 │  Strategy         Trades  Win%    P&L        Avg R          │
 │  ──────────────────────────────────────────────────────────  │
 │  EQUITY               77    59.7%  ₹  +178,140  +0.07R       │
-│  NAKED_OPTION         81    60.5%  ₹   +54,560  +0.17R       │
-│  DEBIT_SPREAD          3    66.7%  ₹   +10,852  +0.38R       │
+│  NAKED_OPTION         89    55.1%  ₹   +18,443  +0.16R       │
+│  DEBIT_SPREAD          4    75.0%  ₹   +17,977  +0.44R       │
 │  IRON_CONDOR           3     0.0%  ₹    -1,270  +0.00R       │
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── P&L BY SCORE TIER ──────────────────────────────────────┐
 │  Tier            Trades  Win%    P&L        Avg Score       │
 │  ──────────────────────────────────────────────────────────  │
-│  unknown             80    57.5%  ₹  +176,870     0.0         │
-│  standard            22    68.2%  ₹   +33,544    57.5         │
-│  base                30    56.7%  ₹   +29,344    58.1         │
-│  premium             32    59.4%  ₹    +2,523    76.8         │
+│  unknown             84    54.8%  ₹  +154,026     0.0         │
+│  standard            24    66.7%  ₹   +40,190    55.3         │
+│  base                31    54.8%  ₹   +20,196    58.0         │
+│  premium             34    55.9%  ₹    -1,123    76.2         │
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── SECTOR MONEY FLOW ──────────────────────────────────────┐
@@ -61,20 +61,20 @@
 │  PHARMA             8    87.5%  ₹   +22,106  CIPLA,GLENMARK │
 │  BANKS             15    66.7%  ₹   +19,087  AXISBANK,BANDHANBNK,HDFCBANK+3│
 │  INSURANCE          1   100.0%  ₹    +3,673  HDFCLIFE       │
-│  CHEMICALS          2   100.0%  ₹    +1,946  SRF            │
 │  IT                14    71.4%  ₹    +1,797  COFORGE,INFY,PERSISTENT+2│
-│  INFRA              8    50.0%  ₹       -42  ABB,BHEL,LT+1  │
+│  CHEMICALS          3    66.7%  ₹    +1,277  SRF            │
 │  TELECOM            4    25.0%  ₹      -251  BHARTIARTL,IDEA│
-│  OTHER             47    46.8%  ₹    -6,007  ADANIPORTS,AMBER,ANGELONE+23│
+│  OTHER             53    43.4%  ₹   -12,211  ADANIPORTS,AMBER,ANGELONE+27│
+│  INFRA              9    44.4%  ₹   -13,014  ABB,BHEL,HAL+2 │
 │  NBFC               8    75.0%  ₹   -13,368  BAJFINANCE     │
-│  FMCG               8    25.0%  ₹   -86,969  DABUR,GODREJCP,ITC+1│
+│  FMCG               9    22.2%  ₹   -96,117  COLPAL,DABUR,GODREJCP+2│
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── TIME OF DAY ANALYSIS ───────────────────────────────────┐
 │  Hour         Trades  Win%    P&L        Avg P&L            │
 │  ──────────────────────────────────────────────────────────  │
-│  09:00-09:59     26    65.4%  ₹   +66,001  ₹ +2,538    │
-│  10:00-10:59     41    63.4%  ₹   +58,783  ₹ +1,434    │
+│  09:00-09:59     29    62.1%  ₹   +69,929  ₹ +2,411    │
+│  10:00-10:59     47    55.3%  ₹   +25,864  ₹   +550    │
 │  11:00-11:59     19    52.6%  ₹   -19,591  ₹ -1,031    │
 │  12:00-12:59     26    46.2%  ₹   -31,446  ₹ -1,209    │
 │  13:00-13:59     18    61.1%  ₹   +22,517  ₹ +1,251    │
@@ -83,16 +83,16 @@
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── EXIT QUALITY ───────────────────────────────────────────┐
-│  MFE Capture (avg):  215.6%  (how much of the best move we keep) │
+│  MFE Capture (avg):  210.1%  (how much of the best move we keep) │
 │  MFE Capture (med):  100.0%                                    │
-│  Avg Candles Held:    10.3                                      │
-│  Avg R at Exit:      +0.37                                      │
+│  Avg Candles Held:    10.1                                      │
+│  Avg R at Exit:      +0.38                                      │
 │                                                              │
 │  Exit Type           Count   P&L        Avg R               │
 │  ──────────────────────────────────────────────────────────  │
-│  TIME_STOP               38   ₹   -82,977  +0.09R            │
+│  TIME_STOP               40   ₹  -104,457  +0.10R            │
 │  SESSION_CUTOFF          25   ₹   +19,960  +0.13R            │
-│  STOPLOSS_HIT            22   ₹  -201,268  +0.00R            │
+│  STOPLOSS_HIT            23   ₹  -210,415  +0.00R            │
 │  PARTIAL_PROFIT          18   ₹   +81,895  +0.00R            │
 │  TARGET_HIT              14   ₹  +376,716  +0.00R            │
 │  SL_HIT                  14   ₹   +41,271  +0.70R            │
@@ -112,22 +112,23 @@
 │  🟢 2026-02-16     38   21/16   ₹   +82,903  +57.94%       │
 │  🔴 2026-02-17     23   16/7   ₹   -17,978  +54.35%       │
 │  🔴 2026-02-18     12   7/5   ₹   -29,450  +48.46%       │
+│  🔴 2026-02-19      9   1/8   ₹   -28,992  +42.66%       │
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── ROLLING EDGE (last 10-trade window) ────────────────────┐
 │  Trade # 10: WR  60.0%  R +0.00  P&L ₹+140,724  │
-│  Trade # 87: WR  40.0%  R +0.31  P&L ₹  -3,060  │
-│  Trade #164: WR  60.0%  R +0.32  P&L ₹ -28,382  │
-│  Win Rate Trend: STABLE →                                  │
+│  Trade # 92: WR  60.0%  R +0.20  P&L ₹ +10,306  │
+│  Trade #173: WR  20.0%  R +0.19  P&L ₹ -25,319  │
+│  Win Rate Trend: DECLINING ↓                               │
 └────────────────────────────────────────────────────────────────┘
 
 ┌─── QUANT INSIGHTS & RECOMMENDATIONS ───────────────────────┐
-│  ✅ Scoring system has positive edge (r=0.106). Higher scores → better outcomes.│
+│  ✅ Scoring system has positive edge (r=0.117). Higher scores → better outcomes.│
 │  ✅ Best sector: METALS (+₹186,051 from COALINDIA,HINDALCO,HINDCOPPER)│
-│  🔴 Worst sector: FMCG (₹-86,969) — consider sector filters or reduced sizing│
+│  🔴 Worst sector: FMCG (₹-96,117) — consider sector filters or reduced sizing│
 │  ✅ Best hour: 14:00-14:59 → ₹+146,116 (27 trades)            │
 │  🔴 Worst hour: 12:00-12:59 → ₹-31,446 — consider blocking this window│
-│  ✅ MFE capture 216% — excellent exit quality.                │
+│  ✅ MFE capture 210% — excellent exit quality.                │
 │  ✅ Best strategy: EQUITY (₹+178,140, 60% WR)                 │
 │  🔴 Worst strategy: IRON_CONDOR (₹-1,270) — review or disable │
 └────────────────────────────────────────────────────────────────┘

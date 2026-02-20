@@ -16,6 +16,8 @@ from dataclasses import dataclass, asdict
 import json
 import os
 import logging
+import threading
+from safe_io import atomic_json_save
 
 # Structured logger for speed gate evaluations
 _speed_gate_logger = logging.getLogger('speed_gate')
@@ -27,6 +29,8 @@ if not _speed_gate_logger.handlers:
     _speed_gate_logger.addHandler(_sg_handler)
     _speed_gate_logger.setLevel(logging.INFO)
     _speed_gate_logger.propagate = False
+
+logger = logging.getLogger('exit_manager')
 
 
 @dataclass
@@ -124,13 +128,9 @@ class ExitManager:
         self.option_speed_gate_pct = 3.0     # Need +3% premium gain — was 5%
         self.option_speed_gate_max_r = 0.10  # OR need +0.10R — was 0.15
         
-        # === QUICK PROFIT TARGET: Book full position at +18% gain ===
-        # Applies to ALL position types (naked options, debit spreads, credit spreads).
-        # Raised from 16% → 18% to let winners run slightly longer (spreads need room).
-        self.quick_profit_pct = 18.0
-        
         # Track trades
         self.trade_states: Dict[str, TradeState] = {}
+        self._states_lock = threading.Lock()  # Thread-safety for trade_states
         
         # State persistence path
         self._state_file = os.path.join(os.path.dirname(__file__), 'exit_manager_state.json')
@@ -157,8 +157,7 @@ class ExitManager:
                 d = state.to_dict()
                 d['entry_time'] = state.entry_time.isoformat()
                 data[sym] = d
-            with open(self._state_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            atomic_json_save(self._state_file, data)
         except Exception as e:
             print(f"⚠️ Exit Manager: Could not persist state: {e}")
     
@@ -250,23 +249,6 @@ class ExitManager:
         if exit_signal:
             return exit_signal
         
-        # 2.5 QUICK PROFIT TARGET: Book at +18% gain (before trailing/target)
-        # Stocks oscillate a lot intraday — grab 18% and move on.
-        if state.entry_price > 0:
-            if state.side == "BUY":
-                _qp_pnl_pct = (current_price - state.entry_price) / state.entry_price * 100
-            else:
-                _qp_pnl_pct = (state.entry_price - current_price) / state.entry_price * 100
-            if _qp_pnl_pct >= self.quick_profit_pct:
-                return ExitSignal(
-                    symbol=state.symbol,
-                    should_exit=True,
-                    exit_type="QUICK_PROFIT",
-                    exit_price=current_price,
-                    reason=f"Quick profit target hit: +{_qp_pnl_pct:.1f}% (target: {self.quick_profit_pct}%)",
-                    urgency="NORMAL"
-                )
-        
         # 3. TARGET HIT CHECK
         exit_signal = self._check_target(state, current_price)
         if exit_signal:
@@ -304,6 +286,7 @@ class ExitManager:
         """Check if hard stop loss is hit"""
         # Guard: skip SL check if price is 0 or negative (data gap / quote failure)
         if current_price <= 0:
+            logger.warning(f"SL check skipped for {state.symbol}: price={current_price} (quote failure)")
             return None
         if state.side == "BUY":
             if current_price <= state.current_sl:
@@ -424,7 +407,8 @@ class ExitManager:
             from options_trader import FNO_LOT_SIZES
             # symbol like NFO:TATASTEEL26FEB207CE — extract underlying
             clean = symbol.replace('NFO:', '')
-            for name, size in FNO_LOT_SIZES.items():
+            # Sort by longest name first to prevent TATA matching before TATASTEEL
+            for name, size in sorted(FNO_LOT_SIZES.items(), key=lambda x: len(x[0]), reverse=True):
                 if clean.startswith(name):
                     return size
         except ImportError:
@@ -536,17 +520,6 @@ class ExitManager:
                 urgency="IMMEDIATE"
             )
         
-        # 2.5 QUICK PROFIT TARGET: Book at +18% profit (before trailing/target)
-        if profit_pct >= self.quick_profit_pct:
-            return ExitSignal(
-                symbol=state.symbol,
-                should_exit=True,
-                exit_type="QUICK_PROFIT",
-                exit_price=current_debit,
-                reason=f"Credit spread quick profit: +{profit_pct:.1f}% of credit (target: {self.quick_profit_pct}%) | Profit: ₹{profit_per_share:+.2f}/share",
-                urgency="NORMAL"
-            )
-        
         # 3. TARGET: captured enough of the credit
         if current_debit <= state.target:
             return ExitSignal(
@@ -653,17 +626,6 @@ class ExitManager:
                 exit_price=current_value,
                 reason=f"Debit spread SL hit | Value ₹{current_value:.2f} <= SL ₹{state.current_sl:.2f} | Loss: ₹{profit_per_share:.2f}/share ({profit_pct:.1f}%)",
                 urgency="IMMEDIATE"
-            )
-        
-        # 2.5 QUICK PROFIT TARGET: Book at +18% profit (before trailing/target)
-        if profit_pct >= self.quick_profit_pct:
-            return ExitSignal(
-                symbol=state.symbol,
-                should_exit=True,
-                exit_type="QUICK_PROFIT",
-                exit_price=current_value,
-                reason=f"Debit spread quick profit: +{profit_pct:.1f}% on debit (target: {self.quick_profit_pct}%) | Profit: ₹{profit_per_share:+.2f}/share",
-                urgency="NORMAL"
             )
         
         # 3. TARGET: spread value rose enough

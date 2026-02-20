@@ -18,6 +18,7 @@ from enum import Enum
 import json
 import os
 import logging
+from safe_io import atomic_json_save
 
 logger = logging.getLogger('risk_governor')
 
@@ -219,11 +220,13 @@ class RiskGovernor:
             print(f"⚠️ Risk Governor: P&L reconciliation failed: {e}")
     
     def _save_state(self):
-        """Save state to file"""
-        data = asdict(self.state)
-        data['date'] = str(datetime.now().date())
-        with open(self.state_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        """Save state to file (atomic write with error handling)"""
+        try:
+            data = asdict(self.state)
+            data['date'] = str(datetime.now().date())
+            atomic_json_save(self.state_file, data)
+        except Exception as e:
+            logger.error(f"Failed to save risk state: {e}")
     
     def _check_new_day(self):
         """Reset state if new trading day"""
@@ -249,7 +252,7 @@ class RiskGovernor:
             if pos.get('status', 'OPEN') != 'OPEN':
                 continue
             pnl = pos.get('pnl', 0)
-            if pnl:
+            if pnl is not None and pnl != 0:
                 unrealized += pnl
                 continue
             # Fallback: compute from avg_price and ltp
@@ -263,11 +266,13 @@ class RiskGovernor:
                 unrealized += (entry - ltp) * qty
         return unrealized
     
-    def can_trade_general(self, active_positions: List[Dict]) -> 'TradePermission':
+    def can_trade_general(self, active_positions: List[Dict], setup_type: str = '') -> 'TradePermission':
         """
         Lightweight pre-scan check: can the system trade AT ALL?
         Checks system state, cooldown, daily loss, consecutive losses, trade count.
         Does NOT check sector/symbol exposure (that's done per-candidate).
+        
+        For GMM_SNIPER trades: skips total exposure check (they have separate ₹3L capital pool).
         """
         self._check_new_day()
         
@@ -302,15 +307,31 @@ class RiskGovernor:
             return TradePermission(allowed=False, reason=f"Max trades per day reached: {self.state.trades_today}", warnings=[])
         
         # Total exposure check — use max_risk for IC positions (avg_price is just credit, understates risk)
-        total_exposure = sum(
-            p.get('max_risk', p.get('avg_price', 0) * p.get('quantity', 0))
-            if p.get('is_iron_condor', False)
-            else p.get('avg_price', 0) * p.get('quantity', 0)
-            for p in active_positions
-        )
-        total_exposure_pct = (total_exposure / self.current_capital) * 100
-        if total_exposure_pct > self.limits.max_total_exposure_pct:
-            return TradePermission(allowed=False, reason=f"Max total exposure: {total_exposure_pct:.1f}%", warnings=[])
+        # GMM_SNIPER trades have separate capital — skip main exposure check for them
+        if setup_type != 'GMM_SNIPER':
+            total_exposure = sum(
+                p.get('max_risk', p.get('avg_price', 0) * p.get('quantity', 0))
+                if p.get('is_iron_condor', False)
+                else p.get('avg_price', 0) * p.get('quantity', 0)
+                for p in active_positions
+                if not p.get('is_sniper', False)  # Exclude sniper positions from main exposure
+            )
+            total_exposure_pct = (total_exposure / self.current_capital) * 100
+            if total_exposure_pct > self.limits.max_total_exposure_pct:
+                return TradePermission(allowed=False, reason=f"Max total exposure: {total_exposure_pct:.1f}%", warnings=[])
+        else:
+            # Sniper-specific exposure check against separate capital
+            from config import GMM_SNIPER
+            sniper_capital = GMM_SNIPER.get('separate_capital', 300000)
+            sniper_max_pct = GMM_SNIPER.get('max_exposure_pct', 90)
+            sniper_exposure = sum(
+                p.get('avg_price', 0) * p.get('quantity', 0)
+                for p in active_positions
+                if p.get('is_sniper', False)
+            )
+            sniper_exposure_pct = (sniper_exposure / sniper_capital) * 100
+            if sniper_exposure_pct > sniper_max_pct:
+                return TradePermission(allowed=False, reason=f"Sniper capital exhausted: {sniper_exposure_pct:.1f}% of ₹{sniper_capital/100000:.0f}L", warnings=[])
         
         warnings = []
         if self.state.trades_today == self.limits.max_trades_per_day - 1:

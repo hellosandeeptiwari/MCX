@@ -23,6 +23,7 @@ from execution_guard import get_execution_guard
 from idempotent_order_engine import get_idempotent_engine
 from correlation_guard import get_correlation_guard
 from regime_score import get_regime_scorer
+from safe_io import atomic_json_save
 from position_reconciliation import get_position_reconciliation
 from data_health_gate import get_data_health_gate
 from options_trader import get_options_trader, OptionType, StrikeSelection, ExpirySelection, get_intraday_scorer, IntradaySignal
@@ -307,8 +308,7 @@ class ZerodhaTools:
                 'realized_pnl': self.paper_pnl,
                 'paper_capital': self.paper_capital
             }
-            with open(self.TRADES_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
+            atomic_json_save(self.TRADES_FILE, data)
         except Exception as e:
             print(f"⚠️ Error saving trades: {e}")
     
@@ -556,8 +556,7 @@ class ZerodhaTools:
             if len(log) > 500:
                 log = log[-500:]
             
-            with open(self.GTT_LOG_FILE, 'w') as f:
-                json.dump(log, f, indent=2)
+            atomic_json_save(self.GTT_LOG_FILE, log)
         except Exception:
             pass  # Never crash on logging
     
@@ -582,8 +581,7 @@ class ZerodhaTools:
             
             history.append(trade_record)
             
-            with open(self.TRADE_HISTORY_FILE, 'w') as f:
-                json.dump(history, f, indent=2)
+            atomic_json_save(self.TRADE_HISTORY_FILE, history)
             
             # === ALSO WRITE TO STRUCTURED EXIT LOG ===
             self._log_exit_event(trade_record, result, pnl, exit_detail)
@@ -643,16 +641,18 @@ class ZerodhaTools:
     
     def is_symbol_in_active_trades(self, symbol: str) -> bool:
         """Check if symbol already has an active trade"""
-        for trade in self.paper_positions:
-            if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
-                return True
+        with self._positions_lock:
+            for trade in self.paper_positions:
+                if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                    return True
         return False
     
     def get_active_trade(self, symbol: str) -> Optional[Dict]:
         """Get active trade for a symbol if exists"""
-        for trade in self.paper_positions:
-            if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
-                return trade
+        with self._positions_lock:
+            for trade in self.paper_positions:
+                if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                    return trade
         return None
     
     def _execute_live_exit(self, trade: Dict, exit_qty: int = None):
@@ -736,7 +736,7 @@ class ZerodhaTools:
                 })
                 with open(critical_log, 'w') as f:
                     _json.dump(failures, f, indent=2)
-            except:
+            except Exception:
                 pass
 
     def _execute_live_spread_exit(self, trade: Dict, exit_qty: int = None):
@@ -811,7 +811,7 @@ class ZerodhaTools:
                     })
                     with open(critical_log, 'w') as f:
                         _json.dump(failures, f, indent=2)
-                except:
+                except Exception:
                     pass
 
     def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None, exit_detail: Dict = None):
@@ -1037,7 +1037,7 @@ class ZerodhaTools:
                 return True
             else:
                 print(f"⚠️ Token file is stale (date: {data.get('date')}, today: {datetime.now().date()})")
-        except:
+        except Exception:
             pass
         
         # 2. Try ZERODHA_ACCESS_TOKEN from .env (user manually updated)
@@ -3037,7 +3037,7 @@ class ZerodhaTools:
             md = self.get_market_data([symbol])
             if symbol in md and isinstance(md[symbol], dict):
                 market_data = md[symbol]
-        except:
+        except Exception:
             pass
         
         # Calculate regime score
@@ -3267,7 +3267,7 @@ class ZerodhaTools:
                 try:
                     quote = self.kite.ltp([symbol])
                     current_ltp = quote[symbol]['last_price']
-                except:
+                except Exception:
                     current_ltp = order.get('entry_price', 0)
                 
                 # Use order's computed SL/target (from ATR/regime/trend), fallback to 1%/1.5% only if missing
@@ -3384,7 +3384,7 @@ class ZerodhaTools:
                     if str(bo.get('order_id')) == str(order_id) and bo.get('status') == 'COMPLETE':
                         fill_price = bo.get('average_price', current_ltp)
                         break
-            except:
+            except Exception:
                 fill_price = current_ltp
             
             # === STORE LIVE POSITION IN TRACKING (same structure as paper) ===
@@ -3470,7 +3470,10 @@ class ZerodhaTools:
                           strike_selection: str = "ATM",
                           expiry_selection: str = "CURRENT_WEEK",
                           rationale: str = "",
-                          use_intraday_scoring: bool = True) -> Dict:
+                          use_intraday_scoring: bool = True,
+                          lot_multiplier: float = 1.0,
+                          setup_type: str = "",
+                          ml_data: dict = None) -> Dict:
         """
         Tool: Place an option order instead of equity order
         
@@ -3529,7 +3532,7 @@ class ZerodhaTools:
         from risk_governor import get_risk_governor
         risk_gov = get_risk_governor()
         active_positions = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
-        trade_perm = risk_gov.can_trade_general(active_positions=active_positions)
+        trade_perm = risk_gov.can_trade_general(active_positions=active_positions, setup_type=setup_type)
         if not trade_perm.allowed:
             return {
                 "success": False,
@@ -3805,18 +3808,58 @@ class ZerodhaTools:
                 "action": "Reduce quantity or choose different strike"
             }
         
-        # Check total options exposure
-        max_total_exposure = 500000  # ₹5 lakh total option exposure (full capital)
-        current_exposure = sum(p.get('total_premium', 0) for p in options_trader.positions if p.get('status') == 'OPEN')
+        # Check total options exposure — use paper_positions (source of truth, synced on exits)
+        # options_trader.positions is stale (never removes exited trades)
+        # GMM_SNIPER trades have separate ₹3L capital pool
+        # Initialize both pools (only the relevant one is checked)
+        current_exposure = 0
+        max_total_exposure = 500000
+        sniper_exposure = 0
+        max_sniper_exposure = 270000
+        if setup_type == 'GMM_SNIPER':
+            from config import GMM_SNIPER as _sniper_cfg
+            sniper_capital = _sniper_cfg.get('separate_capital', 300000)
+            sniper_max_pct = _sniper_cfg.get('max_exposure_pct', 90) / 100.0
+            max_sniper_exposure = sniper_capital * sniper_max_pct
+            sniper_exposure = sum(p.get('total_premium', 0) for p in self.paper_positions 
+                                if p.get('status', 'OPEN') == 'OPEN' and p.get('is_sniper', False))
+            if sniper_exposure + plan.total_premium > max_sniper_exposure:
+                return {
+                    "success": False,
+                    "error": f"Sniper capital exhausted: ₹{sniper_exposure:,.0f} + ₹{plan.total_premium:,.0f} > ₹{max_sniper_exposure:,.0f} (₹{sniper_capital/100000:.0f}L×{sniper_max_pct:.0%})",
+                    "current_exposure": sniper_exposure,
+                    "new_premium": plan.total_premium
+                }
+        else:
+            max_total_exposure = 500000  # ₹5 lakh total option exposure (full capital)
+            current_exposure = sum(p.get('total_premium', 0) for p in self.paper_positions 
+                                 if p.get('status', 'OPEN') == 'OPEN' and not p.get('is_sniper', False))
+            if current_exposure + plan.total_premium > max_total_exposure:
+                return {
+                    "success": False,
+                    "error": f"Total option exposure would exceed ₹{max_total_exposure}",
+                    "current_exposure": current_exposure,
+                    "new_premium": plan.total_premium
+                }
         
-        if current_exposure + plan.total_premium > max_total_exposure:
-            return {
-                "success": False,
-                "error": f"Total option exposure would exceed ₹{max_total_exposure}",
-                "current_exposure": current_exposure,
-                "new_premium": plan.total_premium
-            }
-        
+        # === APPLY LOT MULTIPLIER (for GMM sniper / high-conviction trades) ===
+        if lot_multiplier and lot_multiplier != 1.0:
+            original_lots = plan.quantity
+            new_lots = max(1, round(plan.quantity * lot_multiplier))
+            # Re-check premium cap against appropriate capital pool
+            new_premium = new_lots * plan.premium_per_lot
+            if setup_type == 'GMM_SNIPER':
+                _can_afford = new_premium <= max_premium_per_trade and sniper_exposure + new_premium <= max_sniper_exposure
+            else:
+                _can_afford = new_premium <= max_premium_per_trade and current_exposure + new_premium <= max_total_exposure
+            if _can_afford:
+                plan.quantity = new_lots
+                plan.total_premium = new_premium
+                plan.max_loss = new_premium
+                print(f"   🎯 LOT MULTIPLIER: {lot_multiplier}x → {original_lots} → {new_lots} lots (₹{new_premium:,.0f})")
+            else:
+                print(f"   ⚠️ Lot multiplier {lot_multiplier}x would exceed limits, keeping {original_lots} lots")
+
         # Execute the order
         result = options_trader.execute_option_order(plan)
         
@@ -3861,6 +3904,20 @@ class ZerodhaTools:
                     'entry_score': getattr(plan, 'entry_metadata', {}).get('entry_score', 0),
                     'score_tier': getattr(plan, 'entry_metadata', {}).get('score_tier', 'unknown'),
                     'strategy_type': getattr(plan, 'entry_metadata', {}).get('strategy_type', 'NAKED_OPTION'),
+                    'setup_type': setup_type or 'MANUAL',
+                    'is_sniper': setup_type == 'GMM_SNIPER',
+                    'lot_multiplier': lot_multiplier if lot_multiplier != 1.0 else 1.0,
+                    # === TOP-LEVEL ML SCORES (easy access) ===
+                    'smart_score': (ml_data or {}).get('smart_score', None),
+                    'p_score': (ml_data or {}).get('p_score', None),
+                    'dr_score': (ml_data or {}).get('dr_score', None),
+                    'ml_move_prob': (ml_data or {}).get('ml_move_prob', None),
+                    'ml_confidence': (ml_data or {}).get('ml_confidence', None),
+                    # === ML MODEL DATA (XGB + VAE+GMM) ===
+                    'xgb_model': (ml_data or {}).get('xgb_model', {}),
+                    'gmm_model': (ml_data or {}).get('gmm_model', {}),
+                    'ml_scored_direction': (ml_data or {}).get('scored_direction', ''),
+                    'ml_xgb_disagrees': (ml_data or {}).get('xgb_disagrees', False),
                 }
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
@@ -3877,7 +3934,7 @@ class ZerodhaTools:
                         if str(bo.get('order_id')) == str(result.get('order_id')) and bo.get('status') == 'COMPLETE':
                             fill_price = bo.get('average_price', plan.contract.ltp)
                             break
-                except:
+                except Exception:
                     fill_price = plan.contract.ltp
                 
                 option_position = {
@@ -3910,6 +3967,20 @@ class ZerodhaTools:
                     'entry_score': getattr(plan, 'entry_metadata', {}).get('entry_score', 0),
                     'score_tier': getattr(plan, 'entry_metadata', {}).get('score_tier', 'unknown'),
                     'strategy_type': getattr(plan, 'entry_metadata', {}).get('strategy_type', 'NAKED_OPTION'),
+                    'setup_type': setup_type or 'MANUAL',
+                    'is_sniper': setup_type == 'GMM_SNIPER',
+                    'lot_multiplier': lot_multiplier if lot_multiplier != 1.0 else 1.0,
+                    # === TOP-LEVEL ML SCORES (easy access) ===
+                    'smart_score': (ml_data or {}).get('smart_score', None),
+                    'p_score': (ml_data or {}).get('p_score', None),
+                    'dr_score': (ml_data or {}).get('dr_score', None),
+                    'ml_move_prob': (ml_data or {}).get('ml_move_prob', None),
+                    'ml_confidence': (ml_data or {}).get('ml_confidence', None),
+                    # === ML MODEL DATA (XGB + VAE+GMM) ===
+                    'xgb_model': (ml_data or {}).get('xgb_model', {}),
+                    'gmm_model': (ml_data or {}).get('gmm_model', {}),
+                    'ml_scored_direction': (ml_data or {}).get('scored_direction', ''),
+                    'ml_xgb_disagrees': (ml_data or {}).get('xgb_disagrees', False),
                 }
                 
                 # Place SL-M order for the option

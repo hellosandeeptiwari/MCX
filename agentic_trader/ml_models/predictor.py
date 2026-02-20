@@ -30,6 +30,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
+import threading
 
 import xgboost as xgb
 
@@ -72,6 +73,11 @@ class MovePredictor:
         
         # Legacy 3-class specific
         self.calibrators = None
+        
+        # Thread-safety: PyTorch VAE is not thread-safe for concurrent inference
+        self._down_risk_lock = threading.Lock()
+        # Thread-safety: XGBoost predict_proba is not thread-safe
+        self._xgb_lock = threading.Lock()
         
         # Try meta-labeling first (preferred)
         meta_gate_path = str(MODELS_DIR / "meta_gate_latest.json")
@@ -269,7 +275,8 @@ class MovePredictor:
         - Direction: calibrated P(UP|MOVE) in 0-1 range, dead zone 0.48-0.52
         """
         # Gate model: P(MOVE) — uses full feature set
-        gate_raw = float(self.gate_model.predict_proba(X)[0, 1])  # P(MOVE)
+        with self._xgb_lock:
+            gate_raw = float(self.gate_model.predict_proba(X)[0, 1])  # P(MOVE)
         # Apply isotonic calibration if available
         if self.gate_cal is not None:
             p_move = float(self.gate_cal.predict([gate_raw])[0])
@@ -284,7 +291,8 @@ class MovePredictor:
         else:
             X_dir = X
         
-        dir_raw = float(self.dir_model.predict_proba(X_dir)[0, 1])  # P(UP|MOVE)
+        with self._xgb_lock:
+            dir_raw = float(self.dir_model.predict_proba(X_dir)[0, 1])  # P(UP|MOVE)
         if self.dir_cal is not None:
             p_up_given_move = float(self.dir_cal.predict([dir_raw])[0])
         else:
@@ -648,47 +656,51 @@ class MovePredictor:
         """
         defaults = {
             'ml_down_risk_flag': False,
-            'ml_down_risk_score': 0.0,
-            'ml_down_risk_bucket': 'LOW',
+            'ml_down_risk_score': 0.5,
+            'ml_down_risk_bucket': 'MEDIUM',
             'ml_gmm_confirms_direction': False,
             'ml_gmm_regime_used': None,
+            'ml_down_risk_available': False,
         }
 
         if signal not in ('UP', 'FLAT', 'DOWN'):
             return defaults
 
         try:
-            # Lazy-load detector on first call
-            if not self._down_risk_loaded:
-                self._down_risk_loaded = True
-                try:
-                    from .down_risk_detector import DownRiskDetector
-                    det = DownRiskDetector()
-                    if det.load():
-                        self._down_risk_detector = det
-                        self._log("🛡️ Down-Risk Detector: LOADED (VAE+GMM)")
-                    else:
-                        self._log("🛡️ Down-Risk Detector: Not trained yet (run down_risk_detector train)")
-                except Exception as e:
-                    self._log(f"🛡️ Down-Risk Detector: Load failed ({e})")
+            # Thread-safe lazy-load and inference (PyTorch VAE is NOT thread-safe)
+            with self._down_risk_lock:
+                # Lazy-load detector on first call
+                if not self._down_risk_loaded:
+                    self._down_risk_loaded = True
+                    try:
+                        from .down_risk_detector import DownRiskDetector
+                        det = DownRiskDetector()
+                        if det.load():
+                            self._down_risk_detector = det
+                            self._log("🛡️ Down-Risk Detector: LOADED (VAE+GMM)")
+                        else:
+                            self._log("🛡️ Down-Risk Detector: Not trained yet (run down_risk_detector train)")
+                    except Exception as e:
+                        self._log(f"🛡️ Down-Risk Detector: Load failed ({e})")
 
-            if self._down_risk_detector is None:
-                return defaults
+                if self._down_risk_detector is None:
+                    return defaults
 
-            # Extract feature vector from the prediction's raw features
-            features = pred.get('_features_array')  # set during predict()
-            if features is None:
-                return defaults
+                # Extract feature vector from the prediction's raw features
+                features = pred.get('_features_array')  # set during predict()
+                if features is None:
+                    return defaults
 
-            # Route to appropriate regime model
-            # UP/FLAT signals: use UP regime GMM (detect hidden DOWN risk)
-            # DOWN signals: use DOWN regime GMM (detect hidden UP risk / bear traps)
-            if signal == 'DOWN':
-                regime_to_use = 'DOWN'
-            else:
-                regime_to_use = 'UP'  # validated in simulations
-            result = self._down_risk_detector.predict_single(features, regime_to_use)
+                # Route to appropriate regime model
+                # UP/FLAT signals: use UP regime GMM (detect hidden DOWN risk)
+                # DOWN signals: use DOWN regime GMM (detect hidden UP risk / bear traps)
+                if signal == 'DOWN':
+                    regime_to_use = 'DOWN'
+                else:
+                    regime_to_use = 'UP'  # validated in simulations
+                result = self._down_risk_detector.predict_single(features, regime_to_use)
 
+            # Post-processing outside lock (no shared state)
             dr_flag = bool(result['down_risk_flag'][0])
             dr_score = float(result['anomaly_score'][0])
             dr_bucket = str(result['confidence_bucket'][0])
@@ -708,34 +720,42 @@ class MovePredictor:
                 'ml_down_risk_bucket': dr_bucket,
                 'ml_gmm_confirms_direction': gmm_confirms,
                 'ml_gmm_regime_used': regime_to_use,
+                'ml_down_risk_available': True,  # Genuine score computed
             }
-        except Exception:
+        except Exception as e:
+            self._log(f"⚠️ Down-Risk scoring failed: {e}")
             return defaults
     
     def _titan_defaults(self) -> dict:
-        """Safe neutral defaults — Titan behaves exactly as if ML doesn't exist."""
+        """Safe CONSERVATIVE defaults on total ML failure.
+        
+        These values BLOCK trading — Titan must never trade on crashed-ML
+        with optimistic defaults. Every field is set to the most conservative
+        value so no gate passes by accident.
+        """
         return {
             'ml_score_boost': 0,
             'ml_prob_up': 0.33,
             'ml_prob_down': 0.33,
             'ml_prob_flat': 0.34,
-            'ml_move_prob': 0.5,
+            'ml_move_prob': 0.0,           # No movement detected → blocks gate
             'ml_direction_bias': 0.0,
             'ml_signal': 'UNKNOWN',
-            'ml_confidence': 0.5,
+            'ml_confidence': 0.0,           # Zero confidence → blocks elite
             'ml_sizing_factor': 1.0,
-            'ml_entry_caution': False,
-            'ml_chop_hint': False,
-            'ml_elite_ok': True,
+            'ml_entry_caution': True,        # Caution ON when ML fails
+            'ml_chop_hint': True,            # Assume chop when ML fails
+            'ml_elite_ok': False,            # Block elite trades on ML crash
             'ml_direction_hint': 'NEUTRAL',
             'ml_gpt_summary': '',
             'ml_oi_stale': False,
             'ml_oi_available': False,
-            'ml_down_risk_flag': False,
-            'ml_down_risk_score': 0.0,
-            'ml_down_risk_bucket': 'LOW',
+            'ml_down_risk_flag': True,       # Assume risk when ML fails
+            'ml_down_risk_score': 0.5,       # Neutral risk, not zero
+            'ml_down_risk_bucket': 'MEDIUM', # Neutral bucket, not LOW
             'ml_gmm_confirms_direction': False,
             'ml_gmm_regime_used': None,
+            'ml_down_risk_available': False,  # Flag: ML didn't actually run
         }
     
     def predict_batch(self, stock_candles: dict, stock_daily: dict = None,

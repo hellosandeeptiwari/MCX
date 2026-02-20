@@ -256,19 +256,22 @@ class TitanTicker:
                 return None
         return None
     
-    def get_ltp_batch(self, symbols: List[str]) -> Dict[str, float]:
+    def get_ltp_batch(self, symbols: List[str], max_age_seconds: float = 60.0) -> Dict[str, float]:
         """
         Get LTPs for multiple symbols. Uses cache first, REST fallback for misses.
+        Stale cache entries (older than max_age_seconds) are treated as misses.
         """
         result = {}
         cache_misses = []
+        now = time.time()
         
         for sym in symbols:
             token = self._symbol_to_token.get(sym) or self._resolve_token(sym)
             if token:
                 with self._lock:
                     ltp = self._ltp_cache.get(token)
-                    if ltp is not None:
+                    last_ts = self._last_update.get(token, 0)
+                    if ltp is not None and (now - last_ts) <= max_age_seconds:
                         result[sym] = ltp
                         self._stats['cache_hits'] += 1
                         continue

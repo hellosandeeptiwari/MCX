@@ -89,10 +89,10 @@ def calc_brokerage(entry_price, exit_price, quantity):
 
 # ========== HARD RULES (NEVER VIOLATE) ==========
 HARD_RULES = {
-    "RISK_PER_TRADE": 0.035,        # 3.5% base risk per trade (tiered: 5% premium, 3.5% std, 2% base)
+    "RISK_PER_TRADE": 0.06,         # 6% base risk per trade (tiered: 8% premium, 6% std, 3.5% base)
     "MAX_DAILY_LOSS": 0.15,         # 15% max daily loss
     "MAX_POSITIONS": 20,            # Max simultaneous positions (spreads count as 1)
-    "MAX_POSITIONS_MIXED": 6,        # Max positions in MIXED regime (fakeout-heavy)
+    "MAX_POSITIONS_MIXED": 12,       # Max positions in MIXED regime
     "MAX_POSITIONS_TRENDING": 12,    # Max positions in BULLISH/BEARISH regime
     "STALE_DATA_SECONDS": 60,       # Data older than this is stale
     "API_RATE_LIMIT_MS": 350,       # Min ms between API calls (Kite allows ~3/s, 350ms is safe)
@@ -193,6 +193,34 @@ DOWN_RISK_GATING = {
     "log_rejections": True,           # Log score adjustments for diagnostics
 }
 
+# === ML DIRECTION CONFLICT FILTER ===
+# Blocks/penalizes trades where XGBoost ML direction disagrees with scored direction.
+# If BOTH XGBoost AND GMM disagree → HARD BLOCK (both ML systems say wrong direction).
+# If only XGBoost disagrees → soft penalty on smart_score.
+ML_DIRECTION_CONFLICT = {
+    "enabled": True,
+    "xgb_penalty": 15,              # Smart-score penalty when only XGB disagrees
+    "gmm_caution_threshold": 0.15,  # dr_score above this = GMM not fully confident → counts as GMM disagree
+    "min_xgb_confidence": 0.55,     # Only consider XGB disagreement when ml_move_prob >= this
+    "block_gpt_trades": True,       # Also apply to GPT direct-placed trades
+}
+
+# === GMM SNIPER TRADE (1 high-conviction trade per scan cycle) ===
+# Picks the single cleanest GMM candidate each cycle with 2x lot size.
+# Placed directly (bypasses GPT), tracked by exit manager normally.
+# Separate budget from model-tracker trades.
+GMM_SNIPER = {
+    "enabled": True,
+    "max_sniper_trades_per_day": 5,    # Max GMM sniper trades per day
+    "lot_multiplier": 2.0,             # 2x normal lot size
+    "min_smart_score": 55,             # Minimum smart score to qualify
+    "max_dr_score": 0.10,              # Must be very clean (stricter than 0.15)
+    "min_gate_prob": 0.50,             # XGB gate floor for sniper (slightly relaxed from 0.55)
+    "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
+    "separate_capital": 300000,        # ₹3 Lakh reserved exclusively for sniper trades
+    "max_exposure_pct": 90,            # Max % of sniper capital usable (₹2.7L)
+}
+
 # === DECISION LOG (Full Scan Audit Trail) ===
 # Logs every stock evaluated each cycle with score, outcome, and reason.
 # Enables post-hoc analysis of missed opportunities.
@@ -212,17 +240,17 @@ TRADING_HOURS = {
     "no_new_after": "15:10"  # No new trades after this (12 min buffer before EOD exit)
 }
 
-# Early Session: Use 3-min candles for faster indicator maturation
-# Between 9:15 and EARLY_SESSION_END, fetch 3-minute candles instead of 5-minute
-# This gives 5+ candles by 9:30 instead of just 3, so ORB/FT/VWAP mature sooner
+# Early Session: Use 4-min candles for faster indicator maturation
+# Between 9:15 and EARLY_SESSION_END, fetch 4-minute candles instead of 5-minute
+# This gives 4+ candles by 9:31 instead of just 3, so ORB/FT/VWAP mature sooner
 EARLY_SESSION = {
     "enabled": True,
     "end_time": "09:45",             # Switch back to 5-min after this
-    "candle_interval": "3minute",    # 3-min candles during early session
-    "scan_interval_minutes": 3,      # Scan every 3 min during early session
-    "orb_candle_count": 5,           # 15 min ORB = 5 x 3-min candles
-    "vwap_slope_lookback": 10,       # 30 min = 10 x 3-min candles for VWAP slope
-    "momentum_lookback": 5,          # 15 min = 5 x 3-min candles for momentum
+    "candle_interval": "4minute",    # 4-min candles during early session
+    "scan_interval_minutes": 4,      # Scan every 4 min during early session
+    "orb_candle_count": 4,           # 16 min ORB = 4 x 4-min candles
+    "vwap_slope_lookback": 8,        # 32 min = 8 x 4-min candles for VWAP slope
+    "momentum_lookback": 4,          # 16 min = 4 x 4-min candles for momentum
 }
 
 # === TIERED UNIVERSE (Options-First Strategy) ===
@@ -295,7 +323,7 @@ CREDIT_SPREAD_CONFIG = {
     "min_credit_pct": 20,            # Minimum credit as % of spread width (lower for deeper OTM)
     "preferred_credit_pct": 30,      # Preferred credit >= 30% of max risk
     "min_iv_percentile": 30,         # Sell options when IV is above 30th percentile
-    "min_score_threshold": 62,       # Minimum intraday score to enter spread
+    "min_score_threshold": 57,       # Minimum intraday score to enter spread (reduced 8%)
     # --- Risk Management ---
     "sl_multiplier": 2.0,            # Exit if loss reaches 2× credit received
     "target_pct": 65,                # Exit when 65% of max credit is captured (time decay)
@@ -308,7 +336,7 @@ CREDIT_SPREAD_CONFIG = {
     "rollover_at_dte": 1,            # Roll or close when 1 DTE remaining
     # --- Fallback to Naked Buys ---
     "fallback_to_buy": True,         # If spread not viable, fall back to buying options
-    "buy_only_score_threshold": 62,  # Only buy naked if score >= 62 (high conviction)
+    "buy_only_score_threshold": 57,  # Only buy naked if score >= 57 (reduced 8%)
 }
 
 # === CASH EQUITY INTRADAY SCORING CONFIG ===
@@ -332,7 +360,7 @@ DEBIT_SPREAD_CONFIG = {
     # --- Entry Filters (SMART — candle-data driven) ---
     "min_move_pct": 1.2,             # Stock must have moved >1.2% today (was 2.5% — too strict, zero triggers)
     "min_volume_ratio": 1.3,         # Volume must be 1.3× normal (was 1.5 — slightly relaxed)
-    "min_score_threshold": 62,       # Minimum intraday score for debit spread entry
+    "min_score_threshold": 57,       # Minimum intraday score for debit spread entry (reduced 8%)
     # --- Candle-Smart Gates (mirrors naked buy gates 8-12) ---
     "min_follow_through_candles": 2, # Must have ≥2 follow-through candles (strongest winner signal)
     "min_adx": 28,                   # ADX ≥28 confirms trend strength (winners avg 37)

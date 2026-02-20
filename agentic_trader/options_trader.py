@@ -192,9 +192,9 @@ class IntradayOptionScorer:
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
     # === TRADE THRESHOLDS (Recalibrated Feb 17 after cross-validation fixes) ===
-    BLOCK_THRESHOLD = 52         # < 52 = BLOCK (naked option buy minimum)
-    STANDARD_THRESHOLD = 58      # 58-61 = Standard (ATM/ITM, 1x size)
-    PREMIUM_THRESHOLD = 62       # >= 62 = Premium (ATM/ITM, up to 1.5x)
+    BLOCK_THRESHOLD = 58         # < 58 = BLOCK (naked option buy minimum)
+    STANDARD_THRESHOLD = 64      # 64-67 = Standard (ATM/ITM, 1x size)
+    PREMIUM_THRESHOLD = 68       # >= 68 = Premium (ATM/ITM, up to 1.5x)
     CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
     # === AGGRESSIVE SIZING REQUIREMENTS (Risk of ruin protection) ===

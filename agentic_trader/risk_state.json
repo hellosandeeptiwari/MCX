@@ -1,17 +1,17 @@
 {
   "system_state": "ACTIVE",
-  "daily_pnl": -28991.729999999996,
-  "daily_pnl_pct": -5.798346,
-  "trades_today": 9,
-  "wins_today": 1,
-  "losses_today": 8,
-  "consecutive_losses": 3,
-  "last_trade_time": "2026-02-19T11:48:56.120644",
-  "last_loss_time": "2026-02-19T11:48:56.120644",
+  "daily_pnl": 97245.76999999999,
+  "daily_pnl_pct": 19.449154,
+  "trades_today": 66,
+  "wins_today": 47,
+  "losses_today": 19,
+  "consecutive_losses": 0,
+  "last_trade_time": "2026-02-20T15:15:04.596356",
+  "last_loss_time": "2026-02-20T15:15:03.929111",
   "cooldown_until": "",
-  "halt_reason": "Max consecutive losses: 5",
+  "halt_reason": "",
   "positions_by_sector": {},
   "order_rejections": 0,
   "data_stale_count": 0,
-  "date": "2026-02-19"
+  "date": "2026-02-20"
 }

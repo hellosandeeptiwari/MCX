@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import schedule
 import sys
 import os
+from safe_io import atomic_json_save
 
 # Fix Windows cp1252 encoding for emoji output
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -211,6 +212,7 @@ class AutonomousTrader:
         self._adaptive_scan_cfg = ADAPTIVE_SCAN
         self._dynamic_max_picks_cfg = DYNAMIC_MAX_PICKS
         self._decision_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), DECISION_LOG.get('file', 'scan_decisions.json'))
+        self._decision_log_lock = threading.Lock()  # Protect scan_decisions.json read-modify-write
         self._auto_fired_this_session = set()   # Symbols auto-fired today (no re-fire)
         self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
         
@@ -225,10 +227,18 @@ class AutonomousTrader:
         self._model_tracker_trades_today = 0
         self._model_tracker_date = datetime.now().date()
         self._model_tracker_symbols = set()
+        # GMM Sniper state: 1 high-conviction trade per scan cycle
+        from config import GMM_SNIPER
+        self._gmm_sniper_cfg = GMM_SNIPER
+        self._gmm_sniper_trades_today = 0
+        self._gmm_sniper_date = datetime.now().date()
+        self._gmm_sniper_symbols = set()
         # _gmm_flip_count_today removed — GMM now used as veto/boost, not flip
         if DOWN_RISK_GATING.get('enabled'):
             print(f"  🛡️ Down-Risk Graduated Scoring: ACTIVE (boost +{DOWN_RISK_GATING.get('clean_boost', 8)} / caution −{DOWN_RISK_GATING.get('mid_risk_penalty', 8)} / block −{DOWN_RISK_GATING.get('high_risk_penalty', 15)})")
             print(f"  📊 Model Tracker: ACTIVE ({DOWN_RISK_GATING.get('model_tracker_trades', 7)} exclusive trades/day for model evaluation)")
+        if GMM_SNIPER.get('enabled'):
+            print(f"  🎯 GMM Sniper: ACTIVE ({GMM_SNIPER.get('max_sniper_trades_per_day', 5)}/day, {GMM_SNIPER.get('lot_multiplier', 2.0)}x lots, dr<{GMM_SNIPER.get('max_dr_score', 0.10)})")
         
         # === ML MOVE PREDICTOR ===
         self._ml_predictor = None
@@ -448,24 +458,24 @@ class AutonomousTrader:
             if extra:
                 entry.update(extra)
             
-            # Append to file
-            log_data = []
-            if os.path.exists(self._decision_log_file):
-                try:
-                    with open(self._decision_log_file, 'r') as f:
-                        log_data = json.load(f)
-                except (json.JSONDecodeError, Exception):
-                    log_data = []
-            
-            log_data.append(entry)
-            
-            # Rotate if too large
-            max_entries = self._decision_log_cfg.get('max_entries', 50000)
-            if len(log_data) > max_entries:
-                log_data = log_data[-max_entries:]
-            
-            with open(self._decision_log_file, 'w') as f:
-                json.dump(log_data, f, indent=1)
+            # Append to file (thread-safe read-modify-write)
+            with self._decision_log_lock:
+                log_data = []
+                if os.path.exists(self._decision_log_file):
+                    try:
+                        with open(self._decision_log_file, 'r') as f:
+                            log_data = json.load(f)
+                    except (json.JSONDecodeError, Exception):
+                        log_data = []
+                
+                log_data.append(entry)
+                
+                # Rotate if too large
+                max_entries = self._decision_log_cfg.get('max_entries', 50000)
+                if len(log_data) > max_entries:
+                    log_data = log_data[-max_entries:]
+                
+                atomic_json_save(self._decision_log_file, log_data, indent=1)
         except Exception as e:
             pass  # Silent — decision log should never break trading
     
@@ -611,11 +621,44 @@ class AutonomousTrader:
             print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}")
             
             try:
+                # Build ML data for elite auto-fire trades
+                _elite_ml = getattr(self, '_cycle_ml_results', {}).get(sym, {})
+                _elite_ml_data = {
+                    'smart_score': score,
+                    'p_score': score,
+                    'dr_score': _elite_ml.get('ml_down_risk_score', 0),
+                    'ml_move_prob': _elite_ml.get('ml_move_prob', 0),
+                    'ml_confidence': _elite_ml.get('ml_confidence', 0),
+                    'xgb_model': {
+                        'signal': _elite_ml.get('ml_signal', 'UNKNOWN'),
+                        'move_prob': _elite_ml.get('ml_move_prob', 0),
+                        'prob_up': _elite_ml.get('ml_prob_up', 0),
+                        'prob_down': _elite_ml.get('ml_prob_down', 0),
+                        'prob_flat': _elite_ml.get('ml_prob_flat', 0),
+                        'direction_bias': _elite_ml.get('ml_direction_bias', 0),
+                        'confidence': _elite_ml.get('ml_confidence', 0),
+                        'score_boost': _elite_ml.get('ml_score_boost', 0),
+                        'direction_hint': _elite_ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'model_type': _elite_ml.get('ml_model_type', 'unknown'),
+                        'sizing_factor': _elite_ml.get('ml_sizing_factor', 1.0),
+                    },
+                    'gmm_model': {
+                        'down_risk_score': _elite_ml.get('ml_down_risk_score', 0),
+                        'down_risk_flag': _elite_ml.get('ml_down_risk_flag', False),
+                        'down_risk_bucket': _elite_ml.get('ml_down_risk_bucket', 'LOW'),
+                        'gmm_confirms_direction': _elite_ml.get('ml_gmm_confirms_direction', False),
+                        'gmm_regime_used': _elite_ml.get('ml_gmm_regime_used', None),
+                        'gmm_action': 'ELITE_AUTO',
+                    },
+                    'scored_direction': direction,
+                    'xgb_disagrees': False,
+                } if _elite_ml else {}
                 result = self.tools.place_option_order(
                     underlying=sym,
                     direction=direction,
                     strike_selection="ATM",
-                    rationale=f"ELITE AUTO-FIRE: Score {score:.0f} (threshold {threshold}) — bypassing GPT for immediate execution"
+                    rationale=f"ELITE AUTO-FIRE: Score {score:.0f} (threshold {threshold}) — bypassing GPT for immediate execution",
+                    ml_data=_elite_ml_data
                 )
                 if result and result.get('success'):
                     print(f"   ✅ ELITE AUTO-FIRED: {sym} ({direction}) score={score:.0f}")
@@ -802,34 +845,52 @@ class AutonomousTrader:
                 continue  # Scorer couldn't determine direction → skip
             
             # ── DUAL-REGIME GMM VETO/BOOST LOGIC ──
-            # dr_flag behavior depends on which GMM regime was used:
-            #   UP regime (for BUY): dr_flag=True → hidden crash → block CE
-            #   DOWN regime (for SELL): dr_flag=True → bear trap → block PE
-            # The predictor.py routes: BUY→UP regime, SELL→DOWN regime
+            # CRITICAL: We must check the ACTUAL XGB signal (ml_signal), not gmm_regime.
+            # Reason: FLAT signals (very common — ~30-50% of stocks) get routed to
+            # UP regime by default in predictor. Using gmm_regime would incorrectly
+            # treat all FLAT signals as "XGB says UP", creating a massive BUY bias.
+            #
+            # Logic:
+            #   XGB=FLAT/UNKNOWN → no directional opinion → ALLOW (no boost, no block)
+            #   XGB aligns with trade (UP+BUY, DOWN+SELL) → use GMM: BOOST or BLOCK
+            #   XGB opposes trade (UP+SELL, DOWN+BUY) → if GMM confirms opposing dir → BLOCK
             trade_type = 'MODEL_TRACKER'
             gmm_action = 'ALLOW'  # default
+            _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
             gmm_regime = ml.get('ml_gmm_regime_used', 'UP')
             
-            if direction == 'BUY':
-                # CE candidate — UP regime GMM was used
+            if _xgb_signal in ('FLAT', 'UNKNOWN'):
+                # XGB has no directional opinion → GMM regime is just default routing
+                # Cannot use GMM to BOOST or BLOCK directionally → ALLOW
+                gmm_action = 'ALLOW'
+            elif (_xgb_signal == 'UP' and direction == 'BUY') or (_xgb_signal == 'DOWN' and direction == 'SELL'):
+                # XGB signal ALIGNS with trade direction → GMM result is relevant
                 if dr_flag:
-                    # GMM HIGH (UP regime): hidden crash risk → BLOCK CE
+                    # GMM flags anomaly in the aligned direction → BLOCK
                     gmm_action = 'BLOCK'
-                    continue  # Hard block — crash incoming, CE will die
+                    continue
                 else:
-                    # GMM LOW (UP regime): genuine UP pattern → BOOST CE
+                    # GMM confirms aligned direction is genuine → BOOST
                     gmm_action = 'BOOST'
                     trade_type = 'GMM_BOOST'
             else:
-                # PE candidate (direction == 'SELL') — DOWN regime GMM was used
-                if dr_flag:
-                    # GMM HIGH (DOWN regime): bear trap / hidden UP → BLOCK PE
-                    gmm_action = 'BLOCK'
-                    continue  # Block — stock looks bearish but may rally
-                else:
-                    # GMM LOW (DOWN regime): genuine DOWN pattern → BOOST PE
+                # XGB signal OPPOSES trade direction (UP vs SELL, DOWN vs BUY)
+                if not dr_flag:
+                    # GMM confirms the opposing direction is genuine → FLIP to ML direction
+                    # Instead of blocking, trust ML and reverse the trade direction
+                    old_direction = direction
+                    direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
                     gmm_action = 'BOOST'
-                    trade_type = 'GMM_BOOST'
+                    trade_type = 'ML_OVERRIDE'
+                    sym_clean_tmp = sym.replace('NSE:', '')
+                    print(f"      🔄 ML OVERRIDE: {sym_clean_tmp} — XGB={_xgb_signal} + GMM confirms "
+                          f"(dr={dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
+                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ML_OVERRIDE',
+                                      reason=f"XGB={_xgb_signal} + GMM (dr={dr_score:.3f}) overrode scorer {old_direction}→{direction}",
+                                      direction=direction)
+                else:
+                    # GMM flags anomaly in opposing direction → XGB opposition may be wrong → ALLOW
+                    gmm_action = 'ALLOW'
             
             # Gather available ML metrics (Gate model still runs)
             ml_confidence = ml.get('ml_confidence', 0.0)  # Gate confidence
@@ -842,9 +903,39 @@ class AutonomousTrader:
             if ml_move_prob < 0.40:
                 continue  # Gate says stock unlikely to move — skip
             
+            # ── ML DIRECTION CONFLICT FILTER ──
+            # Check if XGBoost ML signal disagrees with scored direction
+            from config import ML_DIRECTION_CONFLICT
+            _dir_conflict_cfg = ML_DIRECTION_CONFLICT
+            _xgb_disagrees = False
+            if _dir_conflict_cfg.get('enabled', False):
+                _ml_signal = ml.get('ml_signal', 'UNKNOWN')
+                if direction == 'BUY' and _ml_signal == 'DOWN' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
+                    _xgb_disagrees = True
+                elif direction == 'SELL' and _ml_signal == 'UP' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
+                    _xgb_disagrees = True
+                
+                if _xgb_disagrees:
+                    _gmm_caution = dr_score > _dir_conflict_cfg.get('gmm_caution_threshold', 0.15)
+                    if _gmm_caution:
+                        # HARD BLOCK: Both XGBoost AND GMM disagree with scored direction
+                        print(f"      🚫 DIRECTION CONFLICT BLOCK: {sym_clean} — XGB={_ml_signal} vs scored={direction}, "
+                              f"GMM dr={dr_score:.3f} > {_dir_conflict_cfg.get('gmm_caution_threshold', 0.15)} → BOTH disagree")
+                        self._log_decision(cycle_time, sym, p_score, 'ML_DIRECTION_BLOCK',
+                                          reason=f"XGB={_ml_signal} + GMM dr={dr_score:.3f} vs scored={direction}",
+                                          direction=direction)
+                        continue
+                    else:
+                        # SOFT PENALTY: Only XGB disagrees, GMM is clean — penalize score
+                        _xgb_penalty = _dir_conflict_cfg.get('xgb_penalty', 15)
+                        print(f"      ⚠️ XGB DIRECTION CONFLICT: {sym_clean} — XGB={_ml_signal} vs scored={direction}, "
+                              f"GMM clean (dr={dr_score:.3f}) → −{_xgb_penalty} penalty")
+            
             # ── Composite smart score (dual-regime GMM-aware) ──
-            # Weight 1: Conviction = Gate P(MOVE) × pre_score quality (0-40 pts)
-            conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 40.0
+            # Weight 1: Conviction = Gate P(MOVE) × ML confidence (0-40 pts)
+            # NOTE: Uses ml_confidence (not p_score) to avoid double-counting
+            # p_score already represented in Weight 3 (technical)
+            conviction = ml_move_prob * max(ml_confidence, 0.01) * 40.0
             
             # Weight 2: Safety / GMM-awareness (0-25 pts)
             # Both CE and PE get BOOST when GMM confirms — symmetric treatment
@@ -860,6 +951,10 @@ class AutonomousTrader:
             
             smart_score = conviction + safety + technical + move_bonus
             
+            # Apply XGB direction conflict penalty (soft gate — only XGB disagrees, GMM clean)
+            if _dir_conflict_cfg.get('enabled', False) and _xgb_disagrees:
+                smart_score -= _dir_conflict_cfg.get('xgb_penalty', 15)
+            
             raw_candidates.append({
                 'sym': sym,
                 'sym_clean': sym_clean,
@@ -873,6 +968,37 @@ class AutonomousTrader:
                 'ml_confidence': ml_confidence,
                 'ml_move_prob': ml_move_prob,
                 'p_score': p_score,
+                # === FULL ML DATA for trade record ===
+                'ml_data': {
+                    'smart_score': round(smart_score, 2),
+                    'p_score': p_score,
+                    'dr_score': dr_score,
+                    'ml_move_prob': ml_move_prob,
+                    'ml_confidence': ml_confidence,
+                    'xgb_model': {
+                        'signal': ml.get('ml_signal', 'UNKNOWN'),
+                        'move_prob': ml.get('ml_move_prob', 0),
+                        'prob_up': ml.get('ml_prob_up', 0),
+                        'prob_down': ml.get('ml_prob_down', 0),
+                        'prob_flat': ml.get('ml_prob_flat', 0),
+                        'direction_bias': ml.get('ml_direction_bias', 0),
+                        'confidence': ml.get('ml_confidence', 0),
+                        'score_boost': ml.get('ml_score_boost', 0),
+                        'direction_hint': ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'model_type': ml.get('ml_model_type', 'unknown'),
+                        'sizing_factor': ml.get('ml_sizing_factor', 1.0),
+                    },
+                    'gmm_model': {
+                        'down_risk_score': dr_score,
+                        'down_risk_flag': dr_flag,
+                        'down_risk_bucket': ml.get('ml_down_risk_bucket', 'LOW'),
+                        'gmm_confirms_direction': ml.get('ml_gmm_confirms_direction', False),
+                        'gmm_regime_used': ml.get('ml_gmm_regime_used', None),
+                        'gmm_action': gmm_action,
+                    },
+                    'scored_direction': direction,
+                    'xgb_disagrees': _xgb_disagrees,
+                },
             })
         
         if not raw_candidates:
@@ -932,7 +1058,9 @@ class AutonomousTrader:
                     rationale=(f"{trade_type} smart-pick #{selected.index(cand)+1}: "
                               f"smart={cand['smart_score']:.1f}, dr={cand['dr_score']:.3f}, "
                               f"gate={cand['ml_move_prob']:.2f}, gmm_action={cand['gmm_action']}, "
-                              f"sector={cand['sector']}")
+                              f"sector={cand['sector']}"),
+                    setup_type=trade_type,
+                    ml_data=cand.get('ml_data', {})
                 )
                 if result and result.get('success'):
                     print(f"   ✅ MODEL-TRACKER PLACED: {cand['sym_clean']} ({direction}) [smart={cand['smart_score']:.1f}]{_type_label}")
@@ -956,6 +1084,248 @@ class AutonomousTrader:
         
         return placed
     
+    # ========== GMM SNIPER TRADE (1 per cycle, 2x lots) ==========
+    def _place_gmm_sniper_trade(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
+        """Place 1 high-conviction GMM sniper trade per scan cycle.
+        
+        Picks the single CLEANEST GMM candidate (lowest down_risk score) that
+        also passes strict quality gates. Placed with 2x lot size for maximum
+        conviction. Separate budget from model-tracker trades.
+        
+        Selection criteria (all must pass):
+          1. GMM down_risk_score < max_dr_score (very clean, stricter than 0.15)
+          2. Smart score >= min_smart_score
+          3. XGB gate P(move) >= min_gate_prob (higher floor than model-tracker)
+          4. GMM confirms direction (not flagged)
+          5. Not already in model-tracker or sniper set today
+          
+        The candidate with the LOWEST dr_score wins (most confident CLEAN signal).
+        """
+        cfg = self._gmm_sniper_cfg
+        if not cfg.get('enabled', False):
+            return None
+        
+        # Reset on new day
+        today = datetime.now().date()
+        if today != self._gmm_sniper_date:
+            self._gmm_sniper_trades_today = 0
+            self._gmm_sniper_date = today
+            self._gmm_sniper_symbols = set()
+        
+        max_per_day = cfg.get('max_sniper_trades_per_day', 5)
+        if self._gmm_sniper_trades_today >= max_per_day:
+            return None
+        
+        lot_multiplier = cfg.get('lot_multiplier', 2.0)
+        min_smart = cfg.get('min_smart_score', 55)
+        max_dr = cfg.get('max_dr_score', 0.10)
+        min_gate = cfg.get('min_gate_prob', 0.55)
+        score_tier = cfg.get('score_tier', 'premium')
+        
+        # Import sector mapping
+        try:
+            from ml_models.feature_engineering import get_sector_for_symbol as _get_sector_sniper
+        except Exception:
+            _get_sector_sniper = lambda s: 'OTHER'
+        
+        # Build candidate pool — same logic as model-tracker but stricter thresholds
+        _cycle_decs = getattr(self.tools, '_cached_cycle_decisions', {})
+        candidates = []
+        
+        for sym in pre_scores:
+            ml = ml_results.get(sym, {})
+            dr_score = ml.get('ml_down_risk_score', None)
+            dr_flag = ml.get('ml_down_risk_flag', None)
+            
+            if dr_score is None or dr_flag is None:
+                continue
+            
+            # Skip if already traded as sniper or model-tracker today
+            if sym in self._gmm_sniper_symbols or sym in self._model_tracker_symbols:
+                continue
+            
+            # Skip if already in active positions
+            active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', []) 
+                          if p.get('status', 'OPEN') == 'OPEN'}
+            if sym in active_syms:
+                continue
+            
+            # Strict GMM cleanliness gate
+            if dr_score > max_dr:
+                continue
+            if dr_flag:
+                continue  # Must not be flagged
+            
+            # Get direction from IntradayScorer
+            _cd = _cycle_decs.get(sym, {})
+            _decision = _cd.get('decision')
+            if _decision and hasattr(_decision, 'recommended_direction') and _decision.recommended_direction:
+                direction = _decision.recommended_direction
+            else:
+                continue
+            
+            if direction == 'HOLD':
+                continue
+            
+            # ── XGB DIRECTION ALIGNMENT CHECK (Sniper) ──
+            # Check actual XGB signal, not gmm_regime. FLAT signals default to
+            # UP regime routing in predictor — treating that as "XGB says UP"
+            # would incorrectly block all SELL snipers when XGB is indecisive.
+            _sniper_was_flipped = False
+            _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
+            if _xgb_signal in ('FLAT', 'UNKNOWN'):
+                pass  # No XGB directional opinion — proceed on GMM cleanliness + IntradayScorer
+            elif (_xgb_signal == 'UP' and direction == 'SELL') or (_xgb_signal == 'DOWN' and direction == 'BUY'):
+                # XGB actively opposes trade direction → FLIP to ML direction (sniper is dr_flag=False here)
+                old_direction = direction
+                direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
+                _sniper_was_flipped = True
+                sym_clean_tmp = sym.replace('NSE:', '')
+                print(f"      🔄 SNIPER ML OVERRIDE: {sym_clean_tmp} — XGB={_xgb_signal} + GMM clean "
+                      f"(dr={dr_score:.4f}) → FLIPPED {old_direction}→{direction}")
+            
+            # XGB gate probability floor
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+            if ml_move_prob < min_gate:
+                continue
+            
+            # ── ML DIRECTION CONFLICT FILTER (Sniper) ──
+            from config import ML_DIRECTION_CONFLICT
+            _dir_conflict_cfg = ML_DIRECTION_CONFLICT
+            _xgb_disagrees = False
+            if _dir_conflict_cfg.get('enabled', False):
+                _ml_signal = ml.get('ml_signal', 'UNKNOWN')
+                sym_clean_chk = sym.replace('NSE:', '')
+                if direction == 'BUY' and _ml_signal == 'DOWN' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
+                    _xgb_disagrees = True
+                elif direction == 'SELL' and _ml_signal == 'UP' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
+                    _xgb_disagrees = True
+                if _xgb_disagrees:
+                    # For sniper, any XGB disagreement is a hard block (high-conviction trades only)
+                    _gmm_caution = dr_score > _dir_conflict_cfg.get('gmm_caution_threshold', 0.15)
+                    if _gmm_caution:
+                        print(f"      🚫 SNIPER DIRECTION BLOCK: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
+                              f"GMM dr={dr_score:.3f} → BOTH disagree")
+                        continue
+                    else:
+                        print(f"      ⚠️ SNIPER XGB CONFLICT: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
+                              f"GMM clean (dr={dr_score:.3f}) → −{_dir_conflict_cfg.get('xgb_penalty', 15)} penalty")
+            
+            # Compute smart score (same formula as model-tracker)
+            p_score = pre_scores.get(sym, 0)
+            conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 40.0
+            safety = (1.0 - min(dr_score, 1.0)) * 20.0 + 5.0
+            technical = min(p_score, 100) * 0.20
+            move_bonus = ml_move_prob * 15.0
+            smart_score = conviction + safety + technical + move_bonus
+            
+            # Apply XGB direction conflict penalty for sniper
+            if _dir_conflict_cfg.get('enabled', False) and _xgb_disagrees:
+                smart_score -= _dir_conflict_cfg.get('xgb_penalty', 15)
+            
+            if smart_score < min_smart:
+                continue
+            
+            sym_clean = sym.replace('NSE:', '')
+            sector = _get_sector_sniper(sym_clean) or 'OTHER'
+            
+            candidates.append({
+                'sym': sym,
+                'sym_clean': sym_clean,
+                'direction': direction,
+                'sector': sector,
+                'smart_score': round(smart_score, 2),
+                'dr_score': dr_score,
+                'ml_move_prob': ml_move_prob,
+                'p_score': p_score,
+                'was_flipped': _sniper_was_flipped,
+                # === FULL ML DATA for trade record ===
+                'ml_data': {
+                    'smart_score': round(smart_score, 2),
+                    'p_score': p_score,
+                    'dr_score': dr_score,
+                    'ml_move_prob': ml_move_prob,
+                    'ml_confidence': ml.get('ml_confidence', 0),
+                    'xgb_model': {
+                        'signal': ml.get('ml_signal', 'UNKNOWN'),
+                        'move_prob': ml.get('ml_move_prob', 0),
+                        'prob_up': ml.get('ml_prob_up', 0),
+                        'prob_down': ml.get('ml_prob_down', 0),
+                        'prob_flat': ml.get('ml_prob_flat', 0),
+                        'direction_bias': ml.get('ml_direction_bias', 0),
+                        'confidence': ml.get('ml_confidence', 0),
+                        'score_boost': ml.get('ml_score_boost', 0),
+                        'direction_hint': ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'model_type': ml.get('ml_model_type', 'unknown'),
+                        'sizing_factor': ml.get('ml_sizing_factor', 1.0),
+                    },
+                    'gmm_model': {
+                        'down_risk_score': dr_score,
+                        'down_risk_flag': ml.get('ml_down_risk_flag', False),
+                        'down_risk_bucket': ml.get('ml_down_risk_bucket', 'LOW'),
+                        'gmm_confirms_direction': ml.get('ml_gmm_confirms_direction', False),
+                        'gmm_regime_used': ml.get('ml_gmm_regime_used', None),
+                        'gmm_action': 'BOOST',
+                    },
+                    'scored_direction': direction,
+                    'xgb_disagrees': _xgb_disagrees,
+                },
+            })
+        
+        if not candidates:
+            return None
+        
+        # Pick the ONE with lowest dr_score (most confident CLEAN signal)
+        # Tiebreak by highest smart_score
+        candidates.sort(key=lambda c: (c['dr_score'], -c['smart_score']))
+        pick = candidates[0]
+        
+        print(f"\n   🎯 GMM SNIPER: {pick['sym_clean']} ({pick['direction']}) "
+              f"| dr={pick['dr_score']:.4f} | smart={pick['smart_score']:.1f} "
+              f"| gate={pick['ml_move_prob']:.2f} | {pick['sector']} "
+              f"| {lot_multiplier}x lots")
+        if len(candidates) > 1:
+            runner_up = candidates[1]
+            print(f"      Runner-up: {runner_up['sym_clean']} (dr={runner_up['dr_score']:.4f}, smart={runner_up['smart_score']:.1f})")
+        
+        # Place with lot_multiplier
+        _sniper_setup = 'ML_OVERRIDE' if pick.get('was_flipped') else 'GMM_SNIPER'
+        try:
+            result = self.tools.place_option_order(
+                underlying=pick['sym'],
+                direction=pick['direction'],
+                strike_selection="ATM",
+                use_intraday_scoring=False,
+                lot_multiplier=lot_multiplier,
+                rationale=(f"{_sniper_setup}: dr={pick['dr_score']:.4f}, smart={pick['smart_score']:.1f}, "
+                          f"gate={pick['ml_move_prob']:.2f}, sector={pick['sector']}, "
+                          f"lots={lot_multiplier}x"),
+                setup_type=_sniper_setup,
+                ml_data=pick.get('ml_data', {})
+            )
+            
+            if result and result.get('success'):
+                self._gmm_sniper_trades_today += 1
+                self._gmm_sniper_symbols.add(pick['sym'])
+                print(f"   ✅ GMM SNIPER PLACED: {pick['sym_clean']} ({pick['direction']}) "
+                      f"[{lot_multiplier}x lots] dr={pick['dr_score']:.4f}")
+                
+                self._log_decision(cycle_time, pick['sym'], pick['p_score'], 'GMM_SNIPER_PLACED',
+                                  reason=(f"Sniper: dr={pick['dr_score']:.4f}, smart={pick['smart_score']:.1f}, "
+                                         f"gate={pick['ml_move_prob']:.2f}, lots={lot_multiplier}x"),
+                                  direction=pick['direction'], setup='GMM_SNIPER')
+                
+                remaining = max_per_day - self._gmm_sniper_trades_today
+                print(f"   📊 GMM SNIPER: {self._gmm_sniper_trades_today}/{max_per_day} today | {remaining} remaining")
+                return pick['sym_clean']
+            else:
+                error = result.get('error', 'unknown') if result else 'no result'
+                print(f"   ⚠️ GMM Sniper failed for {pick['sym_clean']}: {error}")
+        except Exception as e:
+            print(f"   ❌ GMM Sniper error for {pick['sym_clean']}: {e}")
+        
+        return None
+
     # ========== ADAPTIVE SCAN INTERVAL ==========
     def _adapt_scan_interval(self, pre_scores: dict):
         """Adjust the next scan interval based on current signal quality."""
@@ -1039,8 +1409,7 @@ class AutonomousTrader:
                 'date': str(self.orb_tracking_date),
                 'trades': self.orb_trades_today
             }
-            with open(self._orb_state_file, 'w') as f:
-                json.dump(state, f)
+            atomic_json_save(self._orb_state_file, state, indent=0)
         except Exception as e:
             print(f"⚠️ Failed to save ORB state: {e}")
 
@@ -1153,7 +1522,7 @@ class AutonomousTrader:
                         if state:
                             state.candles_since_entry = estimated_candles
                             state.entry_time = entry_time
-                    except:
+                    except Exception:
                         pass
                 registered += 1
         
@@ -1254,7 +1623,7 @@ class AutonomousTrader:
                             quotes.update(self.tools.kite.ltp(missing))
                     else:
                         quotes = self.tools.kite.ltp(all_symbols)
-                except:
+                except Exception:
                     return
                 
                 # --- Close regular trades ---
@@ -1380,7 +1749,9 @@ class AutonomousTrader:
     
     def _check_positions_realtime(self):
         """Check all positions for target/stoploss hits using Exit Manager"""
-        active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        # Snapshot under lock to prevent race with trading thread
+        with self.tools._positions_lock:
+            active_trades = [t.copy() for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
         
         if not active_trades:
             return
@@ -1435,13 +1806,13 @@ class AutonomousTrader:
                     try:
                         eq_syms = [t['symbol'] for t in equity_trades]
                         quotes.update(self.tools.kite.ltp(eq_syms))
-                    except:
+                    except Exception:
                         pass
                 if option_trades:
                     try:
                         opt_syms = [t['symbol'] for t in option_trades]
                         quotes.update(self.tools.kite.ltp(opt_syms))
-                    except:
+                    except Exception:
                         pass
         else:
             quotes = {}
@@ -1484,8 +1855,10 @@ class AutonomousTrader:
                         try:
                             opt_quote = self.tools.kite.ltp([symbol])
                             ltp = opt_quote[symbol]['last_price']
-                        except:
-                            ltp = entry  # Assume flat if can't get price
+                        except Exception:
+                            # WARN: Quote failure — skip exit to avoid masking real P&L
+                            print(f"   ⚠️ Quote failure for {symbol} — skipping option exit (will retry)")
+                            continue
                         
                         pnl = (ltp - entry) * qty
                         pnl -= calc_brokerage(entry, ltp, qty)
@@ -1500,7 +1873,7 @@ class AutonomousTrader:
                             self.capital += pnl
                         
                         # Record with Risk Governor (include unrealized P&L from open positions)
-                        open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
+                        open_pos = [t for t in active_trades if t.get('symbol') != symbol]
                         unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                         self.risk_governor.record_trade_result(symbol, pnl, pnl > 0, unrealized_pnl=unrealized)
                         self.risk_governor.update_capital(self.capital)
@@ -1607,7 +1980,7 @@ class AutonomousTrader:
                             self.exit_manager._persist_state()
                         
                         # Record partial win with risk governor
-                        open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+                        open_pos = [t for t in active_trades if t.get('symbol') != symbol]
                         unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                         self.risk_governor.record_trade_result(symbol + "_PARTIAL", partial_pnl, True, unrealized_pnl=unrealized)
                         self.risk_governor.update_capital(self.capital)
@@ -1642,7 +2015,6 @@ class AutonomousTrader:
                     emoji = {
                         'SL_HIT': '❌',
                         'TARGET_HIT': '🎯',
-                        'QUICK_PROFIT': '💰',
                         'SESSION_CUTOFF': '⏰',
                         'TIME_STOP': '⏱️',
                         'TRAILING_SL': '📈',
@@ -1686,7 +2058,7 @@ class AutonomousTrader:
                         self.capital += pnl
                     
                     # Record with Risk Governor (include unrealized P&L from open positions)
-                    open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
+                    open_pos = [t for t in active_trades if t.get('symbol') != symbol]
                     unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                     self.risk_governor.record_trade_result(symbol, pnl, was_win, unrealized_pnl=unrealized)
                     self.risk_governor.update_capital(self.capital)
@@ -1796,7 +2168,7 @@ class AutonomousTrader:
                         if not underlying_ltp:
                             ul_data = self.tools.kite.ltp([underlying])
                             underlying_ltp = ul_data[underlying]['last_price']
-                    except:
+                    except Exception:
                         pass
                     
                     exit_reason = None
@@ -1855,7 +2227,7 @@ class AutonomousTrader:
                             self.capital += ic_pnl
                         
                         # Record with risk governor
-                        open_pos = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != trade['symbol']]
+                        open_pos = [t for t in active_trades if t.get('symbol') != trade['symbol']]
                         unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                         self.risk_governor.record_trade_result(trade['symbol'], ic_pnl, ic_pnl > 0, unrealized_pnl=unrealized)
                         self.risk_governor.update_capital(self.capital)
@@ -1984,8 +2356,8 @@ class AutonomousTrader:
             # --- Show regular trades ---
             regular_open = [t for t in active_trades if not t.get('is_credit_spread', False) and not t.get('is_debit_spread', False) and not t.get('is_iron_condor', False) and t.get('status', 'OPEN') == 'OPEN']
             if regular_open:
-                print(f"{'Symbol':15} {'Side':6} {'Entry':>10} {'LTP':>10} {'SL':>10} {'Target':>10} {'P&L':>12} {'Status'}")
-                print("-" * 95)
+                print(f"{'Symbol':15} {'Side':6} {'Entry':>10} {'LTP':>10} {'SL':>10} {'Target':>10} {'P&L':>12} {'Type':10} {'Status'}")
+                print("-" * 110)
         
         for trade in active_trades:
             if trade.get('is_credit_spread', False) or trade.get('is_debit_spread', False) or trade.get('is_iron_condor', False):
@@ -2012,6 +2384,22 @@ class AutonomousTrader:
                 if state.trailing_active:
                     status_flags += "📈TRAIL "
             
+            # Get trade type tag for display
+            _setup = trade.get('setup_type', '')
+            _type_tag = ''
+            if _setup == 'GMM_SNIPER':
+                _type_tag = '🎯SNIPER'
+            elif _setup == 'ML_OVERRIDE':
+                _type_tag = '🔄ML_OVR'
+            elif _setup == 'GMM_BOOST':
+                _type_tag = '🧬GMM'
+            elif _setup == 'MODEL_TRACKER':
+                _type_tag = '🧠SCORE'
+            elif _setup in ('', 'MANUAL', 'GPT') or not _setup:
+                _type_tag = '🤖GPT'
+            else:
+                _type_tag = _setup[:8]
+            
             # Calculate current P&L
             if side == 'BUY':
                 pnl = (ltp - entry) * qty
@@ -2021,7 +2409,7 @@ class AutonomousTrader:
                     status = "🟢" if pnl > 0 else "🔴"
                     sl_dist = (ltp - sl) / ltp * 100
                     tgt_dist = (target - ltp) / ltp * 100
-                    print(f"{status} {symbol:13} {'BUY':6} ₹{entry:>9.2f} ₹{ltp:>9.2f} ₹{sl:>9.2f} ₹{target:>9.2f} ₹{pnl:>+10,.0f} ({pnl_pct:+.1f}%) {status_flags}")
+                    print(f"{status} {symbol:13} {'BUY':6} ₹{entry:>9.2f} ₹{ltp:>9.2f} ₹{sl:>9.2f} ₹{target:>9.2f} ₹{pnl:>+10,.0f} ({pnl_pct:+.1f}%) {_type_tag:10} {status_flags}")
                     print(f"   └─ SL: {sl_dist:.1f}% away | Target: {tgt_dist:.1f}% away")
             
             else:  # SHORT position
@@ -2032,7 +2420,7 @@ class AutonomousTrader:
                     status = "🟢" if pnl > 0 else "🔴"
                     sl_dist = (sl - ltp) / ltp * 100
                     tgt_dist = (ltp - target) / ltp * 100
-                    print(f"{status} {symbol:13} {'SHORT':6} ₹{entry:>9.2f} ₹{ltp:>9.2f} ₹{sl:>9.2f} ₹{target:>9.2f} ₹{pnl:>+10,.0f} ({pnl_pct:+.1f}%) {status_flags}")
+                    print(f"{status} {symbol:13} {'SHORT':6} ₹{entry:>9.2f} ₹{ltp:>9.2f} ₹{sl:>9.2f} ₹{target:>9.2f} ₹{pnl:>+10,.0f} ({pnl_pct:+.1f}%) {_type_tag:10} {status_flags}")
                     print(f"   └─ SL: {sl_dist:.1f}% away | Target: {tgt_dist:.1f}% away")
         
         # Print summary after all positions
@@ -2876,6 +3264,17 @@ class AutonomousTrader:
                 except Exception as _mt_err:
                     print(f"   ⚠️ Model-tracker error (non-fatal): {_mt_err}")
                     _model_tracker_placed = []
+                
+                # === GMM SNIPER TRADE: 1 highest-conviction trade per cycle, 2x lots ===
+                # Picks the cleanest GMM candidate (lowest dr_score) with strict gates.
+                # Separate from model-tracker — this is the alpha trade.
+                try:
+                    _sniper_placed = self._place_gmm_sniper_trade(
+                        _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
+                    )
+                except Exception as _snp_err:
+                    print(f"   ⚠️ GMM Sniper error (non-fatal): {_snp_err}")
+                    _sniper_placed = None
                 
                 # === OI SNAPSHOT LOGGER: Collect data for future model retraining ===
                 # Now includes NSE OI change data (richer than Kite-only snapshots)
@@ -4327,13 +4726,85 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         
                         print(f"   🔄 Direct-placing {sym} ({direction}) — parsed from GPT analysis")
                         
+                        # ── ML DIRECTION CONFLICT FILTER (GPT direct-place) ──
+                        _gpt_was_flipped = False
+                        from config import ML_DIRECTION_CONFLICT
+                        _gpt_dir_cfg = ML_DIRECTION_CONFLICT
+                        if _gpt_dir_cfg.get('enabled', False) and _gpt_dir_cfg.get('block_gpt_trades', True):
+                            _gpt_ml = getattr(self, '_cycle_ml_results', {}).get(f'NSE:{sym}', {})
+                            _gpt_ml_signal = _gpt_ml.get('ml_signal', 'UNKNOWN')
+                            _gpt_move_prob = _gpt_ml.get('ml_move_prob', _gpt_ml.get('ml_p_move', 0.0))
+                            _gpt_dr_score = _gpt_ml.get('ml_down_risk_score', 0.0)
+                            _gpt_xgb_disagrees = False
+                            if direction == 'BUY' and _gpt_ml_signal == 'DOWN' and _gpt_move_prob >= _gpt_dir_cfg.get('min_xgb_confidence', 0.55):
+                                _gpt_xgb_disagrees = True
+                            elif direction == 'SELL' and _gpt_ml_signal == 'UP' and _gpt_move_prob >= _gpt_dir_cfg.get('min_xgb_confidence', 0.55):
+                                _gpt_xgb_disagrees = True
+                            
+                            if _gpt_xgb_disagrees:
+                                # XGB actively opposes trade. GMM regime follows XGB signal,
+                                # so it also opposes trade direction. Check if GMM confirms
+                                # the opposing direction is genuine (dr_flag=False) → FLIP
+                                if not _gpt_ml.get('ml_down_risk_flag', False):
+                                    # GMM confirms XGB's opposing direction → FLIP to ML direction
+                                    old_direction = direction
+                                    direction = 'BUY' if _gpt_ml_signal == 'UP' else 'SELL'
+                                    _gpt_was_flipped = True
+                                    print(f"   🔄 GPT ML OVERRIDE: {sym} — XGB={_gpt_ml_signal} + GMM confirms "
+                                          f"(dr={_gpt_dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
+                                _gpt_gmm_caution = _gpt_dr_score > _gpt_dir_cfg.get('gmm_caution_threshold', 0.15)
+                                if _gpt_gmm_caution:
+                                    # HARD BLOCK: Both XGB and GMM disagree — skip this GPT trade
+                                    print(f"   🚫 GPT DIRECTION BLOCK: {sym} — XGB={_gpt_ml_signal} vs GPT={direction}, "
+                                          f"GMM dr={_gpt_dr_score:.3f} → BOTH ML systems disagree, skipping")
+                                    continue
+                                else:
+                                    # SOFT WARNING: Only XGB disagrees but GMM is clean — allow with warning
+                                    print(f"   ⚠️ GPT XGB CONFLICT: {sym} — XGB={_gpt_ml_signal} vs GPT={direction}, "
+                                          f"GMM clean (dr={_gpt_dr_score:.3f}) → allowing with caution")
+                        
                         try:
+                            # Build ML data for GPT direct-place trades
+                            _gpt_ml_full = getattr(self, '_cycle_ml_results', {}).get(f'NSE:{sym}', {})
+                            _gpt_ml_data = {
+                                'smart_score': None,
+                                'p_score': getattr(self, '_cycle_pre_scores', {}).get(f'NSE:{sym}', 0),
+                                'dr_score': _gpt_ml_full.get('ml_down_risk_score', 0),
+                                'ml_move_prob': _gpt_ml_full.get('ml_move_prob', 0),
+                                'ml_confidence': _gpt_ml_full.get('ml_confidence', 0),
+                                'xgb_model': {
+                                    'signal': _gpt_ml_full.get('ml_signal', 'UNKNOWN'),
+                                    'move_prob': _gpt_ml_full.get('ml_move_prob', 0),
+                                    'prob_up': _gpt_ml_full.get('ml_prob_up', 0),
+                                    'prob_down': _gpt_ml_full.get('ml_prob_down', 0),
+                                    'prob_flat': _gpt_ml_full.get('ml_prob_flat', 0),
+                                    'direction_bias': _gpt_ml_full.get('ml_direction_bias', 0),
+                                    'confidence': _gpt_ml_full.get('ml_confidence', 0),
+                                    'score_boost': _gpt_ml_full.get('ml_score_boost', 0),
+                                    'direction_hint': _gpt_ml_full.get('ml_direction_hint', 'NEUTRAL'),
+                                    'model_type': _gpt_ml_full.get('ml_model_type', 'unknown'),
+                                    'sizing_factor': _gpt_ml_full.get('ml_sizing_factor', 1.0),
+                                },
+                                'gmm_model': {
+                                    'down_risk_score': _gpt_ml_full.get('ml_down_risk_score', 0),
+                                    'down_risk_flag': _gpt_ml_full.get('ml_down_risk_flag', False),
+                                    'down_risk_bucket': _gpt_ml_full.get('ml_down_risk_bucket', 'LOW'),
+                                    'gmm_confirms_direction': _gpt_ml_full.get('ml_gmm_confirms_direction', False),
+                                    'gmm_regime_used': _gpt_ml_full.get('ml_gmm_regime_used', None),
+                                    'gmm_action': 'GPT_DIRECT',
+                                },
+                                'scored_direction': direction,
+                                'xgb_disagrees': _gpt_xgb_disagrees if '_gpt_xgb_disagrees' in dir() else False,
+                            } if _gpt_ml_full else {}
+                            _gpt_setup_type = 'ML_OVERRIDE' if _gpt_was_flipped else 'GPT'
                             if sym in fno_prefer_set:
                                 result = self.tools.place_option_order(
                                     underlying=f"NSE:{sym}",
                                     direction=direction,
                                     strike_selection="ATM",
-                                    rationale=f"GPT identified {sym} as top setup ({direction})"
+                                    rationale=f"GPT identified {sym} as top setup ({direction})" + (" [ML-FLIPPED]" if _gpt_was_flipped else ""),
+                                    setup_type=_gpt_setup_type,
+                                    ml_data=_gpt_ml_data
                                 )
                             else:
                                 # For non-F&O, try option first then cash
@@ -4341,7 +4812,9 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                     underlying=f"NSE:{sym}",
                                     direction=direction,
                                     strike_selection="ATM",
-                                    rationale=f"GPT identified {sym} as top setup ({direction})"
+                                    rationale=f"GPT identified {sym} as top setup ({direction})" + (" [ML-FLIPPED]" if _gpt_was_flipped else ""),
+                                    setup_type=_gpt_setup_type,
+                                    ml_data=_gpt_ml_data
                                 )
                             if result:
                                 status = "PLACED" if result.get('success') else result.get('error', 'unknown')[:80]
@@ -4415,8 +4888,33 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             
             # Current portfolio state
             _total_open = len(_active_now)
+            _sniper_positions = [t for t in _active_now if t.get('is_sniper') or t.get('setup_type') == 'GMM_SNIPER']
+            _ml_override_positions = [t for t in _active_now if t.get('setup_type') == 'ML_OVERRIDE']
+            _model_tracker_positions = [t for t in _active_now if t.get('setup_type') in ('MODEL_TRACKER', 'GMM_BOOST')]
+            _gpt_positions = [t for t in _active_now if t.get('setup_type') in ('', 'MANUAL', 'GPT') or not t.get('setup_type')]
             if _total_open > 0:
-                print(f"\n💼 PORTFOLIO: {_total_open} positions ({len(_options_now)} options, {len(_spreads_now)} spreads, {len(_ics_now)} ICs)")
+                _breakdown_parts = []
+                if _sniper_positions:
+                    _breakdown_parts.append(f"🎯{len(_sniper_positions)} sniper")
+                if _ml_override_positions:
+                    _breakdown_parts.append(f"🔄{len(_ml_override_positions)} ML-override")
+                if _model_tracker_positions:
+                    _breakdown_parts.append(f"🧠{len(_model_tracker_positions)} score-based")
+                if _gpt_positions:
+                    _breakdown_parts.append(f"🤖{len(_gpt_positions)} GPT")
+                _breakdown = " | ".join(_breakdown_parts) if _breakdown_parts else f"{len(_options_now)} options"
+                print(f"\n💼 PORTFOLIO: {_total_open} positions ({_breakdown} | {len(_spreads_now)} spreads, {len(_ics_now)} ICs)")
+                
+                # Show sniper trades detail
+                if _sniper_positions:
+                    print(f"   🎯 SNIPER TRADES:")
+                    for st in _sniper_positions:
+                        _sym = st.get('underlying', st.get('symbol', '?')).replace('NSE:', '')
+                        _dir = st.get('direction', '?')
+                        _lots = st.get('lots', '?')
+                        _mult = st.get('lot_multiplier', 1.0)
+                        _entry = st.get('avg_price', 0)
+                        print(f"      {_sym} ({_dir}) | {_lots} lots ({_mult}x) | Entry: ₹{_entry:.2f}")
             else:
                 print(f"\n💼 PORTFOLIO: Empty — no open positions")
             
@@ -4619,7 +5117,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                     o.get('status') == 'COMPLETE' and 
                                     o.get('transaction_type') in ('SELL', 'BUY')):
                                     exit_price = o.get('average_price', 0)
-                    except:
+                    except Exception:
                         pass
                     
                     if not exit_price:
@@ -4627,7 +5125,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         try:
                             q = self.tools.kite.ltp([symbol])
                             exit_price = q[symbol]['last_price']
-                        except:
+                        except Exception:
                             exit_price = entry  # Last resort
                     
                     # Calculate P&L
@@ -4893,8 +5391,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             os.makedirs(summary_dir, exist_ok=True)
             summary_file = os.path.join(summary_dir, f'daily_summary_{today}.json')
             
-            with open(summary_file, 'w') as f:
-                json.dump(summary, f, indent=2)
+            atomic_json_save(summary_file, summary)
             print(f"\n  💾 Daily summary saved to: daily_summaries/daily_summary_{today}.json")
             
             # Flush OI collector buffers to parquet (EOD)
