@@ -1,4 +1,938 @@
 {
+  "EURINR": [
+    {
+      "id": "1545",
+      "sym": "EURINR-Jul2025-FUT",
+      "expiry": "2025-07-18 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3674",
+      "sym": "EURINR-Jul2025-FUT",
+      "expiry": "2025-07-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1100",
+      "sym": "EURINR-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2851",
+      "sym": "EURINR-Aug2025-FUT",
+      "expiry": "2025-08-01 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3142",
+      "sym": "EURINR-Aug2025-FUT",
+      "expiry": "2025-08-08 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1043",
+      "sym": "EURINR-Aug2025-FUT",
+      "expiry": "2025-08-14 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3944",
+      "sym": "EURINR-Aug2025-FUT",
+      "expiry": "2025-08-22 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4733",
+      "sym": "EURINR-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6819",
+      "sym": "EURINR-Aug2025-FUT",
+      "expiry": "2025-08-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4668",
+      "sym": "EURINR-Sep2025-FUT",
+      "expiry": "2025-09-04 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1119",
+      "sym": "EURINR-Sep2025-FUT",
+      "expiry": "2025-09-12 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1255",
+      "sym": "EURINR-Sep2025-FUT",
+      "expiry": "2025-09-19 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2364",
+      "sym": "EURINR-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2892",
+      "sym": "EURINR-Oct2025-FUT",
+      "expiry": "2025-10-03 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1005",
+      "sym": "EURINR-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1094",
+      "sym": "EURINR-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1799",
+      "sym": "EURINR-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2792",
+      "sym": "EURINR-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1007",
+      "sym": "EURINR-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2195",
+      "sym": "EURINR-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1147",
+      "sym": "EURINR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3150",
+      "sym": "EURINR-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6572",
+      "sym": "EURINR-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "11NSETEST": [
+    {
+      "id": "1009",
+      "sym": "11NSETEST-Dec2036-FUT",
+      "expiry": "2036-12-29 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "EURUSD": [
+    {
+      "id": "1169",
+      "sym": "EURUSD-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4734",
+      "sym": "EURUSD-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2365",
+      "sym": "EURUSD-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1031",
+      "sym": "EURUSD-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1097",
+      "sym": "EURUSD-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2118",
+      "sym": "EURUSD-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2819",
+      "sym": "EURUSD-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1013",
+      "sym": "EURUSD-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2198",
+      "sym": "EURUSD-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1149",
+      "sym": "EURUSD-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3157",
+      "sym": "EURUSD-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6597",
+      "sym": "EURUSD-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GBPINR": [
+    {
+      "id": "1586",
+      "sym": "GBPINR-Jul2025-FUT",
+      "expiry": "2025-07-18 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3675",
+      "sym": "GBPINR-Jul2025-FUT",
+      "expiry": "2025-07-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1186",
+      "sym": "GBPINR-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2862",
+      "sym": "GBPINR-Aug2025-FUT",
+      "expiry": "2025-08-01 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3143",
+      "sym": "GBPINR-Aug2025-FUT",
+      "expiry": "2025-08-08 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1056",
+      "sym": "GBPINR-Aug2025-FUT",
+      "expiry": "2025-08-14 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3948",
+      "sym": "GBPINR-Aug2025-FUT",
+      "expiry": "2025-08-22 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4735",
+      "sym": "GBPINR-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6826",
+      "sym": "GBPINR-Aug2025-FUT",
+      "expiry": "2025-08-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4669",
+      "sym": "GBPINR-Sep2025-FUT",
+      "expiry": "2025-09-04 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "14640",
+      "sym": "GBPINR-Sep2025-FUT",
+      "expiry": "2025-09-12 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1510",
+      "sym": "GBPINR-Sep2025-FUT",
+      "expiry": "2025-09-19 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2366",
+      "sym": "GBPINR-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2893",
+      "sym": "GBPINR-Oct2025-FUT",
+      "expiry": "2025-10-03 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1055",
+      "sym": "GBPINR-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1115",
+      "sym": "GBPINR-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2119",
+      "sym": "GBPINR-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2820",
+      "sym": "GBPINR-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1024",
+      "sym": "GBPINR-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2221",
+      "sym": "GBPINR-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1162",
+      "sym": "GBPINR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3180",
+      "sym": "GBPINR-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6598",
+      "sym": "GBPINR-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GBPUSD": [
+    {
+      "id": "1187",
+      "sym": "GBPUSD-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4736",
+      "sym": "GBPUSD-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2368",
+      "sym": "GBPUSD-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1069",
+      "sym": "GBPUSD-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1124",
+      "sym": "GBPUSD-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2120",
+      "sym": "GBPUSD-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2826",
+      "sym": "GBPUSD-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1027",
+      "sym": "GBPUSD-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2257",
+      "sym": "GBPUSD-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1182",
+      "sym": "GBPUSD-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3205",
+      "sym": "GBPUSD-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6599",
+      "sym": "GBPUSD-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "JPYINR": [
+    {
+      "id": "1591",
+      "sym": "JPYINR-Jul2025-FUT",
+      "expiry": "2025-07-18 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3915",
+      "sym": "JPYINR-Jul2025-FUT",
+      "expiry": "2025-07-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1228",
+      "sym": "JPYINR-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2880",
+      "sym": "JPYINR-Aug2025-FUT",
+      "expiry": "2025-08-01 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3145",
+      "sym": "JPYINR-Aug2025-FUT",
+      "expiry": "2025-08-08 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1060",
+      "sym": "JPYINR-Aug2025-FUT",
+      "expiry": "2025-08-14 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3956",
+      "sym": "JPYINR-Aug2025-FUT",
+      "expiry": "2025-08-22 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4737",
+      "sym": "JPYINR-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6831",
+      "sym": "JPYINR-Aug2025-FUT",
+      "expiry": "2025-08-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4670",
+      "sym": "JPYINR-Sep2025-FUT",
+      "expiry": "2025-09-04 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "14641",
+      "sym": "JPYINR-Sep2025-FUT",
+      "expiry": "2025-09-12 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1513",
+      "sym": "JPYINR-Sep2025-FUT",
+      "expiry": "2025-09-19 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2369",
+      "sym": "JPYINR-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2895",
+      "sym": "JPYINR-Oct2025-FUT",
+      "expiry": "2025-10-03 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1087",
+      "sym": "JPYINR-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1210",
+      "sym": "JPYINR-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2121",
+      "sym": "JPYINR-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2827",
+      "sym": "JPYINR-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1057",
+      "sym": "JPYINR-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2263",
+      "sym": "JPYINR-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1195",
+      "sym": "JPYINR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3219",
+      "sym": "JPYINR-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6600",
+      "sym": "JPYINR-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "USDINR": [
+    {
+      "id": "1594",
+      "sym": "USDINR-Jul2025-FUT",
+      "expiry": "2025-07-18 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3916",
+      "sym": "USDINR-Jul2025-FUT",
+      "expiry": "2025-07-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1229",
+      "sym": "USDINR-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2911",
+      "sym": "USDINR-Aug2025-FUT",
+      "expiry": "2025-08-01 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3146",
+      "sym": "USDINR-Aug2025-FUT",
+      "expiry": "2025-08-08 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1061",
+      "sym": "USDINR-Aug2025-FUT",
+      "expiry": "2025-08-14 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3958",
+      "sym": "USDINR-Aug2025-FUT",
+      "expiry": "2025-08-22 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4738",
+      "sym": "USDINR-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6871",
+      "sym": "USDINR-Aug2025-FUT",
+      "expiry": "2025-08-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4685",
+      "sym": "USDINR-Sep2025-FUT",
+      "expiry": "2025-09-04 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "14642",
+      "sym": "USDINR-Sep2025-FUT",
+      "expiry": "2025-09-12 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1518",
+      "sym": "USDINR-Sep2025-FUT",
+      "expiry": "2025-09-19 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2375",
+      "sym": "USDINR-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2912",
+      "sym": "USDINR-Oct2025-FUT",
+      "expiry": "2025-10-03 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1104",
+      "sym": "USDINR-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1212",
+      "sym": "USDINR-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2122",
+      "sym": "USDINR-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2932",
+      "sym": "USDINR-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1065",
+      "sym": "USDINR-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2264",
+      "sym": "USDINR-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1196",
+      "sym": "USDINR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3225",
+      "sym": "USDINR-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6601",
+      "sym": "USDINR-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "USDJPY": [
+    {
+      "id": "1350",
+      "sym": "USDJPY-Jul2025-FUT",
+      "expiry": "2025-07-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "4739",
+      "sym": "USDJPY-Aug2025-FUT",
+      "expiry": "2025-08-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2376",
+      "sym": "USDJPY-Sep2025-FUT",
+      "expiry": "2025-09-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1118",
+      "sym": "USDJPY-Oct2025-FUT",
+      "expiry": "2025-10-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1263",
+      "sym": "USDJPY-Nov2025-FUT",
+      "expiry": "2025-11-26 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2125",
+      "sym": "USDJPY-Dec2025-FUT",
+      "expiry": "2025-12-29 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2933",
+      "sym": "USDJPY-Jan2026-FUT",
+      "expiry": "2026-01-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1071",
+      "sym": "USDJPY-Feb2026-FUT",
+      "expiry": "2026-02-25 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "2269",
+      "sym": "USDJPY-Mar2026-FUT",
+      "expiry": "2026-03-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "1207",
+      "sym": "USDJPY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "3285",
+      "sym": "USDJPY-May2026-FUT",
+      "expiry": "2026-05-27 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "6602",
+      "sym": "USDJPY-Jun2026-FUT",
+      "expiry": "2026-06-26 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "011NSETEST": [
+    {
+      "id": "36687",
+      "sym": "011NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "021NSETEST": [
+    {
+      "id": "36690",
+      "sym": "021NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "031NSETEST": [
+    {
+      "id": "36691",
+      "sym": "031NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "041NSETEST": [
+    {
+      "id": "36694",
+      "sym": "041NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "051NSETEST": [
+    {
+      "id": "36697",
+      "sym": "051NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "061NSETEST": [
+    {
+      "id": "36700",
+      "sym": "061NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "071NSETEST": [
+    {
+      "id": "36702",
+      "sym": "071NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "081NSETEST": [
+    {
+      "id": "36709",
+      "sym": "081NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "091NSETEST": [
+    {
+      "id": "36713",
+      "sym": "091NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "101NSETEST": [
+    {
+      "id": "36715",
+      "sym": "101NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "111NSETEST": [
+    {
+      "id": "36716",
+      "sym": "111NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "121NSETEST": [
+    {
+      "id": "36718",
+      "sym": "121NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "131NSETEST": [
+    {
+      "id": "36720",
+      "sym": "131NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "141NSETEST": [
+    {
+      "id": "36721",
+      "sym": "141NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "151NSETEST": [
+    {
+      "id": "36724",
+      "sym": "151NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "161NSETEST": [
+    {
+      "id": "36725",
+      "sym": "161NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "171NSETEST": [
+    {
+      "id": "48576",
+      "sym": "171NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "181NSETEST": [
+    {
+      "id": "48577",
+      "sym": "181NSETEST-Nov2036-FUT",
+      "expiry": "2036-11-27 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "BANKNIFTY": [
     {
       "id": "59175",
@@ -39,6 +973,26 @@
       "type": "FUT"
     }
   ],
+  "MIDCPNIFTY": [
+    {
+      "id": "59181",
+      "sym": "MIDCPNIFTY-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51713",
+      "sym": "MIDCPNIFTY-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66690",
+      "sym": "MIDCPNIFTY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "NIFTY": [
     {
       "id": "59182",
@@ -55,6 +1009,306 @@
     {
       "id": "66691",
       "sym": "NIFTY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "NIFTYNXT50": [
+    {
+      "id": "59187",
+      "sym": "NIFTYNXT50-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51715",
+      "sym": "NIFTYNXT50-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66692",
+      "sym": "NIFTYNXT50-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "360ONE": [
+    {
+      "id": "59188",
+      "sym": "360ONE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51722",
+      "sym": "360ONE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66693",
+      "sym": "360ONE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ABB": [
+    {
+      "id": "59189",
+      "sym": "ABB-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51723",
+      "sym": "ABB-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66694",
+      "sym": "ABB-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ABCAPITAL": [
+    {
+      "id": "59190",
+      "sym": "ABCAPITAL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51724",
+      "sym": "ABCAPITAL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66695",
+      "sym": "ABCAPITAL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ADANIENSOL": [
+    {
+      "id": "59193",
+      "sym": "ADANIENSOL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51725",
+      "sym": "ADANIENSOL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66696",
+      "sym": "ADANIENSOL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ADANIENT": [
+    {
+      "id": "59194",
+      "sym": "ADANIENT-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51728",
+      "sym": "ADANIENT-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66703",
+      "sym": "ADANIENT-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ADANIGREEN": [
+    {
+      "id": "59201",
+      "sym": "ADANIGREEN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51729",
+      "sym": "ADANIGREEN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66704",
+      "sym": "ADANIGREEN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ADANIPORTS": [
+    {
+      "id": "59202",
+      "sym": "ADANIPORTS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51734",
+      "sym": "ADANIPORTS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66705",
+      "sym": "ADANIPORTS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ALKEM": [
+    {
+      "id": "59203",
+      "sym": "ALKEM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51735",
+      "sym": "ALKEM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66706",
+      "sym": "ALKEM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "AMBER": [
+    {
+      "id": "59204",
+      "sym": "AMBER-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51736",
+      "sym": "AMBER-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66707",
+      "sym": "AMBER-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "AMBUJACEM": [
+    {
+      "id": "59205",
+      "sym": "AMBUJACEM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51737",
+      "sym": "AMBUJACEM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66708",
+      "sym": "AMBUJACEM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ANGELONE": [
+    {
+      "id": "59206",
+      "sym": "ANGELONE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51747",
+      "sym": "ANGELONE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66709",
+      "sym": "ANGELONE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "APLAPOLLO": [
+    {
+      "id": "59207",
+      "sym": "APLAPOLLO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51748",
+      "sym": "APLAPOLLO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66710",
+      "sym": "APLAPOLLO-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "APOLLOHOSP": [
+    {
+      "id": "59208",
+      "sym": "APOLLOHOSP-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51756",
+      "sym": "APOLLOHOSP-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66711",
+      "sym": "APOLLOHOSP-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ASHOKLEY": [
+    {
+      "id": "59209",
+      "sym": "ASHOKLEY-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51757",
+      "sym": "ASHOKLEY-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66712",
+      "sym": "ASHOKLEY-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -79,6 +1333,66 @@
       "type": "FUT"
     }
   ],
+  "ASTRAL": [
+    {
+      "id": "59211",
+      "sym": "ASTRAL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51774",
+      "sym": "ASTRAL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66714",
+      "sym": "ASTRAL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "AUBANK": [
+    {
+      "id": "59213",
+      "sym": "AUBANK-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51795",
+      "sym": "AUBANK-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66715",
+      "sym": "AUBANK-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "AUROPHARMA": [
+    {
+      "id": "59214",
+      "sym": "AUROPHARMA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51796",
+      "sym": "AUROPHARMA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66716",
+      "sym": "AUROPHARMA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "AXISBANK": [
     {
       "id": "59215",
@@ -95,6 +1409,26 @@
     {
       "id": "66717",
       "sym": "AXISBANK-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BAJAJ": [
+    {
+      "id": "59216",
+      "sym": "BAJAJ-AUTO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51814",
+      "sym": "BAJAJ-AUTO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66718",
+      "sym": "BAJAJ-AUTO-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -119,6 +1453,26 @@
       "type": "FUT"
     }
   ],
+  "BAJAJHLDNG": [
+    {
+      "id": "51817",
+      "sym": "BAJAJHLDNG-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51818",
+      "sym": "BAJAJHLDNG-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66720",
+      "sym": "BAJAJHLDNG-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "BAJFINANCE": [
     {
       "id": "59255",
@@ -135,6 +1489,26 @@
     {
       "id": "66721",
       "sym": "BAJFINANCE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BANDHANBNK": [
+    {
+      "id": "59256",
+      "sym": "BANDHANBNK-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51820",
+      "sym": "BANDHANBNK-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66722",
+      "sym": "BANDHANBNK-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -159,6 +1533,86 @@
       "type": "FUT"
     }
   ],
+  "BANKINDIA": [
+    {
+      "id": "59258",
+      "sym": "BANKINDIA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51822",
+      "sym": "BANKINDIA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66724",
+      "sym": "BANKINDIA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BDL": [
+    {
+      "id": "59259",
+      "sym": "BDL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51823",
+      "sym": "BDL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66725",
+      "sym": "BDL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BEL": [
+    {
+      "id": "59260",
+      "sym": "BEL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51824",
+      "sym": "BEL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66726",
+      "sym": "BEL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BHARATFORG": [
+    {
+      "id": "59263",
+      "sym": "BHARATFORG-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51825",
+      "sym": "BHARATFORG-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66727",
+      "sym": "BHARATFORG-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "BHARTIARTL": [
     {
       "id": "59264",
@@ -175,6 +1629,86 @@
     {
       "id": "66728",
       "sym": "BHARTIARTL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BHEL": [
+    {
+      "id": "59267",
+      "sym": "BHEL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51827",
+      "sym": "BHEL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66729",
+      "sym": "BHEL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BIOCON": [
+    {
+      "id": "59268",
+      "sym": "BIOCON-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51828",
+      "sym": "BIOCON-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66730",
+      "sym": "BIOCON-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BLUESTARCO": [
+    {
+      "id": "59269",
+      "sym": "BLUESTARCO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51829",
+      "sym": "BLUESTARCO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66731",
+      "sym": "BLUESTARCO-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BOSCHLTD": [
+    {
+      "id": "59270",
+      "sym": "BOSCHLTD-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51830",
+      "sym": "BOSCHLTD-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66732",
+      "sym": "BOSCHLTD-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -199,6 +1733,66 @@
       "type": "FUT"
     }
   ],
+  "BRITANNIA": [
+    {
+      "id": "59276",
+      "sym": "BRITANNIA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51832",
+      "sym": "BRITANNIA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66734",
+      "sym": "BRITANNIA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "BSE": [
+    {
+      "id": "59277",
+      "sym": "BSE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51835",
+      "sym": "BSE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66735",
+      "sym": "BSE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "CAMS": [
+    {
+      "id": "59278",
+      "sym": "CAMS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51836",
+      "sym": "CAMS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66736",
+      "sym": "CAMS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "CANBK": [
     {
       "id": "59283",
@@ -219,6 +1813,66 @@
       "type": "FUT"
     }
   ],
+  "CDSL": [
+    {
+      "id": "59284",
+      "sym": "CDSL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51838",
+      "sym": "CDSL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66751",
+      "sym": "CDSL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "CGPOWER": [
+    {
+      "id": "59287",
+      "sym": "CGPOWER-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51843",
+      "sym": "CGPOWER-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66752",
+      "sym": "CGPOWER-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "CHOLAFIN": [
+    {
+      "id": "59288",
+      "sym": "CHOLAFIN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51844",
+      "sym": "CHOLAFIN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66753",
+      "sym": "CHOLAFIN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "CIPLA": [
     {
       "id": "59289",
@@ -235,6 +1889,266 @@
     {
       "id": "66776",
       "sym": "CIPLA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "COALINDIA": [
+    {
+      "id": "59290",
+      "sym": "COALINDIA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51848",
+      "sym": "COALINDIA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66777",
+      "sym": "COALINDIA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "COFORGE": [
+    {
+      "id": "59291",
+      "sym": "COFORGE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51849",
+      "sym": "COFORGE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66778",
+      "sym": "COFORGE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "COLPAL": [
+    {
+      "id": "59292",
+      "sym": "COLPAL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51850",
+      "sym": "COLPAL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66779",
+      "sym": "COLPAL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "CONCOR": [
+    {
+      "id": "59293",
+      "sym": "CONCOR-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51852",
+      "sym": "CONCOR-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66780",
+      "sym": "CONCOR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "CROMPTON": [
+    {
+      "id": "59294",
+      "sym": "CROMPTON-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51853",
+      "sym": "CROMPTON-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66781",
+      "sym": "CROMPTON-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "CUMMINSIND": [
+    {
+      "id": "59301",
+      "sym": "CUMMINSIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51859",
+      "sym": "CUMMINSIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66784",
+      "sym": "CUMMINSIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DABUR": [
+    {
+      "id": "59302",
+      "sym": "DABUR-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51860",
+      "sym": "DABUR-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66785",
+      "sym": "DABUR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DALBHARAT": [
+    {
+      "id": "59303",
+      "sym": "DALBHARAT-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51861",
+      "sym": "DALBHARAT-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66786",
+      "sym": "DALBHARAT-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DELHIVERY": [
+    {
+      "id": "59304",
+      "sym": "DELHIVERY-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51862",
+      "sym": "DELHIVERY-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66787",
+      "sym": "DELHIVERY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DIVISLAB": [
+    {
+      "id": "59305",
+      "sym": "DIVISLAB-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51865",
+      "sym": "DIVISLAB-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66788",
+      "sym": "DIVISLAB-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DIXON": [
+    {
+      "id": "59306",
+      "sym": "DIXON-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51866",
+      "sym": "DIXON-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66819",
+      "sym": "DIXON-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DLF": [
+    {
+      "id": "59307",
+      "sym": "DLF-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51871",
+      "sym": "DLF-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66820",
+      "sym": "DLF-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "DMART": [
+    {
+      "id": "59308",
+      "sym": "DMART-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51872",
+      "sym": "DMART-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66821",
+      "sym": "DMART-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -299,6 +2213,226 @@
       "type": "FUT"
     }
   ],
+  "EXIDEIND": [
+    {
+      "id": "59312",
+      "sym": "EXIDEIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51876",
+      "sym": "EXIDEIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66825",
+      "sym": "EXIDEIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "FEDERALBNK": [
+    {
+      "id": "59315",
+      "sym": "FEDERALBNK-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51877",
+      "sym": "FEDERALBNK-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66826",
+      "sym": "FEDERALBNK-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "FORTIS": [
+    {
+      "id": "59316",
+      "sym": "FORTIS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51878",
+      "sym": "FORTIS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66827",
+      "sym": "FORTIS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GAIL": [
+    {
+      "id": "59321",
+      "sym": "GAIL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51879",
+      "sym": "GAIL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66835",
+      "sym": "GAIL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GLENMARK": [
+    {
+      "id": "59322",
+      "sym": "GLENMARK-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51880",
+      "sym": "GLENMARK-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66836",
+      "sym": "GLENMARK-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GMRAIRPORT": [
+    {
+      "id": "59335",
+      "sym": "GMRAIRPORT-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51881",
+      "sym": "GMRAIRPORT-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66838",
+      "sym": "GMRAIRPORT-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GODREJCP": [
+    {
+      "id": "59338",
+      "sym": "GODREJCP-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51882",
+      "sym": "GODREJCP-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66839",
+      "sym": "GODREJCP-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GODREJPROP": [
+    {
+      "id": "59339",
+      "sym": "GODREJPROP-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51883",
+      "sym": "GODREJPROP-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66840",
+      "sym": "GODREJPROP-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "GRASIM": [
+    {
+      "id": "59340",
+      "sym": "GRASIM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51884",
+      "sym": "GRASIM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66841",
+      "sym": "GRASIM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "HAL": [
+    {
+      "id": "59341",
+      "sym": "HAL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51885",
+      "sym": "HAL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66842",
+      "sym": "HAL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "HAVELLS": [
+    {
+      "id": "59342",
+      "sym": "HAVELLS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51886",
+      "sym": "HAVELLS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66843",
+      "sym": "HAVELLS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "HCLTECH": [
     {
       "id": "59343",
@@ -319,6 +2453,26 @@
       "type": "FUT"
     }
   ],
+  "HDFCAMC": [
+    {
+      "id": "59344",
+      "sym": "HDFCAMC-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51892",
+      "sym": "HDFCAMC-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66845",
+      "sym": "HDFCAMC-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "HDFCBANK": [
     {
       "id": "59345",
@@ -335,6 +2489,26 @@
     {
       "id": "66846",
       "sym": "HDFCBANK-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "HDFCLIFE": [
+    {
+      "id": "59346",
+      "sym": "HDFCLIFE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51894",
+      "sym": "HDFCLIFE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66847",
+      "sym": "HDFCLIFE-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -379,6 +2553,26 @@
       "type": "FUT"
     }
   ],
+  "HINDPETRO": [
+    {
+      "id": "59349",
+      "sym": "HINDPETRO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51901",
+      "sym": "HINDPETRO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66850",
+      "sym": "HINDPETRO-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "HINDUNILVR": [
     {
       "id": "59350",
@@ -395,6 +2589,46 @@
     {
       "id": "66851",
       "sym": "HINDUNILVR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "HINDZINC": [
+    {
+      "id": "59351",
+      "sym": "HINDZINC-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51903",
+      "sym": "HINDZINC-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66852",
+      "sym": "HINDZINC-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "HUDCO": [
+    {
+      "id": "59352",
+      "sym": "HUDCO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51904",
+      "sym": "HUDCO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66853",
+      "sym": "HUDCO-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -419,6 +2653,46 @@
       "type": "FUT"
     }
   ],
+  "ICICIGI": [
+    {
+      "id": "59354",
+      "sym": "ICICIGI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51910",
+      "sym": "ICICIGI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66855",
+      "sym": "ICICIGI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ICICIPRULI": [
+    {
+      "id": "59355",
+      "sym": "ICICIPRULI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51912",
+      "sym": "ICICIPRULI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66856",
+      "sym": "ICICIPRULI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "IDEA": [
     {
       "id": "59356",
@@ -435,6 +2709,106 @@
     {
       "id": "66857",
       "sym": "IDEA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "IDFCFIRSTB": [
+    {
+      "id": "59357",
+      "sym": "IDFCFIRSTB-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51917",
+      "sym": "IDFCFIRSTB-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66858",
+      "sym": "IDFCFIRSTB-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "IEX": [
+    {
+      "id": "59358",
+      "sym": "IEX-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51918",
+      "sym": "IEX-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66859",
+      "sym": "IEX-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "INDHOTEL": [
+    {
+      "id": "59359",
+      "sym": "INDHOTEL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51919",
+      "sym": "INDHOTEL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66860",
+      "sym": "INDHOTEL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "INDIANB": [
+    {
+      "id": "59360",
+      "sym": "INDIANB-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51920",
+      "sym": "INDIANB-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66861",
+      "sym": "INDIANB-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "INDIGO": [
+    {
+      "id": "59372",
+      "sym": "INDIGO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51922",
+      "sym": "INDIGO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66862",
+      "sym": "INDIGO-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -459,6 +2833,26 @@
       "type": "FUT"
     }
   ],
+  "INDUSTOWER": [
+    {
+      "id": "59374",
+      "sym": "INDUSTOWER-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51928",
+      "sym": "INDUSTOWER-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66864",
+      "sym": "INDUSTOWER-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "INFY": [
     {
       "id": "59375",
@@ -475,6 +2869,66 @@
     {
       "id": "66865",
       "sym": "INFY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "INOXWIND": [
+    {
+      "id": "59378",
+      "sym": "INOXWIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51933",
+      "sym": "INOXWIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66866",
+      "sym": "INOXWIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "IOC": [
+    {
+      "id": "59379",
+      "sym": "IOC-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51934",
+      "sym": "IOC-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66867",
+      "sym": "IOC-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "IREDA": [
+    {
+      "id": "59381",
+      "sym": "IREDA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51935",
+      "sym": "IREDA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66868",
+      "sym": "IREDA-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -539,6 +2993,46 @@
       "type": "FUT"
     }
   ],
+  "JIOFIN": [
+    {
+      "id": "59389",
+      "sym": "JIOFIN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51947",
+      "sym": "JIOFIN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66872",
+      "sym": "JIOFIN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "JSWENERGY": [
+    {
+      "id": "59390",
+      "sym": "JSWENERGY-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51948",
+      "sym": "JSWENERGY-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66873",
+      "sym": "JSWENERGY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "JSWSTEEL": [
     {
       "id": "59391",
@@ -555,6 +3049,106 @@
     {
       "id": "66874",
       "sym": "JSWSTEEL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "JUBLFOOD": [
+    {
+      "id": "59392",
+      "sym": "JUBLFOOD-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51950",
+      "sym": "JUBLFOOD-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66875",
+      "sym": "JUBLFOOD-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "KALYANKJIL": [
+    {
+      "id": "59393",
+      "sym": "KALYANKJIL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51951",
+      "sym": "KALYANKJIL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66876",
+      "sym": "KALYANKJIL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "KAYNES": [
+    {
+      "id": "59394",
+      "sym": "KAYNES-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51952",
+      "sym": "KAYNES-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66877",
+      "sym": "KAYNES-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "KEI": [
+    {
+      "id": "59395",
+      "sym": "KEI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51953",
+      "sym": "KEI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66878",
+      "sym": "KEI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "KFINTECH": [
+    {
+      "id": "59396",
+      "sym": "KFINTECH-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51954",
+      "sym": "KFINTECH-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66879",
+      "sym": "KFINTECH-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -579,6 +3173,146 @@
       "type": "FUT"
     }
   ],
+  "KPITTECH": [
+    {
+      "id": "59398",
+      "sym": "KPITTECH-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51958",
+      "sym": "KPITTECH-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66881",
+      "sym": "KPITTECH-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LAURUSLABS": [
+    {
+      "id": "59399",
+      "sym": "LAURUSLABS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51961",
+      "sym": "LAURUSLABS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66882",
+      "sym": "LAURUSLABS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LICHSGFIN": [
+    {
+      "id": "59400",
+      "sym": "LICHSGFIN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51962",
+      "sym": "LICHSGFIN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66883",
+      "sym": "LICHSGFIN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LICI": [
+    {
+      "id": "59401",
+      "sym": "LICI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51963",
+      "sym": "LICI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66884",
+      "sym": "LICI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LODHA": [
+    {
+      "id": "59402",
+      "sym": "LODHA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51964",
+      "sym": "LODHA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66885",
+      "sym": "LODHA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LT": [
+    {
+      "id": "59403",
+      "sym": "LT-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51966",
+      "sym": "LT-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66886",
+      "sym": "LT-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LTF": [
+    {
+      "id": "59404",
+      "sym": "LTF-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51967",
+      "sym": "LTF-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66887",
+      "sym": "LTF-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "LTIM": [
     {
       "id": "59413",
@@ -595,6 +3329,26 @@
     {
       "id": "66888",
       "sym": "LTIM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "LUPIN": [
+    {
+      "id": "59414",
+      "sym": "LUPIN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51969",
+      "sym": "LUPIN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66889",
+      "sym": "LUPIN-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -619,6 +3373,66 @@
       "type": "FUT"
     }
   ],
+  "MANAPPURAM": [
+    {
+      "id": "59416",
+      "sym": "MANAPPURAM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51972",
+      "sym": "MANAPPURAM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66891",
+      "sym": "MANAPPURAM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MANKIND": [
+    {
+      "id": "59417",
+      "sym": "MANKIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51973",
+      "sym": "MANKIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66892",
+      "sym": "MANKIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MARICO": [
+    {
+      "id": "59418",
+      "sym": "MARICO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51974",
+      "sym": "MARICO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66896",
+      "sym": "MARICO-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "MARUTI": [
     {
       "id": "59419",
@@ -635,6 +3449,46 @@
     {
       "id": "66897",
       "sym": "MARUTI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MAXHEALTH": [
+    {
+      "id": "59420",
+      "sym": "MAXHEALTH-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51976",
+      "sym": "MAXHEALTH-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66898",
+      "sym": "MAXHEALTH-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MAZDOCK": [
+    {
+      "id": "59421",
+      "sym": "MAZDOCK-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51977",
+      "sym": "MAZDOCK-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66899",
+      "sym": "MAZDOCK-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -659,6 +3513,86 @@
       "type": "FUT"
     }
   ],
+  "MFSL": [
+    {
+      "id": "59423",
+      "sym": "MFSL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51979",
+      "sym": "MFSL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66901",
+      "sym": "MFSL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MOTHERSON": [
+    {
+      "id": "59424",
+      "sym": "MOTHERSON-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51980",
+      "sym": "MOTHERSON-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66902",
+      "sym": "MOTHERSON-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MPHASIS": [
+    {
+      "id": "59425",
+      "sym": "MPHASIS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51981",
+      "sym": "MPHASIS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66903",
+      "sym": "MPHASIS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "MUTHOOTFIN": [
+    {
+      "id": "59426",
+      "sym": "MUTHOOTFIN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51982",
+      "sym": "MUTHOOTFIN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66904",
+      "sym": "MUTHOOTFIN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "NATIONALUM": [
     {
       "id": "59427",
@@ -675,6 +3609,66 @@
     {
       "id": "66905",
       "sym": "NATIONALUM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "NAUKRI": [
+    {
+      "id": "59428",
+      "sym": "NAUKRI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51984",
+      "sym": "NAUKRI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66906",
+      "sym": "NAUKRI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "NBCC": [
+    {
+      "id": "59429",
+      "sym": "NBCC-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51985",
+      "sym": "NBCC-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66907",
+      "sym": "NBCC-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "NESTLEIND": [
+    {
+      "id": "59430",
+      "sym": "NESTLEIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51986",
+      "sym": "NESTLEIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66908",
+      "sym": "NESTLEIND-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -739,6 +3733,106 @@
       "type": "FUT"
     }
   ],
+  "NUVAMA": [
+    {
+      "id": "59434",
+      "sym": "NUVAMA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51990",
+      "sym": "NUVAMA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66950",
+      "sym": "NUVAMA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "NYKAA": [
+    {
+      "id": "59435",
+      "sym": "NYKAA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51993",
+      "sym": "NYKAA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66953",
+      "sym": "NYKAA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "OBEROIRLTY": [
+    {
+      "id": "59436",
+      "sym": "OBEROIRLTY-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51994",
+      "sym": "OBEROIRLTY-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66954",
+      "sym": "OBEROIRLTY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "OFSS": [
+    {
+      "id": "59437",
+      "sym": "OFSS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51995",
+      "sym": "OFSS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66955",
+      "sym": "OFSS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "OIL": [
+    {
+      "id": "59438",
+      "sym": "OIL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51996",
+      "sym": "OIL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66959",
+      "sym": "OIL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "ONGC": [
     {
       "id": "59439",
@@ -755,6 +3849,206 @@
     {
       "id": "66960",
       "sym": "ONGC-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PAGEIND": [
+    {
+      "id": "59440",
+      "sym": "PAGEIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51998",
+      "sym": "PAGEIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66961",
+      "sym": "PAGEIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PATANJALI": [
+    {
+      "id": "59441",
+      "sym": "PATANJALI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "51999",
+      "sym": "PATANJALI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66962",
+      "sym": "PATANJALI-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PAYTM": [
+    {
+      "id": "59442",
+      "sym": "PAYTM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52000",
+      "sym": "PAYTM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66963",
+      "sym": "PAYTM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PERSISTENT": [
+    {
+      "id": "59443",
+      "sym": "PERSISTENT-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52001",
+      "sym": "PERSISTENT-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66964",
+      "sym": "PERSISTENT-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PETRONET": [
+    {
+      "id": "59444",
+      "sym": "PETRONET-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52002",
+      "sym": "PETRONET-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66965",
+      "sym": "PETRONET-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PFC": [
+    {
+      "id": "59445",
+      "sym": "PFC-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52003",
+      "sym": "PFC-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66966",
+      "sym": "PFC-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PGEL": [
+    {
+      "id": "59446",
+      "sym": "PGEL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52004",
+      "sym": "PGEL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66967",
+      "sym": "PGEL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PHOENIXLTD": [
+    {
+      "id": "59447",
+      "sym": "PHOENIXLTD-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52005",
+      "sym": "PHOENIXLTD-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66968",
+      "sym": "PHOENIXLTD-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PIDILITIND": [
+    {
+      "id": "59448",
+      "sym": "PIDILITIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52006",
+      "sym": "PIDILITIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66969",
+      "sym": "PIDILITIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PIIND": [
+    {
+      "id": "59449",
+      "sym": "PIIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52007",
+      "sym": "PIIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66970",
+      "sym": "PIIND-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -779,6 +4073,66 @@
       "type": "FUT"
     }
   ],
+  "PNBHOUSING": [
+    {
+      "id": "59451",
+      "sym": "PNBHOUSING-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52010",
+      "sym": "PNBHOUSING-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66984",
+      "sym": "PNBHOUSING-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "POLICYBZR": [
+    {
+      "id": "59452",
+      "sym": "POLICYBZR-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52011",
+      "sym": "POLICYBZR-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66985",
+      "sym": "POLICYBZR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "POLYCAB": [
+    {
+      "id": "59453",
+      "sym": "POLYCAB-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52012",
+      "sym": "POLYCAB-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66986",
+      "sym": "POLYCAB-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "POWERGRID": [
     {
       "id": "59454",
@@ -795,6 +4149,126 @@
     {
       "id": "66987",
       "sym": "POWERGRID-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "POWERINDIA": [
+    {
+      "id": "59455",
+      "sym": "POWERINDIA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52014",
+      "sym": "POWERINDIA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66988",
+      "sym": "POWERINDIA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PPLPHARMA": [
+    {
+      "id": "59456",
+      "sym": "PPLPHARMA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52015",
+      "sym": "PPLPHARMA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66998",
+      "sym": "PPLPHARMA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PREMIERENE": [
+    {
+      "id": "52017",
+      "sym": "PREMIERENE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52018",
+      "sym": "PREMIERENE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "66999",
+      "sym": "PREMIERENE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "PRESTIGE": [
+    {
+      "id": "59457",
+      "sym": "PRESTIGE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52019",
+      "sym": "PRESTIGE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67000",
+      "sym": "PRESTIGE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "RBLBANK": [
+    {
+      "id": "59458",
+      "sym": "RBLBANK-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52020",
+      "sym": "RBLBANK-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67001",
+      "sym": "RBLBANK-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "RECLTD": [
+    {
+      "id": "59459",
+      "sym": "RECLTD-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52021",
+      "sym": "RECLTD-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67002",
+      "sym": "RECLTD-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -819,6 +4293,26 @@
       "type": "FUT"
     }
   ],
+  "RVNL": [
+    {
+      "id": "59461",
+      "sym": "RVNL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52024",
+      "sym": "RVNL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67004",
+      "sym": "RVNL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "SAIL": [
     {
       "id": "59462",
@@ -835,6 +4329,66 @@
     {
       "id": "67005",
       "sym": "SAIL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SAMMAANCAP": [
+    {
+      "id": "59463",
+      "sym": "SAMMAANCAP-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52027",
+      "sym": "SAMMAANCAP-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67006",
+      "sym": "SAMMAANCAP-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SBICARD": [
+    {
+      "id": "59464",
+      "sym": "SBICARD-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52028",
+      "sym": "SBICARD-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67007",
+      "sym": "SBICARD-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SBILIFE": [
+    {
+      "id": "59465",
+      "sym": "SBILIFE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52029",
+      "sym": "SBILIFE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67008",
+      "sym": "SBILIFE-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -859,6 +4413,126 @@
       "type": "FUT"
     }
   ],
+  "SHREECEM": [
+    {
+      "id": "59467",
+      "sym": "SHREECEM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52031",
+      "sym": "SHREECEM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67010",
+      "sym": "SHREECEM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SHRIRAMFIN": [
+    {
+      "id": "59468",
+      "sym": "SHRIRAMFIN-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52033",
+      "sym": "SHRIRAMFIN-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67011",
+      "sym": "SHRIRAMFIN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SIEMENS": [
+    {
+      "id": "59469",
+      "sym": "SIEMENS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52034",
+      "sym": "SIEMENS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67012",
+      "sym": "SIEMENS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SOLARINDS": [
+    {
+      "id": "59470",
+      "sym": "SOLARINDS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52035",
+      "sym": "SOLARINDS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67013",
+      "sym": "SOLARINDS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SONACOMS": [
+    {
+      "id": "59471",
+      "sym": "SONACOMS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52036",
+      "sym": "SONACOMS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67014",
+      "sym": "SONACOMS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SRF": [
+    {
+      "id": "59472",
+      "sym": "SRF-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52037",
+      "sym": "SRF-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67015",
+      "sym": "SRF-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "SUNPHARMA": [
     {
       "id": "59473",
@@ -875,6 +4549,120 @@
     {
       "id": "67016",
       "sym": "SUNPHARMA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SUPREMEIND": [
+    {
+      "id": "59474",
+      "sym": "SUPREMEIND-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52039",
+      "sym": "SUPREMEIND-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67017",
+      "sym": "SUPREMEIND-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SUZLON": [
+    {
+      "id": "59475",
+      "sym": "SUZLON-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52040",
+      "sym": "SUZLON-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67018",
+      "sym": "SUZLON-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SWIGGY": [
+    {
+      "id": "52045",
+      "sym": "SWIGGY-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52046",
+      "sym": "SWIGGY-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67019",
+      "sym": "SWIGGY-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "SYNGENE": [
+    {
+      "id": "59476",
+      "sym": "SYNGENE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52047",
+      "sym": "SYNGENE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TATACONSUM": [
+    {
+      "id": "59481",
+      "sym": "TATACONSUM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52049",
+      "sym": "TATACONSUM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67020",
+      "sym": "TATACONSUM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TATAELXSI": [
+    {
+      "id": "59482",
+      "sym": "TATAELXSI-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52050",
+      "sym": "TATAELXSI-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67021",
+      "sym": "TATAELXSI-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -919,6 +4707,26 @@
       "type": "FUT"
     }
   ],
+  "TATATECH": [
+    {
+      "id": "59486",
+      "sym": "TATATECH-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52053",
+      "sym": "TATATECH-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67024",
+      "sym": "TATATECH-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "TCS": [
     {
       "id": "59489",
@@ -959,6 +4767,26 @@
       "type": "FUT"
     }
   ],
+  "TIINDIA": [
+    {
+      "id": "59491",
+      "sym": "TIINDIA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52056",
+      "sym": "TIINDIA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67027",
+      "sym": "TIINDIA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "TITAN": [
     {
       "id": "59492",
@@ -975,6 +4803,126 @@
     {
       "id": "67028",
       "sym": "TITAN-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TMPV": [
+    {
+      "id": "59493",
+      "sym": "TMPV-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52058",
+      "sym": "TMPV-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67029",
+      "sym": "TMPV-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TORNTPHARM": [
+    {
+      "id": "59494",
+      "sym": "TORNTPHARM-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52059",
+      "sym": "TORNTPHARM-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67030",
+      "sym": "TORNTPHARM-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TORNTPOWER": [
+    {
+      "id": "59495",
+      "sym": "TORNTPOWER-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52060",
+      "sym": "TORNTPOWER-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67031",
+      "sym": "TORNTPOWER-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TRENT": [
+    {
+      "id": "59496",
+      "sym": "TRENT-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52061",
+      "sym": "TRENT-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67032",
+      "sym": "TRENT-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "TVSMOTOR": [
+    {
+      "id": "59497",
+      "sym": "TVSMOTOR-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52062",
+      "sym": "TVSMOTOR-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67033",
+      "sym": "TVSMOTOR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ULTRACEMCO": [
+    {
+      "id": "59498",
+      "sym": "ULTRACEMCO-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52063",
+      "sym": "ULTRACEMCO-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67034",
+      "sym": "ULTRACEMCO-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -999,6 +4947,86 @@
       "type": "FUT"
     }
   ],
+  "UNITDSPR": [
+    {
+      "id": "59500",
+      "sym": "UNITDSPR-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52065",
+      "sym": "UNITDSPR-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67036",
+      "sym": "UNITDSPR-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "UNOMINDA": [
+    {
+      "id": "59501",
+      "sym": "UNOMINDA-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52066",
+      "sym": "UNOMINDA-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67037",
+      "sym": "UNOMINDA-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "UPL": [
+    {
+      "id": "59502",
+      "sym": "UPL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52067",
+      "sym": "UPL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67038",
+      "sym": "UPL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "VBL": [
+    {
+      "id": "59503",
+      "sym": "VBL-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52068",
+      "sym": "VBL-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67039",
+      "sym": "VBL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
   "VEDL": [
     {
       "id": "59517",
@@ -1015,6 +5043,46 @@
     {
       "id": "67040",
       "sym": "VEDL-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "VOLTAS": [
+    {
+      "id": "59518",
+      "sym": "VOLTAS-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52070",
+      "sym": "VOLTAS-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67041",
+      "sym": "VOLTAS-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "WAAREEENER": [
+    {
+      "id": "52072",
+      "sym": "WAAREEENER-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52073",
+      "sym": "WAAREEENER-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67042",
+      "sym": "WAAREEENER-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
       "type": "FUT"
     }
@@ -1056,6 +5124,34 @@
       "id": "67044",
       "sym": "YESBANK-Apr2026-FUT",
       "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "ZYDUSLIFE": [
+    {
+      "id": "59521",
+      "sym": "ZYDUSLIFE-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "52090",
+      "sym": "ZYDUSLIFE-Mar2026-FUT",
+      "expiry": "2026-03-30 14:30:00",
+      "type": "FUT"
+    },
+    {
+      "id": "67045",
+      "sym": "ZYDUSLIFE-Apr2026-FUT",
+      "expiry": "2026-04-28 14:30:00",
+      "type": "FUT"
+    }
+  ],
+  "IRCTC": [
+    {
+      "id": "59380",
+      "sym": "IRCTC-Feb2026-FUT",
+      "expiry": "2026-02-24 14:30:00",
       "type": "FUT"
     }
   ]

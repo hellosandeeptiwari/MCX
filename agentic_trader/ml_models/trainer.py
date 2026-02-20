@@ -240,6 +240,7 @@ def load_and_prepare_data(
     #   Train: oldest data → (end - test_days - val_days)
     #   Val:   (end - test_days - val_days) → (end - test_days)  [for early stopping]
     #   Test:  (end - test_days) → latest  [truly unseen evaluation]
+    combined['date'] = pd.to_datetime(combined['date'], utc=True)
     combined['_date'] = combined['date'].dt.date
     all_dates = sorted(combined['_date'].unique())
     total_holdout = test_days + val_days

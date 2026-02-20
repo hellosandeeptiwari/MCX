@@ -225,9 +225,10 @@ class AutonomousTrader:
         self._model_tracker_trades_today = 0
         self._model_tracker_date = datetime.now().date()
         self._model_tracker_symbols = set()
+        # _gmm_flip_count_today removed — GMM now used as veto/boost, not flip
         if DOWN_RISK_GATING.get('enabled'):
-            print(f"  🛡️ Down-Risk Soft Scoring: ACTIVE (+{DOWN_RISK_GATING.get('safe_bonus', 5)}/−{DOWN_RISK_GATING.get('risk_penalty', 5)} score adjust)")
-            print(f"  📊 Model Tracker: ACTIVE ({DOWN_RISK_GATING.get('model_tracker_trades', 3)} exclusive trades/day for model evaluation)")
+            print(f"  🛡️ Down-Risk Graduated Scoring: ACTIVE (boost +{DOWN_RISK_GATING.get('clean_boost', 8)} / caution −{DOWN_RISK_GATING.get('mid_risk_penalty', 8)} / block −{DOWN_RISK_GATING.get('high_risk_penalty', 15)})")
+            print(f"  📊 Model Tracker: ACTIVE ({DOWN_RISK_GATING.get('model_tracker_trades', 7)} exclusive trades/day for model evaluation)")
         
         # === ML MOVE PREDICTOR ===
         self._ml_predictor = None
@@ -604,22 +605,10 @@ class AutonomousTrader:
                 print(f"   ⛔ POSITION LIMIT: {len(active_positions)} >= {_max_pos} ({_elite_breadth} regime)")
                 break
             
-            # === ML DIRECTION OVERRIDE for elite auto-fire ===
-            # Same logic: if ML strongly disagrees with tech direction, flip.
-            _elite_ml_override = ""
-            try:
-                _cached_ml = cycle_decisions.get(sym, {}).get('ml_prediction', {})
-                _ml_dir = _cached_ml.get('ml_direction_hint', 'NEUTRAL')
-                if _ml_dir == 'BULLISH' and direction == 'SELL':
-                    direction = 'BUY'
-                    _elite_ml_override = " [ML_OVERRIDE:BUY]"
-                elif _ml_dir == 'BEARISH' and direction == 'BUY':
-                    direction = 'SELL'
-                    _elite_ml_override = " [ML_OVERRIDE:SELL]"
-            except Exception:
-                pass  # ML unavailable — proceed with original direction
+            # XGB Direction override REMOVED — direction comes from Titan scorer only.
+            # GMM veto/boost is applied in model-tracker, not in elite auto-fire.
             
-            print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}{_elite_ml_override}")
+            print(f"\n   🎯 ELITE AUTO-FIRE: {sym} score={score:.0f} direction={direction}")
             
             try:
                 result = self.tools.place_option_order(
@@ -689,17 +678,26 @@ class AutonomousTrader:
             print(f"📅 New trading day — model-tracker counter reset")
     
     def _apply_down_risk_soft_scores(self, ml_results: dict, pre_scores: dict):
-        """Apply soft score adjustments (+bonus / −penalty) based on down-risk model.
+        """Apply graduated score adjustments based on continuous GMM anomaly score.
         
-        Does NOT block any trades — only nudges scores so the existing workflow
-        naturally favours safer candidates and de-prioritises risky ones.
+        Score-Graduated Soft Gating (symmetric for CE and PE):
+          Score > 0.7 (top ~10%)   → SOFT BLOCK: −15 (high crash/bear-trap risk)
+          Score > threshold         → CAUTION:    −8  (elevated risk)
+          Score < 0.3 (bottom ~30%) → BOOST:      +8  (genuine clean pattern)
+          Otherwise                → NEUTRAL      (no change)
+        
+        Does NOT hard-block any trades — only nudges scores so the existing
+        workflow naturally favours safer candidates and de-prioritises risky ones.
         Called once per scan cycle after ML predictions are merged.
         """
         if not self._down_risk_cfg.get('enabled', False):
             return
         
-        safe_bonus = self._down_risk_cfg.get('safe_bonus', 5)
-        risk_penalty = self._down_risk_cfg.get('risk_penalty', 5)
+        high_thresh = self._down_risk_cfg.get('high_risk_threshold', 0.7)
+        high_penalty = self._down_risk_cfg.get('high_risk_penalty', 15)
+        mid_penalty = self._down_risk_cfg.get('mid_risk_penalty', 8)
+        clean_thresh = self._down_risk_cfg.get('clean_threshold', 0.3)
+        clean_boost = self._down_risk_cfg.get('clean_boost', 8)
         adjustments = []
         
         for sym in list(pre_scores.keys()):
@@ -707,40 +705,59 @@ class AutonomousTrader:
             dr_flag = ml.get('ml_down_risk_flag', None)
             dr_score = ml.get('ml_down_risk_score', None)
             
-            if dr_flag is None:
+            if dr_score is None:
                 continue  # No down-risk prediction for this symbol
             
-            if dr_flag:
-                # Risky — penalise
-                pre_scores[sym] -= risk_penalty
-                adjustments.append(f"🔴 {sym.replace('NSE:', '')} −{risk_penalty} (dr={dr_score:.3f})")
-            else:
-                # Safe — reward
-                pre_scores[sym] += safe_bonus
-                adjustments.append(f"🟢 {sym.replace('NSE:', '')} +{safe_bonus} (dr={dr_score:.3f})")
+            gmm_regime = ml.get('ml_gmm_regime_used', 'UP')
+            
+            # Score-graduated response using continuous anomaly score
+            if dr_score > high_thresh:
+                # Top ~10% anomaly: strong penalty (likely crash or bear trap)
+                pre_scores[sym] -= high_penalty
+                adjustments.append(f"🔴 {sym.replace('NSE:', '')} −{high_penalty} (HIGH_{gmm_regime} dr={dr_score:.3f})")
+            elif dr_flag:
+                # Flagged but not extreme: moderate caution
+                pre_scores[sym] -= mid_penalty
+                adjustments.append(f"🟠 {sym.replace('NSE:', '')} −{mid_penalty} (CAUTION_{gmm_regime} dr={dr_score:.3f})")
+            elif dr_score < clean_thresh:
+                # Bottom ~30% anomaly: genuine clean pattern → boost
+                pre_scores[sym] += clean_boost
+                adjustments.append(f"🟢 {sym.replace('NSE:', '')} +{clean_boost} (CLEAN_{gmm_regime} dr={dr_score:.3f})")
+            # else: neutral zone — no adjustment
         
         if adjustments:
-            print(f"   🛡️ DOWN-RISK SOFT SCORE: {len(adjustments)} adjusted — {' | '.join(adjustments[:8])}")
+            print(f"   🛡️ GMM GRADUATED SCORE: {len(adjustments)} adjusted — {' | '.join(adjustments[:8])}")
             if len(adjustments) > 8:
                 print(f"      ... and {len(adjustments) - 8} more")
     
     def _place_model_tracker_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
-        """Place up to N exclusive model-tracker trades using SMART multi-factor selection.
+        """Place up to N exclusive model-tracker trades using GMM veto/boost selection.
         
         These are SEPARATE from the main trading workflow. The smart selector
-        combines multiple signals into a composite score and enforces
-        diversification rules so the 7 picks are well-spread.
+        combines Titan's technical direction (from IntradayScorer) with GMM
+        anomaly detection as a veto/boost filter.
         
-        Smart Selection Criteria (composite score):
-          1. ML confidence × direction probability  (conviction)
-          2. Down-risk safety (lower dr_score = bonus)
-          3. Pre-score strength (technical quality)
-          4. ML score boost (model agreement signal)
+        Dual-Regime GMM Veto/Boost Logic:
+          Titan scans top stocks, scores them, determines direction (CE/PE).
+          Two GMM models detect anomalous patterns:
+          
+          UP regime GMM (for CE/BUY candidates):
+            GMM HIGH (dr_flag=True) + CE → BLOCK (hidden crash risk, CE dies)
+            GMM LOW  (dr_flag=False) + CE → ALLOW (genuine UP, safe for calls)
+          
+          DOWN regime GMM (for PE/SELL candidates):
+            GMM HIGH (dr_flag=True) + PE → BLOCK (bear trap, hidden UP risk)
+            GMM LOW  (dr_flag=False) + PE → BOOST (genuine DOWN, PE profits)
+        
+        Smart Scoring (composite score):
+          1. Gate P(MOVE) × pre_score quality (conviction)
+          2. GMM anomaly-aware safety (direction-aware)
+          3. Technical strength from pre_score
+          4. Move probability bonus
         
         Diversification Rules:
           - Max 2 stocks per sector (avoid sector concentration)
-          - Mix of BUY and SELL when available (directional balance)
-          - No FLAT signals (need directional conviction)
+          - No HOLD direction (need conviction)
         """
         if not self._down_risk_cfg.get('enabled', False):
             return []
@@ -758,73 +775,104 @@ class AutonomousTrader:
         except Exception:
             _get_sector_mt = lambda s: ''
         
-        # ── Step 1: Build candidate pool with all signals ──
+        # ── Step 1: Build candidate pool with GMM veto/boost on Titan direction ──
+        # Direction comes from Titan's IntradayScorer (technicals), NOT XGB Direction model.
+        # GMM anomaly score decides: block, allow, or boost.
         raw_candidates = []
+        _cycle_decs = getattr(self.tools, '_cached_cycle_decisions', {})
+        
         for sym in pre_scores:
             ml = ml_results.get(sym, {})
             dr_score = ml.get('ml_down_risk_score', None)
             dr_flag = ml.get('ml_down_risk_flag', None)
             if dr_score is None or dr_flag is None:
                 continue
-            if dr_flag:
-                continue  # Only pick unflagged (safe) candidates
             if sym in self._model_tracker_symbols:
                 continue  # Already tracked today
             
-            # Direction from ML signal
-            ml_signal = ml.get('ml_signal', 'UNKNOWN')
-            if ml_signal == 'UP':
-                direction = 'BUY'
-            elif ml_signal == 'DOWN':
-                direction = 'SELL'
+            # ── Get Titan's technical direction from IntradayScorer ──
+            _cd = _cycle_decs.get(sym, {})
+            _decision = _cd.get('decision')
+            if _decision and hasattr(_decision, 'recommended_direction') and _decision.recommended_direction:
+                direction = _decision.recommended_direction
             else:
-                continue  # Skip FLAT / UNKNOWN — need directional conviction
+                continue  # No direction from scorer → skip
             
-            # Gather all available ML metrics
-            ml_confidence = ml.get('ml_confidence', 0.0)
-            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-            ml_score_boost = ml.get('ml_score_boost', 0)
+            if direction == 'HOLD':
+                continue  # Scorer couldn't determine direction → skip
+            
+            # ── DUAL-REGIME GMM VETO/BOOST LOGIC ──
+            # dr_flag behavior depends on which GMM regime was used:
+            #   UP regime (for BUY): dr_flag=True → hidden crash → block CE
+            #   DOWN regime (for SELL): dr_flag=True → bear trap → block PE
+            # The predictor.py routes: BUY→UP regime, SELL→DOWN regime
+            trade_type = 'MODEL_TRACKER'
+            gmm_action = 'ALLOW'  # default
+            gmm_regime = ml.get('ml_gmm_regime_used', 'UP')
+            
+            if direction == 'BUY':
+                # CE candidate — UP regime GMM was used
+                if dr_flag:
+                    # GMM HIGH (UP regime): hidden crash risk → BLOCK CE
+                    gmm_action = 'BLOCK'
+                    continue  # Hard block — crash incoming, CE will die
+                else:
+                    # GMM LOW (UP regime): genuine UP pattern → BOOST CE
+                    gmm_action = 'BOOST'
+                    trade_type = 'GMM_BOOST'
+            else:
+                # PE candidate (direction == 'SELL') — DOWN regime GMM was used
+                if dr_flag:
+                    # GMM HIGH (DOWN regime): bear trap / hidden UP → BLOCK PE
+                    gmm_action = 'BLOCK'
+                    continue  # Block — stock looks bearish but may rally
+                else:
+                    # GMM LOW (DOWN regime): genuine DOWN pattern → BOOST PE
+                    gmm_action = 'BOOST'
+                    trade_type = 'GMM_BOOST'
+            
+            # Gather available ML metrics (Gate model still runs)
+            ml_confidence = ml.get('ml_confidence', 0.0)  # Gate confidence
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))  # P(MOVE) from Gate
             p_score = pre_scores.get(sym, 0)
             sym_clean = sym.replace('NSE:', '')
             sector = _get_sector_mt(sym_clean)
             
-            # Direction-specific probability
-            if direction == 'BUY':
-                dir_prob = ml.get('ml_prob_up', ml.get('ml_p_up_given_move', 0.0))
-            else:
-                dir_prob = ml.get('ml_prob_down', ml.get('ml_p_down_given_move', 0.0))
+            # ── Gate floor: P(MOVE) must be meaningful ──
+            if ml_move_prob < 0.40:
+                continue  # Gate says stock unlikely to move — skip
             
-            # ── Composite smart score (higher = better pick) ──
-            # Weight 1: Conviction = confidence × direction probability (0-1 range → 0-40 pts)
-            conviction = ml_confidence * dir_prob * 40.0
+            # ── Composite smart score (dual-regime GMM-aware) ──
+            # Weight 1: Conviction = Gate P(MOVE) × pre_score quality (0-40 pts)
+            conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 40.0
             
-            # Weight 2: Safety = inverted dr_score (lower risk → higher score, 0-20 pts)
-            # dr_score typically 0.0 - 1.0; safest = 0.0
-            safety = (1.0 - min(dr_score, 1.0)) * 20.0
+            # Weight 2: Safety / GMM-awareness (0-25 pts)
+            # Both CE and PE get BOOST when GMM confirms — symmetric treatment
+            # Lower anomaly score = more genuine pattern = higher safety score
+            safety = (1.0 - min(dr_score, 1.0)) * 20.0 + 5.0  # up to 25 pts (boosted)
             
             # Weight 3: Technical strength = pre_score normalized (0-100 → 0-20 pts)
             technical = min(p_score, 100) * 0.20
             
-            # Weight 4: Model agreement = score_boost (−8 to +10 → 0-15 pts)
-            agreement = max(0, (ml_score_boost + 8)) * (15.0 / 18.0)
+            # Weight 4: Move probability bonus (0-1 → 0-15 pts)
+            # Increased weight since we no longer have direction model agreement signal
+            move_bonus = ml_move_prob * 15.0
             
-            # Weight 5: Move probability bonus (0-1 → 0-5 pts)
-            move_bonus = ml_move_prob * 5.0
-            
-            smart_score = conviction + safety + technical + agreement + move_bonus
+            smart_score = conviction + safety + technical + move_bonus
             
             raw_candidates.append({
                 'sym': sym,
                 'sym_clean': sym_clean,
                 'direction': direction,
+                'trade_type': trade_type,
+                'gmm_action': gmm_action,
                 'sector': sector or 'OTHER',
                 'smart_score': round(smart_score, 2),
                 'dr_score': dr_score,
+                'dr_flag': dr_flag,
                 'ml_confidence': ml_confidence,
-                'dir_prob': dir_prob,
                 'ml_move_prob': ml_move_prob,
                 'p_score': p_score,
-                'ml_score_boost': ml_score_boost,
             })
         
         if not raw_candidates:
@@ -851,41 +899,51 @@ class AutonomousTrader:
         if selected:
             buy_count = sum(1 for c in selected if c['direction'] == 'BUY')
             sell_count = len(selected) - buy_count
+            boost_count = sum(1 for c in selected if c['trade_type'] == 'GMM_BOOST')
             sectors_used = set(c['sector'] for c in selected)
             print(f"\n   🧠 MODEL-TRACKER SMART SELECT: {len(selected)} picks from {len(raw_candidates)} candidates")
-            print(f"      Direction mix: {buy_count} BUY / {sell_count} SELL | Sectors: {', '.join(sorted(sectors_used))}")
+            print(f"      Direction mix: {buy_count} BUY(CALL) / {sell_count} SELL(PUT) | GMM-boosted: {boost_count}")
+            print(f"      Sectors: {', '.join(sorted(sectors_used))}")
             for i, c in enumerate(selected, 1):
+                _type_tag = f" [{c['trade_type']}]" if c['trade_type'] != 'MODEL_TRACKER' else ''
+                _gmm_tag = f" dr={c['dr_score']:.3f}"
                 print(f"      #{i} {c['sym_clean']:<12s} {c['direction']:<4s} smart={c['smart_score']:5.1f} "
-                      f"(conf={c['ml_confidence']:.2f}, dir={c['dir_prob']:.2f}, dr={c['dr_score']:.3f}, "
-                      f"tech={c['p_score']:.0f}, boost={c['ml_score_boost']:+d}) [{c['sector']}]")
+                      f"(gate={c['ml_move_prob']:.2f}, dr={c['dr_score']:.3f}, "
+                      f"tech={c['p_score']:.0f}) [{c['sector']}]{_type_tag}{_gmm_tag}")
         
         # ── Step 4: Place trades ──
         placed = []
         for cand in selected:
             sym = cand['sym']
             direction = cand['direction']
+            trade_type = cand['trade_type']
             try:
-                print(f"\n   📊 MODEL-TRACKER TRADE: {cand['sym_clean']} ({direction}, smart={cand['smart_score']:.1f})")
+                _type_label = f" [{trade_type}]" if trade_type != 'MODEL_TRACKER' else ''
+                print(f"\n   📊 MODEL-TRACKER TRADE: {cand['sym_clean']} ({direction}, smart={cand['smart_score']:.1f}){_type_label}")
+                
+                # TODO: Wire score_tier_override='premium' for GMM_BOOST to increase lots
+                # For now, GMM_BOOST gets higher smart_score → naturally higher entry score
+                
                 result = self.tools.place_option_order(
                     underlying=sym,
                     direction=direction,
                     strike_selection="ATM",
-                    use_intraday_scoring=False,  # Bypass scorer — model-tracker evaluates model independently
-                    rationale=(f"MODEL-TRACKER smart-pick #{selected.index(cand)+1}: "
+                    use_intraday_scoring=False,  # Bypass scorer — model-tracker evaluates independently
+                    rationale=(f"{trade_type} smart-pick #{selected.index(cand)+1}: "
                               f"smart={cand['smart_score']:.1f}, dr={cand['dr_score']:.3f}, "
-                              f"conf={cand['ml_confidence']:.2f}, dir_p={cand['dir_prob']:.2f}, "
+                              f"gate={cand['ml_move_prob']:.2f}, gmm_action={cand['gmm_action']}, "
                               f"sector={cand['sector']}")
                 )
                 if result and result.get('success'):
-                    print(f"   ✅ MODEL-TRACKER PLACED: {cand['sym_clean']} ({direction}) [smart={cand['smart_score']:.1f}]")
+                    print(f"   ✅ MODEL-TRACKER PLACED: {cand['sym_clean']} ({direction}) [smart={cand['smart_score']:.1f}]{_type_label}")
                     self._model_tracker_symbols.add(sym)
                     self._model_tracker_trades_today += 1
                     placed.append(cand['sym_clean'])
-                    self._log_decision(cycle_time, sym, cand['p_score'], 'MODEL_TRACKER_PLACED',
+                    self._log_decision(cycle_time, sym, cand['p_score'], f'{trade_type}_PLACED',
                                       reason=(f"Smart pick: score={cand['smart_score']:.1f}, "
-                                             f"dr={cand['dr_score']:.3f}, conf={cand['ml_confidence']:.2f}, "
-                                             f"sector={cand['sector']}"),
-                                      direction=direction, setup='MODEL_TRACKER')
+                                             f"dr={cand['dr_score']:.3f}, gate={cand['ml_move_prob']:.2f}, "
+                                             f"gmm_action={cand['gmm_action']}, sector={cand['sector']}"),
+                                      direction=direction, setup=trade_type)
                 else:
                     error = result.get('error', 'unknown') if result else 'no result'
                     print(f"   ⚠️ Model-tracker failed for {cand['sym_clean']}: {error}")
@@ -3486,21 +3544,8 @@ class AutonomousTrader:
                             direction = "BUY"
                     
                     if setup_type and direction:
-                        # === ML DIRECTION OVERRIDE (smart flip) ===
-                        # If ML has HIGH conviction in opposite direction, flip CE↔PE.
-                        # Only triggers for BULLISH / BEARISH (≥60% directional confidence),
-                        # NOT for _LEAN variants (too weak to override technicals).
-                        _ml_override_tag = ""
-                        try:
-                            _ml_dir = _ml_results.get(symbol, {}).get('ml_direction_hint', 'NEUTRAL')
-                            if _ml_dir == 'BULLISH' and direction == 'SELL':
-                                direction = 'BUY'
-                                _ml_override_tag = " [🧠ML_OVERRIDE:CE]"
-                            elif _ml_dir == 'BEARISH' and direction == 'BUY':
-                                direction = 'SELL'
-                                _ml_override_tag = " [🧠ML_OVERRIDE:PE]"
-                        except Exception:
-                            pass  # ML unavailable — proceed with technical direction
+                        # XGB Direction override REMOVED — direction comes from technicals only.
+                        # GMM veto/boost is applied in model-tracker, not in GPT path.
                         
                         opt_type = "CE" if direction == "BUY" else "PE"
                         wc_tag = " [⭐WILDCARD]" if is_wildcard else ""
@@ -3533,7 +3578,7 @@ class AutonomousTrader:
                             pass
                         
                         fno_opportunities.append(
-                            f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]{_fno_score_tag}{_ml_tag}{_oi_tag}{wc_tag}{_ml_override_tag}"
+                            f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]{_fno_score_tag}{_ml_tag}{_oi_tag}{wc_tag}"
                         )
             
             # === PROACTIVE DEBIT SPREAD SCANNER ===

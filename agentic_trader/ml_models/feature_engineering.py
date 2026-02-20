@@ -314,31 +314,55 @@ def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame 
     else:
         df['oi_price_confirm'] = 0.0
     
+    # 11. Previous day's return (%) — momentum carry-over signal
+    #     Yesterday's direction tends to persist (especially in first hour)
+    df['prev_day_return'] = _prev_day_return(df)
+    
+    # 12. VWAP slope — rate of change of VWAP over 6 candles
+    #     Rising VWAP = institutional buying (money-weighted price increasing)
+    #     Falling VWAP = institutional selling
+    vwap_vals = df['vwap'].values
+    vwap_roc = np.zeros(len(vwap_vals))
+    _vwap_prev = vwap_vals[:-6]
+    vwap_roc[6:] = np.where(_vwap_prev > 0,
+                            (vwap_vals[6:] - _vwap_prev) / _vwap_prev * 100, 0)
+    df['vwap_slope'] = vwap_roc
+    
+    # 13. Close vs previous day's high-low range — breakout/breakdown detection
+    #     > +1 = above yesterday's high (bullish breakout)
+    #     < -1 = below yesterday's low (bearish breakdown)
+    #     -1 to +1 = inside yesterday's range (0 = midpoint)
+    df['close_vs_prev_range'] = _close_vs_prev_range(df)
+    
+    # 14. 2-hour momentum (fills gap between roc_12 and day_return_pct)
+    df['roc_24'] = pd.Series(c).pct_change(24).values * 100
+    
+    # 15. Buying/selling climax — volume spike at price extremes (Wyckoff signal)
+    #     Distribution top: big volume + up candle near highs → exhaustion
+    #     Capitulation bottom: big volume + down candle near lows → reversal
+    vol_surge = np.where(vol_ma20 > 0, v / vol_ma20, 1.0)
+    candle_dir = np.sign(c - o)
+    day_pos = df['day_position'].values
+    df['buying_climax'] = np.where(vol_surge > 2.0,
+                                    candle_dir * (day_pos - 0.5) * np.minimum(vol_surge, 5.0),
+                                    0.0)
+    
+    # 16. ATR-normalized day return — how significant is today's move?
+    #     A 1% return in a 0.5% ATR stock = 2× normal (very significant)
+    #     A 1% return in a 2% ATR stock = 0.5× normal (just noise)
+    day_ret = df['day_return_pct'].values
+    df['atr_norm_day_return'] = np.where(df['atr_pct'].values > 0,
+                                          day_ret / df['atr_pct'].values,
+                                          0.0)
+    
     # === CROSS-FEATURE INTERACTION FEATURES ===
-    # Following the oi_price_confirm pattern — interactions between directional signals
-    # compound their predictive power for UP vs DOWN.
+    # Only keep interactions that survived feature importance pruning (>0.3%)
     
-    # 11. CMF × momentum alignment — money flow agrees with multi-TF momentum?
-    #     Strong positive = institutional buying + all timeframes bullish
-    df['cmf_x_momentum'] = df['cmf_20'].values * df['momentum_alignment'].values
-    
-    # 12. Volume direction × trend consistency — volume flow + candle pattern agree?
-    df['voldir_x_trend'] = df['volume_direction'].values * df['trend_consistency'].values
-    
-    # 13. Net buying pressure × ATR-normalized momentum — buying conviction + price move
+    # Net buying pressure × ATR-normalized momentum — buying conviction + price move
     df['pressure_x_mom'] = df['net_buying_pressure'].values * df['momentum_atr_norm'].values
     
-    # 14. ORB signal × volume ratio — breakout with volume confirmation
+    # ORB signal × volume ratio — breakout with volume confirmation
     df['orb_x_volume'] = df['orb_signal'].values * np.clip(df['volume_ratio'].values, 0, 5)
-    
-    # 15. EMA trend × OBV direction — trend direction confirmed by volume flow
-    sig_ema_spread = np.sign(df['ema_spread'].values)
-    sig_obv = np.sign(df['obv_slope'].values)
-    df['ema_obv_confirm'] = sig_ema_spread * sig_obv  # +1=agree, -1=disagree
-    
-    # 16. RSI deviation from neutral × momentum alignment — overbought/oversold + direction
-    rsi_dev = (df['rsi_14'].values - 50.0) / 50.0  # -1 to +1
-    df['rsi_x_alignment'] = rsi_dev * df['momentum_alignment'].values
     
     # === NIFTY50 MARKET CONTEXT FEATURES ===
     if nifty_5min_df is not None and len(nifty_5min_df) > 50:
@@ -357,81 +381,6 @@ def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame 
     else:
         for col in _get_sector_feature_names():
             df[col] = 0.0
-    
-    # === BOS / SWEEP STRUCTURAL FEATURES ===
-    # Break of Structure (BOS): price breaks AND closes beyond a swing level → continuation
-    # Liquidity Sweep: price wicks beyond a swing level but closes back inside → reversal trap
-    # Uses fractal swing detection: high/low that is higher/lower than 3 bars left + 1 bar right
-    # No existing feature captures "wick crossed a structural level" — wick ratios only measure shape.
-    df['bos_signal'] = 0.0   # +1 = break above swing high, -1 = break below swing low
-    df['sweep_signal'] = 0.0  # +1 = sweep of highs (fake breakout), -1 = sweep of lows (fake breakdown)
-    
-    lookback = 15  # candles to scan for swing points
-    left_bars = 3  # bars left of pivot that must be lower/higher
-    right_bars = 1  # bars right of pivot that must be lower/higher
-    
-    for i in range(lookback + 1, len(df)):
-        seg_h = h[max(0, i - lookback):i]
-        seg_l = l[max(0, i - lookback):i]
-        n_seg = len(seg_h)
-        
-        # Find most recent swing high (fractal)
-        swing_high = 0.0
-        for si in range(n_seg - 1 - right_bars, max(left_bars - 1, 0), -1):
-            is_pivot = True
-            for lb in range(1, left_bars + 1):
-                if si - lb >= 0 and seg_h[si] <= seg_h[si - lb]:
-                    is_pivot = False
-                    break
-            if is_pivot:
-                for rb in range(1, right_bars + 1):
-                    if si + rb < n_seg and seg_h[si] <= seg_h[si + rb]:
-                        is_pivot = False
-                        break
-            if is_pivot:
-                swing_high = seg_h[si]
-                break
-        
-        # Find most recent swing low (fractal)
-        swing_low = 0.0
-        for si in range(n_seg - 1 - right_bars, max(left_bars - 1, 0), -1):
-            is_pivot = True
-            for lb in range(1, left_bars + 1):
-                if si - lb >= 0 and seg_l[si] >= seg_l[si - lb]:
-                    is_pivot = False
-                    break
-            if is_pivot:
-                for rb in range(1, right_bars + 1):
-                    if si + rb < n_seg and seg_l[si] >= seg_l[si + rb]:
-                        is_pivot = False
-                        break
-            if is_pivot:
-                swing_low = seg_l[si]
-                break
-        
-        cur_high = h[i]
-        cur_low = l[i]
-        cur_close = c[i]
-        
-        # BOS / Sweep detection for highs
-        if swing_high > 0 and cur_high > swing_high:
-            if cur_close > swing_high:
-                df.iloc[i, df.columns.get_loc('bos_signal')] = 1.0   # confirmed breakout
-            else:
-                df.iloc[i, df.columns.get_loc('sweep_signal')] = 1.0  # fake breakout
-        
-        # BOS / Sweep detection for lows
-        if swing_low > 0 and cur_low < swing_low:
-            if cur_close < swing_low:
-                df.iloc[i, df.columns.get_loc('bos_signal')] = -1.0  # confirmed breakdown
-            else:
-                df.iloc[i, df.columns.get_loc('sweep_signal')] = -1.0  # fake breakdown
-    
-    # Interaction: sweep × upper_wick → sweep + big wick = stronger reversal signal
-    df['sweep_x_wick'] = df['sweep_signal'].values * np.where(
-        df['sweep_signal'].values > 0, df['upper_wick'].values,
-        np.where(df['sweep_signal'].values < 0, df['lower_wick'].values, 0)
-    )
     
     # === CLEAN UP ===
     
@@ -857,27 +806,25 @@ def _get_direction_feature_names() -> list:
         'trend_consistency',       # Fraction of recent candles closing up (-1 to +1)
         'roc_3',                   # Short-term 15 min momentum
         'oi_price_confirm',        # Futures OI buildup × price direction
+        'prev_day_return',         # Previous day's full return (momentum carry)
+        'vwap_slope',              # VWAP rate of change (institutional direction)
+        'close_vs_prev_range',     # Close position vs prior day's range
+        'roc_24',                  # 2-hour momentum
+        'buying_climax',           # Volume spike at price extremes (Wyckoff)
+        'atr_norm_day_return',     # Day return normalized by ATR
     ]
 
 
 def _get_structure_feature_names() -> list:
-    """BOS/Sweep structural features — wick beyond swing level detection."""
-    return [
-        'bos_signal',              # +1=break above swing high, -1=break below swing low
-        'sweep_signal',            # +1=sweep of highs (trap), -1=sweep of lows (trap)
-        'sweep_x_wick',            # sweep signal × wick ratio (interaction)
-    ]
+    """Structural features (BOS/Sweep removed — 0% importance in both models)."""
+    return []
 
 
 def _get_interaction_feature_names() -> list:
-    """Cross-feature interaction names — signals that compound each other."""
+    """Cross-feature interaction names — only those with >0.3% importance."""
     return [
-        'cmf_x_momentum',          # CMF × momentum alignment
-        'voldir_x_trend',          # Volume direction × trend consistency
         'pressure_x_mom',          # Net buying pressure × ATR-norm momentum
         'orb_x_volume',            # ORB signal × volume ratio
-        'ema_obv_confirm',         # EMA direction × OBV direction agreement
-        'rsi_x_alignment',         # RSI deviation × momentum alignment
     ]
 
 
@@ -1026,6 +973,75 @@ def _first_hour_return(df: pd.DataFrame) -> np.ndarray:
     return result
 
 
+def _prev_day_return(df: pd.DataFrame) -> np.ndarray:
+    """Previous day's open-to-close return (%).
+    
+    For each candle today, returns yesterday's full-day return.
+    Captures momentum carry-over: strong up/down days tend to follow through.
+    """
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    prev_return = 0.0
+    prev_date = None
+    
+    for day, group in sorted(df_copy.groupby('_date'), key=lambda x: x[0]):
+        idx = group.index
+        if prev_date is not None:
+            result[idx] = prev_return
+        
+        day_open = group['open'].iloc[0]
+        day_close = group['close'].iloc[-1]
+        if day_open > 0:
+            prev_return = (day_close - day_open) / day_open * 100
+        else:
+            prev_return = 0.0
+        prev_date = day
+    
+    return result
+
+
+def _close_vs_prev_range(df: pd.DataFrame) -> np.ndarray:
+    """Current close position relative to previous day's high-low range.
+    
+    Returns:
+        > +1: above yesterday's high (bullish breakout)
+        < -1: below yesterday's low (bearish breakdown)
+        Between -1 and +1: inside yesterday's range (0 = midpoint)
+    Capped at ±3 to avoid extreme outliers.
+    """
+    result = np.zeros(len(df))
+    df_copy = df.copy()
+    df_copy['_date'] = df_copy['date'].dt.date
+    
+    prev_high = None
+    prev_low = None
+    prev_date = None
+    
+    for day, group in sorted(df_copy.groupby('_date'), key=lambda x: x[0]):
+        idx = group.index
+        if prev_date is not None and prev_high is not None and prev_low is not None:
+            prev_range = prev_high - prev_low
+            if prev_range > 0:
+                prev_mid = (prev_high + prev_low) / 2.0
+                closes = group['close'].values
+                above = closes > prev_high
+                below = closes < prev_low
+                inside = ~above & ~below
+                vals = np.zeros(len(closes))
+                vals[above] = np.minimum(3.0, (closes[above] - prev_high) / prev_range + 1.0)
+                vals[below] = np.maximum(-3.0, (closes[below] - prev_low) / prev_range - 1.0)
+                vals[inside] = (closes[inside] - prev_mid) / (prev_range / 2.0)
+                result[idx] = vals
+        
+        prev_high = group['high'].max()
+        prev_low = group['low'].min()
+        prev_date = day
+    
+    return result
+
+
 def _add_daily_context(intraday_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
     """Merge daily-derived context features onto each 5-min candle.
     
@@ -1121,13 +1137,28 @@ def _add_daily_context(intraday_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.
             'daily_rsi_14': float(d_rsi),
         }
     
+    # Forward-fill: for intraday dates AFTER the last daily date, use the
+    # latest available daily context.  Daily candles update EOD so today's
+    # live candles won't have today's daily yet — they should use yesterday's.
+    _daily_dates_sorted = sorted(context_by_date.keys()) if context_by_date else []
+    _last_daily_ctx = context_by_date[_daily_dates_sorted[-1]] if _daily_dates_sorted else None
+    
+    def _daily_lookup(d, c):
+        ctx = context_by_date.get(d)
+        if ctx:
+            return ctx.get(c, 0.0)
+        # Forward-fill: date beyond daily coverage → use latest
+        if _last_daily_ctx is not None and _daily_dates_sorted and d > _daily_dates_sorted[-1]:
+            return _last_daily_ctx.get(c, 0.0)
+        return 0.0
+    
     # Map daily context onto each 5-min candle
     intraday_df = intraday_df.copy()
     intraday_df['_date'] = intraday_df['date'].dt.date
     
     for col in _get_daily_feature_names():
         intraday_df[col] = intraday_df['_date'].map(
-            lambda d, c=col: context_by_date.get(d, {}).get(c, 0.0)
+            lambda d, c=col: _daily_lookup(d, c)
         )
     
     intraday_df.drop(columns=['_date'], inplace=True, errors='ignore')
@@ -1424,14 +1455,43 @@ def _add_futures_oi_context(intraday_df: pd.DataFrame, futures_oi_df: pd.DataFra
             for col in fut_features
         }
     
+    # Forward-fill: for intraday dates AFTER the last OI date, use the
+    # latest available OI row.  OI is updated EOD so today's live candles
+    # won't have today's OI yet — they should use yesterday's.
+    if len(foi) > 0:
+        _last_oi_row = foi.iloc[-1]
+        _last_oi_context = {
+            col: float(_last_oi_row[col]) if col in foi.columns and pd.notna(_last_oi_row[col])
+            else 0.0
+            for col in fut_features
+        }
+    else:
+        _last_oi_context = None
+    
     # Map onto each 5-min candle
     result = intraday_df.copy()
     result['_date'] = result['date'].dt.date
+    _ffill_logged = False
+    
+    def _lookup(d, c):
+        nonlocal _ffill_logged
+        val = context_by_date.get(d, {}).get(c)
+        if val is not None:
+            return val
+        # Forward-fill: date beyond OI coverage → use latest OI
+        if _last_oi_context is not None and len(sorted_dates) > 0 and d > sorted_dates[-1]:
+            if not _ffill_logged:
+                import logging
+                logging.getLogger('feature_engineering').info(
+                    f'OI forward-fill: candle date {d} > last OI date {sorted_dates[-1]}, '
+                    f'using latest OI (fut_oi_buildup={_last_oi_context.get("fut_oi_buildup", 0):.3f})'
+                )
+                _ffill_logged = True
+            return _last_oi_context.get(c, 0.0)
+        return 0.0
     
     for col in fut_features:
-        result[col] = result['_date'].map(
-            lambda d, c=col: context_by_date.get(d, {}).get(c, 0.0)
-        )
+        result[col] = result['_date'].map(lambda d, c=col: _lookup(d, c))
     
     result.drop(columns=['_date'], inplace=True, errors='ignore')
     

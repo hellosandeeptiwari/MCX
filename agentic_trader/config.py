@@ -181,8 +181,14 @@ ADAPTIVE_SCAN = {
 # the model's safest candidates, to independently evaluate model performance.
 DOWN_RISK_GATING = {
     "enabled": True,
-    "safe_bonus": 5,                  # Score bonus for unflagged (safe) candidates
-    "risk_penalty": 5,               # Score penalty for flagged (risky) candidates
+    # Graduated soft scoring — thresholds calibrated to GBM probability distribution
+    # GBM outputs P(adverse) ∈ [0,1]. UP flag threshold ≈ 0.22, DOWN ≈ 0.32.
+    # Top decile scores rarely exceed 0.50, so tiers are set accordingly.
+    "high_risk_threshold": 0.40,      # Score > this → strong penalty (top ~5% of scores)
+    "high_risk_penalty": 15,          # Points deducted for high-risk anomaly
+    "mid_risk_penalty": 8,            # Points deducted for flag=True but score < 0.40
+    "clean_threshold": 0.15,          # Score < this → boost (bottom ~40%, genuinely clean)
+    "clean_boost": 8,                 # Points added for clean/genuine pattern
     "model_tracker_trades": 7,        # Exclusive model-only trades per day for tracking
     "log_rejections": True,           # Log score adjustments for diagnostics
 }

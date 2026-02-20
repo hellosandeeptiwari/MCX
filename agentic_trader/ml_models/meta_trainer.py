@@ -33,6 +33,30 @@ from sklearn.isotonic import IsotonicRegression
 
 from .trainer import load_and_prepare_data, LABEL_MAP, LABEL_NAMES, MODELS_DIR, REPORTS_DIR
 
+
+def _get_oi_covered_symbols(all_symbols: list) -> list:
+    """Return symbols that have OI snapshot or futures OI data.
+    
+    Direction model depends heavily on fut_oi_buildup (~20% importance).
+    Stocks without OI data contribute noise (zeros) that dilute this signal.
+    """
+    data_root = Path(__file__).parent / "data"
+    oi_dir = data_root / "oi_snapshots"
+    futures_oi_dir = data_root / "futures_oi"
+    
+    covered = set()
+    for sym in all_symbols:
+        # Check OI snapshots
+        if (oi_dir / f"{sym}.parquet").exists():
+            covered.add(sym)
+        # Check futures OI (naming convention: SYM_futures_oi.parquet)
+        if (futures_oi_dir / f"{sym}_futures_oi.parquet").exists():
+            covered.add(sym)
+    
+    # Preserve original ordering
+    return [s for s in all_symbols if s in covered]
+
+
 # Gate model: FLAT=0, MOVE=1
 GATE_LABELS = {0: 'FLAT', 1: 'MOVE'}
 # Direction model: DOWN=0, UP=1
@@ -122,10 +146,21 @@ def train_meta_models(
             label_method=gate_label_method,
         )
         
-        # Load direction labels (net_return, ATR×1.0)
+        # Load direction labels — ONLY stocks with OI coverage
+        # Direction model's #1 feature is fut_oi_buildup (~20% importance).
+        # Stocks without OI data contribute noise (zeros) that destroy signal.
+        dir_symbols = _get_oi_covered_symbols(symbols) if symbols else None
+        if dir_symbols is None:
+            # symbols=None means "use all parquets" — filter those too
+            from .trainer import DATA_DIR
+            all_syms = [f.stem for f in DATA_DIR.glob("*.parquet")
+                        if not f.stem.startswith('SECTOR_') and f.stem != 'NIFTY50']
+            dir_symbols = _get_oi_covered_symbols(all_syms)
+        
         print(f"\n── Loading data for DIRECTION model ({dir_label_method}, ATR×{dir_atr_factor}) ──")
+        print(f"   Filtered to {len(dir_symbols)} stocks with OI data (from {len(symbols) if symbols else 'all'})")
         train_df_dir, val_df_dir, test_df_dir, feature_names_check = load_and_prepare_data(
-            symbols=symbols,
+            symbols=dir_symbols,
             atr_factor=dir_atr_factor,
             test_days=test_days,
             val_days=val_days,
@@ -604,7 +639,7 @@ if __name__ == '__main__':
     parser.add_argument('--gate-atr', type=float, default=1.5, help='Gate ATR factor in hybrid mode (default: 1.5)')
     parser.add_argument('--gate-label', type=str, default='first_to_break', choices=['net_return', 'first_to_break'],
                         help='Gate label method in hybrid mode (default: first_to_break)')
-    parser.add_argument('--dir-atr', type=float, default=1.0, help='Direction ATR factor in hybrid mode (default: 1.0)')
+    parser.add_argument('--dir-atr', type=float, default=1.5, help='Direction ATR factor in hybrid mode (default: 1.5)')
     parser.add_argument('--dir-label', type=str, default='net_return', choices=['net_return', 'first_to_break'],
                         help='Direction label method in hybrid mode (default: net_return)')
     

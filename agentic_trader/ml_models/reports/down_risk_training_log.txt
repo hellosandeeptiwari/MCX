@@ -1,0 +1,787 @@
+﻿python.exe : 22:15:23 | down_risk_detector | Loading base dataset...
+At line:1 char:103
++ ...  = 'utf-8'; & 'C:\Users\SandeepTiwari\SharepointAgent\Sharepoint_AI_A ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (22:15:23 | down...base dataset... 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+22:15:25 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:26 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:27 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:28 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:15:30 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:355:
+ RuntimeWarning: invalid value encountered in divide
+  day_ret / df['atr_pct'].values,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:31 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:32 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:33 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:35 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:36 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:37 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:39 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:40 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:41 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:42 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+22:15:44 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:15:45 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:355:
+ RuntimeWarning: invalid value encountered in divide
+  day_ret / df['atr_pct'].values,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:46 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:48 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:15:50 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:355:
+ RuntimeWarning: invalid value encountered in divide
+  day_ret / df['atr_pct'].values,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:51 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:15:53 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:15:54 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:15:55 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:15:57 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:15:58 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:15:59 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:00 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:02 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:03 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:04 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:06 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:07 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:08 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:10 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:11 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:12 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:14 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:15 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:16 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:17 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:16:19 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:20 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:21 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:23 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:24 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:26 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+22:16:27 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:28 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:30 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:31 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:16:32 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:33 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:16:35 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:36 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+22:16:38 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:16:39 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:355:
+ RuntimeWarning: invalid value encountered in divide
+  day_ret / df['atr_pct'].values,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:40 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:42 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:43 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:45 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:46 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:642:
+ RuntimeWarning: invalid value encountered in divide
+  pos = np.where(day_range > 0, (closes - running_low) / day_range, 0.5)
+22:16:47 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:16:49 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:50 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:52 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:53 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:55 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:16:56 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:16:58 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:16:59 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:17:01 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:17:02 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:17:04 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:17:06 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:17:07 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:642:
+ RuntimeWarning: invalid value encountered in divide
+  pos = np.where(day_range > 0, (closes - running_low) / day_range, 0.5)
+22:17:09 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:17:10 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:17:12 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:17:13 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.000)
+22:17:15 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:17:16 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:642:
+ RuntimeWarning: invalid value encountered in divide
+  pos = np.where(day_range > 0, (closes - running_low) / day_range, 0.5)
+22:17:18 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:17:20 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:642:
+ RuntimeWarning: invalid value encountered in divide
+  pos = np.where(day_range > 0, (closes - running_low) / day_range, 0.5)
+22:17:21 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:17:22 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+22:17:24 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=1.000)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+22:17:25 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:153:
+ RuntimeWarning: invalid value encountered in divide
+  df['body_ratio'] = np.where(candle_range > 0, candle_body / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:157:
+ RuntimeWarning: invalid value encountered in divide
+  (h - np.maximum(c, o)) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:159:
+ RuntimeWarning: invalid value encountered in divide
+  (np.minimum(c, o) - l) / candle_range, 0)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:642:
+ RuntimeWarning: invalid value encountered in divide
+  pos = np.where(day_range > 0, (closes - running_low) / day_range, 0.5)
+22:17:27 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:262:
+ RuntimeWarning: invalid value encountered in divide
+  ((c - l) - (h - c)) / candle_range * v,
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:270:
+ RuntimeWarning: invalid value encountered in divide
+  buy_pct = np.where(candle_range > 0, (c - l) / candle_range, 0.5)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:79: 
+RuntimeWarning: invalid value encountered in divide
+  atr14 > 0, (c - np.roll(c, 6)) / atr14, 0
+22:17:28 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:17:30 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+C:\Users\SandeepTiwari\MCX\agentic_trader\ml_models\feature_engineering.py:355:
+ RuntimeWarning: invalid value encountered in divide
+  day_ret / df['atr_pct'].values,
+22:17:31 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=-0.500)
+22:17:33 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+22:17:36 | feature_engineering | OI forward-fill: candle date 2026-02-18 > 
+last OI date 2026-02-17, using latest OI (fut_oi_buildup=0.500)
+forrtl: error (200): program aborting due to window-CLOSE event
+Image              PC                Routine            Line        Source     
+        
+KERNELBASE.dll     00007FFA97C6D64D  Unknown               Unknown  Unknown
+KERNEL32.DLL       00007FFA981AE8D7  Unknown               Unknown  Unknown
+ntdll.dll          00007FFA9A28C53C  Unknown               Unknown  Unknown

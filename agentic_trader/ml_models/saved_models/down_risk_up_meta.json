@@ -1,7 +1,7 @@
 {
   "regime": "UP",
-  "threshold": 0.20977400749496725,
-  "base_down_rate": 0.2551150895140665,
+  "threshold": 0.2212638327529074,
+  "base_down_rate": 0.2530018063967697,
   "config": {
     "input_dim": 84,
     "latent_dim": 32,
@@ -27,10 +27,11 @@
     "down_lookahead": 8,
     "down_atr_factor": 3.0,
     "down_fixed_pct": 0.5,
+    "up_atr_factor": 3.0,
     "target_flag_rate": 0.15,
     "min_lift": 1.05,
     "test_days": 20,
     "val_days": 10
   },
-  "timestamp": "2026-02-19 00:12:07"
+  "timestamp": "2026-02-19 23:50:52"
 }

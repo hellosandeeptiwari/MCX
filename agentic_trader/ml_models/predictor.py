@@ -212,6 +212,21 @@ class MovePredictor:
             if featured.empty or len(featured) < 2:
                 return {}
             
+            # ── SAFEGUARD: Detect zero-OI when OI was provided ──
+            # If futures_oi_df was given but fut_oi_buildup is still 0 on the
+            # latest candle, something went wrong with the date merge.
+            if futures_oi_df is not None and len(futures_oi_df) > 0:
+                _latest_oi_val = featured.iloc[-1].get('fut_oi_buildup', 0.0)
+                if _latest_oi_val == 0.0:
+                    # Check if OI has ANY non-zero values (if all zero, data itself is zero)
+                    _any_nonzero = (featured['fut_oi_buildup'] != 0).any() if 'fut_oi_buildup' in featured.columns else False
+                    if _any_nonzero and self.logger:
+                        self.logger.warning(
+                            'OI forward-fill may have failed: fut_oi_buildup=0 on latest candle '
+                            f'but {(featured["fut_oi_buildup"] != 0).sum()} earlier candles have non-zero values. '
+                            f'Candle date: {featured.iloc[-1]["date"]}, OI max date: {futures_oi_df["date"].max()}'
+                        )
+            
             # Take the LAST row (most recent candle = what we want to predict)
             latest = featured.iloc[-1:]
             
@@ -616,7 +631,7 @@ class MovePredictor:
             }
             
             # ── Down-Risk Detector overlay (VAE+GMM) ──
-            # Only runs for UP/FLAT signals — flags hidden DOWN risk
+            # Runs for UP/FLAT (defensive) AND DOWN (confirmation) signals
             result.update(self._get_down_risk(signal, pred))
             
             return result
@@ -624,16 +639,24 @@ class MovePredictor:
             return self._titan_defaults()
     
     def _get_down_risk(self, signal: str, pred: dict) -> dict:
-        """Run down-risk detector for UP/FLAT signals. Fail-safe: never blocks."""
+        """Run anomaly detector for ALL directional signals. Fail-safe: never blocks.
+
+        For UP/FLAT: uses UP regime GMM — flags hidden DOWN risk.
+        For DOWN: uses DOWN regime GMM — flags hidden UP risk (bear traps).
+          - DOWN regime anomaly=True → pattern ≠ normal DOWN → bear trap (hidden UP)
+          - DOWN regime anomaly=False → pattern fits genuine DOWN → confirms bearish
+        """
         defaults = {
             'ml_down_risk_flag': False,
             'ml_down_risk_score': 0.0,
             'ml_down_risk_bucket': 'LOW',
+            'ml_gmm_confirms_direction': False,
+            'ml_gmm_regime_used': None,
         }
-        
-        if signal not in ('UP', 'FLAT'):
+
+        if signal not in ('UP', 'FLAT', 'DOWN'):
             return defaults
-        
+
         try:
             # Lazy-load detector on first call
             if not self._down_risk_loaded:
@@ -648,20 +671,43 @@ class MovePredictor:
                         self._log("🛡️ Down-Risk Detector: Not trained yet (run down_risk_detector train)")
                 except Exception as e:
                     self._log(f"🛡️ Down-Risk Detector: Load failed ({e})")
-            
+
             if self._down_risk_detector is None:
                 return defaults
-            
+
             # Extract feature vector from the prediction's raw features
             features = pred.get('_features_array')  # set during predict()
             if features is None:
                 return defaults
-            
-            result = self._down_risk_detector.predict_single(features, signal)
+
+            # Route to appropriate regime model
+            # UP/FLAT signals: use UP regime GMM (detect hidden DOWN risk)
+            # DOWN signals: use DOWN regime GMM (detect hidden UP risk / bear traps)
+            if signal == 'DOWN':
+                regime_to_use = 'DOWN'
+            else:
+                regime_to_use = 'UP'  # validated in simulations
+            result = self._down_risk_detector.predict_single(features, regime_to_use)
+
+            dr_flag = bool(result['down_risk_flag'][0])
+            dr_score = float(result['anomaly_score'][0])
+            dr_bucket = str(result['confidence_bucket'][0])
+
+            # GMM direction-confirmation logic
+            if signal in ('UP', 'FLAT'):
+                # UP regime: flag=True → hidden DOWN risk → does NOT confirm UP
+                gmm_confirms = not dr_flag
+            else:  # signal == 'DOWN'
+                # DOWN regime: flag=True → hidden UP risk (bear trap) → does NOT confirm DOWN
+                # DOWN regime: flag=False → genuine DOWN pattern → confirms DOWN
+                gmm_confirms = not dr_flag
+
             return {
-                'ml_down_risk_flag': bool(result['down_risk_flag'][0]),
-                'ml_down_risk_score': float(result['anomaly_score'][0]),
-                'ml_down_risk_bucket': str(result['confidence_bucket'][0]),
+                'ml_down_risk_flag': dr_flag,
+                'ml_down_risk_score': dr_score,
+                'ml_down_risk_bucket': dr_bucket,
+                'ml_gmm_confirms_direction': gmm_confirms,
+                'ml_gmm_regime_used': regime_to_use,
             }
         except Exception:
             return defaults
@@ -688,6 +734,8 @@ class MovePredictor:
             'ml_down_risk_flag': False,
             'ml_down_risk_score': 0.0,
             'ml_down_risk_bucket': 'LOW',
+            'ml_gmm_confirms_direction': False,
+            'ml_gmm_regime_used': None,
         }
     
     def predict_batch(self, stock_candles: dict, stock_daily: dict = None,

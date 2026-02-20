@@ -1,13 +1,14 @@
 """
-DOWN-RISK DETECTOR v3 — VAE + GMM + GBM anomaly detector for UP/FLAT regimes
+DOWN-RISK DETECTOR v4 — VAE + GMM + GBM anomaly detector for UP/DOWN regimes
 
-Detects hidden DOWN risk when the XGBoost meta-labeling model predicts UP or FLAT.
-Runs AFTER the main model, only on UP/FLAT predictions.
+Detects hidden risks when the XGBoost meta-labeling model predicts UP or DOWN.
+UP regime: detects hidden DOWN risk (crash risk). DOWN regime: detects hidden UP risk (bear traps).
 
-Architecture (v3 improvements over v2):
+Architecture (v4 improvements over v3):
   1. Reuse existing feature pipeline (88 features from feature_engineering.py)
   2. Generate XGBoost regime predictions via cross-prediction (no leakage)
-  3. Train separate VAE+GMM for UP and FLAT regimes on "clean normal" samples
+  3. Train separate VAE+GMM for UP and DOWN regimes on "clean normal" samples
+     - DOWN regime trains on confirmed-bearish (y_down8=1), detects hidden UP (y_up8)
      - v3: Wider VAE [128,64,32]->32 latent (was [64,32]->16)
      - v3: Beta warmup from 0.01 -> 0.5 over first 30% of epochs
   4. Extract rich anomaly features (~52 dims) from VAE latent + GMM:
@@ -20,8 +21,9 @@ Architecture (v3 improvements over v2):
   6. Proper val split: 60% GBM training, 40% threshold calibration
      (v2 used same val set for both => overfitting)
 
-Evaluation label (NOT a training target):
+Evaluation labels (NOT training targets):
   y_down8 = 1 if worst drawdown over next 8 candles > ATR x 3.0
+  y_up8   = 1 if best rally over next 8 candles > ATR x 3.0 (symmetric upside)
   Used only for metric computation (AUROC, lift, precision@flag)
 
 Usage:
@@ -106,13 +108,14 @@ class DetectorConfig:
     calibrator_lr: float = 0.05
     calibrator_val_split: float = 0.6  # fraction of val for GBM training (rest for threshold)
     
-    # Down event label (evaluation only)
+    # Down/Up event labels (evaluation only)
     down_lookahead: int = 8      # candles to look ahead
     down_atr_factor: float = 3.0 # ATR multiplier for "down event" threshold (12% base rate)
     down_fixed_pct: float = 0.5  # fallback if ATR not available
+    up_atr_factor: float = 3.0   # ATR multiplier for "up event" threshold (symmetric)
     
     # Threshold calibration
-    target_flag_rate: float = 0.15  # flag ~15% of UP/FLAT as risky
+    target_flag_rate: float = 0.15  # flag ~15% of UP/DOWN as risky
     min_lift: float = 1.05          # minimum lift to accept threshold
     
     # Data
@@ -246,6 +249,43 @@ def _create_down_label(df: pd.DataFrame, lookahead: int = 8,
     return y_down
 
 
+def _create_up_label(df: pd.DataFrame, lookahead: int = 8,
+                     atr_factor: float = 3.0,
+                     fixed_pct: float = 0.5) -> np.ndarray:
+    """Create y_up8: 1 if best rally in next `lookahead` candles breaches threshold.
+    
+    Symmetric mirror of y_down8 — detects upside surprise (bear traps).
+    Uses ATR-normalized threshold if 'atr_pct' column exists, else fixed %.
+    """
+    n = len(df)
+    y_up = np.zeros(n, dtype=np.int32)
+    close = df['close'].values
+    high = df['high'].values if 'high' in df.columns else close
+    
+    # ATR-based threshold (per-candle, adaptive)
+    has_atr = 'atr_pct' in df.columns
+    if has_atr:
+        atr_pct = df['atr_pct'].values
+        threshold_pct = atr_factor * atr_pct  # array
+        threshold_pct = np.where(np.isnan(threshold_pct), fixed_pct, threshold_pct)
+        threshold_pct = np.maximum(threshold_pct, 0.10)  # floor at 0.1%
+    else:
+        threshold_pct = np.full(n, fixed_pct)
+    
+    for i in range(n - lookahead):
+        # Best rally: (max high in next 8 candles - current close) / current close
+        future_highs = high[i + 1: i + 1 + lookahead]
+        if close[i] > 0:
+            max_up = (future_highs.max() - close[i]) / close[i] * 100  # positive %
+            if max_up >= threshold_pct[i]:
+                y_up[i] = 1
+    
+    # Last `lookahead` candles: insufficient data
+    y_up[n - lookahead:] = -1  # sentinel for "unknown"
+    
+    return y_up
+
+
 def _generate_xgb_cross_predictions(
     X: np.ndarray, y_gate: np.ndarray, y_dir: np.ndarray,
     dates: np.ndarray, feature_names: list,
@@ -289,10 +329,10 @@ def _generate_xgb_cross_predictions(
         # Gate model: MOVE vs FLAT
         y_gate_tr = y_gate[train_idx]
         gate = xgb.XGBClassifier(
-            objective='binary:logistic', max_depth=5, learning_rate=0.05,
-            n_estimators=500, min_child_weight=15, subsample=0.75,
-            colsample_bytree=0.8, gamma=1.5, reg_lambda=2.0,
-            random_state=SEED, verbosity=0,
+            objective='binary:logistic', max_depth=4, learning_rate=0.1,
+            n_estimators=200, min_child_weight=20, subsample=0.7,
+            colsample_bytree=0.7, gamma=2.0, reg_lambda=2.0,
+            tree_method='hist', random_state=SEED, verbosity=0,
             scale_pos_weight=(y_gate_tr == 0).sum() / max((y_gate_tr == 1).sum(), 1),
         )
         gate.fit(X_tr, y_gate_tr, verbose=False)
@@ -305,10 +345,10 @@ def _generate_xgb_cross_predictions(
         
         if len(X_tr_move) > 50 and len(np.unique(y_dir_tr_move)) > 1:
             direction = xgb.XGBClassifier(
-                objective='binary:logistic', max_depth=6, learning_rate=0.03,
-                n_estimators=800, min_child_weight=18, subsample=0.72,
-                colsample_bytree=0.75, gamma=1.0, reg_lambda=2.0,
-                random_state=SEED, verbosity=0,
+                objective='binary:logistic', max_depth=4, learning_rate=0.1,
+                n_estimators=200, min_child_weight=20, subsample=0.7,
+                colsample_bytree=0.7, gamma=2.0, reg_lambda=2.0,
+                tree_method='hist', random_state=SEED, verbosity=0,
             )
             direction.fit(X_tr_move, y_dir_tr_move, verbose=False)
             dir_proba = direction.predict_proba(X_te)[:, 1]  # P(UP|MOVE)
@@ -337,6 +377,7 @@ def load_detector_dataset(
         (df, feature_names) where df has columns:
         - All original features
         - 'y_down8': binary down-event label (for evaluation)
+        - 'y_up8': binary up-event label (for DOWN regime evaluation)
         - 'xgb_regime': cross-predicted regime (UP/DOWN/FLAT)
         - 'date', 'symbol'
     """
@@ -358,7 +399,7 @@ def load_detector_dataset(
     
     logger.info(f"Combined dataset: {len(combined):,} rows, {len(feature_names)} features")
     
-    # ── Create y_down8 label (evaluation only) ──
+    # ── Create y_down8 label (evaluation only — for UP/FLAT regimes) ──
     logger.info("Creating y_down8 labels (per-symbol, ATR-normalized)...")
     y_down_all = np.zeros(len(combined), dtype=np.int32)
     
@@ -373,9 +414,24 @@ def load_detector_dataset(
     
     combined['y_down8'] = y_down_all
     
-    # Filter out boundary rows (y_down8 == -1)
+    # ── Create y_up8 label (evaluation only — for DOWN regime) ──
+    logger.info("Creating y_up8 labels (symmetric upside surprise)...")
+    y_up_all = np.zeros(len(combined), dtype=np.int32)
+    
+    for sym, grp in combined.groupby('symbol'):
+        idx = grp.index
+        y_up = _create_up_label(
+            grp, lookahead=config.down_lookahead,
+            atr_factor=config.up_atr_factor,
+            fixed_pct=config.down_fixed_pct,
+        )
+        y_up_all[idx] = y_up
+    
+    combined['y_up8'] = y_up_all
+    
+    # Filter out boundary rows (y_down8 == -1 or y_up8 == -1)
     before = len(combined)
-    combined = combined[combined['y_down8'] >= 0].reset_index(drop=True)
+    combined = combined[(combined['y_down8'] >= 0) & (combined['y_up8'] >= 0)].reset_index(drop=True)
     logger.info(f"Removed {before - len(combined)} boundary rows → {len(combined):,} remaining")
     
     # ── Generate XGB cross-predictions (no leakage) ──
@@ -400,33 +456,37 @@ def load_detector_dataset(
     # Stats
     regime_counts = combined['xgb_regime'].value_counts()
     down_rate = combined['y_down8'].mean()
+    up_rate = combined['y_up8'].mean()
     logger.info(f"XGB regime distribution: {regime_counts.to_dict()}")
-    logger.info(f"Overall y_down8 rate: {down_rate:.3f}")
+    logger.info(f"Overall y_down8 rate: {down_rate:.3f}, y_up8 rate: {up_rate:.3f}")
     
     for regime in ['UP', 'FLAT', 'DOWN']:
         mask = combined['xgb_regime'] == regime
         if mask.sum() > 0:
-            rate = combined.loc[mask, 'y_down8'].mean()
-            logger.info(f"  y_down8 rate within {regime}: {rate:.3f} ({mask.sum():,} samples)")
+            dr = combined.loc[mask, 'y_down8'].mean()
+            ur = combined.loc[mask, 'y_up8'].mean()
+            logger.info(f"  {regime}: y_down8={dr:.3f}, y_up8={ur:.3f} ({mask.sum():,} samples)")
     
     return combined, feature_names
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  REGIME DETECTOR (one per regime: UP or FLAT)
+#  REGIME DETECTOR (one per regime: UP or DOWN)
 # ══════════════════════════════════════════════════════════════════════
 
 class RegimeDetector:
-    """VAE + GMM anomaly detector for a single regime (UP or FLAT).
+    """VAE + GMM anomaly detector for a single regime (UP or DOWN).
     
-    Hybrid scoring: combines 3 signals via logistic regression:
-      1. GMM negative log-likelihood in VAE latent space
-      2. VAE reconstruction MSE
-      3. VAE KL divergence per sample
+    UP: trained on clean samples (y_down8=0), calibrated against y_down8.
+      → Detects hidden DOWN risk. HIGH anomaly = crash likely.
+    DOWN: trained on confirmed-down samples (y_down8=1), calibrated against y_up8.
+      → Detects hidden UP risk (bear traps). HIGH anomaly = rally likely.
+    
+    Hybrid scoring: GBM on ~52 rich anomaly features from VAE latent + GMM.
     """
     
     def __init__(self, regime: str, config: DetectorConfig):
-        assert regime in ('UP', 'FLAT'), f"Invalid regime: {regime}"
+        assert regime in ('UP', 'DOWN'), f"Invalid regime: {regime}"
         self.regime = regime
         self.config = config
         self.scaler: Optional[StandardScaler] = None
@@ -435,7 +495,7 @@ class RegimeDetector:
         self.gbm_calibrator: Optional[HistGradientBoostingClassifier] = None  # v3: GBM calibrator
         self.lr_calibrator: Optional[LogisticRegression] = None  # v2 fallback
         self.threshold: float = 0.0
-        self.base_down_rate: float = 0.0
+        self.base_down_rate: float = 0.0  # base event rate (down for UP, up for DOWN)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._is_trained = False
     
@@ -985,16 +1045,20 @@ class RegimeDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  UNIFIED DETECTOR (wraps UP + FLAT regime detectors)
+#  UNIFIED DETECTOR (wraps UP + DOWN regime detectors)
 # ══════════════════════════════════════════════════════════════════════
 
 class DownRiskDetector:
-    """Unified down-risk detector that dispatches to UP or FLAT regime models."""
+    """Unified anomaly detector that dispatches to UP or DOWN regime models.
+    
+    UP: detects hidden down risk (crash risk).
+    DOWN: detects hidden up risk (bear trap — rally in bearish-looking stocks).
+    """
     
     def __init__(self, config: Optional[DetectorConfig] = None):
         self.config = config or DetectorConfig()
         self.up_detector = RegimeDetector('UP', self.config)
-        self.flat_detector = RegimeDetector('FLAT', self.config)
+        self.down_detector = RegimeDetector('DOWN', self.config)
         self._feature_names: list = []
     
     def train(self, symbols: Optional[list] = None) -> dict:
@@ -1028,34 +1092,55 @@ class DownRiskDetector:
         X_all = np.nan_to_num(combined[feature_names].values.astype(np.float32),
                               nan=0.0, posinf=0.0, neginf=0.0)
         y_down_all = combined['y_down8'].values
+        y_up_all = combined['y_up8'].values
         regime_all = combined['xgb_regime'].values
         
-        # ── Train each regime detector ──
-        for regime, detector in [('UP', self.up_detector), ('FLAT', self.flat_detector)]:
-            # Training: clean normal = regime predicted AND y_down8=0
-            train_regime = train_mask & (combined['xgb_regime'] == regime)
-            train_normal = train_regime & (combined['y_down8'] == 0)
+        # ── Train UP regime detector ──
+        # UP: train on clean (y_down8=0), calibrate against y_down8
+        up_train_regime = train_mask & (combined['xgb_regime'] == 'UP')
+        up_train_normal = up_train_regime & (combined['y_down8'] == 0)
+        up_val_regime = val_mask & (combined['xgb_regime'] == 'UP')
+        
+        n_up_train = up_train_regime.sum()
+        n_up_normal = up_train_normal.sum()
+        n_up_val = up_val_regime.sum()
+        
+        logger.info(f"\nUP regime: {n_up_train:,} train total, {n_up_normal:,} clean normal, {n_up_val:,} val")
+        
+        if n_up_normal < 100 or n_up_val < 50:
+            logger.warning(f"  Insufficient data for UP detector, skipping")
+            all_metrics['UP_skipped'] = True
+        else:
+            X_normal = X_all[up_train_normal.values]
+            X_val_regime = X_all[up_val_regime.values]
+            y_val_down = y_down_all[up_val_regime.values]
             
-            # Validation: all samples in regime (both normal and down)
-            val_regime = val_mask & (combined['xgb_regime'] == regime)
+            up_metrics = self.up_detector.train(X_normal, X_val_regime, y_val_down)
+            all_metrics['UP_metrics'] = up_metrics
+        
+        # DOWN regime: train on confirmed-down (y_down8=1), calibrate against y_up8
+        # This detects "bear traps" — stocks predicted DOWN that actually rally
+        down_regime = 'DOWN'
+        down_train_regime = train_mask & (combined['xgb_regime'] == down_regime)
+        down_train_normal = down_train_regime & (combined['y_down8'] == 1)  # confirmed bearish = "clean DOWN"
+        down_val_regime = val_mask & (combined['xgb_regime'] == down_regime)
+        
+        n_down_train = down_train_regime.sum()
+        n_down_normal = down_train_normal.sum()
+        n_down_val = down_val_regime.sum()
+        
+        logger.info(f"\nDOWN regime: {n_down_train:,} train total, {n_down_normal:,} confirmed-down (clean), {n_down_val:,} val")
+        
+        if n_down_normal < 100 or n_down_val < 50:
+            logger.warning(f"  Insufficient data for DOWN detector, skipping")
+            all_metrics['DOWN_skipped'] = True
+        else:
+            X_down_normal = X_all[down_train_normal.values]
+            X_down_val = X_all[down_val_regime.values]
+            y_val_up = y_up_all[down_val_regime.values]  # calibrate against y_up8 (upside surprise)
             
-            n_regime_train = train_regime.sum()
-            n_normal = train_normal.sum()
-            n_val = val_regime.sum()
-            
-            logger.info(f"\n{regime} regime: {n_regime_train:,} train total, {n_normal:,} clean normal, {n_val:,} val")
-            
-            if n_normal < 100 or n_val < 50:
-                logger.warning(f"  Insufficient data for {regime} detector, skipping")
-                all_metrics[f'{regime}_skipped'] = True
-                continue
-            
-            X_normal = X_all[train_normal.values]
-            X_val_regime = X_all[val_regime.values]
-            y_val_down = y_down_all[val_regime.values]
-            
-            regime_metrics = detector.train(X_normal, X_val_regime, y_val_down)
-            all_metrics[f'{regime}_metrics'] = regime_metrics
+            down_metrics = self.down_detector.train(X_down_normal, X_down_val, y_val_up)
+            all_metrics['DOWN_metrics'] = down_metrics
         
         # ── Evaluate on test set ──
         logger.info(f"\n{'='*60}")
@@ -1065,13 +1150,14 @@ class DownRiskDetector:
         test_eval = self._evaluate_test(
             X_all[test_mask.values],
             y_down_all[test_mask.values],
+            y_up_all[test_mask.values],
             regime_all[test_mask.values],
         )
         all_metrics['test'] = test_eval
         
         # ── Save artifacts ──
         self.up_detector.save(MODELS_DIR)
-        self.flat_detector.save(MODELS_DIR)
+        self.down_detector.save(MODELS_DIR)
         
         # Save feature names
         with open(MODELS_DIR / "down_risk_feature_names.json", 'w') as f:
@@ -1092,62 +1178,54 @@ class DownRiskDetector:
         return all_metrics
     
     def _evaluate_test(self, X_test: np.ndarray, y_test_down: np.ndarray,
-                       regime_test: np.ndarray) -> dict:
-        """Evaluate both detectors on the test set."""
+                       y_test_up: np.ndarray, regime_test: np.ndarray) -> dict:
+        """Evaluate all regime detectors on the test set."""
         results = {}
         
-        for regime, detector in [('UP', self.up_detector), ('FLAT', self.flat_detector)]:
-            mask = regime_test == regime
-            if mask.sum() < 20 or not detector._is_trained:
-                continue
+        # UP regime: evaluate against y_down8
+        up_mask = regime_test == 'UP'
+        if up_mask.sum() >= 20 and self.up_detector._is_trained:
+            X_r = X_test[up_mask]
+            y_r = y_test_down[up_mask]
+            scores = self.up_detector.score(X_r)
+            flags = scores >= self.up_detector.threshold
             
-            X_r = X_test[mask]
-            y_r = y_test_down[mask]
-            scores = detector.score(X_r)
-            
-            regime_eval = detector._evaluate(scores, y_r, prefix=f'test_{regime.lower()}')
-            results[regime] = regime_eval
-        
-        # Combined: unified score for all UP+FLAT
-        up_flat_mask = (regime_test == 'UP') | (regime_test == 'FLAT')
-        if up_flat_mask.sum() > 50:
-            X_uf = X_test[up_flat_mask]
-            y_uf = y_test_down[up_flat_mask]
-            regimes_uf = regime_test[up_flat_mask]
-            
-            # v3: vectorized scoring by regime (much faster than per-sample loop)
-            scores_uf = np.zeros(len(X_uf))
-            flags = np.zeros(len(scores_uf), dtype=bool)
-            
-            up_mask = (regimes_uf == 'UP')
-            flat_mask = (regimes_uf == 'FLAT')
-            
-            if up_mask.sum() > 0 and self.up_detector._is_trained:
-                scores_uf[up_mask] = self.up_detector.score(X_uf[up_mask])
-                flags[up_mask] = scores_uf[up_mask] >= self.up_detector.threshold
-            if flat_mask.sum() > 0 and self.flat_detector._is_trained:
-                scores_uf[flat_mask] = self.flat_detector.score(X_uf[flat_mask])
-                flags[flat_mask] = scores_uf[flat_mask] >= self.flat_detector.threshold
-            
-            if len(np.unique(y_uf)) > 1:
-                combined_auroc = roc_auc_score(y_uf, scores_uf)
-                results['combined_auroc'] = round(combined_auroc, 4)
-                logger.info(f"\n  COMBINED TEST AUROC (UP+FLAT): {combined_auroc:.4f}")
+            up_eval = self.up_detector._evaluate(scores, y_r, prefix='test_up')
+            results['UP'] = up_eval
             
             if flags.sum() > 0:
-                base = y_uf.mean()
-                flagged_rate = y_uf[flags].mean()
-                clean_rate = y_uf[~flags].mean() if (~flags).sum() > 0 else 0
-                
-                results['combined_flag_rate'] = round(flags.mean(), 4)
-                results['combined_down_if_flagged'] = round(flagged_rate, 4)
-                results['combined_down_if_clean'] = round(clean_rate, 4)
-                results['combined_lift'] = round(flagged_rate / max(base, 0.001), 2)
-                
-                logger.info(f"  COMBINED: flag={flags.mean():.1%}, down_if_flag={flagged_rate:.3f} "
+                base = y_r.mean()
+                flagged_rate = y_r[flags].mean()
+                clean_rate = y_r[~flags].mean() if (~flags).sum() > 0 else 0
+                results['up_flag_rate'] = round(flags.mean(), 4)
+                results['up_down_if_flagged'] = round(flagged_rate, 4)
+                results['up_down_if_clean'] = round(clean_rate, 4)
+                results['up_lift'] = round(flagged_rate / max(base, 0.001), 2)
+                logger.info(f"  UP: flag={flags.mean():.1%}, down_if_flag={flagged_rate:.3f} "
                             f"vs base={base:.3f} → lift {flagged_rate/max(base,0.001):.2f}x")
-                logger.info(f"  COMBINED: Avoiding flagged would reduce down-risk to {clean_rate:.3f} "
-                            f"({(1 - clean_rate/max(base,0.001))*100:.1f}% reduction)")
+        
+        # DOWN regime: evaluate against y_up8 (upside surprise detection)
+        down_mask = regime_test == 'DOWN'
+        if down_mask.sum() >= 20 and self.down_detector._is_trained:
+            X_down = X_test[down_mask]
+            y_up_down = y_test_up[down_mask]
+            scores_down = self.down_detector.score(X_down)
+            flags_down = scores_down >= self.down_detector.threshold
+            
+            down_eval = self.down_detector._evaluate(scores_down, y_up_down, prefix='test_down')
+            results['DOWN'] = down_eval
+            logger.info(f"  DOWN regime: detects hidden UP risk (bear traps)")
+            
+            if flags_down.sum() > 0:
+                base_down = y_up_down.mean()
+                flagged_rate_down = y_up_down[flags_down].mean()
+                clean_rate_down = y_up_down[~flags_down].mean() if (~flags_down).sum() > 0 else 0
+                results['down_flag_rate'] = round(flags_down.mean(), 4)
+                results['down_up_if_flagged'] = round(flagged_rate_down, 4)
+                results['down_up_if_clean'] = round(clean_rate_down, 4)
+                results['down_lift'] = round(flagged_rate_down / max(base_down, 0.001), 2)
+                logger.info(f"  DOWN: flag={flags_down.mean():.1%}, up_if_flag={flagged_rate_down:.3f} "
+                            f"vs base={base_down:.3f} → lift {flagged_rate_down/max(base_down,0.001):.2f}x")
         
         return results
     
@@ -1156,18 +1234,22 @@ class DownRiskDetector:
         
         Args:
             X: Feature array, shape (n_features,) or (n, n_features)
-            regime: 'UP' or 'FLAT'
+            regime: 'UP' or 'DOWN'
             
         Returns:
             dict with anomaly_score, anomaly_flag, down_risk_flag, confidence_bucket
+            For DOWN regime: anomaly_flag = True means hidden UP risk (bear trap)
         """
         if X.ndim == 1:
             X = X.reshape(1, -1)
         
         if regime == 'UP' and self.up_detector._is_trained:
             return self.up_detector.predict(X)
-        elif regime == 'FLAT' and self.flat_detector._is_trained:
-            return self.flat_detector.predict(X)
+        elif regime == 'DOWN' and self.down_detector._is_trained:
+            result = self.down_detector.predict(X)
+            # Rename for clarity: "down_risk_flag" → "up_risk_flag" semantically
+            # but keep same key names for API compatibility
+            return result
         else:
             # Fallback: no flag
             n = X.shape[0]
@@ -1179,7 +1261,7 @@ class DownRiskDetector:
             }
     
     def load(self, path: Optional[Path] = None) -> bool:
-        """Load both regime detectors from saved artifacts."""
+        """Load all regime detectors from saved artifacts."""
         path = path or MODELS_DIR
         
         # Load feature names
@@ -1189,10 +1271,11 @@ class DownRiskDetector:
                 self._feature_names = json.load(f)
         
         up_ok = self.up_detector.load(path)
-        flat_ok = self.flat_detector.load(path)
+        down_ok = self.down_detector.load(path)
         
-        if up_ok or flat_ok:
-            logger.info(f"DownRiskDetector loaded: UP={'OK' if up_ok else 'FAIL'}, FLAT={'OK' if flat_ok else 'FAIL'}")
+        if up_ok or down_ok:
+            logger.info(f"DownRiskDetector loaded: UP={'OK' if up_ok else 'FAIL'}, "
+                        f"DOWN={'OK' if down_ok else 'FAIL'}")
             return True
         return False
 
@@ -1220,10 +1303,11 @@ def evaluate_detector(symbols: Optional[list] = None, config: Optional[DetectorC
     
     X_test = np.nan_to_num(combined.loc[test_mask, feature_names].values.astype(np.float32),
                            nan=0.0, posinf=0.0, neginf=0.0)
-    y_test = combined.loc[test_mask, 'y_down8'].values
+    y_test_down = combined.loc[test_mask, 'y_down8'].values
+    y_test_up = combined.loc[test_mask, 'y_up8'].values
     regimes = combined.loc[test_mask, 'xgb_regime'].values
     
-    results = detector._evaluate_test(X_test, y_test, regimes)
+    results = detector._evaluate_test(X_test, y_test_down, y_test_up, regimes)
     
     print("\n" + "="*60)
     print("  EVALUATION RESULTS")
@@ -1244,7 +1328,7 @@ def infer_from_features(X: np.ndarray, regime: str,
     
     Args:
         X: Feature array (n_features,) or (n, n_features)
-        regime: 'UP' or 'FLAT' (from your XGBoost prediction)
+        regime: 'UP' or 'DOWN' (from your prediction)
         detector: Pre-loaded detector (if None, loads from disk)
     
     Returns:
@@ -1333,11 +1417,12 @@ def main():
         print("="*60)
         
         # Print summary
-        for regime in ['UP', 'FLAT']:
+        for regime in ['UP', 'DOWN']:
             key = f'{regime}_metrics'
             if key in metrics and metrics[key]:
                 m = metrics[key]
-                print(f"\n  {regime} Regime:")
+                label = "hidden DOWN risk" if regime == 'UP' else "hidden UP risk (bear traps)"
+                print(f"\n  {regime} Regime ({label}):")
                 print(f"    Val AUROC:        {m.get('val_auroc', 'N/A')}")
                 print(f"    Val Lift:         {m.get('val_lift', 'N/A')}x")
                 print(f"    Val Flag Rate:    {m.get('val_flag_rate', 'N/A')}")
@@ -1389,15 +1474,16 @@ def main():
         X = np.nan_to_num(df_tail[feature_names].values.astype(np.float32),
                           nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Score for both regimes
+        # Score for all regimes
         print(f"\n{'='*70}")
-        print(f"  Down-Risk Inference: {args.symbol} (last {len(df_tail)} candles)")
+        print(f"  Anomaly Risk Inference: {args.symbol} (last {len(df_tail)} candles)")
         print(f"{'='*70}")
         
-        for regime in ['UP', 'FLAT']:
+        for regime in ['UP', 'DOWN']:
             result = detector.predict_single(X, regime)
             
-            print(f"\n  If XGB predicts {regime}:")
+            risk_type = "hidden UP risk (bear trap)" if regime == 'DOWN' else "hidden DOWN risk"
+            print(f"\n  If XGB predicts {regime} ({risk_type}):")
             flagged = result['down_risk_flag']
             scores = result['anomaly_score']
             buckets = result['confidence_bucket']

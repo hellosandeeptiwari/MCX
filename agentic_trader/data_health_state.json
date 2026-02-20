@@ -1,885 +1,821 @@
 {
-  "date": "2026-02-18",
-  "last_updated": "2026-02-18T15:22:44.254819",
+  "date": "2026-02-19",
+  "last_updated": "2026-02-19T12:01:49.359180",
   "stale_counters": {
-    "NSE:TITAN": 0,
-    "NSE:NTPC": 0,
-    "NSE:KOTAKBANK": 0,
-    "NSE:INFY": 1,
-    "NSE:ITC": 0,
-    "NSE:HINDALCO": 0,
-    "NSE:ONGC": 1,
-    "NSE:LT": 0,
     "NSE:TCS": 0,
-    "NSE:JINDALSTEL": 0,
+    "NSE:INFY": 0,
+    "NSE:MARUTI": 0,
+    "NSE:ONGC": 0,
+    "NSE:HINDALCO": 0,
+    "NSE:SBIN": 0,
+    "NSE:HDFCBANK": 0,
     "NSE:ICICIBANK": 0,
     "NSE:AXISBANK": 0,
-    "NSE:JSWSTEEL": 0,
+    "NSE:KOTAKBANK": 0,
     "NSE:BAJFINANCE": 0,
-    "NSE:BHARTIARTL": 0,
-    "NSE:SUNPHARMA": 0,
     "NSE:RELIANCE": 0,
-    "NSE:CIPLA": 0,
-    "NSE:HDFCBANK": 0,
-    "NSE:IDEA": 0,
+    "NSE:BHARTIARTL": 0,
     "NSE:TATASTEEL": 0,
-    "NSE:SBIN": 1,
-    "NSE:MARUTI": 0,
-    "NSE:PETRONET": 0,
-    "NSE:M&M": 0,
-    "NSE:INDUSTOWER": 0,
-    "NSE:GODREJPROP": 0,
-    "NSE:CUMMINSIND": 0,
-    "NSE:PATANJALI": 1,
-    "NSE:HDFCAMC": 0,
-    "NSE:COLPAL": 0,
-    "NSE:CGPOWER": 0,
-    "NSE:SONACOMS": 1,
-    "NSE:DIVISLAB": 0,
-    "NSE:CDSL": 0,
-    "NSE:BAJAJHLDNG": 1,
-    "NSE:INOXWIND": 0,
-    "NSE:VBL": 0,
-    "NSE:TORNTPOWER": 0,
-    "NSE:MARICO": 0,
-    "NSE:WIPRO": 0,
-    "NSE:LAURUSLABS": 0,
-    "NSE:TATACONSUM": 1,
-    "NSE:NESTLEIND": 1,
+    "NSE:JSWSTEEL": 0,
+    "NSE:JINDALSTEL": 0,
+    "NSE:LT": 0,
+    "NSE:TITAN": 0,
+    "NSE:SUNPHARMA": 0,
+    "NSE:NTPC": 0,
+    "NSE:ITC": 0,
+    "NSE:CIPLA": 0,
+    "NSE:IDEA": 0,
     "NSE:KAYNES": 0,
-    "NSE:BPCL": 0,
-    "NSE:WAAREEENER": 0,
-    "NSE:BANDHANBNK": 0,
-    "NSE:JIOFIN": 0,
-    "NSE:POWERINDIA": 1,
     "NSE:INDHOTEL": 0,
-    "NSE:NATIONALUM": 0,
-    "NSE:NMDC": 0,
-    "NSE:BSE": 0,
-    "NSE:COALINDIA": 1,
     "NSE:ETERNAL": 0,
-    "NSE:KFINTECH": 0,
-    "NSE:OIL": 1,
-    "NSE:HDFCLIFE": 0,
-    "NSE:AUBANK": 0,
-    "NSE:VEDL": 0,
-    "NSE:MCX": 0,
-    "NSE:ICICIPRULI": 0,
-    "NSE:BDL": 0,
-    "NSE:BAJAJ-AUTO": 0,
-    "NSE:NUVAMA": 1,
-    "NSE:IOC": 0,
-    "NSE:JUBLFOOD": 0,
-    "NSE:KPITTECH": 0,
-    "NSE:OFSS": 0,
-    "NSE:FORTIS": 0,
-    "NSE:PIIND": 0,
-    "NSE:BHARATFORG": 0,
+    "NSE:WAAREEENER": 0,
+    "NSE:BEL": 0,
+    "NSE:CHOLAFIN": 1,
     "NSE:BHEL": 0,
+    "NSE:OIL": 0,
+    "NSE:PREMIERENE": 1,
+    "NSE:RBLBANK": 0,
+    "NSE:TRENT": 0,
+    "NSE:MARICO": 0,
+    "NSE:JIOFIN": 0,
+    "NSE:HDFCAMC": 0,
+    "NSE:M&M": 0,
+    "NSE:ADANIENT": 0,
+    "NSE:ANGELONE": 0,
+    "NSE:APLAPOLLO": 0,
+    "NSE:ADANIENSOL": 0,
+    "NSE:BIOCON": 0,
+    "NSE:PNBHOUSING": 3,
+    "NSE:SHREECEM": 2,
+    "NSE:360ONE": 0,
+    "NSE:IREDA": 0,
+    "NSE:HINDPETRO": 0,
+    "NSE:PRESTIGE": 0,
+    "NSE:KALYANKJIL": 1,
+    "NSE:GAIL": 1,
+    "NSE:PGEL": 0,
+    "NSE:BPCL": 0,
+    "NSE:ADANIGREEN": 0,
+    "NSE:AUROPHARMA": 0,
+    "NSE:INDUSTOWER": 0,
+    "NSE:GMRAIRPORT": 1,
+    "NSE:BSE": 0,
+    "NSE:WIPRO": 0,
+    "NSE:DLF": 0,
+    "NSE:CDSL": 0,
+    "NSE:DIXON": 0,
+    "NSE:PERSISTENT": 0,
+    "NSE:SYNGENE": 0,
+    "NSE:SWIGGY": 1,
+    "NSE:VBL": 0,
+    "NSE:LODHA": 0,
+    "NSE:MFSL": 1,
+    "NSE:MOTHERSON": 0,
+    "NSE:DMART": 0,
+    "NSE:POWERGRID": 0,
+    "NSE:ASIANPAINT": 0,
+    "NSE:SAMMAANCAP": 0,
+    "NSE:HAL": 0,
+    "NSE:TATAELXSI": 0,
+    "NSE:HEROMOTOCO": 0,
+    "NSE:ADANIPORTS": 1,
+    "NSE:BLUESTARCO": 0,
+    "NSE:TIINDIA": 0,
+    "NSE:NATIONALUM": 0,
     "NSE:CROMPTON": 0,
-    "NSE:POLYCAB": 0
+    "NSE:OBEROIRLTY": 0,
+    "NSE:TATAPOWER": 0,
+    "NSE:NAUKRI": 0,
+    "NSE:PATANJALI": 1,
+    "NSE:CGPOWER": 0,
+    "NSE:BANDHANBNK": 0,
+    "NSE:BHARATFORG": 1,
+    "NSE:RVNL": 0,
+    "NSE:PIDILITIND": 1,
+    "NSE:EXIDEIND": 0,
+    "NSE:COFORGE": 0,
+    "NSE:AMBUJACEM": 1,
+    "NSE:ULTRACEMCO": 0,
+    "NSE:HAVELLS": 0,
+    "NSE:HDFCLIFE": 0,
+    "NSE:GODREJPROP": 0,
+    "NSE:GLENMARK": 0
   },
   "halted_symbols": [],
   "health_history": [
     {
-      "timestamp": "2026-02-18T15:18:54.412618",
-      "symbol": "NSE:PETRONET",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.658299",
+      "symbol": "NSE:IREDA",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.412618",
-      "symbol": "NSE:M&M",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.666088",
+      "symbol": "NSE:HAL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.412618",
-      "symbol": "NSE:INDUSTOWER",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.677886",
+      "symbol": "NSE:HINDPETRO",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.417851",
-      "symbol": "NSE:GODREJPROP",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.687923",
+      "symbol": "NSE:OBEROIRLTY",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.417851",
-      "symbol": "NSE:CUMMINSIND",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.694692",
+      "symbol": "NSE:KALYANKJIL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.417851",
-      "symbol": "NSE:PATANJALI",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.702721",
+      "symbol": "NSE:PGEL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.421017",
-      "symbol": "NSE:HDFCAMC",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.715412",
+      "symbol": "NSE:HEROMOTOCO",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.421017",
-      "symbol": "NSE:COLPAL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.724497",
+      "symbol": "NSE:HDFCBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.421017",
-      "symbol": "NSE:TATASTEEL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.423023",
-      "symbol": "NSE:CGPOWER",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 94s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.423023",
-      "symbol": "NSE:LT",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.425029",
-      "symbol": "NSE:SONACOMS",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.425029",
-      "symbol": "NSE:DIVISLAB",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.425029",
-      "symbol": "NSE:CDSL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.425029",
-      "symbol": "NSE:BAJAJHLDNG",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 97s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.427033",
-      "symbol": "NSE:INOXWIND",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.427033",
-      "symbol": "NSE:VBL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.428537",
-      "symbol": "NSE:TORNTPOWER",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.428537",
-      "symbol": "NSE:MARICO",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.430100",
-      "symbol": "NSE:WIPRO",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.431105",
-      "symbol": "NSE:LAURUSLABS",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.431105",
-      "symbol": "NSE:TATACONSUM",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.432558",
-      "symbol": "NSE:NESTLEIND",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.433584",
-      "symbol": "NSE:KAYNES",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.434583",
+      "timestamp": "2026-02-19T11:53:00.735602",
       "symbol": "NSE:BPCL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.434583",
-      "symbol": "NSE:WAAREEENER",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.745063",
+      "symbol": "NSE:ADANIGREEN",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.436126",
-      "symbol": "NSE:BANDHANBNK",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.753105",
+      "symbol": "NSE:AUROPHARMA",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.437404",
-      "symbol": "NSE:JIOFIN",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:53:00.761152",
+      "symbol": "NSE:INDUSTOWER",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.439044",
-      "symbol": "NSE:POWERINDIA",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.441049",
-      "symbol": "NSE:INDHOTEL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.441049",
-      "symbol": "NSE:NATIONALUM",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.441049",
-      "symbol": "NSE:NMDC",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 91s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.441049",
+      "timestamp": "2026-02-19T11:53:00.781071",
       "symbol": "NSE:BSE",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.788858",
+      "symbol": "NSE:TCS",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.800961",
+      "symbol": "NSE:TATAPOWER",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.810776",
+      "symbol": "NSE:DLF",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.818549",
+      "symbol": "NSE:CDSL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.828652",
+      "symbol": "NSE:DIXON",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.836449",
+      "symbol": "NSE:PERSISTENT",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.848514",
+      "symbol": "NSE:CGPOWER",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.858295",
+      "symbol": "NSE:SWIGGY",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.872128",
+      "symbol": "NSE:VBL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:53:00.880167",
+      "symbol": "NSE:LODHA",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:20.127639",
+      "symbol": "NSE:SWIGGY",
       "status": "STALE",
       "can_trade": false,
       "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
+        "STALE_TICK: 79s old (limit: 60s)"
       ]
     },
     {
-      "timestamp": "2026-02-18T15:18:54.441049",
-      "symbol": "NSE:COALINDIA",
+      "timestamp": "2026-02-19T11:54:20.183654",
+      "symbol": "NSE:KALYANKJIL",
       "status": "STALE",
       "can_trade": false,
       "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
+        "STALE_TICK: 79s old (limit: 60s)"
       ]
     },
     {
-      "timestamp": "2026-02-18T15:18:54.445600",
-      "symbol": "NSE:ETERNAL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:54:25.578048",
+      "symbol": "NSE:SBIN",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.447653",
-      "symbol": "NSE:KFINTECH",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 90s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:54:25.587604",
+      "symbol": "NSE:HDFCBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.448653",
-      "symbol": "NSE:BAJFINANCE",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:54:25.597658",
+      "symbol": "NSE:ICICIBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.449652",
-      "symbol": "NSE:RELIANCE",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.450652",
-      "symbol": "NSE:OIL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.451653",
+      "timestamp": "2026-02-19T11:54:25.607712",
       "symbol": "NSE:AXISBANK",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.453334",
-      "symbol": "NSE:HDFCLIFE",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 89s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:54:25.631381",
+      "symbol": "NSE:KOTAKBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.455340",
-      "symbol": "NSE:AUBANK",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:54:25.640547",
+      "symbol": "NSE:BAJFINANCE",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.455340",
-      "symbol": "NSE:VEDL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
+      "timestamp": "2026-02-19T11:54:25.650676",
+      "symbol": "NSE:RELIANCE",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:18:54.457345",
+      "timestamp": "2026-02-19T11:54:25.660155",
+      "symbol": "NSE:BHARTIARTL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.679017",
+      "symbol": "NSE:INFY",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.687055",
+      "symbol": "NSE:TCS",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.695876",
+      "symbol": "NSE:TATASTEEL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.704915",
+      "symbol": "NSE:JSWSTEEL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.711940",
+      "symbol": "NSE:JINDALSTEL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.738777",
+      "symbol": "NSE:HINDALCO",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.746806",
+      "symbol": "NSE:LT",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.774525",
+      "symbol": "NSE:MARUTI",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.784327",
+      "symbol": "NSE:TITAN",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.792353",
+      "symbol": "NSE:SUNPHARMA",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.802161",
+      "symbol": "NSE:ONGC",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.814030",
+      "symbol": "NSE:NTPC",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T11:54:25.824126",
       "symbol": "NSE:ITC",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.457345",
-      "symbol": "NSE:MCX",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.460555",
-      "symbol": "NSE:ICICIPRULI",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 90s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.460555",
-      "symbol": "NSE:BDL",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 93s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.463176",
-      "symbol": "NSE:BAJAJ-AUTO",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 88s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.464171",
-      "symbol": "NSE:NUVAMA",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 90s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:18:54.464171",
-      "symbol": "NSE:IOC",
-      "status": "STALE",
-      "can_trade": false,
-      "issues": [
-        "STALE_TICK: 92s old (limit: 60s)"
-      ]
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.109524",
-      "symbol": "NSE:PETRONET",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.109524",
-      "symbol": "NSE:JUBLFOOD",
+      "timestamp": "2026-02-19T11:54:25.834463",
+      "symbol": "NSE:CIPLA",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.109524",
-      "symbol": "NSE:M&M",
+      "timestamp": "2026-02-19T11:54:25.848068",
+      "symbol": "NSE:IDEA",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.125757",
-      "symbol": "NSE:INDUSTOWER",
+      "timestamp": "2026-02-19T12:00:45.359719",
+      "symbol": "NSE:SBIN",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.125757",
-      "symbol": "NSE:GODREJPROP",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.125757",
-      "symbol": "NSE:CUMMINSIND",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.125757",
-      "symbol": "NSE:KPITTECH",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.141728",
-      "symbol": "NSE:HDFCAMC",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.141728",
-      "symbol": "NSE:OFSS",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.141728",
-      "symbol": "NSE:COLPAL",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.141728",
-      "symbol": "NSE:TATASTEEL",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.154480",
-      "symbol": "NSE:CGPOWER",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:LT",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:DIVISLAB",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:CDSL",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:INOXWIND",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:VBL",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:TORNTPOWER",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.157592",
-      "symbol": "NSE:MARICO",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.173542",
-      "symbol": "NSE:WIPRO",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.173542",
-      "symbol": "NSE:LAURUSLABS",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.173542",
-      "symbol": "NSE:FORTIS",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.173542",
+      "timestamp": "2026-02-19T12:00:45.375638",
       "symbol": "NSE:KAYNES",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.173542",
-      "symbol": "NSE:BPCL",
+      "timestamp": "2026-02-19T12:00:45.390868",
+      "symbol": "NSE:TATASTEEL",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.173542",
-      "symbol": "NSE:WAAREEENER",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.173542",
-      "symbol": "NSE:BANDHANBNK",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.189640",
-      "symbol": "NSE:JIOFIN",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.189640",
-      "symbol": "NSE:INDHOTEL",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.189640",
-      "symbol": "NSE:NATIONALUM",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.189640",
-      "symbol": "NSE:PIIND",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.189640",
-      "symbol": "NSE:NMDC",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.205300",
-      "symbol": "NSE:BSE",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.205300",
+      "timestamp": "2026-02-19T12:00:45.405398",
       "symbol": "NSE:ETERNAL",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.205300",
-      "symbol": "NSE:KFINTECH",
+      "timestamp": "2026-02-19T12:00:45.420317",
+      "symbol": "NSE:BEL",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.220970",
-      "symbol": "NSE:BAJFINANCE",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.220970",
-      "symbol": "NSE:BHARATFORG",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.220970",
-      "symbol": "NSE:RELIANCE",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.220970",
-      "symbol": "NSE:AXISBANK",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.220970",
-      "symbol": "NSE:HDFCLIFE",
-      "status": "HEALTHY",
-      "can_trade": true,
-      "issues": []
-    },
-    {
-      "timestamp": "2026-02-18T15:22:44.220970",
+      "timestamp": "2026-02-19T12:00:45.426951",
       "symbol": "NSE:BHEL",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.237159",
-      "symbol": "NSE:AUBANK",
+      "timestamp": "2026-02-19T12:00:45.438237",
+      "symbol": "NSE:ONGC",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.237159",
-      "symbol": "NSE:VEDL",
+      "timestamp": "2026-02-19T12:00:45.450274",
+      "symbol": "NSE:GLENMARK",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.237159",
+      "timestamp": "2026-02-19T12:00:45.456565",
+      "symbol": "NSE:BLUESTARCO",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.465121",
+      "symbol": "NSE:OIL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.475349",
+      "symbol": "NSE:MOTHERSON",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.482047",
+      "symbol": "NSE:RVNL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.500728",
+      "symbol": "NSE:NTPC",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.515794",
+      "symbol": "NSE:RELIANCE",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.526828",
+      "symbol": "NSE:DMART",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.539154",
+      "symbol": "NSE:RBLBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.549671",
+      "symbol": "NSE:POWERGRID",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.565970",
+      "symbol": "NSE:TRENT",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.565970",
+      "symbol": "NSE:GODREJPROP",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.582743",
+      "symbol": "NSE:MARICO",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.593856",
+      "symbol": "NSE:PIDILITIND",
+      "status": "STALE",
+      "can_trade": false,
+      "issues": [
+        "STALE_TICK: 63s old (limit: 60s)"
+      ]
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.603914",
+      "symbol": "NSE:JIOFIN",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.615136",
+      "symbol": "NSE:M&M",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.621052",
+      "symbol": "NSE:NAUKRI",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.627535",
+      "symbol": "NSE:ANGELONE",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.633026",
+      "symbol": "NSE:ICICIBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.649115",
       "symbol": "NSE:ITC",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.237159",
-      "symbol": "NSE:MCX",
+      "timestamp": "2026-02-19T12:00:45.657468",
+      "symbol": "NSE:BIOCON",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.237159",
-      "symbol": "NSE:ICICIPRULI",
+      "timestamp": "2026-02-19T12:00:45.671494",
+      "symbol": "NSE:PNBHOUSING",
+      "status": "STALE",
+      "can_trade": false,
+      "issues": [
+        "STALE_TICK: 62s old (limit: 60s)"
+      ]
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.677550",
+      "symbol": "NSE:360ONE",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.237159",
-      "symbol": "NSE:BDL",
+      "timestamp": "2026-02-19T12:00:45.682581",
+      "symbol": "NSE:IREDA",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.254819",
-      "symbol": "NSE:CROMPTON",
+      "timestamp": "2026-02-19T12:00:45.695356",
+      "symbol": "NSE:HAL",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.254819",
-      "symbol": "NSE:BAJAJ-AUTO",
+      "timestamp": "2026-02-19T12:00:45.699668",
+      "symbol": "NSE:HINDPETRO",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.254819",
-      "symbol": "NSE:POLYCAB",
+      "timestamp": "2026-02-19T12:00:45.699668",
+      "symbol": "NSE:PATANJALI",
+      "status": "STALE",
+      "can_trade": false,
+      "issues": [
+        "STALE_TICK: 67s old (limit: 60s)"
+      ]
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.716135",
+      "symbol": "NSE:OBEROIRLTY",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
     },
     {
-      "timestamp": "2026-02-18T15:22:44.254819",
-      "symbol": "NSE:IOC",
+      "timestamp": "2026-02-19T12:00:45.716135",
+      "symbol": "NSE:KALYANKJIL",
       "status": "HEALTHY",
       "can_trade": true,
       "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.730254",
+      "symbol": "NSE:HEROMOTOCO",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.737005",
+      "symbol": "NSE:HDFCBANK",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.743041",
+      "symbol": "NSE:AUROPHARMA",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.749061",
+      "symbol": "NSE:BSE",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.760692",
+      "symbol": "NSE:TCS",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.776423",
+      "symbol": "NSE:TATAPOWER",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.783407",
+      "symbol": "NSE:DLF",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.796978",
+      "symbol": "NSE:CDSL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.807876",
+      "symbol": "NSE:DIXON",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.817249",
+      "symbol": "NSE:PERSISTENT",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.827989",
+      "symbol": "NSE:CGPOWER",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.834883",
+      "symbol": "NSE:SWIGGY",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.854059",
+      "symbol": "NSE:VBL",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:00:45.863565",
+      "symbol": "NSE:LODHA",
+      "status": "HEALTHY",
+      "can_trade": true,
+      "issues": []
+    },
+    {
+      "timestamp": "2026-02-19T12:01:49.345453",
+      "symbol": "NSE:SWIGGY",
+      "status": "STALE",
+      "can_trade": false,
+      "issues": [
+        "STALE_TICK: 63s old (limit: 60s)"
+      ]
+    },
+    {
+      "timestamp": "2026-02-19T12:01:49.359180",
+      "symbol": "NSE:KALYANKJIL",
+      "status": "STALE",
+      "can_trade": false,
+      "issues": [
+        "STALE_TICK: 64s old (limit: 60s)"
+      ]
     }
   ]
 }

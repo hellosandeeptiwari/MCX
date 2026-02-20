@@ -180,7 +180,9 @@ class FuturesOIFetcher:
             # Extract base symbol from trading symbol like "SBIN-Feb2026-FUT"
             base = trading_sym.split('-')[0] if '-' in trading_sym else trading_sym
             
-            if base not in UNIVERSE_STOCKS and base not in ('NIFTY', 'BANKNIFTY', 'FINNIFTY'):
+            # Accept ALL NSE stock futures (no hardcoded filter)
+            # Only skip index futures that aren't equity-based
+            if inst_type == 'FUTIDX' and base not in ('NIFTY', 'BANKNIFTY', 'FINNIFTY'):
                 continue
             
             if base not in contracts:
@@ -480,8 +482,13 @@ class FuturesOIFetcher:
     # BACKFILL — fetch and save for all universe stocks
     # ================================================================
     
-    def backfill_all(self, months_back: int = 36) -> dict:
-        """Fetch and save futures OI features for all universe stocks.
+    def backfill_all(self, months_back: int = 36, symbols: list = None) -> dict:
+        """Fetch and save futures OI features for all F&O stocks.
+        
+        Args:
+            months_back: How many months of history to fetch
+            symbols: Optional list of symbols. If None, uses all stocks from
+                     the instrument master (dynamic, not hardcoded).
         
         Returns:
             dict: symbol -> {'rows': int, 'status': 'ok'|'failed'|'no_contract'}
@@ -489,10 +496,17 @@ class FuturesOIFetcher:
         # Ensure we have instrument master
         contracts = self.load_instrument_master()
         
-        results = {}
-        total = len(UNIVERSE_STOCKS)
+        # Use all available F&O stocks from instrument master (not hardcoded list)
+        if symbols is None:
+            # Filter to FUTSTK only (exclude index futures and test symbols)
+            symbols = [s for s in sorted(contracts.keys())
+                       if s not in ('NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50')
+                       and 'NSETEST' not in s]
         
-        for i, symbol in enumerate(UNIVERSE_STOCKS, 1):
+        results = {}
+        total = len(symbols)
+        
+        for i, symbol in enumerate(symbols, 1):
             print(f"[{i}/{total}] {symbol}...", end=" ", flush=True)
             
             if symbol not in contracts:
@@ -526,17 +540,21 @@ class FuturesOIFetcher:
         
         return results
     
-    def backfill_intraday_all(self, days_back: int = 85) -> dict:
-        """Fetch and save intraday futures OI for all universe stocks.
+    def backfill_intraday_all(self, days_back: int = 85, symbols: list = None) -> dict:
+        """Fetch and save intraday futures OI for all F&O stocks.
         
         This provides 5-min-level OI for much richer ML features.
         WARNING: This is API-intensive (~2 calls per stock).
         """
         contracts = self.load_instrument_master()
+        if symbols is None:
+            symbols = [s for s in sorted(contracts.keys())
+                       if s not in ('NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50')
+                       and 'NSETEST' not in s]
         results = {}
-        total = len(UNIVERSE_STOCKS)
+        total = len(symbols)
         
-        for i, symbol in enumerate(UNIVERSE_STOCKS, 1):
+        for i, symbol in enumerate(symbols, 1):
             print(f"[{i}/{total}] {symbol} intraday...", end=" ", flush=True)
             
             if symbol not in contracts:
@@ -589,9 +607,19 @@ def load_futures_oi_intraday(symbol: str) -> Optional[pd.DataFrame]:
 
 
 def load_all_futures_oi_daily(symbols: list = None) -> Dict[str, pd.DataFrame]:
-    """Load daily futures OI features for all symbols."""
+    """Load daily futures OI features for all symbols.
+    
+    If no symbols specified, scans the futures_oi directory for all available
+    parquet files instead of using a hardcoded list.
+    """
     if symbols is None:
-        symbols = UNIVERSE_STOCKS
+        # Discover all available futures OI parquets dynamically
+        if os.path.exists(DATA_DIR):
+            symbols = [f.replace('_futures_oi.parquet', '')
+                       for f in os.listdir(DATA_DIR)
+                       if f.endswith('_futures_oi.parquet')]
+        else:
+            symbols = UNIVERSE_STOCKS  # fallback
     
     result = {}
     for sym in symbols:
