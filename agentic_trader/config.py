@@ -89,15 +89,22 @@ def calc_brokerage(entry_price, exit_price, quantity):
 
 # ========== HARD RULES (NEVER VIOLATE) ==========
 HARD_RULES = {
-    "RISK_PER_TRADE": 0.06,         # 6% base risk per trade (tiered: 8% premium, 6% std, 3.5% base)
-    "MAX_DAILY_LOSS": 0.15,         # 15% max daily loss
-    "MAX_POSITIONS": 20,            # Max simultaneous positions (spreads count as 1)
-    "MAX_POSITIONS_MIXED": 12,       # Max positions in MIXED regime
-    "MAX_POSITIONS_TRENDING": 12,    # Max positions in BULLISH/BEARISH regime
+    "RISK_PER_TRADE": 0.07,         # 7% base risk per trade (tiered: 7% premium, 5% std, 4% base)
+    "MAX_DAILY_LOSS": 0.20,         # 20% max daily loss
+    "MAX_POSITIONS": 80,            # Max simultaneous positions (spreads count as 1)
+    "MAX_POSITIONS_MIXED": 80,       # Max positions in MIXED regime
+    "MAX_POSITIONS_TRENDING": 80,    # Max positions in BULLISH/BEARISH regime
     "STALE_DATA_SECONDS": 60,       # Data older than this is stale
     "API_RATE_LIMIT_MS": 350,       # Min ms between API calls (Kite allows ~3/s, 350ms is safe)
     "CAPITAL": 500000,              # Starting capital ₹5,00,000
-    "REENTRY_COOLDOWN_MINUTES": 20, # Skip same underlying for 20 min after any exit
+    "REENTRY_COOLDOWN_MINUTES": 30, # Skip same underlying for 30 min after any exit
+    # === PENNY PREMIUM PROTECTION (Feb 24 fix) ===
+    # Cheap options (<₹3) create position-size bombs:
+    #   ₹0.94 × lot 4300 = ₹4042/lot → sizer gives 15 lots = 64,500 units
+    #   ₹0.10 move = ₹6,450 loss. Massive notional on tiny premium.
+    # Also cap max units per trade to prevent outsized exposure.
+    "MIN_OPTION_PREMIUM": 3.0,      # Reject options with LTP < ₹3 (avoids penny traps)
+    "MAX_UNITS_PER_TRADE": 30000,   # Hard cap on units (lots × lot_size) per single trade
 }
 
 # === FULL F&O UNIVERSE SCAN ===
@@ -181,16 +188,22 @@ ADAPTIVE_SCAN = {
 # the model's safest candidates, to independently evaluate model performance.
 DOWN_RISK_GATING = {
     "enabled": True,
-    # Graduated soft scoring — thresholds calibrated to GBM probability distribution
+    # Direction-aware graduated soft scoring
     # GBM outputs P(adverse) ∈ [0,1]. UP flag threshold ≈ 0.22, DOWN ≈ 0.32.
-    # Top decile scores rarely exceed 0.50, so tiers are set accordingly.
-    "high_risk_threshold": 0.40,      # Score > this → strong penalty (top ~5% of scores)
-    "high_risk_penalty": 15,          # Points deducted for high-risk anomaly
-    "mid_risk_penalty": 8,            # Points deducted for flag=True but score < 0.40
-    "clean_threshold": 0.15,          # Score < this → boost (bottom ~40%, genuinely clean)
-    "clean_boost": 8,                 # Points added for clean/genuine pattern
-    "model_tracker_trades": 7,        # Exclusive model-only trades per day for tracking
+    # If dr OPPOSES trade direction → PENALIZE (crash hurts CE, trap hurts PE)
+    # If dr CONFIRMS trade direction → BOOST (crash helps PE, trap helps CE)
+    "high_risk_threshold": 0.40,      # Score > this → strong penalty/boost depending on direction
+    "high_risk_penalty": 15,          # Points deducted when high-dr OPPOSES trade direction
+    "mid_risk_penalty": 8,            # Points deducted when flagged + opposes direction
+    "clean_threshold": 0.15,          # Score < this → boost (genuine clean pattern)
+    "clean_boost": 8,                 # Points added for clean/genuine pattern or dr-confirms-direction
+    "model_tracker_trades": 14,       # Exclusive model-only trades per day for tracking
     "log_rejections": True,           # Log score adjustments for diagnostics
+    # === HARD DR_SCORE GATE FOR MODEL-TRACKER ===
+    # Blocks ANY model-tracker candidate with dr_score above this — no exceptions.
+    # Prevents high-anomaly trades like PETRONET (dr=0.186), TORNTPHARM (dr=0.141).
+    # Sniper uses 0.10; model-tracker slightly looser but still strict.
+    "max_dr_score": 0.12,             # HARD cap — dr_score above this = BLOCKED (or DR_FLIP)
 }
 
 # === ML DIRECTION CONFLICT FILTER ===
@@ -205,6 +218,35 @@ ML_DIRECTION_CONFLICT = {
     "block_gpt_trades": True,       # Also apply to GPT direct-placed trades
 }
 
+# === ML_OVERRIDE_WGMM TIGHTENING ===
+# Extra gates for ML_OVERRIDE_WGMM (XGB+GMM override Titan direction) trades.
+# These are ON TOP OF the normal gating — ML_OVERRIDE_WGMM only fires when ALL pass.
+#
+# DR SCORE INTERPRETATION (correct):
+#   High dr in DOWN regime = stock WILL go DOWN (confirms DOWN direction)
+#   High dr in UP regime = stock WILL go UP (confirms UP direction)
+#   → ML_OVERRIDE needs HIGH dr to confirm that XGB's opposing direction is real
+ML_OVERRIDE_GATES = {
+    "min_move_prob": 0.58,            # XGB gate P(MOVE) floor for overrides (vs 0.40 general)
+    "min_dr_score": 0.15,             # GMM must show strong directional confirmation (high dr = confirmed)
+    "min_directional_prob": 0.40,     # XGB prob_up/prob_down must show real conviction
+    "max_concurrent_open": 3,         # Max simultaneously open ML_OVERRIDE_WGMM positions
+}
+
+# === GMM CONTRARIAN (DR_FLIP) — Feb 24 fix ===
+# When GMM dr_score is VERY HIGH for XGB=FLAT stocks (default regime routing):
+# The high dr is a strong directional signal that Titan may be wrong.
+# Safety: requires high Gate P(MOVE) + XGB must not strongly disagree with flipped dir.
+GMM_CONTRARIAN = {
+    "enabled": True,
+    "min_dr_score": 0.15,              # Only flip when dr is convincingly high (not borderline)
+    "min_gate_prob": 0.50,             # Gate must confirm stock is moving (P(MOVE) >= 0.50)
+    "max_concurrent_open": 3,          # Max simultaneously open DR_FLIP positions
+    "max_trades_per_day": 4,           # Conservative daily limit — these are contrarian
+    "lot_multiplier": 1.0,             # Standard lots (not boosted — contrarian = careful)
+    "score_tier": "standard",          # Standard risk tier, not premium
+}
+
 # === GMM SNIPER TRADE (1 high-conviction trade per scan cycle) ===
 # Picks the single cleanest GMM candidate each cycle with 2x lot size.
 # Placed directly (bypasses GPT), tracked by exit manager normally.
@@ -213,12 +255,66 @@ GMM_SNIPER = {
     "enabled": True,
     "max_sniper_trades_per_day": 5,    # Max GMM sniper trades per day
     "lot_multiplier": 2.0,             # 2x normal lot size
-    "min_smart_score": 55,             # Minimum smart score to qualify
+    "min_smart_score": 52,             # Minimum smart score to qualify (relaxed from 55)
     "max_dr_score": 0.10,              # Must be very clean (stricter than 0.15)
     "min_gate_prob": 0.50,             # XGB gate floor for sniper (slightly relaxed from 0.55)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 300000,        # ₹3 Lakh reserved exclusively for sniper trades
     "max_exposure_pct": 90,            # Max % of sniper capital usable (₹2.7L)
+}
+
+# === SNIPER: OI UNWINDING REVERSAL (Sniper-OIUnwinding) ===
+# Detects LONG_UNWINDING / SHORT_COVERING with price at OI support/resistance.
+# Contrarian reversal entry — fading trapped-traders exit.
+# GMM + XGB confirm direction safety. Tagged as 'SNIPER_OI_UNWINDING'.
+SNIPER_OI_UNWINDING = {
+    "enabled": True,
+    "max_trades_per_day": 4,            # Max OI Unwinding sniper trades per day
+    "lot_multiplier": 1.5,              # 1.5x lots (conviction but conservative)
+    # --- OI Unwinding Detection ---
+    "required_buildups": ["LONG_UNWINDING", "SHORT_COVERING"],
+    "min_buildup_strength": 0.45,       # OI buildup signal strength >= 0.45
+    "min_oi_change_pct": 8.0,           # Dominant OI side must have changed >= 8%
+    # --- Price Reversal at S/R ---
+    "max_distance_from_sr_pct": 1.5,    # Spot must be within 1.5% of OI support/resistance
+    # --- GMM Quality Gate ---
+    "max_dr_score": 0.15,               # GMM down-risk must be clean
+    "min_gate_prob": 0.45,              # XGB gate P(move) floor
+    "min_smart_score": 50,              # Minimum smart_score
+    # --- Timing ---
+    "earliest_entry": "09:45",          # Wait for OI data to settle
+    "no_entry_after": "14:30",          # No entries after 2:30 PM
+    # --- Risk ---
+    "score_tier": "premium",
+    "separate_capital": 200000,         # ₹2L reserved for OI unwinding sniper
+}
+
+# === SNIPER: PCR EXTREME FADE (Sniper-PCRExtreme) ===
+# Fires when stock/index PCR hits extreme levels.
+# PCR >= 1.35 = oversold → contrarian BUY. PCR <= 0.65 = overbought → SELL.
+# Blends stock PCR with NIFTY index PCR for macro confirmation.
+# Tagged as 'SNIPER_PCR_EXTREME'.
+SNIPER_PCR_EXTREME = {
+    "enabled": True,
+    "max_trades_per_day": 3,            # Max PCR Extreme trades per day
+    "lot_multiplier": 1.5,              # 1.5x lots
+    # --- PCR Extreme Detection ---
+    "pcr_oversold_threshold": 1.35,     # PCR >= 1.35 → market oversold → BUY
+    "pcr_overbought_threshold": 0.65,   # PCR <= 0.65 → market overbought → SELL
+    # --- Index PCR (Macro Confirmation) ---
+    "use_index_pcr": True,              # Also check NIFTY PCR for macro regime
+    "index_symbol": "NIFTY",            # Index to check
+    "index_pcr_weight": 0.4,            # Blend: 60% stock PCR + 40% index PCR
+    # --- GMM Quality Gate ---
+    "max_dr_score": 0.18,               # Slightly relaxed — PCR is strong standalone signal
+    "min_gate_prob": 0.40,              # XGB gate P(move) floor
+    "min_smart_score": 45,              # Lower floor — PCR extreme itself is high-edge
+    # --- Timing ---
+    "earliest_entry": "10:00",          # Need 45 min for reliable PCR
+    "no_entry_after": "14:00",          # Earlier cutoff — PCR plays are multi-hour
+    # --- Risk ---
+    "score_tier": "premium",
+    "separate_capital": 150000,         # ₹1.5L reserved for PCR extreme sniper
 }
 
 # === DECISION LOG (Full Scan Audit Trail) ===
@@ -300,7 +396,7 @@ FNO_CONFIG = {
     "option_type_on_bullish": "CE",  # Buy Call on bullish signal
     "option_type_on_bearish": "PE",  # Buy Put on bearish signal
     "strike_selection": "ATM",       # ATM, ITM, OTM
-    "max_option_premium": 150000,    # Max premium per trade (₹1.5 lakh)
+    "max_option_premium": 200000,    # Max premium per trade (₹2 lakh)
 }
 
 # === CREDIT SPREAD CONFIGURATION (THETA-POSITIVE STRATEGY) ===
@@ -319,24 +415,24 @@ CREDIT_SPREAD_CONFIG = {
     "max_spread_risk": 75000,        # Max risk per spread = ₹75K (spread_width × lot_size - credit)
     "max_total_spread_exposure": 250000,  # Max total risk across all spreads ₹2.5L (50% of capital)
     "max_lots_per_spread": 5,        # Max lots per single spread trade
-    # --- Entry Criteria ---
-    "min_credit_pct": 20,            # Minimum credit as % of spread width (lower for deeper OTM)
-    "preferred_credit_pct": 30,      # Preferred credit >= 30% of max risk
-    "min_iv_percentile": 30,         # Sell options when IV is above 30th percentile
-    "min_score_threshold": 57,       # Minimum intraday score to enter spread (reduced 8%)
+    # --- Entry Criteria (RELAXED — credit spreads are theta-positive, we WANT them to fire) ---
+    "min_credit_pct": 15,            # Minimum credit as % of spread width (was 20% — too strict, filtered viable setups)
+    "preferred_credit_pct": 25,      # Preferred credit >= 25% of max risk (was 30%)
+    "min_iv_percentile": 20,         # Sell options when IV is above 20th percentile (was 30% — relaxed for more entries)
+    "min_score_threshold": 50,       # Minimum intraday score to enter spread (was 57 — credit spreads need less conviction)
     # --- Risk Management ---
     "sl_multiplier": 2.0,            # Exit if loss reaches 2× credit received
     "target_pct": 65,                # Exit when 65% of max credit is captured (time decay)
     "time_decay_exit_minutes": 90,   # If < 90 min to close, exit at whatever P&L
     "max_days_to_expiry": 21,        # Stock options are monthly — accept up to 21 DTE
     "min_days_to_expiry": 2,         # Don't sell with <2 DTE (gamma risk)
-    "max_sold_delta": 0.35,          # Sold leg delta must be ≤ 0.35 (probability of profit)
+    "max_sold_delta": 0.40,          # Sold leg delta must be ≤ 0.40 (was 0.35 — slight relaxation for more entries)
     # --- Expiry Management ---
     "prefer_expiry": "CURRENT_WEEK", # Weekly options for faster theta decay
     "rollover_at_dte": 1,            # Roll or close when 1 DTE remaining
     # --- Fallback to Naked Buys ---
     "fallback_to_buy": True,         # If spread not viable, fall back to buying options
-    "buy_only_score_threshold": 57,  # Only buy naked if score >= 57 (reduced 8%)
+    "buy_only_score_threshold": 60,  # Only buy naked if score >= 60 (RAISED — naked buys face theta, need more conviction)
 }
 
 # === CASH EQUITY INTRADAY SCORING CONFIG ===
@@ -398,6 +494,120 @@ DEBIT_SPREAD_CONFIG = {
     "proactive_scan": True,          # Actively scan for debit spread opportunities (not just fallback)
     "proactive_scan_min_score": 62,  # Minimum score for proactive debit spread
     "proactive_scan_min_move_pct": 1.5,  # Proactive scan needs slightly stronger move
+}
+
+# === THESIS HEDGE PROTOCOL (THP) CONFIGURATION ===
+# When TIE invalidates a naked option thesis, THP converts it to a debit spread
+# instead of immediately exiting — limits max loss while allowing for recovery.
+THESIS_HEDGE_CONFIG = {
+    "enabled": True,
+    # --- Hedge Leg Selection ---
+    "sell_strike_offset": 3,          # Sell leg = 3 strikes OTM from current ATM
+    "min_hedge_premium": 3.0,         # Min ₹ premium on sell leg (too cheap = worthless hedge)
+    "min_hedge_premium_pct": 15,      # Sell leg premium must be ≥15% of buy leg entry price
+    # --- Liquidity Gates ---
+    "min_oi": 500,                    # Minimum OI on sell leg
+    "max_bid_ask_pct": 5.0,           # Max bid-ask spread as % of LTP on sell leg
+    # --- Extended Hold Window ---
+    "extended_time_stop_candles": 20,  # Hedged trades get 20 candles (100 min) vs 10
+    # --- Hedged Position Exit Rules ---
+    "hedged_sl_pct": 50,              # SL: exit when spread value drops 50% of net_debit
+    "hedged_target_pct": 150,         # Target: exit at 150% of net_debit (1.5x)
+    "hedged_breakeven_trail_pct": 100, # Trail activation: when spread value >= net_debit (breakeven)
+    "hedged_trail_giveback_pct": 45,  # Once trailing, give back 45% of peak profit
+    # --- Auto-exit (same as debit spreads) ---
+    "auto_exit_time": "15:05",        # Hard exit time for hedged positions
+    # --- Universal Hedge Loss Cap ---
+    "max_hedge_loss_pct": 20,          # UNIFIED: only hedge if current loss ≤ 20% (TIE + TIME_STOP)
+    # --- TIME_STOP Hedge (dead-trade rescue) ---
+    "hedge_time_stop": True,          # Also hedge naked options hitting TIME_STOP (not just TIE)
+    # --- Hedge Unwind (restore full upside on recovery) ---
+    "unwind_enabled": True,           # Buy back sold leg when thesis re-validates
+    "unwind_buy_leg_recovery_pct": 100, # Unwind when buy leg LTP >= 100% of entry (fully recovered)
+    "unwind_min_profit_after_cost": 2,  # Min ₹ profit remaining after buyback cost (avoid pointless unwinds)
+}
+
+# === PROACTIVE LOSS HEDGE CONFIGURATION ===
+# Monitors open naked options every minute. If any position's unrealized
+# loss crosses the trigger threshold, automatically converts to debit spread
+# BEFORE SL/TIE/TIME_STOP fires — catches fast moves between scan cycles.
+PROACTIVE_HEDGE_CONFIG = {
+    "enabled": True,
+    "loss_trigger_pct": 8,            # Convert when loss >= 8% of entry price
+    "check_interval_seconds": 60,     # Check every 60 seconds (inside realtime monitor)
+    "max_hedge_loss_pct": 20,         # Don't hedge if already > 20% loss (too deep)
+    "cooldown_seconds": 300,          # After a hedge, wait 5 min before checking same underlying again
+    "log_checks": True,               # Log every check cycle to bot_debug.log for diagnostics
+}
+
+# === EXPIRY DAY SHIELD CONFIGURATION ===
+# Protects against gamma risk on expiry days (0DTE/1DTE).
+# Options can swing 200-500% in minutes on expiry day due to extreme gamma.
+# ⚠️ MONTHLY EXPIRY MODE: Tighter settings — gamma risk is 2-3× higher than weekly expiry
+EXPIRY_SHIELD_CONFIG = {
+    "enabled": True,                    # Auto-managed by expiry detection (Feb 24 fix)
+    "is_monthly_expiry": False,        # 🟢 NOW AUTO-DETECTED — no manual toggle needed
+    # --- Entry Restrictions (TIGHTENED for monthly expiry) ---
+    "no_new_naked_after": "10:30",     # No new naked options after 10:30 AM (was 11:00 — monthly gamma is extreme)
+    "no_new_any_after": "12:00",       # No new entries at all after 12:00 PM (was 12:30)
+    # --- Exit Rules (EARLIER exit for monthly) ---
+    "force_exit_0dte_by": "14:15",     # Force-exit all 0DTE positions by 2:15 PM (was 14:30)
+    "sl_tighten_factor_0dte": 0.40,    # SL distance = 40% of normal on 0DTE (60% tighter — monthly gamma!)
+    "sl_tighten_factor_1dte": 0.70,    # SL distance = 70% of normal on 1DTE (30% tighter)
+    # --- Speed Gate Override ---
+    "speed_gate_candles_0dte": 4,      # Speed gate fires after 4 candles (20 min) on 0DTE monthly
+    "speed_gate_pct_0dte": 6.0,        # Need +6% gain in 20 min on 0DTE monthly (was 5%)
+}
+
+# === THETA BLEED PREVENTION (Entry-Side Gates) ===
+# Prevents naked option buys that will lose to time decay before direction plays out.
+# Root cause: options bought with high theta-to-premium ratio bleed even if direction is right.
+THETA_ENTRY_GATE = {
+    "enabled": True,
+    # --- Theta/Premium Ratio Gate (blocks trades where decay > expected gain) ---
+    # Daily |theta| as % of premium. If theta eats >5% per day, stock needs >5% move just to break even.
+    "max_theta_pct_of_premium": 5.0,    # Block if |daily theta| > 5% of option LTP
+    # --- DTE Floor for Naked Buys (non-expiry days) ---
+    # On non-expiry days, avoid buying options with <3 DTE — theta curve steepens quadratically.
+    # On expiry day, expiry_shield handles 0DTE separately.
+    "min_dte_naked_buy": 3,             # Don't buy naked options with DTE < 3
+    # --- Afternoon Theta Multiplier (EXPIRY DAY ONLY) ---
+    # After 1PM on expiry day, theta accelerates sharply for near-month options.
+    # Require 1.5× the normal score threshold to enter naked buys in afternoon.
+    "expiry_day_pm_score_multiplier": 1.5,  # Score must be 1.5× threshold after PM cutoff
+    "expiry_day_pm_after": "13:00",         # When PM multiplier kicks in (1 PM)
+}
+
+# === GREEKS-BASED EXIT INTELLIGENCE ===
+# Dynamic SL/target based on option Greeks instead of fixed percentages.
+# Makes exits context-aware: deep ITM gets wider SL, far OTM gets tighter SL.
+GREEKS_EXIT_CONFIG = {
+    "enabled": True,
+    # --- Delta Collapse Exit ---
+    "delta_collapse_threshold": 0.08,   # Exit if |delta| < 0.08 (option nearly worthless)
+    "delta_collapse_max_dte": 2,        # Only check delta collapse within 2 DTE
+    # --- Theta Bleed Guard ---
+    "theta_bleed_max_pct_hour": 3.0,    # Exit if theta > 3% of premium per hour AND trade losing
+    "theta_bleed_min_candles": 4,       # Don't check theta bleed before 4 candles (20 min)
+    # --- SL/Target Adjustments (by moneyness) ---
+    # These override the fixed 28% SL / tier-based target with Greeks-adaptive values
+    "apply_greeks_sl": True,             # Use Greeks-adjusted SL instead of fixed %
+    "apply_greeks_target": True,         # Use Greeks-adjusted target instead of fixed %
+    # --- Deep ITM (δ > 0.80): behaves like stock ---
+    "deep_itm_sl_pct": 35,              # Wider SL — low noise, moves track underlying
+    "deep_itm_target_pct": 50,          # Modest target — premium dense (less leverage)
+    # --- ITM (δ 0.55-0.80): solid directional ---
+    "itm_sl_pct": 28,                   # Standard SL
+    "itm_target_pct": 65,               # Good leverage
+    # --- ATM (δ 0.40-0.55): max gamma zone ---
+    "atm_sl_pct": 25,                   # Slightly tighter — gamma amplifies
+    "atm_target_pct": 80,               # Best R:R zone
+    # --- OTM (δ 0.15-0.40): leveraged but fragile ---
+    "otm_sl_pct": 22,                   # Tight — premium erodes fast
+    "otm_target_pct": 100,              # OTM doubles are the win scenario
+    # --- Deep OTM (δ < 0.15): lottery ticket ---
+    "deep_otm_sl_pct": 18,              # Very tight — likely worthless
+    "deep_otm_target_pct": 150,         # Moonshot or nothing
 }
 
 # === IRON CONDOR CONFIGURATION (INTRADAY IV CRUSH + PREMIUM CAPTURE) ===

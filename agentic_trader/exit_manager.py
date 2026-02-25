@@ -18,6 +18,7 @@ import os
 import logging
 import threading
 from safe_io import atomic_json_save
+from thesis_validator import check_thesis, ThesisResult
 
 # Structured logger for speed gate evaluations
 _speed_gate_logger = logging.getLogger('speed_gate')
@@ -72,9 +73,22 @@ class TradeState:
     spread_width: float = 0.0       # Strike distance between legs (spreads)
     is_debit_spread: bool = False    # True for debit spread positions
     net_debit: float = 0.0          # Net debit paid per share (debit spreads)
+    hedged_from_tie: bool = False    # True if converted from naked via THP
+    # Greeks & Expiry tracking
+    strike: float = 0.0              # Option strike price
+    option_type_str: str = ''        # 'CE' or 'PE'
+    expiry_str: str = ''             # ISO date string of option expiry
+    underlying_symbol: str = ''      # e.g., 'NSE:RELIANCE'
+    last_delta: float = 0.0          # Last computed delta
+    last_greeks_update: str = ''     # ISO timestamp of last Greeks recompute
+    greeks_sl_applied: bool = False  # True once Greeks-adjusted SL has been set
+    score_tier: str = 'standard'     # 'premium', 'standard', or 'base'
+    _cached_greeks: object = None    # Last full GreeksSnapshot (not serialised)
     
     def to_dict(self) -> Dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop('_cached_greeks', None)  # Not serialisable to JSON
+        return d
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'TradeState':
@@ -87,6 +101,16 @@ class TradeState:
         data.setdefault('spread_width', 0.0)
         data.setdefault('is_debit_spread', False)
         data.setdefault('net_debit', 0.0)
+        data.setdefault('hedged_from_tie', False)
+        data.setdefault('strike', 0.0)
+        data.setdefault('option_type_str', '')
+        data.setdefault('expiry_str', '')
+        data.setdefault('underlying_symbol', '')
+        data.setdefault('last_delta', 0.0)
+        data.setdefault('last_greeks_update', '')
+        data.setdefault('greeks_sl_applied', False)
+        data.setdefault('score_tier', 'standard')
+        data.pop('_cached_greeks', None)  # Not serialisable
         return cls(**data)
 
 
@@ -142,7 +166,14 @@ class ExitManager:
             if os.path.exists(self._state_file):
                 with open(self._state_file, 'r') as f:
                     data = json.load(f)
+                # Handle wrapper format: {"date": ..., "trade_states": {...}}
+                if isinstance(data, dict) and 'trade_states' in data:
+                    data = data['trade_states']
+                if not isinstance(data, dict):
+                    return
                 for sym, state_dict in data.items():
+                    if not isinstance(state_dict, dict):
+                        continue
                     self.trade_states[sym] = TradeState.from_dict(state_dict)
                 if self.trade_states:
                     print(f"📊 Exit Manager: Restored {len(self.trade_states)} trade states from disk")
@@ -194,13 +225,15 @@ class ExitManager:
         print(f"📊 Exit Manager: Registered {symbol} {side} @ {entry_price}")
         return state
     
-    def update_trade(self, symbol: str, current_price: float) -> Optional[ExitSignal]:
+    def update_trade(self, symbol: str, current_price: float, underlying_ltp: float = 0.0) -> Optional[ExitSignal]:
         """
         Update trade state and check for exit signals
         Call this on every price update.
         
         For credit spreads, current_price = net debit to close (sold_ltp - hedge_ltp).
         Profit = net_credit - current_debit. If current_debit rises, we're losing.
+        
+        underlying_ltp: spot price of the underlying (for option thesis checks).
         """
         if symbol not in self.trade_states:
             return None
@@ -239,6 +272,17 @@ class ExitManager:
         
         # Check all exit conditions in priority order
         
+        # 0.5 GREEKS-BASED DYNAMIC SL ADJUSTMENT (before SL check)
+        # Recompute Greeks every ~30 seconds and adjust SL by moneyness
+        if state.is_option and not state.is_debit_spread and not state.is_credit_spread:
+            self._apply_greeks_adjustment(state, current_price, underlying_ltp)
+        
+        # 0.7 EXPIRY DAY FORCE-EXIT (0DTE gamma protection)
+        if state.is_option and state.expiry_str:
+            exit_signal = self._check_expiry_force_exit(state, current_price)
+            if exit_signal:
+                return exit_signal
+        
         # 1. HARD STOP LOSS CHECK (IMMEDIATE)
         exit_signal = self._check_hard_sl(state, current_price)
         if exit_signal:
@@ -248,6 +292,22 @@ class ExitManager:
         exit_signal = self._check_session_cutoff(state, current_price)
         if exit_signal:
             return exit_signal
+        
+        # 2.5 THESIS INVALIDATION ENGINE (TIE) — structural thesis broken?
+        # Skip TIE for positions already hedged by THP (they're debit spreads now)
+        if not state.is_debit_spread:
+            tie_result = check_thesis(state, current_price, underlying_ltp)
+            if tie_result is not None and tie_result.is_invalid:
+                print(f"\n🔴 THESIS INVALID [{state.symbol}]: {tie_result.check_name}")
+                print(f"   {tie_result.reason}")
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type=f"THESIS_INVALID_{tie_result.check_name}",
+                    exit_price=current_price,
+                    reason=f"TIE: {tie_result.reason}",
+                    urgency="IMMEDIATE",
+                )
         
         # 3. TARGET HIT CHECK
         exit_signal = self._check_target(state, current_price)
@@ -269,6 +329,12 @@ class ExitManager:
         exit_signal = self._check_option_speed_gate(state, r_multiple)
         if exit_signal:
             return exit_signal
+        
+        # 6.5 GREEKS EXIT SIGNALS — delta collapse / theta bleed
+        if state.is_option and not state.is_debit_spread and not state.is_credit_spread:
+            exit_signal = self._check_greeks_exit(state, current_price)
+            if exit_signal:
+                return exit_signal
         
         # 7. TIME STOP CHECK (after updates)
         exit_signal = self._check_time_stop(state, r_multiple)
@@ -419,12 +485,16 @@ class ExitManager:
         """Early exit for options that aren't moving fast enough.
         
         Options are theta-bleeding instruments. If the premium hasn't gained
-        +5% within 6 candles (30 min), AND R-multiple is also < +0.15R,
-        the trade thesis is failing — exit before theta eats the position.
+        enough within the speed gate window, the trade thesis is failing —
+        exit before theta eats the position.
+        
+        DTE-AWARE TIGHTENING (Feb 24 fix):
+          DTE ≤ 2: 4 candles (20 min), need +8% premium (theta is extreme)
+          DTE 3-7: 8 candles (40 min), need +5% premium (theta is steep)
+          DTE 8+:  12 candles (60 min), need +3% premium (theta is mild)
         
         Uses OR-pass logic: survives if EITHER premium% OR R-multiple is good enough.
         Only applies to option positions (is_option=True).
-        Logs every evaluation (EXIT and PASS) for evidence-based tuning.
         """
         if not state.is_option:
             return None
@@ -435,11 +505,33 @@ class ExitManager:
         if state.is_debit_spread:
             return None
         
-        if state.candles_since_entry >= self.option_speed_gate_candles:
+        # DTE-aware speed gate parameters
+        _sg_candles = self.option_speed_gate_candles  # default 12
+        _sg_pct = self.option_speed_gate_pct          # default 3.0%
+        _sg_max_r = self.option_speed_gate_max_r      # default 0.10
+        
+        try:
+            from expiry_shield import get_dte
+            _dte = get_dte({'expiry': state.expiry_str}) if state.expiry_str else 99
+            if _dte >= 0 and _dte <= 2:
+                # Near-expiry: theta is extreme, demand faster/bigger moves
+                _sg_candles = 4    # 20 min — cut losers fast
+                _sg_pct = 8.0      # Need +8% gain (theta eats 3-5%/day at this DTE)
+                _sg_max_r = 0.20   # Or +0.20R
+            elif _dte >= 3 and _dte <= 7:
+                # Mid-term: theta is meaningful but not extreme
+                _sg_candles = 8    # 40 min
+                _sg_pct = 5.0      # Need +5% gain
+                _sg_max_r = 0.15   # Or +0.15R
+            # else: DTE 8+ or unknown → use defaults (12 candles, 3%, 0.10R)
+        except Exception:
+            pass  # Use defaults if DTE unavailable
+        
+        if state.candles_since_entry >= _sg_candles:
             t_minutes = state.candles_since_entry * 5
             # OR-pass: trade survives if EITHER condition is met
-            premium_ok = state.max_premium_gain_pct >= self.option_speed_gate_pct
-            r_ok = state.max_favorable_move >= self.option_speed_gate_max_r
+            premium_ok = state.max_premium_gain_pct >= _sg_pct
+            r_ok = state.max_favorable_move >= _sg_max_r
             should_exit = not premium_ok and not r_ok  # Only exit if BOTH fail
             
             # Structured log for every evaluation at the gate candle
@@ -462,9 +554,9 @@ class ExitManager:
                     should_exit=True,
                     exit_type="OPTION_SPEED_GATE",
                     exit_price=0,  # Will use current market price
-                    reason=f"Option speed gate: {state.candles_since_entry} candles ({t_minutes}min), "
-                           f"max premium +{state.max_premium_gain_pct:.1f}% (need +{self.option_speed_gate_pct}%), "
-                           f"max R: {state.max_favorable_move:.2f} (need +{self.option_speed_gate_max_r}R)",
+                    reason=f"Option speed gate (DTE-aware): {state.candles_since_entry} candles ({t_minutes}min), "
+                           f"max premium +{state.max_premium_gain_pct:.1f}% (need +{_sg_pct}%), "
+                           f"max R: {state.max_favorable_move:.2f} (need +{_sg_max_r}R)",
                     urgency="NORMAL"
                 )
         return None
@@ -685,8 +777,15 @@ class ExitManager:
         return None
     
     def _check_time_stop(self, state: TradeState, r_multiple: float) -> Optional[ExitSignal]:
-        """Exit if no follow-through after X candles"""
-        if state.candles_since_entry >= self.time_stop_candles:
+        """Exit if no follow-through after X candles.
+        THP-hedged positions get extended window (20 candles vs 10)."""
+        # Hedged positions get extended time to recover
+        effective_time_stop = self.time_stop_candles
+        if state.is_debit_spread and state.hedged_from_tie:
+            from config import THESIS_HEDGE_CONFIG
+            effective_time_stop = THESIS_HEDGE_CONFIG.get('extended_time_stop_candles', 20)
+        
+        if state.candles_since_entry >= effective_time_stop:
             if state.max_favorable_move < self.time_stop_min_r:
                 return ExitSignal(
                     symbol=state.symbol,
@@ -708,6 +807,166 @@ class ExitManager:
                     reason=f"Gave back gains: {state.candles_since_entry} candles, had {state.max_favorable_move:.2f}R now {r_multiple:.2f}R — dead trade",
                     urgency="NORMAL"
                 )
+        return None
+    
+    # ═══════════════════════════════════════════════════════════════
+    # GREEKS-BASED DYNAMIC EXIT INTELLIGENCE
+    # ═══════════════════════════════════════════════════════════════
+    
+    def _apply_greeks_adjustment(self, state: TradeState, current_price: float, underlying_ltp: float):
+        """
+        Recompute Greeks and dynamically adjust SL/target based on moneyness.
+        
+        Called before the hard SL check so the SL value is Greeks-aware when checked.
+        Only applies to naked option positions (not spreads).
+        """
+        from config import GREEKS_EXIT_CONFIG
+        if not GREEKS_EXIT_CONFIG.get('enabled', False) or not GREEKS_EXIT_CONFIG.get('apply_greeks_sl', False):
+            return
+        
+        # Need strike, option_type, underlying to compute Greeks
+        if not state.strike or not state.option_type_str or underlying_ltp <= 0:
+            return
+        
+        # Throttle: only recompute every 30 seconds
+        now = datetime.now()
+        if state.last_greeks_update:
+            try:
+                last_update = datetime.fromisoformat(state.last_greeks_update)
+                if (now - last_update).total_seconds() < 30:
+                    return
+            except (ValueError, TypeError):
+                pass
+        
+        try:
+            from greeks_engine import compute_live_greeks, get_greeks_adjusted_sl, get_greeks_adjusted_target
+            from expiry_shield import get_dte, get_expiry_adjusted_sl
+            
+            dte = -1
+            if state.expiry_str:
+                dte = get_dte({'expiry': state.expiry_str})
+            
+            greeks = compute_live_greeks(
+                spot_price=underlying_ltp,
+                strike=state.strike,
+                dte=max(0, dte) if dte >= 0 else 5,  # Default 5 if unknown
+                risk_free_rate=0.065,
+                option_ltp=current_price,
+                option_type=state.option_type_str,
+            )
+            
+            if greeks is None:
+                return
+            
+            # Update tracked delta and cache full snapshot
+            state.last_delta = greeks.delta
+            state.last_greeks_update = now.isoformat()
+            state._cached_greeks = greeks
+            
+            # Compute Greeks-adjusted SL
+            greeks_sl = get_greeks_adjusted_sl(state.entry_price, greeks, state.score_tier)
+            
+            # Apply expiry-day tightening on top of Greeks SL
+            if dte >= 0 and dte <= 1:
+                greeks_sl = get_expiry_adjusted_sl(
+                    state.entry_price, greeks_sl, dte, delta=greeks.delta
+                )
+            
+            # Only apply if this is initial application or SL is moving in protective direction
+            if not state.greeks_sl_applied:
+                # First time: set Greeks-adjusted SL (may be tighter or wider than fixed %)
+                if state.side == "BUY":
+                    # For longs: only set if greeks_sl is reasonable (not 0)
+                    if greeks_sl > 0 and greeks_sl < state.entry_price:
+                        state.initial_sl = greeks_sl
+                        # Don't override if trailing/breakeven already moved SL higher
+                        if not state.breakeven_applied and not state.trailing_active:
+                            state.current_sl = greeks_sl
+                        state.greeks_sl_applied = True
+                
+                # Also adjust target
+                if GREEKS_EXIT_CONFIG.get('apply_greeks_target', False):
+                    greeks_target = get_greeks_adjusted_target(state.entry_price, greeks, state.score_tier)
+                    if greeks_target > state.entry_price:
+                        state.target = greeks_target
+                        
+        except Exception as e:
+            pass  # Silent fail — don't block exits due to Greeks computation errors
+    
+    def _check_expiry_force_exit(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
+        """
+        Force-exit 0DTE positions at 2:45 PM.
+        Gamma risk on expiry day is the #1 account killer.
+        """
+        from config import EXPIRY_SHIELD_CONFIG
+        if not EXPIRY_SHIELD_CONFIG.get('enabled', False):
+            return None
+        
+        try:
+            from expiry_shield import should_force_exit_expiry
+            should_exit, reason = should_force_exit_expiry({'expiry': state.expiry_str})
+            if should_exit:
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="EXPIRY_FORCE_EXIT",
+                    exit_price=current_price,
+                    reason=reason,
+                    urgency="IMMEDIATE",
+                )
+        except Exception:
+            pass
+        return None
+    
+    def _check_greeks_exit(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
+        """
+        Check for Greeks-based exit signals:
+          1. Delta collapse (δ < 0.08) — option dying
+          2. Theta bleed (θ > 3%/hour of premium) — slow death
+        """
+        from config import GREEKS_EXIT_CONFIG
+        if not GREEKS_EXIT_CONFIG.get('enabled', False):
+            return None
+        
+        # Need recently computed Greeks
+        if not state.last_greeks_update or not state.option_type_str:
+            return None
+        
+        try:
+            from greeks_engine import should_exit_on_greeks, GreeksSnapshot, classify_moneyness
+            from expiry_shield import get_dte
+            
+            dte = get_dte({'expiry': state.expiry_str}) if state.expiry_str else 5
+            
+            # Use the full cached snapshot from _apply_greeks_adjustment if available
+            if hasattr(state, '_cached_greeks') and state._cached_greeks is not None:
+                greeks = state._cached_greeks
+            else:
+                # Fallback: build partial snapshot from stored delta
+                greeks = GreeksSnapshot(
+                    delta=state.last_delta,
+                    gamma=0,
+                    theta=0,
+                    vega=0,
+                    iv=0,
+                    moneyness=classify_moneyness(state.last_delta),
+                    dte=max(0, dte),
+                )
+            
+            should_exit, reason = should_exit_on_greeks(
+                greeks, current_price, state.entry_price, state.candles_since_entry
+            )
+            if should_exit:
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="GREEKS_EXIT",
+                    exit_price=current_price,
+                    reason=reason,
+                    urgency="NORMAL",
+                )
+        except Exception:
+            pass
         return None
     
     def _apply_breakeven(self, state: TradeState, r_multiple: float):
@@ -798,14 +1057,18 @@ class ExitManager:
         """Get all tracked trades"""
         return list(self.trade_states.values())
     
-    def check_all_exits(self, prices: Dict[str, float]) -> List[ExitSignal]:
+    def check_all_exits(self, prices: Dict[str, float], underlying_prices: Optional[Dict[str, float]] = None) -> List[ExitSignal]:
         """
         Check all trades for exit signals
         prices: Dict of symbol -> current_price
+        underlying_prices: Dict of option_symbol -> underlying_ltp (for TIE checks)
         """
+        if underlying_prices is None:
+            underlying_prices = {}
         signals = []
         for symbol, price in prices.items():
-            signal = self.update_trade(symbol, price)
+            ul_ltp = underlying_prices.get(symbol, 0.0)
+            signal = self.update_trade(symbol, price, underlying_ltp=ul_ltp)
             if signal:
                 signals.append(signal)
         return signals

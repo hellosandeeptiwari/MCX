@@ -174,7 +174,7 @@ class ZerodhaTools:
     
     # Trade tracking file path
     TRADES_FILE = os.path.join(os.path.dirname(__file__), 'active_trades.json')
-    TRADE_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'trade_history.json')
+    # Trade logging is handled by centralized TradeLedger (trade_ledger.py)
     
     def __init__(self, paper_mode: bool = True, paper_capital: float = None):
         self.kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
@@ -195,6 +195,20 @@ class ZerodhaTools:
         
         # Load saved token
         self._load_token()
+        
+        # === LIVE MODE: Sync capital from broker margins ===
+        if not paper_mode and self.access_token:
+            try:
+                margins = self.kite.margins()
+                equity_margin = margins.get('equity', {})
+                live_balance = equity_margin.get('available', {}).get('live_balance', 0)
+                if live_balance > 0:
+                    self.paper_capital = live_balance
+                    print(f"   💰 LIVE capital synced from broker: ₹{live_balance:,.0f}")
+                else:
+                    print(f"   ⚠️ Could not fetch live balance, using config capital: ₹{self.paper_capital:,.0f}")
+            except Exception as e:
+                print(f"   ⚠️ Broker margin fetch failed ({e}), using config capital: ₹{self.paper_capital:,.0f}")
         
         # === INITIALIZE KITE TICKER (WebSocket streaming) ===
         self.ticker: TitanTicker = None
@@ -560,84 +574,124 @@ class ZerodhaTools:
         except Exception:
             pass  # Never crash on logging
     
-    def _save_to_history(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
-        """Save completed trade to history file with full exit context"""
+    def _log_entry_to_ledger(self, position: Dict):
+        """Log a new trade entry to centralized Trade Ledger (single source of truth).
+        
+        Called from EVERY position append point (options, equity, spreads, condors).
+        Mirrors _save_to_history which centralizes all exits.
+        The position dict already has all the data we need.
+        """
         try:
-            history = []
-            if os.path.exists(self.TRADE_HISTORY_FILE):
-                with open(self.TRADE_HISTORY_FILE, 'r') as f:
-                    history = json.load(f)
+            from trade_ledger import get_trade_ledger
+            _ml = position.get('entry_metadata', {})
+            _md = position.get('xgb_model', {})
+            _gm = position.get('gmm_model', {})
             
-            trade_record = {
-                **trade,
-                'result': result,  # 'TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT'
-                'pnl': pnl,
-                'closed_at': datetime.now().isoformat()
-            }
+            # Determine strategy type from position flags
+            if position.get('is_iron_condor'):
+                _strat = 'IRON_CONDOR'
+            elif position.get('is_credit_spread'):
+                _strat = 'CREDIT_SPREAD'
+            elif position.get('is_debit_spread'):
+                _strat = 'DEBIT_SPREAD'
+            elif position.get('is_option'):
+                _strat = position.get('strategy_type', 'NAKED_OPTION')
+            else:
+                _strat = position.get('strategy_type', 'EQUITY')
             
-            # Attach exit context if provided (candles_held, R-multiple, etc.)
-            if exit_detail:
-                trade_record['exit_detail'] = exit_detail
-            
-            history.append(trade_record)
-            
-            atomic_json_save(self.TRADE_HISTORY_FILE, history)
-            
-            # === ALSO WRITE TO STRUCTURED EXIT LOG ===
-            self._log_exit_event(trade_record, result, pnl, exit_detail)
-            
+            get_trade_ledger().log_entry(
+                symbol=position.get('symbol', ''),
+                underlying=position.get('underlying', position.get('symbol', '')),
+                direction=position.get('direction', position.get('side', '')),
+                source=position.get('setup_type', position.get('strategy_type', 'MANUAL')),
+                smart_score=position.get('smart_score') or 0,
+                pre_score=position.get('p_score') or position.get('entry_score', 0),
+                final_score=position.get('entry_score') or position.get('p_score', 0),
+                dr_score=position.get('dr_score') or 0,
+                dr_flag=position.get('dr_flag', False),
+                gate_prob=position.get('ml_move_prob') or 0,
+                gmm_action=position.get('gmm_action', _gm.get('action', '')),
+                ml_direction=position.get('ml_scored_direction', _md.get('scored_direction', '')),
+                ml_move_prob=position.get('ml_move_prob') or _md.get('ml_move_prob', 0),
+                ml_confidence=position.get('ml_confidence') or _md.get('confidence', ''),
+                xgb_disagrees=position.get('ml_xgb_disagrees', False),
+                sector=position.get('sector', ''),
+                strategy_type=_strat,
+                score_tier=position.get('score_tier', ''),
+                is_sniper=position.get('is_sniper', False),
+                lot_multiplier=position.get('lot_multiplier', 1.0),
+                option_symbol=position.get('symbol', ''),
+                strike=position.get('strike', 0),
+                option_type=position.get('option_type', ''),
+                expiry=position.get('expiry', '') or '',
+                entry_price=position.get('avg_price', 0),
+                quantity=position.get('quantity', 0),
+                lots=position.get('lots', 0),
+                stop_loss=position.get('stop_loss', 0),
+                target=position.get('target', 0),
+                total_premium=position.get('total_premium', 0),
+                delta=position.get('delta', position.get('net_delta', 0)),
+                iv=position.get('iv', 0),
+                rationale=position.get('rationale', ''),
+                order_id=position.get('order_id', ''),
+                trade_id=position.get('trade_id', ''),
+            )
         except Exception as e:
-            print(f"⚠️ Error saving to history: {e}")
-    
-    def _log_exit_event(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
-        """Write structured exit event to trade_decisions.log for post-trade review"""
+            print(f"⚠️ TradeLedger entry log error: {e}")
+
+    def _save_to_history(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
+        """Save completed trade to centralized Trade Ledger (single source of truth)"""
         try:
-            from options_trader import TRADE_DECISIONS_LOG
-            symbol = trade.get('symbol', '?')
-            underlying = trade.get('underlying', symbol)
-            entry = trade.get('avg_price', 0)
-            exit_price = trade.get('exit_price', 0)
-            qty = trade.get('quantity', 0)
-            side = trade.get('side', '?')
-            entry_score = trade.get('entry_score', 0)
-            score_tier = trade.get('score_tier', '?')
-            trade_id = trade.get('trade_id', '?')
-            strategy = trade.get('strategy_type', trade.get('spread_type', 'NAKED_OPTION'))
-            entry_time = trade.get('timestamp', '?')
-            
-            # Exit detail fields
-            candles_held = (exit_detail or {}).get('candles_held', '?')
-            r_multiple = (exit_detail or {}).get('r_multiple_achieved', '?')
-            max_favorable = (exit_detail or {}).get('max_favorable_excursion', '?')
-            exit_reason = (exit_detail or {}).get('exit_reason', result)
-            
-            # Calculate hold duration
-            hold_mins = '?'
+            from trade_ledger import get_trade_ledger
+            _ed = exit_detail or {}
+            _entry_price = trade.get('avg_price', 0)
+            _exit_price = trade.get('exit_price', 0)
+            _qty = trade.get('quantity', 0)
+            _pnl_pct = (pnl / (_entry_price * _qty) * 100) if _entry_price > 0 and _qty > 0 else 0
+            _hold_mins = 0
             try:
-                if entry_time and entry_time != '?':
-                    from datetime import datetime as dt
-                    entry_dt = dt.fromisoformat(entry_time)
-                    hold_mins = int((datetime.now() - entry_dt).total_seconds() / 60)
+                _et = trade.get('timestamp', '')
+                if _et:
+                    _hold_mins = int((datetime.now() - datetime.fromisoformat(_et)).total_seconds() / 60)
             except Exception:
                 pass
-            
-            pnl_pct = (pnl / (entry * qty) * 100) if entry > 0 and qty > 0 else 0
-            
-            emoji = '🎯' if pnl > 0 else '❌'
-            
-            with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                f.write(f"\n{'─'*70}\n")
-                f.write(f"{emoji} EXIT: {underlying} ({symbol}) | {result}\n")
-                f.write(f"   Trade ID: {trade_id}\n")
-                f.write(f"   Entry: ₹{entry:.2f} → Exit: ₹{exit_price:.2f} | {side} {qty} qty\n")
-                f.write(f"   P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)\n")
-                f.write(f"   Hold: {hold_mins} min | Candles: {candles_held} | R-Multiple: {r_multiple}\n")
-                f.write(f"   Max Favorable: {max_favorable} | Exit Reason: {exit_reason}\n")
-                f.write(f"   Entry Score: {entry_score} | Tier: {score_tier} | Strategy: {strategy}\n")
-                f.write(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"{'─'*70}\n")
-        except Exception:
-            pass  # Never crash on logging
+            get_trade_ledger().log_exit(
+                symbol=trade.get('symbol', ''),
+                underlying=trade.get('underlying', trade.get('symbol', '')),
+                direction=trade.get('direction', trade.get('side', '')),
+                source=trade.get('setup_type', trade.get('strategy_type', '')),
+                sector=trade.get('sector', ''),
+                exit_type=result,
+                entry_price=_entry_price,
+                exit_price=_exit_price,
+                quantity=_qty,
+                pnl=pnl,
+                pnl_pct=_pnl_pct,
+                smart_score=trade.get('smart_score', trade.get('entry_metadata', {}).get('smart_score', 0)),
+                final_score=trade.get('entry_score', 0),
+                dr_score=trade.get('dr_score', trade.get('entry_metadata', {}).get('dr_score', 0)),
+                score_tier=trade.get('score_tier', ''),
+                strategy_type=trade.get('strategy_type', ''),
+                is_sniper=trade.get('is_sniper', False),
+                candles_held=_ed.get('candles_held', 0),
+                r_multiple=_ed.get('r_multiple_achieved', 0),
+                max_favorable=_ed.get('max_favorable_excursion', 0),
+                exit_reason=_ed.get('exit_reason', result),
+                breakeven_applied=_ed.get('breakeven_applied', False),
+                trailing_active=_ed.get('trailing_active', False),
+                partial_booked=_ed.get('partial_booked', False),
+                current_sl=_ed.get('current_sl_at_exit', 0),
+                hold_minutes=_hold_mins,
+                order_id=trade.get('order_id', ''),
+                trade_id=trade.get('trade_id', ''),
+                entry_time=trade.get('timestamp', ''),
+                # TIE: pass thesis invalidation metadata via extra dict
+                extra={k: v for k, v in _ed.items() if k in (
+                    'thesis_check', 'thesis_reason', 'underlying_ltp_at_exit'
+                )} or None,
+            )
+        except Exception as e:
+            print(f"⚠️ Error saving to trade ledger: {e}")
     
     def is_symbol_in_active_trades(self, symbol: str) -> bool:
         """Check if symbol already has an active trade"""
@@ -840,12 +894,16 @@ class ZerodhaTools:
                     _known_exit_statuses = {
                         'TARGET_HIT', 'STOPLOSS_HIT', 'MANUAL_EXIT', 'EOD_EXIT',
                         'SL_HIT', 'OPTION_SPEED_GATE', 'TIME_STOP', 'TRAILING_SL',
-                        'SESSION_CUTOFF', 'GREEKS_EXIT', 'PARTIAL_PROFIT',
+                        'SESSION_CUTOFF', 'GREEKS_EXIT', 'EXPIRY_FORCE_EXIT', 'PARTIAL_PROFIT',
                         'IC_TARGET_HIT', 'IC_SL_HIT', 'IC_TIME_EXIT', 'IC_BREAKOUT_EXIT', 'IC_EOD_EXIT',
                         'SPREAD_TRAIL_SL', 'THETA_DECAY_WARNING',
                         'DEBIT_SPREAD_SL', 'DEBIT_SPREAD_TARGET', 'DEBIT_SPREAD_TIME_EXIT',
                         'DEBIT_SPREAD_TRAIL_SL', 'DEBIT_SPREAD_MAX_PROFIT',
                         'SNIPE_TRAILING_SL', 'SNIPE_TIME_GUARD', 'CONVICTION_REVERSAL',
+                        # Thesis Invalidation Engine (TIE) exit types
+                        'THESIS_INVALID_R_COLLAPSE', 'THESIS_INVALID_NEVER_SHOWED_LIFE',
+                        'THESIS_INVALID_IV_CRUSH', 'THESIS_INVALID_UNDERLYING_BOS',
+                        'THESIS_INVALID_MAX_PAIN_CEILING',
                     }
                     # Catch-all: if exit_price and pnl are set, treat as closed even for unknown statuses
                     is_closed = status in _known_exit_statuses or (exit_price is not None and pnl is not None)
@@ -3297,6 +3355,7 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(position)
                 
                 # Record slippage
                 expected_entry = order.get('expected_entry', current_ltp)
@@ -3410,6 +3469,7 @@ class ZerodhaTools:
             with self._positions_lock:
                 self.paper_positions.append(live_position)
                 self._save_active_trades()
+            self._log_entry_to_ledger(live_position)
             
             # === GTT SAFETY NET (server-side backup SL + target) ===
             gtt_trigger_id = None
@@ -3473,7 +3533,8 @@ class ZerodhaTools:
                           use_intraday_scoring: bool = True,
                           lot_multiplier: float = 1.0,
                           setup_type: str = "",
-                          ml_data: dict = None) -> Dict:
+                          ml_data: dict = None,
+                          sector: str = "") -> Dict:
         """
         Tool: Place an option order instead of equity order
         
@@ -3660,6 +3721,30 @@ class ZerodhaTools:
         # === LOOKUP CACHED CYCLE DECISION (avoid re-scoring) ===
         _cached = getattr(self, '_cached_cycle_decisions', {}).get(underlying, None)
         
+        # === EXPIRY DAY SHIELD — Block/restrict 0DTE entries ===
+        from config import EXPIRY_SHIELD_CONFIG
+        if EXPIRY_SHIELD_CONFIG.get('enabled', False):
+            try:
+                from expiry_shield import expiry_entry_gate
+                # Get nearest expiry to determine if today is expiry day
+                _nearest_expiry = options_trader.chain_fetcher.get_nearest_expiry(
+                    underlying.replace('NSE:', ''), ExpirySelection.CURRENT_WEEK
+                )
+                _expiry_iso = _nearest_expiry.isoformat() if _nearest_expiry else ''
+                _is_spread = False  # Will be determined by routing below
+                _gate_ok, _gate_reason = expiry_entry_gate('naked_option', _is_spread, _expiry_iso)
+                if not _gate_ok:
+                    print(f"   🛡️ {_gate_reason}")
+                    return {
+                        "success": False,
+                        "error": _gate_reason,
+                        "action": "EXPIRY SHIELD: Wait or use different expiry"
+                    }
+                elif _gate_reason == "EXPIRY_DAY_TRADE":
+                    print(f"   ⚡ Expiry Day Shield: 0DTE entry — SL will be tightened, force-exit by 14:45")
+            except Exception as e:
+                print(f"   ⚠️ Expiry shield check failed (proceeding): {e}")
+        
         # === AUTO-TRY DEBIT SPREAD FIRST (directional momentum play) ===
         from config import DEBIT_SPREAD_CONFIG
         if DEBIT_SPREAD_CONFIG.get('enabled', False):
@@ -3799,6 +3884,111 @@ class ZerodhaTools:
                 "action": "SKIP - look for other opportunities"
             }
         
+        # === PENNY PREMIUM GATE (Feb 24 fix) ===
+        # Block options with LTP below minimum — prevents position-size bombs
+        # e.g. ₹0.94 option × 64,500 units: ₹0.10 move = ₹6,450 loss
+        from config import HARD_RULES as _hr
+        _min_premium = _hr.get('MIN_OPTION_PREMIUM', 3.0)
+        if plan.contract.ltp < _min_premium:
+            print(f"   🚫 PENNY PREMIUM BLOCKED: {plan.contract.symbol} LTP=₹{plan.contract.ltp:.2f} < min ₹{_min_premium}")
+            return {
+                "success": False,
+                "error": f"Option premium ₹{plan.contract.ltp:.2f} below minimum ₹{_min_premium} — penny options create position-size bombs",
+                "action": "Skip — premium too cheap, excessive unit exposure risk"
+            }
+        
+        # === MAX UNITS GATE (Feb 24 fix) ===
+        # Hard cap on total units (lots × lot_size) to prevent outsized notional exposure
+        _max_units = _hr.get('MAX_UNITS_PER_TRADE', 30000)
+        _total_units = plan.quantity * plan.contract.lot_size
+        if _total_units > _max_units:
+            _new_lots = max(1, _max_units // plan.contract.lot_size)
+            print(f"   ⚠️ UNITS CAP: {plan.contract.symbol} {_total_units:,} units > {_max_units:,} max → capped to {_new_lots} lots ({_new_lots * plan.contract.lot_size:,} units)")
+            plan.quantity = _new_lots
+            plan.total_premium = _new_lots * plan.premium_per_lot
+            plan.max_loss = plan.total_premium
+        
+        # === THETA BLEED ENTRY GATES (Feb 24 fix) ===
+        # Three gates to prevent naked option buys that will bleed to theta:
+        #   1. Theta/premium ratio gate — block if daily theta > 5% of premium
+        #   2. DTE floor — block if DTE < 3 on non-expiry days
+        #   3. Afternoon score multiplier — on expiry day after 1PM, require 1.5× score
+        from config import THETA_ENTRY_GATE as _theta_cfg
+        if _theta_cfg.get('enabled', True):
+            try:
+                _opt_ltp = plan.contract.ltp
+                _opt_theta = plan.contract.theta
+                _opt_expiry = plan.contract.expiry
+                
+                # Compute DTE for this contract
+                _dte = -1
+                if _opt_expiry:
+                    from datetime import date as _date_cls
+                    _exp_d = _opt_expiry.date() if hasattr(_opt_expiry, 'date') else _opt_expiry
+                    _dte = (_exp_d - _date_cls.today()).days
+                
+                # Gate 1: Theta/premium ratio — block if theta eats >5% of premium per day
+                if _opt_theta and _opt_ltp and _opt_ltp > 0:
+                    _theta_pct = abs(_opt_theta) / _opt_ltp * 100
+                    _max_theta_pct = _theta_cfg.get('max_theta_pct_of_premium', 5.0)
+                    if _theta_pct > _max_theta_pct:
+                        print(f"   🕐 THETA GATE BLOCKED: {plan.contract.symbol} — daily θ=₹{_opt_theta:.2f} "
+                              f"= {_theta_pct:.1f}% of LTP ₹{_opt_ltp:.2f} (max {_max_theta_pct}%)")
+                        return {
+                            "success": False,
+                            "error": f"THETA GATE: Daily theta ₹{_opt_theta:.2f} = {_theta_pct:.1f}% of premium (>{_max_theta_pct}%). "
+                                     f"Option will decay faster than directional move can compensate.",
+                            "action": "Skip — choose higher DTE or deeper ITM option"
+                        }
+                
+                # Gate 2: DTE floor — don't buy naked options with DTE < 3 (non-expiry days)
+                # On expiry day (DTE=0), expiry_shield already handles entry restrictions
+                _min_dte = _theta_cfg.get('min_dte_naked_buy', 3)
+                from config import EXPIRY_SHIELD_CONFIG as _exp_cfg
+                _is_expiry_day = _exp_cfg.get('is_monthly_expiry', False)
+                if _dte >= 0 and _dte < _min_dte and not _is_expiry_day:
+                    print(f"   🕐 DTE FLOOR BLOCKED: {plan.contract.symbol} — DTE={_dte} < min {_min_dte} "
+                          f"(theta curve steepens quadratically near expiry)")
+                    return {
+                        "success": False,
+                        "error": f"DTE FLOOR: Option expires in {_dte} day(s), min DTE for naked buy is {_min_dte}. "
+                                 f"Time decay accelerates exponentially near expiry.",
+                        "action": "Skip — select further-dated expiry or use spread instead"
+                    }
+                
+                # Gate 3: Afternoon theta multiplier — EXPIRY DAY ONLY, after 1PM
+                # On expiry day afternoon, theta accelerates sharply. Require higher score.
+                if _is_expiry_day:
+                    _pm_after = _theta_cfg.get('expiry_day_pm_after', '13:00')
+                    _pm_time = datetime.strptime(_pm_after, '%H:%M').time()
+                    _now_time = datetime.now().time()
+                    if _now_time >= _pm_time:
+                        _score_mult = _theta_cfg.get('expiry_day_pm_score_multiplier', 1.5)
+                        _entry_score = getattr(plan, 'entry_metadata', {}).get('entry_score', 0)
+                        # Get the normal threshold from scorer
+                        try:
+                            from options_trader import get_intraday_scorer
+                            _scorer = get_intraday_scorer()
+                            _normal_threshold = getattr(_scorer, 'BLOCK_THRESHOLD', 57)
+                        except Exception:
+                            _normal_threshold = 57
+                        _raised_threshold = _normal_threshold * _score_mult
+                        if _entry_score < _raised_threshold:
+                            print(f"   🕐 EXPIRY PM GATE: {plan.contract.symbol} — Score {_entry_score:.0f} < "
+                                  f"{_raised_threshold:.0f} (normal {_normal_threshold}×{_score_mult} after {_pm_after} on expiry day)")
+                            return {
+                                "success": False,
+                                "error": f"EXPIRY PM GATE: Score {_entry_score:.0f} < {_raised_threshold:.0f} "
+                                         f"(need {_score_mult}× normal threshold after {_pm_after} on expiry day). "
+                                         f"Afternoon theta decay is extreme.",
+                                "action": "Skip — only highest-conviction trades allowed in expiry afternoon"
+                            }
+                        else:
+                            print(f"   ⚡ EXPIRY PM: Score {_entry_score:.0f} ≥ {_raised_threshold:.0f} "
+                                  f"— passed afternoon theta gate on expiry day")
+            except Exception as _theta_err:
+                print(f"   ⚠️ Theta entry gate check failed (proceeding): {_theta_err}")
+        
         # Validate risk - max premium check
         max_premium_per_trade = 150000  # ₹1.5 lakh per option trade
         if plan.total_premium > max_premium_per_trade:
@@ -3918,10 +4108,12 @@ class ZerodhaTools:
                     'gmm_model': (ml_data or {}).get('gmm_model', {}),
                     'ml_scored_direction': (ml_data or {}).get('scored_direction', ''),
                     'ml_xgb_disagrees': (ml_data or {}).get('xgb_disagrees', False),
+                    'sector': sector or '',
                 }
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(option_position)
             else:
                 # LIVE MODE: Track option position + get fill price
                 option_side = 'BUY'
@@ -3981,6 +4173,7 @@ class ZerodhaTools:
                     'gmm_model': (ml_data or {}).get('gmm_model', {}),
                     'ml_scored_direction': (ml_data or {}).get('scored_direction', ''),
                     'ml_xgb_disagrees': (ml_data or {}).get('xgb_disagrees', False),
+                    'sector': sector or '',
                 }
                 
                 # Place SL-M order for the option
@@ -4021,6 +4214,7 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(option_position)
                 
                 print(f"   ✅ LIVE OPTION: {option_side} {plan.quantity * plan.contract.lot_size} {plan.contract.symbol} @ ₹{fill_price:.2f}")
         
@@ -4231,8 +4425,9 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(spread_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(spread_position)
             else:
-                # LIVE MODE: Track credit spread position
+                # LIVE MODE: Track credit spread position (full metadata parity with paper)
                 spread_position = {
                     'symbol': f"{plan.sold_contract.symbol}|{plan.hedge_contract.symbol}",
                     'underlying': plan.underlying,
@@ -4272,10 +4467,22 @@ class ZerodhaTools:
                     'status': 'OPEN',
                     'rationale': rationale or plan.rationale,
                     'total_premium': 0,
+                    # === ENTRY METADATA (parity with paper mode) ===
+                    'strategy_type': 'CREDIT_SPREAD',
+                    'trade_id': f"CS_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'entry_score': getattr(plan, '_score', 0),
+                    'score_tier': 'premium' if getattr(plan, '_score', 0) >= 70 else 'standard',
+                    'entry_metadata': {
+                        'strategy_type': 'CREDIT_SPREAD',
+                        'spread_type': plan.spread_type,
+                        'credit_pct': plan.credit_pct,
+                        'dte': plan.dte,
+                    },
                 }
                 with self._positions_lock:
                     self.paper_positions.append(spread_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(spread_position)
                 print(f"   ✅ LIVE credit spread tracked: {plan.spread_type}")
         
         # Subscribe spread leg contracts to WebSocket for real-time PnL
@@ -4487,6 +4694,7 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(debit_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(debit_position)
             else:
                 # LIVE MODE: Track debit spread position
                 debit_position = {
@@ -4544,11 +4752,336 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(debit_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(debit_position)
                 print(f"   ✅ LIVE debit spread tracked: {plan.spread_type}")
         
         # Subscribe spread leg contracts to WebSocket for real-time PnL
         self._subscribe_position_symbols()
         return result
+    
+    # =================================================================
+    # THESIS HEDGE PROTOCOL — CONVERT NAKED OPTION → DEBIT SPREAD
+    # =================================================================
+    
+    def convert_naked_to_spread(self, trade: Dict, tie_check: str = "") -> Dict:
+        """
+        Convert an existing naked option into a debit spread by selling an OTM leg.
+        Called by THP when TIE fires on a hedgeable check (R_COLLAPSE, NEVER_SHOWED_LIFE, UNDERLYING_BOS).
+        
+        The naked option becomes the BUY leg; we add a SELL leg further OTM.
+        This caps max loss at (buy_entry - sell_premium) and gives time for recovery.
+        
+        Args:
+            trade: The existing naked option position dict (from paper_positions)
+            tie_check: The TIE check that triggered this (for logging)
+            
+        Returns:
+            {"success": True, ...} or {"success": False, "error": "..."}
+        """
+        from options_trader import get_options_trader, OptionType, ExpirySelection
+        from config import THESIS_HEDGE_CONFIG
+        
+        if not THESIS_HEDGE_CONFIG.get('enabled', False):
+            return {"success": False, "error": "THP disabled in config"}
+        
+        symbol = trade.get('symbol', '')
+        underlying = trade.get('underlying', '')
+        option_type_str = trade.get('option_type', '')  # 'CE' or 'PE'
+        buy_strike = trade.get('strike', 0)
+        buy_entry_price = trade.get('avg_price', 0)
+        expiry_str = trade.get('expiry', '')
+        lot_size_from_trade = trade.get('lot_size', 0) or (trade.get('quantity', 0) // max(1, trade.get('lots', 1)))
+        lots = trade.get('lots', 1)
+        direction = trade.get('direction', '')
+        
+        if not all([underlying, option_type_str, buy_strike, buy_entry_price, expiry_str]):
+            return {"success": False, "error": f"Incomplete trade data for hedge: {symbol}"}
+        
+        # Parse option type
+        opt_type = OptionType.CE if option_type_str == 'CE' else OptionType.PE
+        
+        # Parse expiry
+        from datetime import date as _date
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+        except (ValueError, TypeError):
+            try:
+                expiry = datetime.strptime(str(expiry_str), '%Y-%m-%d')
+            except Exception:
+                return {"success": False, "error": f"Cannot parse expiry '{expiry_str}'"}
+        
+        # Check DTE — on 0DTE, hedging is still valuable to cap max loss
+        # but warn that sell leg premium may be thin
+        dte = (expiry.date() - datetime.now().date()).days if hasattr(expiry, 'date') else 0
+        if dte < 0:
+            return {"success": False, "error": f"DTE={dte} — option already expired"}
+        if dte == 0:
+            print(f"   ⚡ THP 0DTE: Hedging on expiry day — sell leg premium may be thin but caps max loss")
+        
+        print(f"\n🛡️ THP: Converting {symbol} to debit spread (TIE: {tie_check})")
+        print(f"   Buy leg: {option_type_str} {buy_strike} @ ₹{buy_entry_price:.2f}")
+        
+        # === FETCH OPTION CHAIN ===
+        options_trader = get_options_trader(
+            kite=self.kite,
+            capital=getattr(self, 'paper_capital', 500000),
+            paper_mode=self.paper_mode
+        )
+        chain = options_trader.chain_fetcher.fetch_option_chain(underlying, expiry)
+        if chain is None:
+            return {"success": False, "error": f"Cannot fetch option chain for {underlying}"}
+        
+        # === FIND SELL LEG ===
+        # Get all strikes of the same option type, sorted
+        strikes = sorted(set(
+            c.strike for c in chain.contracts
+            if c.option_type == opt_type and c.expiry == expiry
+        ))
+        if not strikes:
+            return {"success": False, "error": f"No {option_type_str} strikes in chain for {underlying}"}
+        
+        sell_offset = THESIS_HEDGE_CONFIG.get('sell_strike_offset', 3)
+        min_hedge_premium = THESIS_HEDGE_CONFIG.get('min_hedge_premium', 3.0)
+        min_hedge_premium_pct = THESIS_HEDGE_CONFIG.get('min_hedge_premium_pct', 15)
+        min_oi = THESIS_HEDGE_CONFIG.get('min_oi', 500)
+        max_bid_ask_pct = THESIS_HEDGE_CONFIG.get('max_bid_ask_pct', 5.0)
+        
+        # Find the index of our buy strike (or nearest)
+        buy_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - buy_strike))
+        
+        # Sell leg is further OTM:
+        # CE (bullish): sell higher strike (buy_idx + offset)
+        # PE (bearish): sell lower strike (buy_idx - offset)
+        if opt_type == OptionType.CE:
+            sell_idx = buy_idx + sell_offset
+        else:
+            sell_idx = buy_idx - sell_offset
+        
+        if sell_idx < 0 or sell_idx >= len(strikes):
+            return {"success": False, "error": f"Sell leg index {sell_idx} out of range (total strikes: {len(strikes)})"}
+        
+        sell_strike = strikes[sell_idx]
+        sell_contract = chain.get_contract(sell_strike, opt_type, expiry)
+        if sell_contract is None:
+            return {"success": False, "error": f"No contract at sell strike {sell_strike} {option_type_str}"}
+        
+        sell_premium = sell_contract.ltp
+        sell_oi = sell_contract.oi
+        sell_bid = sell_contract.bid
+        sell_ask = sell_contract.ask
+        
+        # === LIQUIDITY VALIDATION ===
+        if sell_oi < min_oi:
+            return {"success": False, "error": f"Sell leg OI={sell_oi} < {min_oi} — illiquid"}
+        
+        if sell_premium > 0 and sell_bid > 0 and sell_ask > 0:
+            bid_ask_pct = ((sell_ask - sell_bid) / sell_premium) * 100
+            if bid_ask_pct > max_bid_ask_pct:
+                return {"success": False, "error": f"Sell leg bid-ask spread {bid_ask_pct:.1f}% > {max_bid_ask_pct}% — illiquid"}
+        
+        # === MINIMUM PREMIUM CHECK ===
+        if sell_premium < min_hedge_premium:
+            return {"success": False, "error": f"Sell leg premium ₹{sell_premium:.2f} < ₹{min_hedge_premium:.2f} — too cheap to hedge"}
+        
+        premium_ratio_pct = (sell_premium / buy_entry_price * 100) if buy_entry_price > 0 else 0
+        if premium_ratio_pct < min_hedge_premium_pct:
+            return {"success": False, "error": f"Sell leg only {premium_ratio_pct:.1f}% of buy entry — need ≥{min_hedge_premium_pct}%"}
+        
+        # === COMPUTE SPREAD METRICS ===
+        spread_width = abs(buy_strike - sell_strike)
+        # Net debit = what we paid for buy leg - what we receive for sell leg
+        net_debit = buy_entry_price - sell_premium
+        if net_debit < 0:
+            net_debit = 0  # Can't have negative debit
+        net_debit_total = net_debit * lots * lot_size_from_trade
+        
+        print(f"   Sell leg: {option_type_str} {sell_strike} @ ₹{sell_premium:.2f} (OI: {sell_oi:,})")
+        print(f"   Spread: width={spread_width} | net_debit=₹{net_debit:.2f}/share | total=₹{net_debit_total:,.0f}")
+        
+        # === EXECUTE SELL LEG ===
+        sell_symbol = sell_contract.symbol
+        quantity = lots * lot_size_from_trade
+        
+        if self.paper_mode:
+            sell_order_id = f"PAPER_THP_{random.randint(100000, 999999)}"
+            print(f"   📝 PAPER sell order: {sell_symbol} × {quantity} @ ₹{sell_premium:.2f}")
+        else:
+            # LIVE: Place sell (SELL) order for the OTM leg
+            try:
+                nfo_symbol = sell_symbol.replace("NFO:", "")
+                sell_order_id = self._place_order_autoslice(
+                    tradingsymbol=nfo_symbol,
+                    exchange="NFO",
+                    transaction_type="SELL",
+                    quantity=quantity,
+                    order_type="MARKET",
+                    product="MIS",
+                    tag="THP_HEDGE",
+                )
+                print(f"   🔴 LIVE sell order placed: {sell_symbol} × {quantity} → order_id={sell_order_id}")
+            except Exception as e:
+                return {"success": False, "error": f"Sell order failed: {e}"}
+        
+        # === COMPUTE HEDGED EXIT LEVELS ===
+        hedged_sl_pct = THESIS_HEDGE_CONFIG.get('hedged_sl_pct', 50)
+        hedged_target_pct = THESIS_HEDGE_CONFIG.get('hedged_target_pct', 150)
+        
+        # SL: spread value drops to (1 - sl_pct/100) * net_debit
+        hedged_sl_value = net_debit * (1 - hedged_sl_pct / 100)
+        if hedged_sl_value < 0:
+            hedged_sl_value = 0
+        
+        # Target: spread value rises to (hedged_target_pct/100) * net_debit
+        hedged_target_value = net_debit * (hedged_target_pct / 100)
+        
+        # === UPDATE POSITION DICT IN-PLACE ===
+        with self._positions_lock:
+            # Find the trade in paper_positions and update
+            for pos in self.paper_positions:
+                if pos.get('symbol') == symbol and pos.get('status') == 'OPEN':
+                    # Convert to debit spread
+                    old_symbol = pos['symbol']
+                    pos['symbol'] = f"{old_symbol}|{sell_symbol}"
+                    pos['is_debit_spread'] = True
+                    pos['hedged_from_tie'] = True
+                    pos['tie_check'] = tie_check
+                    pos['hedge_timestamp'] = datetime.now().isoformat()
+                    # Spread leg info
+                    pos['buy_symbol'] = old_symbol
+                    pos['buy_strike'] = buy_strike
+                    pos['buy_premium'] = buy_entry_price
+                    pos['sell_symbol'] = sell_symbol
+                    pos['sell_strike'] = sell_strike
+                    pos['sell_premium'] = sell_premium
+                    pos['sell_order_id'] = sell_order_id
+                    # Spread metrics
+                    pos['net_debit'] = net_debit
+                    pos['net_debit_total'] = net_debit_total
+                    pos['spread_width'] = spread_width
+                    pos['spread_type'] = f"{'BULL_CALL' if opt_type == OptionType.CE else 'BEAR_PUT'}_SPREAD"
+                    # New exit levels
+                    pos['stop_loss'] = hedged_sl_value
+                    pos['target'] = hedged_target_value
+                    pos['avg_price'] = net_debit  # Now tracking net debit instead of buy premium
+                    pos['strategy_type'] = 'THP_HEDGED_SPREAD'
+                    break
+            self._save_active_trades()
+        
+        # Subscribe sell leg to WebSocket
+        self._subscribe_position_symbols()
+        
+        print(f"   ✅ THP HEDGE COMPLETE: {symbol} → debit spread")
+        print(f"      SL: ₹{hedged_sl_value:.2f} | Target: ₹{hedged_target_value:.2f}")
+        
+        return {
+            "success": True,
+            "symbol": f"{symbol}|{sell_symbol}",
+            "sell_symbol": sell_symbol,
+            "sell_strike": sell_strike,
+            "sell_premium": sell_premium,
+            "sell_order_id": sell_order_id,
+            "net_debit": net_debit,
+            "net_debit_total": net_debit_total,
+            "spread_width": spread_width,
+            "hedged_sl": hedged_sl_value,
+            "hedged_target": hedged_target_value,
+            "tie_check": tie_check,
+        }
+    
+    def unwind_hedge(self, trade: Dict, sell_leg_ltp: float) -> Dict:
+        """
+        Unwind a THP hedge by buying back the sold leg.
+        Converts the debit spread back to a naked option — restores full upside.
+        
+        Called when the buy leg has recovered past entry price, indicating
+        the original thesis has re-validated and the hedge is now capping profits.
+        
+        Args:
+            trade: The THP-hedged position dict (is_debit_spread=True, hedged_from_tie=True)
+            sell_leg_ltp: Current LTP of the sell leg (cost to buy back)
+            
+        Returns:
+            {"success": True, ...} or {"success": False, "error": "..."}
+        """
+        symbol = trade.get('symbol', '')
+        buy_symbol = trade.get('buy_symbol', '')
+        sell_symbol = trade.get('sell_symbol', '')
+        sell_entry_premium = trade.get('sell_premium', 0)  # What we received when we sold
+        buy_entry_price = trade.get('buy_premium', 0)       # Original buy leg entry
+        lots = trade.get('lots', 1)
+        lot_size = trade.get('lot_size', 0) or (trade.get('quantity', 0) // max(1, lots))
+        quantity = lots * lot_size
+        
+        if not all([buy_symbol, sell_symbol, sell_leg_ltp > 0]):
+            return {"success": False, "error": "Missing data for unwind"}
+        
+        # Cost of buying back the sold leg
+        buyback_cost_per_share = sell_leg_ltp - sell_entry_premium  # Positive = loss on hedge leg
+        buyback_cost_total = buyback_cost_per_share * quantity
+        
+        print(f"\n🔓 THP UNWIND: Buying back sold leg to restore full upside")
+        print(f"   Sell leg: {sell_symbol}")
+        print(f"   Sold at: ₹{sell_entry_premium:.2f} → Buy back at: ₹{sell_leg_ltp:.2f}")
+        print(f"   Hedge leg cost: ₹{buyback_cost_per_share:+.2f}/share (₹{buyback_cost_total:+,.0f} total)")
+        
+        # === EXECUTE BUYBACK ===
+        if self.paper_mode:
+            buyback_order_id = f"PAPER_UNWIND_{random.randint(100000, 999999)}"
+            print(f"   📝 PAPER buyback: {sell_symbol} × {quantity} @ ₹{sell_leg_ltp:.2f}")
+        else:
+            try:
+                nfo_symbol = sell_symbol.replace("NFO:", "")
+                buyback_order_id = self._place_order_autoslice(
+                    tradingsymbol=nfo_symbol,
+                    exchange="NFO",
+                    transaction_type="BUY",  # Buy back the sold leg
+                    quantity=quantity,
+                    order_type="MARKET",
+                    product="MIS",
+                    tag="THP_UNWIND",
+                )
+                print(f"   🟢 LIVE buyback placed: {sell_symbol} × {quantity} → order_id={buyback_order_id}")
+            except Exception as e:
+                return {"success": False, "error": f"Buyback order failed: {e}"}
+        
+        # === REVERT POSITION DICT TO NAKED OPTION ===
+        with self._positions_lock:
+            for pos in self.paper_positions:
+                if pos.get('symbol') == symbol and pos.get('status') == 'OPEN':
+                    # Revert symbol to buy leg only
+                    pos['symbol'] = buy_symbol
+                    pos['is_debit_spread'] = False
+                    pos['hedged_from_tie'] = False
+                    pos['hedge_unwound'] = True
+                    pos['unwind_timestamp'] = datetime.now().isoformat()
+                    pos['unwind_cost_per_share'] = buyback_cost_per_share
+                    pos['unwind_cost_total'] = buyback_cost_total
+                    # Restore naked option fields
+                    pos['avg_price'] = buy_entry_price
+                    pos['stop_loss'] = buy_entry_price * 0.85  # Fresh 15% SL from entry
+                    pos['target'] = buy_entry_price * 1.40     # Fresh 40% target
+                    pos['strategy_type'] = 'NAKED_OPTION'
+                    # Clean up spread fields
+                    for key in ['sell_symbol', 'sell_strike', 'sell_premium', 'sell_order_id',
+                                'net_debit', 'net_debit_total', 'spread_width', 'spread_type',
+                                'tie_check', 'hedge_timestamp']:
+                        pos.pop(key, None)
+                    break
+            self._save_active_trades()
+        
+        self._subscribe_position_symbols()
+        
+        print(f"   ✅ UNWIND COMPLETE: {buy_symbol} is naked again — full upside restored")
+        
+        return {
+            "success": True,
+            "symbol": buy_symbol,
+            "old_symbol": symbol,
+            "buyback_cost_per_share": buyback_cost_per_share,
+            "buyback_cost_total": buyback_cost_total,
+            "buyback_order_id": buyback_order_id,
+            "buy_entry_price": buy_entry_price,
+        }
     
     # =================================================================
     # IRON CONDOR — NEUTRAL THETA HARVEST (CHOPPY STOCKS)
@@ -4735,6 +5268,7 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(ic_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(ic_position)
             else:
                 # LIVE MODE: Track iron condor position
                 ic_position = {
@@ -4795,6 +5329,7 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(ic_position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(ic_position)
                 print(f"   ✅ LIVE iron condor tracked: {plan.underlying}")
         
         # Subscribe IC leg contracts to WebSocket for real-time PnL
@@ -5099,6 +5634,7 @@ class ZerodhaTools:
                 with self._positions_lock:
                     self.paper_positions.append(position)
                     self._save_active_trades()
+                self._log_entry_to_ledger(position)
                 
                 cost = premium * total_qty
                 

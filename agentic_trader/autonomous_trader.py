@@ -38,6 +38,7 @@ from correlation_guard import get_correlation_guard
 from regime_score import get_regime_scorer
 from position_reconciliation import get_position_reconciliation
 from data_health_gate import get_data_health_gate
+from trade_ledger import get_trade_ledger
 
 
 class AutonomousTrader:
@@ -91,6 +92,19 @@ class AutonomousTrader:
         # Auto-execute is ON for both paper and live trading
         self.agent = TradingAgent(auto_execute=True, paper_mode=paper_mode, paper_capital=capital)
         self.tools = get_tools(paper_mode=paper_mode, paper_capital=capital)
+        
+        # === LIVE MODE: Validate token before proceeding ===
+        if not paper_mode:
+            try:
+                profile = self.tools.kite.profile()
+                print(f"  ✅ Kite token valid — logged in as: {profile.get('user_name', 'Unknown')}")
+                print(f"  💰 Live capital: ₹{self.tools.paper_capital:,.0f}")
+            except Exception as e:
+                print(f"\n  🚨 CRITICAL: Kite access token is invalid/expired!")
+                print(f"     Error: {e}")
+                print(f"     Run 'python agentic_trader/quick_auth.py' to refresh the token.")
+                print(f"     Cannot start LIVE mode without a valid token.")
+                sys.exit(1)
         
         # === RESTORE daily P&L from persisted realized P&L ===
         # On restart, zerodha_tools loads paper_pnl from active_trades.json.
@@ -211,8 +225,6 @@ class AutonomousTrader:
         self._elite_auto_fire_cfg = ELITE_AUTO_FIRE
         self._adaptive_scan_cfg = ADAPTIVE_SCAN
         self._dynamic_max_picks_cfg = DYNAMIC_MAX_PICKS
-        self._decision_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), DECISION_LOG.get('file', 'scan_decisions.json'))
-        self._decision_log_lock = threading.Lock()  # Protect scan_decisions.json read-modify-write
         self._auto_fired_this_session = set()   # Symbols auto-fired today (no re-fire)
         self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
         
@@ -233,12 +245,39 @@ class AutonomousTrader:
         self._gmm_sniper_trades_today = 0
         self._gmm_sniper_date = datetime.now().date()
         self._gmm_sniper_symbols = set()
+        # GMM Contrarian (DR_FLIP) state
+        self._dr_flip_symbols = set()
+        self._dr_flip_trades_today = 0
+        # ML_OVERRIDE gates: loaded from config.ML_OVERRIDE_GATES
+        try:
+            from config import ML_OVERRIDE_GATES
+            self._ml_ovr_cfg = ML_OVERRIDE_GATES
+        except ImportError:
+            self._ml_ovr_cfg = {'min_move_prob': 0.58, 'max_dr_score': 0.12,
+                                'min_directional_prob': 0.40, 'max_concurrent_open': 3}
         # _gmm_flip_count_today removed — GMM now used as veto/boost, not flip
+        # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
+        try:
+            from config import SNIPER_OI_UNWINDING, SNIPER_PCR_EXTREME
+            from sniper_strategies import SniperStrategies
+            self._sniper_engine = SniperStrategies(
+                oi_unwinding_cfg=SNIPER_OI_UNWINDING,
+                pcr_extreme_cfg=SNIPER_PCR_EXTREME,
+            )
+        except Exception as _snp_init_err:
+            print(f"  ⚠️ Sniper Strategies init error: {_snp_init_err}")
+            self._sniper_engine = None
         if DOWN_RISK_GATING.get('enabled'):
             print(f"  🛡️ Down-Risk Graduated Scoring: ACTIVE (boost +{DOWN_RISK_GATING.get('clean_boost', 8)} / caution −{DOWN_RISK_GATING.get('mid_risk_penalty', 8)} / block −{DOWN_RISK_GATING.get('high_risk_penalty', 15)})")
             print(f"  📊 Model Tracker: ACTIVE ({DOWN_RISK_GATING.get('model_tracker_trades', 7)} exclusive trades/day for model evaluation)")
         if GMM_SNIPER.get('enabled'):
             print(f"  🎯 GMM Sniper: ACTIVE ({GMM_SNIPER.get('max_sniper_trades_per_day', 5)}/day, {GMM_SNIPER.get('lot_multiplier', 2.0)}x lots, dr<{GMM_SNIPER.get('max_dr_score', 0.10)})")
+        if getattr(self, '_sniper_engine', None):
+            _se_status = self._sniper_engine.get_status()
+            if _se_status['oi_unwinding']['enabled']:
+                print(f"  🔫 Sniper-OIUnwinding: ACTIVE ({_se_status['oi_unwinding']['max_per_day']}/day, OI reversal at S/R)")
+            if _se_status['pcr_extreme']['enabled']:
+                print(f"  🔫 Sniper-PCRExtreme: ACTIVE ({_se_status['pcr_extreme']['max_per_day']}/day, PCR contrarian fade)")
         
         # === ML MOVE PREDICTOR ===
         self._ml_predictor = None
@@ -438,45 +477,78 @@ class AutonomousTrader:
         
         print("="*60)
     
+    # ========== ML_OVERRIDE_WGMM GATE CHECK ==========
+    def _ml_override_allowed(self, sym_clean: str, ml: dict, dr_score: float,
+                             path: str = 'MODEL_TRACKER') -> tuple:
+        """Check tightened ML_OVERRIDE_WGMM gates. Returns (allowed: bool, reason: str).
+        Call BEFORE flipping direction.
+        
+        DR SCORE INTERPRETATION (correct):
+          High dr in DOWN regime = stock WILL go DOWN (confirms DOWN)
+          High dr in UP regime = stock WILL go UP (confirms UP)
+          → ML_OVERRIDE fires when XGB opposes AND GMM confirms XGB via high dr
+        
+        Gates:
+          1. Concurrent open position limit
+          2. ml_move_prob minimum (higher bar than general gate)
+          3. dr_score MINIMUM — need HIGH dr to confirm XGB's opposing direction
+          4. XGB directional probability minimum
+        """
+        cfg = self._ml_ovr_cfg
+        
+        # Gate 1: Max concurrent open ML_OVERRIDE_WGMM positions
+        _max_concurrent = cfg.get('max_concurrent_open', 3)
+        try:
+            _active = getattr(self.tools, 'paper_positions', []) or []
+            _open_ovr = sum(1 for t in _active if t.get('setup_type') == 'ML_OVERRIDE_WGMM' and not t.get('closed'))
+            if _open_ovr >= _max_concurrent:
+                return False, f"concurrent open {_open_ovr}/{_max_concurrent}"
+        except Exception:
+            pass
+        
+        # Gate 2: ml_move_prob minimum
+        _min_move = cfg.get('min_move_prob', 0.58)
+        _move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+        if _move_prob < _min_move:
+            return False, f"move_prob {_move_prob:.2f} < {_min_move}"
+        
+        # Gate 3: dr_score MINIMUM — high dr confirms XGB's direction is real
+        _min_dr = cfg.get('min_dr_score', 0.15)
+        if dr_score < _min_dr:
+            return False, f"dr_score {dr_score:.3f} < {_min_dr} (need high dr to confirm XGB)"
+        
+        # Gate 4: XGB directional probability
+        _min_dir_prob = cfg.get('min_directional_prob', 0.40)
+        _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
+        if _xgb_signal == 'UP':
+            _dir_prob = ml.get('ml_prob_up', 0.0)
+        elif _xgb_signal == 'DOWN':
+            _dir_prob = ml.get('ml_prob_down', 0.0)
+        else:
+            _dir_prob = 0.0
+        if _dir_prob < _min_dir_prob:
+            return False, f"dir_prob({_xgb_signal}) {_dir_prob:.2f} < {_min_dir_prob}"
+        
+        return True, "all gates passed"
+    
     # ========== DECISION LOG ==========
     def _log_decision(self, cycle_time: str, symbol: str, score: float, outcome: str,
                       reason: str = '', setup: str = '', direction: str = '', extra: dict = None):
-        """Log a scanning decision to scan_decisions.json for post-hoc analysis"""
+        """Log a scanning decision to centralized Trade Ledger"""
         if not self._decision_log_cfg.get('enabled', False):
             return
         try:
-            entry = {
-                'timestamp': datetime.now().isoformat(),
-                'cycle': cycle_time,
-                'symbol': symbol,
-                'score': round(score, 1),
-                'outcome': outcome,    # TRADED, AUTO_FIRED, REJECTED, FILTERED, GPT_SKIP, SCORED
-                'reason': reason,
-                'setup': setup,
-                'direction': direction,
-            }
-            if extra:
-                entry.update(extra)
-            
-            # Append to file (thread-safe read-modify-write)
-            with self._decision_log_lock:
-                log_data = []
-                if os.path.exists(self._decision_log_file):
-                    try:
-                        with open(self._decision_log_file, 'r') as f:
-                            log_data = json.load(f)
-                    except (json.JSONDecodeError, Exception):
-                        log_data = []
-                
-                log_data.append(entry)
-                
-                # Rotate if too large
-                max_entries = self._decision_log_cfg.get('max_entries', 50000)
-                if len(log_data) > max_entries:
-                    log_data = log_data[-max_entries:]
-                
-                atomic_json_save(self._decision_log_file, log_data, indent=1)
-        except Exception as e:
+            from trade_ledger import get_trade_ledger
+            get_trade_ledger().log_scan_decision(
+                symbol=symbol,
+                score=score,
+                outcome=outcome,
+                reason=reason,
+                direction=direction,
+                cycle=cycle_time,
+                extra=extra,
+            )
+        except Exception:
             pass  # Silent — decision log should never break trading
     
     # ========== ELITE AUTO-FIRE ==========
@@ -718,30 +790,39 @@ class AutonomousTrader:
             self._model_tracker_trades_today = 0
             self._model_tracker_date = today
             self._model_tracker_symbols = set()
+            self._dr_flip_symbols = set()
+            self._dr_flip_trades_today = 0
             print(f"📅 New trading day — model-tracker counter reset")
     
     def _apply_down_risk_soft_scores(self, ml_results: dict, pre_scores: dict):
-        """Apply graduated score adjustments based on continuous GMM anomaly score.
+        """Apply DIRECTION-AWARE graduated score adjustments based on GMM anomaly.
         
-        Score-Graduated Soft Gating (symmetric for CE and PE):
-          Score > 0.7 (top ~10%)   → SOFT BLOCK: −15 (high crash/bear-trap risk)
-          Score > threshold         → CAUTION:    −8  (elevated risk)
-          Score < 0.3 (bottom ~30%) → BOOST:      +8  (genuine clean pattern)
-          Otherwise                → NEUTRAL      (no change)
+        GMM dr_score meaning depends on regime + trade direction:
+          UP regime  (detects hidden crash):
+            high dr + BUY  → crash hurts CE  → PENALIZE
+            high dr + SELL → crash helps PE  → BOOST  (dr CONFIRMS put)
+          DOWN regime (detects bear trap / hidden rally):
+            high dr + SELL → bear trap hurts PE → PENALIZE
+            high dr + BUY  → bear trap = rally helps CE → BOOST (dr CONFIRMS call)
         
-        Does NOT hard-block any trades — only nudges scores so the existing
-        workflow naturally favours safer candidates and de-prioritises risky ones.
+        In short: if dr agrees with trade direction → BOOST, if opposes → PENALIZE.
+        Clean dr (low score) in aligned regime → genuine pattern → BOOST.
+        
+        Does NOT hard-block any trades — only nudges scores for natural prioritisation.
         Called once per scan cycle after ML predictions are merged.
         """
         if not self._down_risk_cfg.get('enabled', False):
             return
         
-        high_thresh = self._down_risk_cfg.get('high_risk_threshold', 0.7)
+        high_thresh = self._down_risk_cfg.get('high_risk_threshold', 0.40)
         high_penalty = self._down_risk_cfg.get('high_risk_penalty', 15)
         mid_penalty = self._down_risk_cfg.get('mid_risk_penalty', 8)
-        clean_thresh = self._down_risk_cfg.get('clean_threshold', 0.3)
+        clean_thresh = self._down_risk_cfg.get('clean_threshold', 0.15)
         clean_boost = self._down_risk_cfg.get('clean_boost', 8)
         adjustments = []
+        
+        # Get cached directions from IntradayScorer (available at this point)
+        _cycle_decs = getattr(self.tools, '_cached_cycle_decisions', {})
         
         for sym in list(pre_scores.keys()):
             ml = ml_results.get(sym, {})
@@ -753,19 +834,53 @@ class AutonomousTrader:
             
             gmm_regime = ml.get('ml_gmm_regime_used', 'UP')
             
-            # Score-graduated response using continuous anomaly score
+            # Get trade direction from IntradayScorer (if available)
+            _cd = _cycle_decs.get(sym, {})
+            _decision = _cd.get('decision')
+            direction = None
+            if _decision and hasattr(_decision, 'recommended_direction'):
+                direction = _decision.recommended_direction
+            
+            # Determine if dr signal OPPOSES or CONFIRMS trade direction
+            # UP regime: high dr = crash likely → opposes BUY, confirms SELL
+            # DOWN regime: high dr = bear trap (rally) → opposes SELL, confirms BUY
+            dr_opposes_trade = True  # default: treat as opposing (conservative)
+            if direction and direction != 'HOLD':
+                if gmm_regime == 'UP':
+                    # UP regime detects hidden crash risk
+                    dr_opposes_trade = (direction == 'BUY')   # crash hurts CE
+                elif gmm_regime == 'DOWN':
+                    # DOWN regime detects bear trap (hidden rally)
+                    dr_opposes_trade = (direction == 'SELL')   # rally hurts PE
+            
+            _sym_diag = sym.replace('NSE:', '')
+            _dir_tag = direction or '?'
+            
+            # Score-graduated response — direction-aware
             if dr_score > high_thresh:
-                # Top ~10% anomaly: strong penalty (likely crash or bear trap)
-                pre_scores[sym] -= high_penalty
-                adjustments.append(f"🔴 {sym.replace('NSE:', '')} −{high_penalty} (HIGH_{gmm_regime} dr={dr_score:.3f})")
+                if dr_opposes_trade:
+                    # High dr OPPOSES trade → strong penalty (crash hurts CE / trap hurts PE)
+                    pre_scores[sym] -= high_penalty
+                    adjustments.append(f"🔴 {_sym_diag} −{high_penalty} (HIGH_{gmm_regime} vs {_dir_tag} dr={dr_score:.3f})")
+                else:
+                    # High dr CONFIRMS trade → BOOST (crash helps PE / trap helps CE)
+                    pre_scores[sym] += clean_boost
+                    adjustments.append(f"🟣 {_sym_diag} +{clean_boost} (DR_CONFIRMS_{_dir_tag} dr={dr_score:.3f})")
             elif dr_flag:
-                # Flagged but not extreme: moderate caution
-                pre_scores[sym] -= mid_penalty
-                adjustments.append(f"🟠 {sym.replace('NSE:', '')} −{mid_penalty} (CAUTION_{gmm_regime} dr={dr_score:.3f})")
+                if dr_opposes_trade:
+                    # Flagged + opposes → moderate penalty
+                    pre_scores[sym] -= mid_penalty
+                    adjustments.append(f"🟠 {_sym_diag} −{mid_penalty} (CAUTION_{gmm_regime} vs {_dir_tag} dr={dr_score:.3f})")
+                else:
+                    # Flagged but confirms trade direction → small boost
+                    _small_boost = clean_boost // 2
+                    pre_scores[sym] += _small_boost
+                    adjustments.append(f"🔵 {_sym_diag} +{_small_boost} (FLAG_CONFIRMS_{_dir_tag} dr={dr_score:.3f})")
             elif dr_score < clean_thresh:
-                # Bottom ~30% anomaly: genuine clean pattern → boost
+                # Low dr = genuine clean pattern in this regime
+                # Clean + aligned regime → boost (stock moving genuinely in scored direction)
                 pre_scores[sym] += clean_boost
-                adjustments.append(f"🟢 {sym.replace('NSE:', '')} +{clean_boost} (CLEAN_{gmm_regime} dr={dr_score:.3f})")
+                adjustments.append(f"🟢 {_sym_diag} +{clean_boost} (CLEAN_{gmm_regime}_{_dir_tag} dr={dr_score:.3f})")
             # else: neutral zone — no adjustment
         
         if adjustments:
@@ -850,10 +965,17 @@ class AutonomousTrader:
             # UP regime by default in predictor. Using gmm_regime would incorrectly
             # treat all FLAT signals as "XGB says UP", creating a massive BUY bias.
             #
+            # DR SCORE INTERPRETATION:
+            #   High dr in DOWN regime = stock WILL go DOWN (confirms DOWN direction)
+            #   High dr in UP regime = stock WILL go UP (confirms UP direction)
+            #   Low dr = uncertain, no strong GMM signal
+            #
             # Logic:
             #   XGB=FLAT/UNKNOWN → no directional opinion → ALLOW (no boost, no block)
-            #   XGB aligns with trade (UP+BUY, DOWN+SELL) → use GMM: BOOST or BLOCK
-            #   XGB opposes trade (UP+SELL, DOWN+BUY) → if GMM confirms opposing dir → BLOCK
+            #   XGB aligns + high dr (flag) → GMM confirms aligned direction → ALL_AGREE BOOST
+            #   XGB aligns + low dr (clean) → GMM uncertain → just ALLOW as MODEL_TRACKER
+            #   XGB opposes + high dr (flag) → GMM confirms XGB's direction → ML_OVERRIDE FLIP
+            #   XGB opposes + low dr (clean) → GMM uncertain → XGB alone opposes → ALLOW Titan
             trade_type = 'MODEL_TRACKER'
             gmm_action = 'ALLOW'  # default
             _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
@@ -864,33 +986,43 @@ class AutonomousTrader:
                 # Cannot use GMM to BOOST or BLOCK directionally → ALLOW
                 gmm_action = 'ALLOW'
             elif (_xgb_signal == 'UP' and direction == 'BUY') or (_xgb_signal == 'DOWN' and direction == 'SELL'):
-                # XGB signal ALIGNS with trade direction → GMM result is relevant
+                # XGB signal ALIGNS with trade direction
                 if dr_flag:
-                    # GMM flags anomaly in the aligned direction → BLOCK
-                    gmm_action = 'BLOCK'
-                    continue
-                else:
-                    # GMM confirms aligned direction is genuine → BOOST
+                    # HIGH dr confirms the aligned direction → ALL 3 systems agree
+                    # XGB says direction + GMM confirms with high dr + Titan agrees → BOOST
                     gmm_action = 'BOOST'
-                    trade_type = 'GMM_BOOST'
+                    trade_type = 'ALL_AGREE'
+                else:
+                    # LOW dr = GMM uncertain about direction → only XGB + Titan agree
+                    # Still proceed but as standard MODEL_TRACKER (no extra boost)
+                    gmm_action = 'ALLOW'
             else:
                 # XGB signal OPPOSES trade direction (UP vs SELL, DOWN vs BUY)
-                if not dr_flag:
-                    # GMM confirms the opposing direction is genuine → FLIP to ML direction
-                    # Instead of blocking, trust ML and reverse the trade direction
+                if dr_flag:
+                    # HIGH dr confirms XGB's opposing direction → XGB + GMM both oppose Titan
+                    # This is the STRONGEST opposition signal → FLIP to XGB direction
+                    sym_clean_tmp = sym.replace('NSE:', '')
+                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym_clean_tmp, ml, dr_score, path='MODEL_TRACKER')
+                    if not _ovr_ok:
+                        print(f"      🚫 ML_OVR BLOCKED: {sym_clean_tmp} — {_ovr_reason}")
+                        continue
+                    # XGB + GMM confirm opposing direction → FLIP
                     old_direction = direction
                     direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
                     gmm_action = 'BOOST'
-                    trade_type = 'ML_OVERRIDE'
-                    sym_clean_tmp = sym.replace('NSE:', '')
-                    print(f"      🔄 ML OVERRIDE: {sym_clean_tmp} — XGB={_xgb_signal} + GMM confirms "
+                    trade_type = 'ML_OVERRIDE_WGMM'
+                    print(f"      🔄 ML_OVERRIDE_WGMM: {sym_clean_tmp} — XGB={_xgb_signal} + GMM confirms "
                           f"(dr={dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
-                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ML_OVERRIDE',
-                                      reason=f"XGB={_xgb_signal} + GMM (dr={dr_score:.3f}) overrode scorer {old_direction}→{direction}",
+                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ML_OVERRIDE_WGMM',
+                                      reason=f"XGB={_xgb_signal} + GMM dr={dr_score:.3f} confirms → flipped {old_direction}→{direction}",
                                       direction=direction)
                 else:
-                    # GMM flags anomaly in opposing direction → XGB opposition may be wrong → ALLOW
+                    # LOW dr = GMM uncertain → XGB alone opposes → weak opposition
+                    # Let Titan's direction stand, soft scoring will penalize for XGB opposition
                     gmm_action = 'ALLOW'
+                    sym_clean_tmp = sym.replace('NSE:', '')
+                    print(f"      ⚠️ XGB opposes ({_xgb_signal}) but GMM uncertain (dr={dr_score:.3f}) "
+                          f"→ ALLOW Titan {direction} (soft penalty via scoring)")
             
             # Gather available ML metrics (Gate model still runs)
             ml_confidence = ml.get('ml_confidence', 0.0)  # Gate confidence
@@ -899,16 +1031,78 @@ class AutonomousTrader:
             sym_clean = sym.replace('NSE:', '')
             sector = _get_sector_mt(sym_clean)
             
+            # ── HARD DR_SCORE GATE → GMM CONTRARIAN FLIP (Feb 24 fix) ──
+            # Instead of just blocking high-dr trades, FLIP direction:
+            #   BUY + high dr = "fake rally, crash likely" → SELL (buy PUT)
+            #   SELL + high dr = "bear trap, bounce likely" → BUY (buy CALL)
+            # The GMM anomaly IS the signal.
+            _mt_max_dr = self._down_risk_cfg.get('max_dr_score', 0.12)
+            if dr_score > _mt_max_dr:
+                # Check if GMM_CONTRARIAN (DR_FLIP) is enabled and conditions met
+                from config import GMM_CONTRARIAN as _dr_flip_cfg
+                _flip_ok = False
+                if _dr_flip_cfg.get('enabled', False) and dr_score >= _dr_flip_cfg.get('min_dr_score', 0.15):
+                    # Check daily limit
+                    _flip_today = getattr(self, '_dr_flip_trades_today', 0)
+                    _flip_max_day = _dr_flip_cfg.get('max_trades_per_day', 4)
+                    # Check concurrent open limit
+                    _flip_open = sum(1 for t in (getattr(self.tools, 'paper_positions', []) or [])
+                                    if t.get('setup_type') == 'DR_FLIP' and t.get('status', 'OPEN') == 'OPEN')
+                    _flip_max_concurrent = _dr_flip_cfg.get('max_concurrent_open', 3)
+                    # Check Gate P(MOVE)
+                    _flip_min_gate = _dr_flip_cfg.get('min_gate_prob', 0.50)
+                    
+                    if _flip_today >= _flip_max_day:
+                        print(f"      🚫 DR_FLIP DAILY LIMIT: {sym_clean} — {_flip_today}/{_flip_max_day} flips today")
+                    elif _flip_open >= _flip_max_concurrent:
+                        print(f"      🚫 DR_FLIP CONCURRENT LIMIT: {sym_clean} — {_flip_open}/{_flip_max_concurrent} open")
+                    elif ml_move_prob < _flip_min_gate:
+                        print(f"      🚫 DR_FLIP GATE LOW: {sym_clean} — P(MOVE)={ml_move_prob:.2f} < {_flip_min_gate}")
+                    else:
+                        # XGB safety: don't flip INTO a direction XGB strongly opposes
+                        _flip_dir = 'SELL' if direction == 'BUY' else 'BUY'
+                        _xgb_blocks_flip = False
+                        if _flip_dir == 'BUY' and _xgb_signal == 'DOWN' and ml.get('ml_prob_down', 0) > 0.55:
+                            _xgb_blocks_flip = True
+                        elif _flip_dir == 'SELL' and _xgb_signal == 'UP' and ml.get('ml_prob_up', 0) > 0.55:
+                            _xgb_blocks_flip = True
+                        
+                        if _xgb_blocks_flip:
+                            print(f"      🚫 DR_FLIP XGB CONFLICT: {sym_clean} — XGB={_xgb_signal} strongly opposes flip to {_flip_dir}")
+                        else:
+                            _flip_ok = True
+                            old_dir = direction
+                            direction = _flip_dir
+                            trade_type = 'DR_FLIP'
+                            gmm_action = 'CONTRARIAN'
+                            if not hasattr(self, '_dr_flip_symbols'):
+                                self._dr_flip_symbols = set()
+                            self._dr_flip_symbols.add(sym)
+                            print(f"      🔀 GMM CONTRARIAN FLIP: {sym_clean} — dr={dr_score:.3f} (HIGH) → "
+                                  f"FLIPPED {old_dir}→{direction} | P(MOVE)={ml_move_prob:.2f}")
+                            self._log_decision(cycle_time, sym, p_score, 'DR_FLIP',
+                                              reason=f"GMM dr={dr_score:.3f} too high for {old_dir} → contrarian {direction}",
+                                              direction=direction)
+                
+                if not _flip_ok:
+                    # Still blocked if flip didn't fire
+                    # Skip ALL_AGREE — high dr was already handled (GMM + XGB + Titan aligned)
+                    # Skip ML_OVERRIDE_WGMM — high dr was used to confirm the flip
+                    if dr_score > _mt_max_dr and trade_type not in ('DR_FLIP', 'ALL_AGREE', 'ML_OVERRIDE_WGMM'):
+                        print(f"      🚫 MODEL-TRACKER DR GATE: {sym_clean} — dr={dr_score:.3f} > {_mt_max_dr} → BLOCKED")
+                        continue
+            
             # ── Gate floor: P(MOVE) must be meaningful ──
             if ml_move_prob < 0.40:
                 continue  # Gate says stock unlikely to move — skip
             
             # ── ML DIRECTION CONFLICT FILTER ──
             # Check if XGBoost ML signal disagrees with scored direction
+            # SKIP for DR_FLIP trades — contrarian direction naturally opposes XGB
             from config import ML_DIRECTION_CONFLICT
             _dir_conflict_cfg = ML_DIRECTION_CONFLICT
             _xgb_disagrees = False
-            if _dir_conflict_cfg.get('enabled', False):
+            if _dir_conflict_cfg.get('enabled', False) and trade_type not in ('DR_FLIP', 'ML_OVERRIDE_WGMM'):
                 _ml_signal = ml.get('ml_signal', 'UNKNOWN')
                 if direction == 'BUY' and _ml_signal == 'DOWN' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
                     _xgb_disagrees = True
@@ -1008,7 +1202,7 @@ class AutonomousTrader:
         raw_candidates.sort(key=lambda c: c['smart_score'], reverse=True)
         
         # ── Step 3: Diversified selection with sector cap ──
-        MAX_PER_SECTOR = 2
+        MAX_PER_SECTOR = 3
         sector_counts = {}
         selected = []
         
@@ -1025,10 +1219,10 @@ class AutonomousTrader:
         if selected:
             buy_count = sum(1 for c in selected if c['direction'] == 'BUY')
             sell_count = len(selected) - buy_count
-            boost_count = sum(1 for c in selected if c['trade_type'] == 'GMM_BOOST')
+            boost_count = sum(1 for c in selected if c['trade_type'] == 'ALL_AGREE')
             sectors_used = set(c['sector'] for c in selected)
             print(f"\n   🧠 MODEL-TRACKER SMART SELECT: {len(selected)} picks from {len(raw_candidates)} candidates")
-            print(f"      Direction mix: {buy_count} BUY(CALL) / {sell_count} SELL(PUT) | GMM-boosted: {boost_count}")
+            print(f"      Direction mix: {buy_count} BUY(CALL) / {sell_count} SELL(PUT) | ALL_AGREE: {boost_count}")
             print(f"      Sectors: {', '.join(sorted(sectors_used))}")
             for i, c in enumerate(selected, 1):
                 _type_tag = f" [{c['trade_type']}]" if c['trade_type'] != 'MODEL_TRACKER' else ''
@@ -1047,8 +1241,8 @@ class AutonomousTrader:
                 _type_label = f" [{trade_type}]" if trade_type != 'MODEL_TRACKER' else ''
                 print(f"\n   📊 MODEL-TRACKER TRADE: {cand['sym_clean']} ({direction}, smart={cand['smart_score']:.1f}){_type_label}")
                 
-                # TODO: Wire score_tier_override='premium' for GMM_BOOST to increase lots
-                # For now, GMM_BOOST gets higher smart_score → naturally higher entry score
+                # TODO: Wire score_tier_override='premium' for ALL_AGREE to increase lots
+                # For now, ALL_AGREE gets higher smart_score → naturally higher entry score
                 
                 result = self.tools.place_option_order(
                     underlying=sym,
@@ -1060,12 +1254,16 @@ class AutonomousTrader:
                               f"gate={cand['ml_move_prob']:.2f}, gmm_action={cand['gmm_action']}, "
                               f"sector={cand['sector']}"),
                     setup_type=trade_type,
-                    ml_data=cand.get('ml_data', {})
+                    ml_data=cand.get('ml_data', {}),
+                    sector=cand.get('sector', ''),
                 )
                 if result and result.get('success'):
                     print(f"   ✅ MODEL-TRACKER PLACED: {cand['sym_clean']} ({direction}) [smart={cand['smart_score']:.1f}]{_type_label}")
                     self._model_tracker_symbols.add(sym)
                     self._model_tracker_trades_today += 1
+                    # Track DR_FLIP trades separately
+                    if trade_type == 'DR_FLIP':
+                        self._dr_flip_trades_today += 1
                     placed.append(cand['sym_clean'])
                     self._log_decision(cycle_time, sym, cand['p_score'], f'{trade_type}_PLACED',
                                       reason=(f"Smart pick: score={cand['smart_score']:.1f}, "
@@ -1114,6 +1312,7 @@ class AutonomousTrader:
         
         max_per_day = cfg.get('max_sniper_trades_per_day', 5)
         if self._gmm_sniper_trades_today >= max_per_day:
+            print(f"   🎯 SNIPER: Daily cap reached ({self._gmm_sniper_trades_today}/{max_per_day})")
             return None
         
         lot_multiplier = cfg.get('lot_multiplier', 2.0)
@@ -1121,6 +1320,8 @@ class AutonomousTrader:
         max_dr = cfg.get('max_dr_score', 0.10)
         min_gate = cfg.get('min_gate_prob', 0.55)
         score_tier = cfg.get('score_tier', 'premium')
+        
+        print(f"\n   🎯 SNIPER SCAN: gates → dr<{max_dr}, smart>={min_smart}, gate>={min_gate} | {self._gmm_sniper_trades_today}/{max_per_day} used")
         
         # Import sector mapping
         try:
@@ -1131,29 +1332,40 @@ class AutonomousTrader:
         # Build candidate pool — same logic as model-tracker but stricter thresholds
         _cycle_decs = getattr(self.tools, '_cached_cycle_decisions', {})
         candidates = []
+        _sniper_reject_counts = {'no_ml': 0, 'already_traded': 0, 'active_pos': 0, 'dr_high': 0, 'dr_flagged': 0, 'no_direction': 0, 'hold': 0, 'gate_low': 0, 'smart_low': 0, 'xgb_block': 0, 'dir_block': 0}
+        _sniper_near_misses = []  # Symbols close to passing
         
         for sym in pre_scores:
             ml = ml_results.get(sym, {})
             dr_score = ml.get('ml_down_risk_score', None)
             dr_flag = ml.get('ml_down_risk_flag', None)
             
+            sym_diag = sym.replace('NSE:', '')
             if dr_score is None or dr_flag is None:
+                _sniper_reject_counts['no_ml'] += 1
                 continue
             
             # Skip if already traded as sniper or model-tracker today
             if sym in self._gmm_sniper_symbols or sym in self._model_tracker_symbols:
+                _sniper_reject_counts['already_traded'] += 1
                 continue
             
             # Skip if already in active positions
             active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', []) 
                           if p.get('status', 'OPEN') == 'OPEN'}
             if sym in active_syms:
+                _sniper_reject_counts['active_pos'] += 1
                 continue
             
             # Strict GMM cleanliness gate
             if dr_score > max_dr:
+                _sniper_reject_counts['dr_high'] += 1
+                if dr_score <= max_dr + 0.05:  # Near miss
+                    _sniper_near_misses.append(f"{sym_diag}(dr={dr_score:.3f}>max {max_dr})")
                 continue
             if dr_flag:
+                _sniper_reject_counts['dr_flagged'] += 1
+                _sniper_near_misses.append(f"{sym_diag}(dr={dr_score:.3f} FLAGGED)")
                 continue  # Must not be flagged
             
             # Get direction from IntradayScorer
@@ -1162,9 +1374,11 @@ class AutonomousTrader:
             if _decision and hasattr(_decision, 'recommended_direction') and _decision.recommended_direction:
                 direction = _decision.recommended_direction
             else:
+                _sniper_reject_counts['no_direction'] += 1
                 continue
             
             if direction == 'HOLD':
+                _sniper_reject_counts['hold'] += 1
                 continue
             
             # ── XGB DIRECTION ALIGNMENT CHECK (Sniper) ──
@@ -1176,17 +1390,35 @@ class AutonomousTrader:
             if _xgb_signal in ('FLAT', 'UNKNOWN'):
                 pass  # No XGB directional opinion — proceed on GMM cleanliness + IntradayScorer
             elif (_xgb_signal == 'UP' and direction == 'SELL') or (_xgb_signal == 'DOWN' and direction == 'BUY'):
-                # XGB actively opposes trade direction → FLIP to ML direction (sniper is dr_flag=False here)
-                old_direction = direction
-                direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
-                _sniper_was_flipped = True
+                # XGB actively opposes trade direction
+                # DR INTERPRETATION: high dr confirms XGB direction is real
                 sym_clean_tmp = sym.replace('NSE:', '')
-                print(f"      🔄 SNIPER ML OVERRIDE: {sym_clean_tmp} — XGB={_xgb_signal} + GMM clean "
-                      f"(dr={dr_score:.4f}) → FLIPPED {old_direction}→{direction}")
+                _sniper_dr_flag = ml.get('ml_down_risk_flag', False)
+                if _sniper_dr_flag:
+                    # HIGH dr → GMM confirms XGB opposing direction → check ML_OVERRIDE gates → FLIP
+                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym_clean_tmp, ml, dr_score, path='SNIPER')
+                    if not _ovr_ok:
+                        print(f"      🚫 SNIPER ML_OVR BLOCKED: {sym_clean_tmp} — {_ovr_reason} (dr={dr_score:.3f})")
+                        _sniper_reject_counts['xgb_block'] += 1
+                        continue
+                    old_direction = direction
+                    direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
+                    _sniper_was_flipped = True
+                    print(f"      🔄 SNIPER ML_OVERRIDE_WGMM: {sym_clean_tmp} — XGB={_xgb_signal} + GMM confirms "
+                          f"(dr={dr_score:.4f}) → FLIPPED {old_direction}→{direction}")
+                else:
+                    # LOW dr → GMM uncertain about XGB's opposing direction → weak opposition
+                    # Sniper needs full alignment — block on unconfirmed XGB opposition
+                    print(f"      🚫 SNIPER XGB_OPPOSE: {sym_clean_tmp} — XGB={_xgb_signal} vs {direction}, "
+                          f"GMM uncertain (dr={dr_score:.3f}) → BLOCK")
+                    _sniper_reject_counts['xgb_block'] += 1
+                    continue
             
             # XGB gate probability floor
             ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
             if ml_move_prob < min_gate:
+                _sniper_reject_counts['gate_low'] += 1
+                _sniper_near_misses.append(f"{sym_diag}(gate={ml_move_prob:.2f}<{min_gate}, dr={dr_score:.3f})")
                 continue
             
             # ── ML DIRECTION CONFLICT FILTER (Sniper) ──
@@ -1206,6 +1438,7 @@ class AutonomousTrader:
                     if _gmm_caution:
                         print(f"      🚫 SNIPER DIRECTION BLOCK: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
                               f"GMM dr={dr_score:.3f} → BOTH disagree")
+                        _sniper_reject_counts['dir_block'] += 1
                         continue
                     else:
                         print(f"      ⚠️ SNIPER XGB CONFLICT: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
@@ -1224,6 +1457,8 @@ class AutonomousTrader:
                 smart_score -= _dir_conflict_cfg.get('xgb_penalty', 15)
             
             if smart_score < min_smart:
+                _sniper_reject_counts['smart_low'] += 1
+                _sniper_near_misses.append(f"{sym_diag}(smart={smart_score:.1f}<{min_smart}, dr={dr_score:.3f}, gate={ml_move_prob:.2f})")
                 continue
             
             sym_clean = sym.replace('NSE:', '')
@@ -1272,6 +1507,17 @@ class AutonomousTrader:
                 },
             })
         
+        # --- SNIPER DIAGNOSTIC SUMMARY ---
+        _total_syms = len(pre_scores)
+        _passed = len(candidates)
+        _reject_str = ', '.join(f"{k}={v}" for k, v in _sniper_reject_counts.items() if v > 0)
+        print(f"   🎯 SNIPER RESULT: {_passed} candidates from {_total_syms} symbols | Rejected: {_reject_str or 'none'}")
+        if candidates:
+            for i, c in enumerate(candidates[:5]):
+                print(f"      #{i+1} {c['sym_clean']} {c['direction']} | dr={c['dr_score']:.4f} smart={c['smart_score']:.1f} gate={c['ml_move_prob']:.2f} | {c['sector']}")
+        if _sniper_near_misses and not candidates:
+            print(f"      Near misses: {' | '.join(_sniper_near_misses[:6])}")
+        
         if not candidates:
             return None
         
@@ -1289,7 +1535,9 @@ class AutonomousTrader:
             print(f"      Runner-up: {runner_up['sym_clean']} (dr={runner_up['dr_score']:.4f}, smart={runner_up['smart_score']:.1f})")
         
         # Place with lot_multiplier
-        _sniper_setup = 'ML_OVERRIDE' if pick.get('was_flipped') else 'GMM_SNIPER'
+        _sniper_setup = 'ML_OVERRIDE_WGMM' if pick.get('was_flipped') else 'GMM_SNIPER'
+        # ML_OVERRIDE_WGMM gates already checked before flip in candidate building
+        
         try:
             result = self.tools.place_option_order(
                 underlying=pick['sym'],
@@ -1301,7 +1549,8 @@ class AutonomousTrader:
                           f"gate={pick['ml_move_prob']:.2f}, sector={pick['sector']}, "
                           f"lots={lot_multiplier}x"),
                 setup_type=_sniper_setup,
-                ml_data=pick.get('ml_data', {})
+                ml_data=pick.get('ml_data', {}),
+                sector=pick.get('sector', ''),
             )
             
             if result and result.get('success'):
@@ -1511,6 +1760,19 @@ class AutonomousTrader:
                         state.is_debit_spread = True
                         state.net_debit = trade.get('net_debit', 0)
                         state.spread_width = trade.get('spread_width', 0)
+                        # THP: sync hedged_from_tie flag for extended time stop
+                        if trade.get('hedged_from_tie', False):
+                            state.hedged_from_tie = True
+                # Populate Greeks/Expiry fields for dynamic SL/target
+                if trade.get('is_option'):
+                    state = self.exit_manager.trade_states.get(symbol)
+                    if state:
+                        state.strike = trade.get('strike', 0)
+                        state.option_type_str = trade.get('option_type', '')
+                        state.expiry_str = trade.get('expiry', '')
+                        state.underlying_symbol = trade.get('underlying', '')
+                        state.last_delta = trade.get('delta', 0)
+                        state.score_tier = trade.get('score_tier', 'standard')
                 # Estimate candles from trade entry timestamp
                 ts = trade.get('timestamp', '')
                 if ts:
@@ -1555,14 +1817,140 @@ class AutonomousTrader:
             self.monitor_thread.join(timeout=5)
         print("⚡ Real-time monitor stopped")
     
+    def _proactive_loss_hedge_check(self):
+        """Proactive loss-based hedge: every 60s check open naked options.
+        If any is down >= loss_trigger_pct, convert to debit spread immediately.
+        Runs in the realtime monitor thread (not tied to scan cycle).
+        """
+        from config import PROACTIVE_HEDGE_CONFIG as _plh_cfg
+        if not _plh_cfg.get('enabled', False):
+            return
+
+        loss_trigger = _plh_cfg.get('loss_trigger_pct', 8)
+        max_loss = _plh_cfg.get('max_hedge_loss_pct', 20)
+        cooldown = _plh_cfg.get('cooldown_seconds', 300)
+        log_checks = _plh_cfg.get('log_checks', False)
+
+        # Snapshot open naked options
+        with self.tools._positions_lock:
+            all_open = [t.copy() for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        naked_opts = [
+            t for t in all_open
+            if t.get('is_option', False)
+            and not t.get('is_debit_spread', False)
+            and not t.get('is_credit_spread', False)
+            and not t.get('is_iron_condor', False)
+            and not t.get('hedged_from_tie', False)
+        ]
+        if not naked_opts:
+            return
+
+        # Cooldown tracking (per-underlying)
+        if not hasattr(self, '_proactive_hedge_cooldowns'):
+            self._proactive_hedge_cooldowns = {}
+        _now_ts = time.time()
+
+        # Fetch LTPs
+        symbols = [t['symbol'] for t in naked_opts]
+        try:
+            if self.tools.ticker and self.tools.ticker.connected:
+                ltp_data = self.tools.ticker.get_ltp_batch(symbols)
+                quotes = {sym: ltp for sym, ltp in ltp_data.items()}
+                missing = [s for s in symbols if s not in quotes]
+                if missing:
+                    rest = self.tools.kite.ltp(missing)
+                    for s, v in rest.items():
+                        quotes[s] = v.get('last_price', 0) if isinstance(v, dict) else 0
+            else:
+                raw = self.tools.kite.ltp(symbols)
+                quotes = {s: v.get('last_price', 0) if isinstance(v, dict) else 0 for s, v in raw.items()}
+        except Exception as e:
+            if log_checks:
+                print(f"   [PLH] Price fetch error: {e}")
+            return
+
+        hedged_this_cycle = []
+        for trade in naked_opts:
+            symbol = trade['symbol']
+            entry = trade.get('avg_price', 0)
+            ltp = quotes.get(symbol, 0)
+            if entry <= 0 or ltp <= 0:
+                continue
+
+            loss_pct = ((entry - ltp) / entry) * 100  # +ve = loss
+            underlying = trade.get('underlying', '')
+
+            # Cooldown check
+            if underlying in self._proactive_hedge_cooldowns:
+                if _now_ts - self._proactive_hedge_cooldowns[underlying] < cooldown:
+                    continue
+
+            if loss_pct >= loss_trigger:
+                if loss_pct > max_loss:
+                    print(f"\n   [PLH] {symbol} loss {loss_pct:.1f}% > {max_loss}% cap -- too deep, skipping")
+                    continue
+
+                print(f"\n🛡️ PROACTIVE HEDGE: {symbol} down {loss_pct:.1f}% (trigger {loss_trigger}%) -- converting to spread")
+                try:
+                    hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="PROACTIVE_LOSS_HEDGE")
+                    if hedge_result.get('success'):
+                        # Update ExitManager
+                        em_state = self.exit_manager.get_trade_state(symbol)
+                        if em_state:
+                            new_symbol = hedge_result['symbol']
+                            em_state.symbol = new_symbol
+                            em_state.is_debit_spread = True
+                            em_state.hedged_from_tie = True
+                            em_state.net_debit = hedge_result['net_debit']
+                            em_state.spread_width = hedge_result['spread_width']
+                            em_state.current_sl = hedge_result['hedged_sl']
+                            em_state.target = hedge_result['hedged_target']
+                            em_state.initial_sl = hedge_result['hedged_sl']
+                            em_state.highest_price = hedge_result['net_debit']
+                            em_state.trailing_active = False
+                            em_state.breakeven_applied = False
+                            em_state.candles_since_entry = 0  # Fresh window
+                            if new_symbol != symbol:
+                                self.exit_manager.trade_states[new_symbol] = em_state
+                                if symbol in self.exit_manager.trade_states:
+                                    del self.exit_manager.trade_states[symbol]
+                            self.exit_manager._persist_state()
+                        print(f"   ✅ PLH: {symbol} hedged -> {hedge_result['symbol']}")
+                        print(f"      Sell: {hedge_result['sell_symbol']} @ Rs{hedge_result['sell_premium']:.2f}")
+                        print(f"      Net debit: Rs{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
+                        hedged_this_cycle.append(symbol)
+                        # Set cooldown for this underlying
+                        self._proactive_hedge_cooldowns[underlying] = _now_ts
+                    else:
+                        print(f"   ⚠️ PLH hedge failed: {hedge_result.get('error', 'unknown')}")
+                except Exception as e:
+                    print(f"   ⚠️ PLH exception: {e}")
+            elif log_checks and loss_pct > 3:  # Log positions approaching trigger
+                print(f"   [PLH] {symbol} loss {loss_pct:.1f}% (trigger at {loss_trigger}%)")
+
+        if hedged_this_cycle:
+            print(f"\n🛡️ PROACTIVE HEDGE CYCLE: converted {len(hedged_this_cycle)} positions")
+
     def _realtime_monitor_loop(self):
         """Continuous loop that checks positions every few seconds"""
         candle_timer = 0  # Track time for candle increment
+        _proactive_hedge_timer = 0  # Track time for proactive hedge check
         while self.monitor_running:
             try:
                 if self.is_trading_hours():
                     self._check_positions_realtime()
                     self._check_eod_exit()  # Check if need to exit before close
+                    
+                    # === PROACTIVE LOSS HEDGE (every 60s) ===
+                    _proactive_hedge_timer += self.monitor_interval
+                    from config import PROACTIVE_HEDGE_CONFIG as _plh_interval_cfg
+                    _plh_check_s = _plh_interval_cfg.get('check_interval_seconds', 60)
+                    if _proactive_hedge_timer >= _plh_check_s:
+                        _proactive_hedge_timer = 0
+                        try:
+                            self._proactive_loss_hedge_check()
+                        except Exception as _plh_err:
+                            print(f"   ⚠️ Proactive hedge check error: {_plh_err}")
                     
                     # Increment candle counter every ~5 minutes (300s / monitor_interval)
                     candle_timer += self.monitor_interval
@@ -1769,7 +2157,9 @@ class AutonomousTrader:
         # === GET CURRENT PRICES ===
         # For spreads (credit & debit), we need both leg symbols
         # For iron condors, we need all 4 leg symbols
+        # For TIE: also fetch underlying symbols for option trades
         all_symbols = set()
+        _option_underlying_map = {}  # option_symbol → underlying_symbol (for TIE)
         for t in active_trades:
             if t.get('is_iron_condor'):
                 all_symbols.add(t.get('sold_ce_symbol', ''))
@@ -1784,6 +2174,11 @@ class AutonomousTrader:
                 all_symbols.add(t.get('sell_symbol', ''))
             else:
                 all_symbols.add(t['symbol'])
+            # TIE: collect underlying symbols for option positions
+            ul = t.get('underlying', '')
+            if ul and t.get('is_option'):
+                all_symbols.add(ul)
+                _option_underlying_map[t['symbol']] = ul
         all_symbols.discard('')
         all_symbols = list(all_symbols)
         if all_symbols:
@@ -1917,11 +2312,77 @@ class AutonomousTrader:
                     # Current value = buy_ltp - sell_ltp (what we'd receive if closing)
                     current_value = buy_ltp - sell_ltp
                     price_dict[t['symbol']] = max(0, current_value)
+                    
+                    # ═══════════════════════════════════════════════════════
+                    # HEDGE UNWIND PROTOCOL — Restore full upside on recovery
+                    # If THP-hedged spread's buy leg recovers past entry price,
+                    # buy back the sold leg so upside is no longer capped.
+                    # ═══════════════════════════════════════════════════════
+                    if t.get('hedged_from_tie', False):
+                        from config import THESIS_HEDGE_CONFIG as _unwind_cfg
+                        _unwind_enabled = _unwind_cfg.get('unwind_enabled', False)
+                        _recovery_pct = _unwind_cfg.get('unwind_buy_leg_recovery_pct', 100)
+                        _min_profit = _unwind_cfg.get('unwind_min_profit_after_cost', 2)
+                        _buy_entry = t.get('buy_premium', 0)
+                        
+                        if _unwind_enabled and _buy_entry > 0:
+                            _recovery_threshold = _buy_entry * (_recovery_pct / 100)
+                            # Check 1: Buy leg has recovered past threshold
+                            # Check 2: After buying back sold leg, we still have net profit
+                            _sell_entry = t.get('sell_premium', 0)
+                            _hedge_leg_cost = sell_ltp - _sell_entry  # +ve = loss on hedge leg
+                            _buy_leg_profit = buy_ltp - _buy_entry    # +ve = gain on buy leg
+                            _net_after_unwind = _buy_leg_profit - max(0, _hedge_leg_cost)
+                            
+                            if buy_ltp >= _recovery_threshold and _net_after_unwind >= _min_profit:
+                                print(f"\n🔓 HEDGE UNWIND: {t['symbol']} — buy leg ₹{buy_ltp:.2f} recovered past ₹{_recovery_threshold:.2f}")
+                                print(f"   Buy leg P&L: ₹{_buy_leg_profit:+.2f} | Hedge leg cost: ₹{_hedge_leg_cost:+.2f} | Net: ₹{_net_after_unwind:+.2f}")
+                                try:
+                                    _old_symbol = t['symbol']
+                                    unwind_result = self.tools.unwind_hedge(t, sell_ltp)
+                                    if unwind_result.get('success'):
+                                        _new_sym = unwind_result['symbol']
+                                        # Update ExitManager: revert to naked option mode
+                                        em_state = self.exit_manager.get_trade_state(_old_symbol)
+                                        if em_state:
+                                            em_state.symbol = _new_sym
+                                            em_state.is_debit_spread = False
+                                            em_state.hedged_from_tie = False
+                                            em_state.entry_price = unwind_result['buy_entry_price']
+                                            em_state.current_sl = unwind_result['buy_entry_price'] * 0.85
+                                            em_state.initial_sl = unwind_result['buy_entry_price'] * 0.85
+                                            em_state.target = unwind_result['buy_entry_price'] * 1.40
+                                            em_state.highest_price = buy_ltp  # Current high
+                                            em_state.trailing_active = False
+                                            em_state.breakeven_applied = False
+                                            em_state.net_debit = 0
+                                            em_state.spread_width = 0
+                                            # Move state to new key
+                                            if _new_sym != _old_symbol:
+                                                self.exit_manager.trade_states[_new_sym] = em_state
+                                                if _old_symbol in self.exit_manager.trade_states:
+                                                    del self.exit_manager.trade_states[_old_symbol]
+                                            self.exit_manager._persist_state()
+                                        # Update price_dict with naked option price
+                                        price_dict[_new_sym] = buy_ltp
+                                        if _old_symbol in price_dict:
+                                            del price_dict[_old_symbol]
+                                        print(f"   ✅ UNWIND DONE: {_new_sym} — naked option with full upside")
+                                    else:
+                                        print(f"   ⚠️ Unwind failed: {unwind_result.get('error', 'unknown')}")
+                                except Exception as e:
+                                    print(f"   ⚠️ Unwind exception: {e}")
             else:
                 ltp_val = quotes.get(t['symbol'], {}).get('last_price', 0)
                 if ltp_val and ltp_val > 0:
                     price_dict[t['symbol']] = ltp_val
-        exit_signals = self.exit_manager.check_all_exits(price_dict)
+        # Build underlying price map for TIE (option_symbol → underlying LTP)
+        underlying_prices = {}
+        for opt_sym, ul_sym in _option_underlying_map.items():
+            ul_ltp = quotes.get(ul_sym, {}).get('last_price', 0)
+            if ul_ltp > 0:
+                underlying_prices[opt_sym] = ul_ltp
+        exit_signals = self.exit_manager.check_all_exits(price_dict, underlying_prices=underlying_prices)
         
         # Process exit signals first (highest priority)
         for signal in exit_signals:
@@ -1932,6 +2393,187 @@ class AutonomousTrader:
                     # Guard: re-check status to prevent double-close from main thread
                     if trade.get('status', 'OPEN') != 'OPEN':
                         continue
+                    
+                    # ═══════════════════════════════════════════════════════
+                    # THESIS HEDGE PROTOCOL (THP) — INTERCEPT TIE SIGNALS
+                    # If TIE fires a hedgeable check on a naked option,
+                    # convert to debit spread instead of exiting.
+                    # ═══════════════════════════════════════════════════════
+                    if signal.exit_type.startswith('THESIS_INVALID_'):
+                        tie_check_name = signal.exit_type.replace('THESIS_INVALID_', '')
+                        is_naked_option = (
+                            trade.get('is_option', False) and
+                            not trade.get('is_debit_spread', False) and
+                            not trade.get('is_credit_spread', False) and
+                            not trade.get('hedged_from_tie', False)
+                        )
+                        if is_naked_option:
+                            from thesis_validator import ThesisResult, should_hedge_instead_of_exit
+                            from config import THESIS_HEDGE_CONFIG as _thp_tie_cfg
+                            _tie_result = ThesisResult(
+                                is_invalid=True,
+                                check_name=tie_check_name,
+                                reason=signal.reason,
+                                details={},
+                            )
+                            # Unified loss cap: don't hedge if already too deep
+                            _tie_ltp = price_dict.get(symbol, 0) or signal.exit_price
+                            _tie_entry = trade.get('avg_price', 0)
+                            _tie_loss_pct = ((_tie_entry - _tie_ltp) / _tie_entry * 100) if _tie_entry > 0 and _tie_ltp > 0 else 999
+                            _max_hedge_loss = _thp_tie_cfg.get('max_hedge_loss_pct', 12)
+                            if _tie_loss_pct > _max_hedge_loss:
+                                print(f"\n📉 THP: {symbol} — loss {_tie_loss_pct:.1f}% > {_max_hedge_loss}% cap — too deep to hedge, exiting")
+                            elif should_hedge_instead_of_exit(_tie_result):
+                                print(f"\n🛡️ THP INTERCEPT: {symbol} — {tie_check_name} is hedgeable ({_tie_loss_pct:.1f}% loss), attempting spread conversion")
+                                try:
+                                    hedge_result = self.tools.convert_naked_to_spread(trade, tie_check=tie_check_name)
+                                    if hedge_result.get('success'):
+                                        # Hedge succeeded — update ExitManager state to debit spread mode
+                                        em_state = self.exit_manager.get_trade_state(symbol)
+                                        if em_state:
+                                            new_symbol = hedge_result['symbol']
+                                            # Re-key ExitManager state under new spread symbol
+                                            em_state.symbol = new_symbol
+                                            em_state.is_debit_spread = True
+                                            em_state.hedged_from_tie = True
+                                            em_state.net_debit = hedge_result['net_debit']
+                                            em_state.spread_width = hedge_result['spread_width']
+                                            em_state.current_sl = hedge_result['hedged_sl']
+                                            em_state.target = hedge_result['hedged_target']
+                                            em_state.initial_sl = hedge_result['hedged_sl']
+                                            em_state.highest_price = hedge_result['net_debit']  # Reset high tracking
+                                            em_state.trailing_active = False
+                                            em_state.breakeven_applied = False
+                                            # Move state to new key
+                                            if new_symbol != symbol:
+                                                self.exit_manager.trade_states[new_symbol] = em_state
+                                                if symbol in self.exit_manager.trade_states:
+                                                    del self.exit_manager.trade_states[symbol]
+                                            self.exit_manager._persist_state()
+                                        print(f"   ✅ THP: {symbol} hedged → {hedge_result['symbol']}")
+                                        print(f"      Sell: {hedge_result['sell_symbol']} @ ₹{hedge_result['sell_premium']:.2f}")
+                                        print(f"      Net debit: ₹{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
+                                        continue  # SKIP exit — position is now a hedged spread
+                                    else:
+                                        print(f"   ⚠️ THP hedge failed: {hedge_result.get('error', 'unknown')} — proceeding with exit")
+                                except Exception as e:
+                                    print(f"   ⚠️ THP exception: {e} — proceeding with exit")
+                            else:
+                                print(f"   🔴 THP: {tie_check_name} is non-hedgeable — immediate exit")
+                    
+                    # ═══════════════════════════════════════════════════════
+                    # THP — INTERCEPT TIME_STOP ON NAKED OPTIONS
+                    # Dead trade at candle 10 with moderate loss? Convert to
+                    # spread so if momentum resumes (candle 11-20) we capture it.
+                    # ═══════════════════════════════════════════════════════
+                    if signal.exit_type == 'TIME_STOP':
+                        from config import THESIS_HEDGE_CONFIG as _thp_cfg
+                        _is_naked_opt = (
+                            trade.get('is_option', False) and
+                            not trade.get('is_debit_spread', False) and
+                            not trade.get('is_credit_spread', False) and
+                            not trade.get('hedged_from_tie', False)
+                        )
+                        _thp_enabled = _thp_cfg.get('enabled', False) and _thp_cfg.get('hedge_time_stop', False)
+                        if _is_naked_opt and _thp_enabled:
+                            # Check current loss is moderate enough to justify hedging
+                            _ts_ltp = price_dict.get(symbol, 0) or signal.exit_price
+                            _ts_entry = trade.get('avg_price', 0)
+                            _ts_loss_pct = ((_ts_entry - _ts_ltp) / _ts_entry * 100) if _ts_entry > 0 and _ts_ltp > 0 else 999
+                            _max_loss_for_hedge = _thp_cfg.get('max_hedge_loss_pct', 12)
+                            if _ts_loss_pct <= _max_loss_for_hedge:
+                                print(f"\n🛡️ THP TIME_STOP INTERCEPT: {symbol} — dead trade ({_ts_loss_pct:.1f}% loss), hedging instead of exiting")
+                                try:
+                                    hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="TIME_STOP_HEDGE")
+                                    if hedge_result.get('success'):
+                                        em_state = self.exit_manager.get_trade_state(symbol)
+                                        if em_state:
+                                            new_symbol = hedge_result['symbol']
+                                            em_state.symbol = new_symbol
+                                            em_state.is_debit_spread = True
+                                            em_state.hedged_from_tie = True
+                                            em_state.net_debit = hedge_result['net_debit']
+                                            em_state.spread_width = hedge_result['spread_width']
+                                            em_state.current_sl = hedge_result['hedged_sl']
+                                            em_state.target = hedge_result['hedged_target']
+                                            em_state.initial_sl = hedge_result['hedged_sl']
+                                            em_state.highest_price = hedge_result['net_debit']
+                                            em_state.trailing_active = False
+                                            em_state.breakeven_applied = False
+                                            em_state.candles_since_entry = 0  # Reset candle count — fresh 20-candle window
+                                            if new_symbol != symbol:
+                                                self.exit_manager.trade_states[new_symbol] = em_state
+                                                if symbol in self.exit_manager.trade_states:
+                                                    del self.exit_manager.trade_states[symbol]
+                                            self.exit_manager._persist_state()
+                                        print(f"   ✅ THP: {symbol} rescued → {hedge_result['symbol']} (20 candle window)")
+                                        print(f"      Sell: {hedge_result['sell_symbol']} @ ₹{hedge_result['sell_premium']:.2f}")
+                                        print(f"      Net debit: ₹{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
+                                        continue  # SKIP exit — position hedged, fresh window
+                                    else:
+                                        print(f"   ⚠️ THP time_stop hedge failed: {hedge_result.get('error', 'unknown')} — exiting")
+                                except Exception as e:
+                                    print(f"   ⚠️ THP time_stop exception: {e} — exiting")
+                            else:
+                                print(f"   📉 THP: TIME_STOP loss {_ts_loss_pct:.1f}% > {_max_loss_for_hedge}% cap — too deep to hedge, exiting")
+                    
+                    # ═══════════════════════════════════════════════════════
+                    # THP — INTERCEPT SL_HIT ON NAKED OPTIONS
+                    # When hard SL fires on a naked option (e.g. 8-20% loss),
+                    # convert to debit spread instead of closing outright.
+                    # Caps max loss and gives the trade a second chance.
+                    # ═══════════════════════════════════════════════════════
+                    if signal.exit_type == 'SL_HIT':
+                        from config import THESIS_HEDGE_CONFIG as _thp_sl_cfg
+                        _is_naked_opt_sl = (
+                            trade.get('is_option', False) and
+                            not trade.get('is_debit_spread', False) and
+                            not trade.get('is_credit_spread', False) and
+                            not trade.get('hedged_from_tie', False)
+                        )
+                        _thp_sl_enabled = _thp_sl_cfg.get('enabled', False)
+                        if _is_naked_opt_sl and _thp_sl_enabled:
+                            _sl_ltp = price_dict.get(symbol, 0) or signal.exit_price
+                            _sl_entry = trade.get('avg_price', 0)
+                            _sl_loss_pct = ((_sl_entry - _sl_ltp) / _sl_entry * 100) if _sl_entry > 0 and _sl_ltp > 0 else 999
+                            _max_sl_hedge_loss = _thp_sl_cfg.get('max_hedge_loss_pct', 20)
+                            if _sl_loss_pct <= _max_sl_hedge_loss:
+                                print(f"\n🛡️ THP SL_HIT INTERCEPT: {symbol} — SL hit ({_sl_loss_pct:.1f}% loss), converting to spread instead of exiting")
+                                try:
+                                    hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="SL_HIT_HEDGE")
+                                    if hedge_result.get('success'):
+                                        em_state = self.exit_manager.get_trade_state(symbol)
+                                        if em_state:
+                                            new_symbol = hedge_result['symbol']
+                                            em_state.symbol = new_symbol
+                                            em_state.is_debit_spread = True
+                                            em_state.hedged_from_tie = True
+                                            em_state.net_debit = hedge_result['net_debit']
+                                            em_state.spread_width = hedge_result['spread_width']
+                                            em_state.current_sl = hedge_result['hedged_sl']
+                                            em_state.target = hedge_result['hedged_target']
+                                            em_state.initial_sl = hedge_result['hedged_sl']
+                                            em_state.highest_price = hedge_result['net_debit']
+                                            em_state.trailing_active = False
+                                            em_state.breakeven_applied = False
+                                            em_state.candles_since_entry = 0  # Reset candle count
+                                            if new_symbol != symbol:
+                                                self.exit_manager.trade_states[new_symbol] = em_state
+                                                if symbol in self.exit_manager.trade_states:
+                                                    del self.exit_manager.trade_states[symbol]
+                                            self.exit_manager._persist_state()
+                                        print(f"   ✅ THP: {symbol} hedged at SL → {hedge_result['symbol']}")
+                                        print(f"      Sell: {hedge_result['sell_symbol']} @ ₹{hedge_result['sell_premium']:.2f}")
+                                        print(f"      Net debit: ₹{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
+                                        print(f"      Max loss now capped | 20 candle window for recovery")
+                                        continue  # SKIP exit — position is now a hedged spread
+                                    else:
+                                        print(f"   ⚠️ THP SL hedge failed: {hedge_result.get('error', 'unknown')} — proceeding with SL exit")
+                                except Exception as e:
+                                    print(f"   ⚠️ THP SL exception: {e} — proceeding with SL exit")
+                            else:
+                                print(f"   📉 THP: SL_HIT loss {_sl_loss_pct:.1f}% > {_max_sl_hedge_loss}% cap — too deep, exiting at SL")
+                    
                     ltp = price_dict.get(symbol, 0) or signal.exit_price
                     # Guard: never exit at price 0 (quote failure)
                     if ltp <= 0:
@@ -2025,6 +2667,11 @@ class AutonomousTrader:
                         'DEBIT_SPREAD_TIME_EXIT': '⏰',
                         'DEBIT_SPREAD_TRAIL_SL': '📈',
                         'DEBIT_SPREAD_MAX_PROFIT': '💰',
+                        'THESIS_INVALID_R_COLLAPSE': '🔴',
+                        'THESIS_INVALID_NEVER_SHOWED_LIFE': '🔴',
+                        'THESIS_INVALID_IV_CRUSH': '🔴',
+                        'THESIS_INVALID_UNDERLYING_BOS': '🔴',
+                        'THESIS_INVALID_MAX_PAIN_CEILING': '🔴',
                     }.get(signal.exit_type, '🚪')
                     
                     print(f"\n{emoji} {signal.exit_type}! {symbol}")
@@ -2048,6 +2695,13 @@ class AutonomousTrader:
                                 'partial_booked': em_state.partial_booked,
                                 'current_sl_at_exit': round(em_state.current_sl, 2),
                             }
+                            # TIE: enrich exit_detail with thesis invalidation metadata
+                            if signal.exit_type.startswith('THESIS_INVALID_'):
+                                exit_detail['thesis_check'] = signal.exit_type.replace('THESIS_INVALID_', '')
+                                exit_detail['thesis_reason'] = signal.reason
+                                ul_sym = _option_underlying_map.get(symbol, '')
+                                if ul_sym:
+                                    exit_detail['underlying_ltp_at_exit'] = underlying_prices.get(symbol, 0)
                             print(f"   📋 Exit context: {em_state.candles_since_entry} candles | MaxR: {em_state.max_favorable_move:.2f} | BE: {em_state.breakeven_applied} | Trail: {em_state.trailing_active}")
                     except Exception as e:
                         print(f"   ⚠️ Could not capture exit detail: {e}")
@@ -2103,7 +2757,7 @@ class AutonomousTrader:
                     # LIVE MODE: Modify the SL order on the exchange
                     if not self.tools.paper_mode:
                         sl_order_id = trade.get('sl_order_id')
-                        if sl_order_id:
+                        if sl_order_id and not str(sl_order_id).startswith('PAPER_'):
                             try:
                                 new_trigger = state.current_sl * (0.999 if trade['side'] == 'BUY' else 1.001)
                                 self.tools.kite.modify_order(
@@ -2111,9 +2765,31 @@ class AutonomousTrader:
                                     order_id=sl_order_id,
                                     trigger_price=round(new_trigger, 1)
                                 )
-                                print(f"   🔄 LIVE SL modified on exchange: {symbol} {old_sl} → {state.current_sl}")
+                                print(f"   🔄 LIVE SL modified on exchange: {symbol} ₹{old_sl:.2f} → ₹{state.current_sl:.2f}")
                             except Exception as e:
                                 print(f"   ⚠️ Failed to modify SL order on exchange for {symbol}: {e}")
+                        elif sl_order_id is None and trade.get('is_live') and trade.get('is_option'):
+                            # Option trade in LIVE mode without broker SL — place one now
+                            try:
+                                exchange, tradingsymbol = symbol.split(':')
+                                sl_trigger = state.current_sl * 0.999
+                                new_sl_oid = self.tools._place_order_autoslice(
+                                    variety=self.tools.kite.VARIETY_REGULAR,
+                                    exchange=exchange,
+                                    tradingsymbol=tradingsymbol,
+                                    transaction_type=self.tools.kite.TRANSACTION_TYPE_SELL,
+                                    quantity=trade.get('quantity', 0),
+                                    product=self.tools.kite.PRODUCT_MIS,
+                                    order_type=self.tools.kite.ORDER_TYPE_SLM,
+                                    trigger_price=round(sl_trigger, 1),
+                                    validity=self.tools.kite.VALIDITY_DAY,
+                                    tag='TITAN_OPT_SL'
+                                )
+                                trade['sl_order_id'] = str(new_sl_oid)
+                                self.tools._save_active_trades()
+                                print(f"   🛡️ LIVE SL order placed for option {symbol}: trigger ₹{sl_trigger:.2f}")
+                            except Exception as e:
+                                print(f"   ⚠️ Failed to place SL order for option {symbol}: {e}")
         
         # === IRON CONDOR MONITORING ===
         # Dedicated exit logic: target capture, SL, time-based auto-exit, breakout
@@ -2389,10 +3065,10 @@ class AutonomousTrader:
             _type_tag = ''
             if _setup == 'GMM_SNIPER':
                 _type_tag = '🎯SNIPER'
-            elif _setup == 'ML_OVERRIDE':
-                _type_tag = '🔄ML_OVR'
-            elif _setup == 'GMM_BOOST':
-                _type_tag = '🧬GMM'
+            elif _setup == 'ML_OVERRIDE_WGMM':
+                _type_tag = '🔄ML_GMM'
+            elif _setup == 'ALL_AGREE':
+                _type_tag = '🧬ALL3'
             elif _setup == 'MODEL_TRACKER':
                 _type_tag = '🧠SCORE'
             elif _setup in ('', 'MANUAL', 'GPT') or not _setup:
@@ -2502,25 +3178,177 @@ class AutonomousTrader:
             return False
         return True
     
+    def _detect_expiry_day(self) -> dict:
+        """
+        Auto-detect if today is an expiry day for stocks or indices.
+        Uses the NFO instrument cache (already loaded by kite_ticker/options_trader).
+        Automatically sets EXPIRY_SHIELD_CONFIG['is_monthly_expiry'] for downstream use.
+        
+        Returns dict with:
+          is_stock_expiry: bool - True if any stock option expires today
+          is_index_expiry: bool - True if any index option expires today
+          stock_count: int - how many stocks expire today
+          index_names: list - which indices expire today
+          next_stock_expiry: str - next stock expiry date (if not today)
+          days_to_stock_expiry: int - days until next stock expiry
+        """
+        from datetime import date as _date_type
+        today = _date_type.today()
+        
+        INDICES = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX', 'BANKEX', 'NIFTYNXT50'}
+        
+        result = {
+            'is_stock_expiry': False,
+            'is_index_expiry': False,
+            'stock_count': 0,
+            'index_names': [],
+            'next_stock_expiry': None,
+            'days_to_stock_expiry': None,
+        }
+        
+        # Use cached expiry info if available (avoid re-querying every 5 min)
+        if hasattr(self, '_expiry_day_cache') and self._expiry_day_cache.get('date') == str(today):
+            return self._expiry_day_cache['result']
+        
+        try:
+            # Get NFO instruments (uses cached data from kite_ticker startup)
+            instruments = self.tools.kite.instruments("NFO") if hasattr(self.tools, 'kite') and self.tools.kite else []
+            if not instruments:
+                # Fallback: try options_trader's cache
+                from options_trader import get_options_trader
+                _ot = get_options_trader()
+                if _ot and hasattr(_ot, 'chain_fetcher'):
+                    instruments = _ot.chain_fetcher._get_nfo_instruments()
+        except Exception:
+            instruments = []
+        
+        if not instruments:
+            return result
+        
+        # Collect unique (name, expiry_date) pairs for options
+        stocks_expiring_today = set()
+        indices_expiring_today = set()
+        stock_future_expiries = set()  # For computing next expiry
+        
+        for inst in instruments:
+            name = inst.get('name', '')
+            inst_type = inst.get('instrument_type', '')
+            expiry = inst.get('expiry')
+            if not name or not expiry or inst_type not in ('CE', 'PE'):
+                continue
+            
+            exp_date = expiry if isinstance(expiry, _date_type) and not isinstance(expiry, datetime) else (
+                expiry.date() if hasattr(expiry, 'date') else None)
+            if exp_date is None:
+                continue
+            
+            if exp_date == today:
+                if name in INDICES:
+                    indices_expiring_today.add(name)
+                else:
+                    stocks_expiring_today.add(name)
+            elif exp_date > today and name not in INDICES:
+                stock_future_expiries.add(exp_date)
+        
+        result['is_stock_expiry'] = len(stocks_expiring_today) > 0
+        result['stock_count'] = len(stocks_expiring_today)
+        result['is_index_expiry'] = len(indices_expiring_today) > 0
+        result['index_names'] = sorted(indices_expiring_today)
+        
+        if stock_future_expiries:
+            next_exp = min(stock_future_expiries)
+            result['next_stock_expiry'] = str(next_exp)
+            result['days_to_stock_expiry'] = (next_exp - today).days
+        
+        # Auto-set EXPIRY_SHIELD for downstream use (replaces manual toggle)
+        try:
+            import config
+            if result['is_stock_expiry']:
+                config.EXPIRY_SHIELD_CONFIG['is_monthly_expiry'] = True
+                config.EXPIRY_SHIELD_CONFIG['enabled'] = True
+            else:
+                config.EXPIRY_SHIELD_CONFIG['is_monthly_expiry'] = False
+        except Exception:
+            pass
+        
+        # Cache for the rest of the day
+        self._expiry_day_cache = {'date': str(today), 'result': result}
+        return result
+
     def scan_and_trade(self):
         """Main trading loop - scan market and execute trades"""
+        import traceback as _scan_tb
+        _dbg_ts = datetime.now().strftime('%H:%M:%S')
+        _debug_log = 'bot_debug.log'
+        def _scan_dbg(msg):
+            _ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            _line = f"[{_ts}] {msg}"
+            print(_line)
+            try:
+                with open(_debug_log, 'a', encoding='utf-8') as _f:
+                    _f.write(_line + '\n')
+            except Exception:
+                pass
+        
+        _scan_dbg("SCAN: scan_and_trade() ENTER")
+        
         if not self.is_trading_hours():
-            print(f"⏰ {datetime.now().strftime('%H:%M')} - Outside trading hours")
+            _scan_dbg(f"SCAN: EXIT - outside trading hours ({datetime.now().strftime('%H:%M')})")
             return
+        
+        _scan_dbg("SCAN: passed is_trading_hours()")
         
         if not self.check_daily_loss_limit():
+            _scan_dbg("SCAN: EXIT - daily loss limit")
             return
         
+        _scan_dbg("SCAN: passed check_daily_loss_limit()")
+        
         # === RISK GOVERNOR CHECK ===
-        if not self.risk_governor.is_trading_allowed():
+        _rg_allowed = self.risk_governor.is_trading_allowed()
+        _scan_dbg(f"SCAN: risk_governor.is_trading_allowed() = {_rg_allowed}")
+        if not _rg_allowed:
+            _scan_dbg(f"SCAN: EXIT - risk governor blocked")
             print(self.risk_governor.get_status())
             return
+        
+        _scan_dbg("SCAN: all pre-checks passed, proceeding to scan...")
         
         self._scanning = True  # Suppress real-time dashboard during scan
         _cycle_start = time.time()
         print(f"\n{'='*80}")
         print(f"🔍 SCAN CYCLE @ {datetime.now().strftime('%H:%M:%S')}")
         print(f"{'='*80}")
+        
+        # === EXPIRY DAY AUTO-DETECTION (Feb 24 fix) ===
+        # Automatically detects if today is stock/index expiry using NFO instrument cache.
+        # Prints prominent warning + auto-enables EXPIRY_SHIELD so _recommend_expiry()
+        # doesn't need manual config toggle.
+        try:
+            _expiry_info = self._detect_expiry_day()
+            if _expiry_info['is_stock_expiry'] or _expiry_info['is_index_expiry']:
+                _exp_tags = []
+                if _expiry_info['is_stock_expiry']:
+                    _exp_tags.append(f"STOCK MONTHLY ({_expiry_info['stock_count']} stocks)")
+                if _expiry_info['is_index_expiry']:
+                    _exp_tags.append(f"INDEX ({', '.join(_expiry_info['index_names'])})")
+                _exp_label = ' + '.join(_exp_tags)
+                print(f"⚠️⚠️⚠️  TODAY IS EXPIRY DAY: {_exp_label}  ⚠️⚠️⚠️")
+                print(f"   → Premium crush risk HIGH | Theta decay accelerated | Gamma spikes possible")
+                if _expiry_info['is_stock_expiry']:
+                    print(f"   → Stock options expire TODAY — cheap premiums will decay to zero")
+                    print(f"   → Auto-enabled: EXPIRY_SHIELD + NEXT_MONTH expiry selection")
+                if _expiry_info.get('next_stock_expiry'):
+                    print(f"   → Next stock expiry: {_expiry_info['next_stock_expiry']}")
+            else:
+                # Not expiry day — show days to next expiry
+                if _expiry_info.get('days_to_stock_expiry') is not None:
+                    _dte = _expiry_info['days_to_stock_expiry']
+                    _next = _expiry_info.get('next_stock_expiry', '?')
+                    print(f"📅 Stock expiry in {_dte} day{'s' if _dte != 1 else ''} ({_next})")
+        except Exception as _exp_err:
+            print(f"   ⚠️ Expiry detection error: {_exp_err}")
+        
         print(self.risk_governor.get_status())
         self._rejected_this_cycle = set()  # Reset rejected symbols for new scan
         
@@ -3276,6 +4104,112 @@ class AutonomousTrader:
                     print(f"   ⚠️ GMM Sniper error (non-fatal): {_snp_err}")
                     _sniper_placed = None
                 
+                # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
+                # Scans OI data for high-edge reversal / contrarian setups.
+                # Independent from GMM Sniper — these use OI flow signals + GMM confirmation.
+                try:
+                    if getattr(self, '_sniper_engine', None) and _oi_results and _ml_results:
+                        _active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', [])
+                                       if p.get('status', 'OPEN') == 'OPEN'}
+                        _cycle_time_now = datetime.now().strftime('%H:%M:%S')
+                        
+                        # --- Strategy 1: OI Unwinding Reversal ---
+                        _oi_unwind_candidates = self._sniper_engine.scan_oi_unwinding(
+                            oi_results=_oi_results, ml_results=_ml_results, pre_scores=_pre_scores,
+                            market_data=market_data,
+                            active_symbols=_active_syms, model_tracker_symbols=self._model_tracker_symbols,
+                            gmm_sniper_symbols=self._gmm_sniper_symbols,
+                        )
+                        _oi_unwind_placed = set()
+                        for _oiu_cand in _oi_unwind_candidates:
+                            try:
+                                _oiu_cfg = getattr(self._sniper_engine, '_oi_cfg', {})
+                                _oiu_lot_mult = _oiu_cfg.get('lot_multiplier', 1.5)
+                                print(f"\n   🔫 SNIPER-OIUnwinding: {_oiu_cand['sym_clean']} ({_oiu_cand['direction']}) "
+                                      f"| {_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f} "
+                                      f"| chg={_oiu_cand.get('change_pct', 0):+.1f}% RSI={_oiu_cand.get('rsi', 50):.0f} "
+                                      f"| exhaust={_oiu_cand.get('exhaustion_score', 0):.2f} "
+                                      f"| spot→SR {_oiu_cand['dist_from_sr_pct']:.1f}% "
+                                      f"| dr={_oiu_cand['dr_score']:.4f} | smart={_oiu_cand['smart_score']:.1f} "
+                                      f"| {_oiu_lot_mult}x lots")
+                                _oiu_result = self.tools.place_option_order(
+                                    underlying=_oiu_cand['sym'], direction=_oiu_cand['direction'],
+                                    strike_selection="ATM", use_intraday_scoring=False,
+                                    lot_multiplier=_oiu_lot_mult,
+                                    rationale=(f"SNIPER_OI_UNWINDING: {_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f}, "
+                                              f"spot→SR={_oiu_cand['dist_from_sr_pct']:.1f}%, dr={_oiu_cand['dr_score']:.4f}, "
+                                              f"smart={_oiu_cand['smart_score']:.1f}, lots={_oiu_lot_mult}x"),
+                                    setup_type='SNIPER_OI_UNWINDING',
+                                    ml_data=_oiu_cand.get('ml_data', {}),
+                                )
+                                if _oiu_result and _oiu_result.get('success'):
+                                    self._sniper_engine.record_oi_trade(_oiu_cand['sym'])
+                                    _oi_unwind_placed.add(_oiu_cand['sym'])
+                                    print(f"   ✅ SNIPER-OIUnwinding PLACED: {_oiu_cand['sym_clean']} ({_oiu_cand['direction']})")
+                                    self._log_decision(_cycle_time_now, _oiu_cand['sym'], _oiu_cand['p_score'],
+                                                      'SNIPER_OI_UNWINDING_PLACED',
+                                                      reason=f"OI={_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f}, dr={_oiu_cand['dr_score']:.4f}",
+                                                      direction=_oiu_cand['direction'], setup='SNIPER_OI_UNWINDING')
+                                else:
+                                    _oiu_err = _oiu_result.get('error', 'unknown') if _oiu_result else 'no result'
+                                    print(f"   ⚠️ Sniper-OIUnwinding failed for {_oiu_cand['sym_clean']}: {_oiu_err}")
+                            except Exception as _oiu_place_err:
+                                print(f"   ❌ Sniper-OIUnwinding error for {_oiu_cand['sym_clean']}: {_oiu_place_err}")
+                        
+                        if _oi_unwind_placed:
+                            _oiu_status = self._sniper_engine.get_status()['oi_unwinding']
+                            print(f"   📊 Sniper-OIUnwinding: {_oiu_status['trades_today']}/{_oiu_status['max_per_day']} today")
+                        
+                        # --- Strategy 2: PCR Extreme Fade ---
+                        _pcr_candidates = self._sniper_engine.scan_pcr_extreme(
+                            oi_results=_oi_results, ml_results=_ml_results, pre_scores=_pre_scores,
+                            market_data=market_data,
+                            active_symbols=_active_syms, model_tracker_symbols=self._model_tracker_symbols,
+                            gmm_sniper_symbols=self._gmm_sniper_symbols,
+                            oi_unwinding_symbols=_oi_unwind_placed,
+                        )
+                        for _pcr_cand in _pcr_candidates:
+                            try:
+                                _pcr_cfg_val = getattr(self._sniper_engine, '_pcr_cfg', {})
+                                _pcr_lot_mult = _pcr_cfg_val.get('lot_multiplier', 1.5)
+                                _pcr_thr_info = f"thr={_pcr_cand.get('adaptive_oversold_thr', 1.35):.2f}/{_pcr_cand.get('adaptive_overbought_thr', 0.65):.2f}"
+                                _pcr_idx_tag = ' IDX✓' if _pcr_cand.get('index_agrees') else ''
+                                print(f"\n   🔫 SNIPER-PCRExtreme: {_pcr_cand['sym_clean']} ({_pcr_cand['direction']}) "
+                                      f"| PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}) "
+                                      f"| edge={_pcr_cand['pcr_edge']:.3f} {_pcr_thr_info}{_pcr_idx_tag} "
+                                      f"| dr={_pcr_cand['dr_score']:.4f} | smart={_pcr_cand['smart_score']:.1f} "
+                                      f"| {_pcr_lot_mult}x lots")
+                                _pcr_result = self.tools.place_option_order(
+                                    underlying=_pcr_cand['sym'], direction=_pcr_cand['direction'],
+                                    strike_selection="ATM", use_intraday_scoring=False,
+                                    lot_multiplier=_pcr_lot_mult,
+                                    rationale=(f"SNIPER_PCR_EXTREME: PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}), "
+                                              f"edge={_pcr_cand['pcr_edge']:.3f}, dr={_pcr_cand['dr_score']:.4f}, "
+                                              f"smart={_pcr_cand['smart_score']:.1f}, lots={_pcr_lot_mult}x"),
+                                    setup_type='SNIPER_PCR_EXTREME',
+                                    ml_data=_pcr_cand.get('ml_data', {}),
+                                )
+                                if _pcr_result and _pcr_result.get('success'):
+                                    self._sniper_engine.record_pcr_trade(_pcr_cand['sym'])
+                                    print(f"   ✅ SNIPER-PCRExtreme PLACED: {_pcr_cand['sym_clean']} ({_pcr_cand['direction']}) "
+                                          f"PCR={_pcr_cand['blended_pcr']:.3f}")
+                                    self._log_decision(_cycle_time_now, _pcr_cand['sym'], _pcr_cand['p_score'],
+                                                      'SNIPER_PCR_EXTREME_PLACED',
+                                                      reason=f"PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}), dr={_pcr_cand['dr_score']:.4f}",
+                                                      direction=_pcr_cand['direction'], setup='SNIPER_PCR_EXTREME')
+                                else:
+                                    _pcr_err = _pcr_result.get('error', 'unknown') if _pcr_result else 'no result'
+                                    print(f"   ⚠️ Sniper-PCRExtreme failed for {_pcr_cand['sym_clean']}: {_pcr_err}")
+                            except Exception as _pcr_place_err:
+                                print(f"   ❌ Sniper-PCRExtreme error for {_pcr_cand['sym_clean']}: {_pcr_place_err}")
+                        
+                        _pcr_placed_count = len([c for c in _pcr_candidates if c['sym'] in getattr(self._sniper_engine, '_pcr_symbols', set())])
+                        if _pcr_placed_count:
+                            _pcr_status = self._sniper_engine.get_status()['pcr_extreme']
+                            print(f"   📊 Sniper-PCRExtreme: {_pcr_status['trades_today']}/{_pcr_status['max_per_day']} today")
+                except Exception as _snp_strat_err:
+                    print(f"   ⚠️ Sniper Strategies error (non-fatal): {_snp_strat_err}")
+                
                 # === OI SNAPSHOT LOGGER: Collect data for future model retraining ===
                 # Now includes NSE OI change data (richer than Kite-only snapshots)
                 try:
@@ -3955,9 +4889,9 @@ class AutonomousTrader:
                         # by 12 (average micro contribution for liquid F&O stocks) to avoid
                         # filtering out stocks that would pass at trade time.
                         _micro_absent_offset = 12
-                        # GPT-selected minimum: score + micro offset must reach 55
-                        # (raw score ~43+ since micro adds ~12)
-                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 55:
+                        # GPT-selected minimum: score + micro offset must reach 60
+                        # (raw score ~48+ since micro adds ~12)
+                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 60:
                             continue
                         # Append ML signal tag if available (fail-safe: empty string if not)
                         _ml_tag = ""
@@ -4742,26 +5676,28 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                 _gpt_xgb_disagrees = True
                             
                             if _gpt_xgb_disagrees:
-                                # XGB actively opposes trade. GMM regime follows XGB signal,
-                                # so it also opposes trade direction. Check if GMM confirms
-                                # the opposing direction is genuine (dr_flag=False) → FLIP
-                                if not _gpt_ml.get('ml_down_risk_flag', False):
-                                    # GMM confirms XGB's opposing direction → FLIP to ML direction
-                                    old_direction = direction
-                                    direction = 'BUY' if _gpt_ml_signal == 'UP' else 'SELL'
-                                    _gpt_was_flipped = True
-                                    print(f"   🔄 GPT ML OVERRIDE: {sym} — XGB={_gpt_ml_signal} + GMM confirms "
-                                          f"(dr={_gpt_dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
-                                _gpt_gmm_caution = _gpt_dr_score > _gpt_dir_cfg.get('gmm_caution_threshold', 0.15)
-                                if _gpt_gmm_caution:
-                                    # HARD BLOCK: Both XGB and GMM disagree — skip this GPT trade
-                                    print(f"   🚫 GPT DIRECTION BLOCK: {sym} — XGB={_gpt_ml_signal} vs GPT={direction}, "
-                                          f"GMM dr={_gpt_dr_score:.3f} → BOTH ML systems disagree, skipping")
-                                    continue
+                                # XGB actively opposes GPT trade direction.
+                                # DR INTERPRETATION: high dr confirms XGB's direction is real
+                                _gpt_dr_flag = _gpt_ml.get('ml_down_risk_flag', False)
+                                if _gpt_dr_flag:
+                                    # HIGH dr → GMM confirms XGB's opposing direction
+                                    # XGB + GMM both oppose → either FLIP or BLOCK
+                                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym, _gpt_ml, _gpt_dr_score, path='GPT')
+                                    if _ovr_ok:
+                                        # Gates passed → FLIP to XGB direction
+                                        old_direction = direction
+                                        direction = 'BUY' if _gpt_ml_signal == 'UP' else 'SELL'
+                                        _gpt_was_flipped = True
+                                        print(f"   🔄 GPT ML_OVERRIDE_WGMM: {sym} — XGB={_gpt_ml_signal} + GMM confirms "
+                                              f"(dr={_gpt_dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
+                                    else:
+                                        # Gates failed → BLOCK (XGB+GMM both oppose but gates not met)
+                                        print(f"   🚫 GPT ML_OVR BLOCKED: {sym} — {_ovr_reason}")
+                                        continue
                                 else:
-                                    # SOFT WARNING: Only XGB disagrees but GMM is clean — allow with warning
+                                    # LOW dr → GMM uncertain → XGB alone opposes → allow with warning
                                     print(f"   ⚠️ GPT XGB CONFLICT: {sym} — XGB={_gpt_ml_signal} vs GPT={direction}, "
-                                          f"GMM clean (dr={_gpt_dr_score:.3f}) → allowing with caution")
+                                          f"GMM uncertain (dr={_gpt_dr_score:.3f}) → allowing with caution")
                         
                         try:
                             # Build ML data for GPT direct-place trades
@@ -4796,7 +5732,9 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                 'scored_direction': direction,
                                 'xgb_disagrees': _gpt_xgb_disagrees if '_gpt_xgb_disagrees' in dir() else False,
                             } if _gpt_ml_full else {}
-                            _gpt_setup_type = 'ML_OVERRIDE' if _gpt_was_flipped else 'GPT'
+                            _gpt_setup_type = 'ML_OVERRIDE_WGMM' if _gpt_was_flipped else 'GPT'
+                            # ML_OVERRIDE gates already checked before flip above
+                            
                             if sym in fno_prefer_set:
                                 result = self.tools.place_option_order(
                                     underlying=f"NSE:{sym}",
@@ -4889,15 +5827,15 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             # Current portfolio state
             _total_open = len(_active_now)
             _sniper_positions = [t for t in _active_now if t.get('is_sniper') or t.get('setup_type') == 'GMM_SNIPER']
-            _ml_override_positions = [t for t in _active_now if t.get('setup_type') == 'ML_OVERRIDE']
-            _model_tracker_positions = [t for t in _active_now if t.get('setup_type') in ('MODEL_TRACKER', 'GMM_BOOST')]
+            _ml_override_positions = [t for t in _active_now if t.get('setup_type') == 'ML_OVERRIDE_WGMM']
+            _model_tracker_positions = [t for t in _active_now if t.get('setup_type') in ('MODEL_TRACKER', 'ALL_AGREE')]
             _gpt_positions = [t for t in _active_now if t.get('setup_type') in ('', 'MANUAL', 'GPT') or not t.get('setup_type')]
             if _total_open > 0:
                 _breakdown_parts = []
                 if _sniper_positions:
                     _breakdown_parts.append(f"🎯{len(_sniper_positions)} sniper")
                 if _ml_override_positions:
-                    _breakdown_parts.append(f"🔄{len(_ml_override_positions)} ML-override")
+                    _breakdown_parts.append(f"🔄{len(_ml_override_positions)} ML-override-wGMM")
                 if _model_tracker_positions:
                     _breakdown_parts.append(f"🧠{len(_model_tracker_positions)} score-based")
                 if _gpt_positions:
@@ -5071,6 +6009,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         
         Compares Kite's actual open positions against Titan's tracked positions.
         If a position was closed by the broker SL order, update Titan's state.
+        Also handles spread/condor positions by checking individual legs.
         """
         if self.paper_mode:
             return
@@ -5095,6 +6034,51 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             # Check each Titan position — if broker has ZERO qty, SL triggered
             for trade in titan_open:
                 symbol = trade.get('symbol', '')
+                
+                # === SPREAD/CONDOR: Check individual legs ===
+                if '|' in symbol:
+                    # Composite symbol — check each leg individually
+                    leg_symbols = symbol.split('|')
+                    all_legs_closed = True
+                    any_leg_closed = False
+                    
+                    for leg_sym in leg_symbols:
+                        if leg_sym in broker_open:
+                            all_legs_closed = False
+                        else:
+                            any_leg_closed = True
+                    
+                    if all_legs_closed:
+                        # All legs closed at broker — mark trade as closed
+                        entry = trade.get('avg_price', 0)
+                        qty = trade.get('quantity', 0)
+                        
+                        # Get total P&L from broker positions for these legs
+                        total_pnl = 0
+                        for leg_sym in leg_symbols:
+                            for bp in day_positions:
+                                bp_sym = f"{bp['exchange']}:{bp['tradingsymbol']}"
+                                if bp_sym == leg_sym:
+                                    total_pnl += bp.get('realised', 0) + bp.get('unrealised', 0)
+                                    break
+                        
+                        print(f"\n🔄 BROKER SYNC: Spread/Condor {trade.get('underlying', symbol)} closed by broker")
+                        print(f"   P&L from broker: ₹{total_pnl:+,.2f}")
+                        
+                        self.tools.update_trade_status(symbol, 'BROKER_CLOSED', 0, total_pnl,
+                            exit_detail={'exit_reason': 'BROKER_CLOSED', 'exit_type': 'SPREAD_CLOSE'})
+                        with self._pnl_lock:
+                            self.daily_pnl += total_pnl
+                            self.capital += total_pnl
+                    
+                    elif any_leg_closed:
+                        # Partial leg close — log warning (spreads should close together)
+                        closed_legs = [s for s in leg_symbols if s not in broker_open]
+                        print(f"   ⚠️ BROKER SYNC: Partial leg close on {trade.get('underlying', symbol)}: {closed_legs}")
+                    
+                    continue  # Skip single-symbol logic
+                
+                # === SINGLE-LEG POSITIONS ===
                 if symbol not in broker_open:
                     # Position closed at broker (SL triggered or manual close)
                     entry = trade.get('avg_price', 0)
@@ -5185,16 +6169,45 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         # After 9:45 always use 5-min interval regardless of CLI arg
         self._normal_interval = 5
         
+        # === DEBUG LOG FILE ===
+        import traceback as _tb
+        _debug_log = os.path.join(os.path.dirname(__file__), 'bot_debug.log')
+        def _dbg(msg):
+            """Write timestamped debug message to file + stdout"""
+            _ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            _line = f"[{_ts}] {msg}"
+            print(_line)
+            try:
+                with open(_debug_log, 'a', encoding='utf-8') as _f:
+                    _f.write(_line + '\n')
+            except Exception:
+                pass
+
+        _dbg("DEBUG: run() entered, scheduling tasks...")
+        
         # Schedule tasks with current interval
         schedule.every(current_interval).minutes.do(self.scan_and_trade)
+        _dbg(f"DEBUG: scheduled scan_and_trade every {current_interval} min")
         
         # Initial scan
-        self.scan_and_trade()
+        _dbg("DEBUG: calling initial scan_and_trade()...")
+        try:
+            self.scan_and_trade()
+            _dbg("DEBUG: initial scan_and_trade() completed OK")
+        except Exception as _e:
+            _dbg(f"ERROR: initial scan_and_trade() CRASHED: {_e}")
+            _dbg(f"TRACEBACK:\n{_tb.format_exc()}")
         
+        _dbg("DEBUG: entering main while-loop...")
         # Run loop
         try:
+            _loop_count = 0
             while True:
-                schedule.run_pending()
+                try:
+                    schedule.run_pending()
+                except Exception as _e:
+                    _dbg(f"ERROR: schedule.run_pending() failed: {_e}")
+                    _dbg(f"TRACEBACK:\n{_tb.format_exc()}")
                 
                 # Check if we need to switch from early session to normal interval
                 if not self._switched_to_normal:
@@ -5203,27 +6216,60 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         self._switched_to_normal = True
                         schedule.clear()
                         schedule.every(self._normal_interval).minutes.do(self.scan_and_trade)
-                        print(f"\n🔄 Early session ended — switching to {self._normal_interval}-minute scan interval with 5-minute candles\n")
+                        _dbg(f"DEBUG: Early session ended — switching to {self._normal_interval}-min interval")
+                
+                _loop_count += 1
+                if _loop_count % 60 == 0:  # Log heartbeat every 60s
+                    _dbg(f"HEARTBEAT: loop iteration {_loop_count}, system_state={getattr(self.risk_governor.state, 'system_state', '?')}")
                 
                 time.sleep(1)
         except KeyboardInterrupt:
+            _dbg("DEBUG: KeyboardInterrupt received, shutting down...")
             print("\n\n👋 Shutting down...")
+            self.stop_realtime_monitor()
+            self._print_summary()
+        except Exception as _e:
+            _dbg(f"FATAL: main loop crashed: {_e}")
+            _dbg(f"TRACEBACK:\n{_tb.format_exc()}")
             self.stop_realtime_monitor()
             self._print_summary()
     
     def _print_summary(self):
-        """Print trading summary AND save structured daily report"""
+        """Print trading summary using centralized Trade Ledger"""
         today = datetime.now().strftime('%Y-%m-%d')
         
-        # === Collect data from trade_history.json ===
+        # === Collect data from Trade Ledger ===
         history = []
         try:
-            import json
-            history_file = os.path.join(os.path.dirname(__file__), 'trade_history.json')
-            if os.path.exists(history_file):
-                with open(history_file, 'r') as f:
-                    all_history = json.load(f)
-                history = [t for t in all_history if t.get('closed_at', '').startswith(today) or t.get('timestamp', '').startswith(today)]
+            from trade_ledger import get_trade_ledger
+            trades = get_trade_ledger().get_trades_with_pnl(today)
+            # Convert TradeLedger format to legacy format for compatibility
+            for t in trades:
+                history.append({
+                    'symbol': t.get('symbol', ''),
+                    'underlying': t.get('underlying', ''),
+                    'side': t.get('direction', ''),
+                    'pnl': t.get('total_pnl', 0),
+                    'result': t.get('final_exit_type', ''),
+                    'entry_score': t.get('smart_score', 0),
+                    'score_tier': t.get('score_tier', ''),
+                    'strategy_type': t.get('strategy_type', ''),
+                    'is_sniper': t.get('is_sniper', False),
+                    'avg_price': t.get('entry_price', 0),
+                    'exit_price': t.get('exit_price', 0),
+                    'timestamp': t.get('entry_time', ''),
+                    'exit_detail': {
+                        'candles_held': t.get('candles_held', 0),
+                        'r_multiple_achieved': t.get('r_multiple', 0),
+                        'max_favorable_excursion': t.get('max_favorable', 0),
+                        'exit_reason': t.get('exit_reason', ''),
+                    },
+                    'entry_metadata': {
+                        'entry_score': t.get('smart_score', 0),
+                        'smart_score': t.get('smart_score', 0),
+                        'score_tier': t.get('score_tier', ''),
+                    },
+                })
         except Exception:
             pass
         
@@ -5338,106 +6384,15 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         
         print("="*60)
         
-        # === SAVE TO DAILY SUMMARY FILE ===
+        # Flush OI collector buffers to parquet (EOD)
         try:
-            import json
-            summary = {
-                'date': today,
-                'capital_start': self.start_capital,
-                'capital_end': round(self.capital, 2),
-                'daily_pnl': round(self.daily_pnl, 2),
-                'return_pct': round((self.capital/self.start_capital - 1)*100, 2),
-                'total_trades': total_trades,
-                'wins': len(winners),
-                'losses': len(losers),
-                'breakevens': len(breakevens),
-                'win_rate': round(win_rate, 1),
-                'avg_winner': round(avg_win, 2),
-                'avg_loser': round(avg_loss, 2),
-                'payoff_ratio': round(abs(avg_win/avg_loss), 2) if avg_loss != 0 else 0,
-                'by_strategy': by_strategy,
-                'by_exit_type': by_exit,
-                'by_score_tier': by_tier,
-                'gate_analysis': gate_analysis,
-                'exit_quality': {
-                    'avg_candles_held': round(avg_candles_held, 1),
-                    'avg_r_multiple': round(avg_r_achieved, 2),
-                },
-                'individual_trades': [
-                    {
-                        'trade_id': t.get('trade_id', ''),
-                        'symbol': t.get('symbol', ''),
-                        'underlying': t.get('underlying', ''),
-                        'side': t.get('side', ''),
-                        'entry_score': t.get('entry_score', t.get('entry_metadata', {}).get('entry_score', 0)),
-                        'score_tier': t.get('score_tier', 'unknown'),
-                        'strategy_type': t.get('strategy_type', ''),
-                        'entry': t.get('avg_price', 0),
-                        'exit': t.get('exit_price', 0),
-                        'pnl': t.get('pnl', 0),
-                        'result': t.get('result', ''),
-                        'candles_held': t.get('exit_detail', {}).get('candles_held', 0),
-                        'r_multiple': t.get('exit_detail', {}).get('r_multiple_achieved', 0),
-                        'ft_at_entry': t.get('entry_metadata', {}).get('follow_through_candles', 0),
-                        'adx_at_entry': t.get('entry_metadata', {}).get('adx', 0),
-                        'orb_at_entry': t.get('entry_metadata', {}).get('orb_strength_pct', 0),
-                        'timestamp': t.get('timestamp', ''),
-                    }
-                    for t in history
-                ],
-            }
-            
-            summary_dir = os.path.join(os.path.dirname(__file__), 'daily_summaries')
-            os.makedirs(summary_dir, exist_ok=True)
-            summary_file = os.path.join(summary_dir, f'daily_summary_{today}.json')
-            
-            atomic_json_save(summary_file, summary)
-            print(f"\n  💾 Daily summary saved to: daily_summaries/daily_summary_{today}.json")
-            
-            # Flush OI collector buffers to parquet (EOD)
-            try:
-                if hasattr(self, '_oi_collector'):
-                    self._oi_collector.flush_all()
-                    print(f"  💾 OI snapshots flushed to parquet for ML training")
-            except Exception:
-                pass
-            
-            # Also append to trade_decisions.log
-            from options_trader import TRADE_DECISIONS_LOG
-            with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                f.write(f"\n{'='*70}\n")
-                f.write(f"📊 DAILY SUMMARY — {today}\n")
-                f.write(f"   Capital: ₹{self.start_capital:,.0f} → ₹{self.capital:,.0f}\n")
-                f.write(f"   P&L: ₹{self.daily_pnl:,.0f} ({(self.capital/self.start_capital - 1)*100:+.2f}%)\n")
-                f.write(f"   Trades: {total_trades} | W: {len(winners)} L: {len(losers)}\n")
-                f.write(f"   Win Rate: {win_rate:.1f}% | Payoff: {abs(avg_win/avg_loss):.2f}:1\n" if avg_loss != 0 else f"   Win Rate: {win_rate:.1f}%\n")
-                for strat, data in by_strategy.items():
-                    f.write(f"   {strat}: W{data['wins']}/L{data['losses']} ₹{data['pnl']:+,.0f}\n")
-                f.write(f"   Avg Candles: {avg_candles_held:.1f} | Avg R: {avg_r_achieved:.2f}\n")
-                f.write(f"{'='*70}\n")
-            
-            # === QUANT ANALYTICS EOD REPORT (Feb 13) ===
-            try:
-                from quant_analytics import load_trade_history, generate_full_report
-                all_trades = load_trade_history()
-                if all_trades:
-                    # Today's report
-                    today_report = generate_full_report(all_trades, self.start_capital, filter_date=today)
-                    report_file = os.path.join(summary_dir, f'quant_report_{today}.txt')
-                    with open(report_file, 'w', encoding='utf-8') as f:
-                        f.write(today_report)
-                    print(f"  📊 Quant analytics report saved to: daily_summaries/quant_report_{today}.txt")
-                    
-                    # Also generate cumulative all-time report
-                    cum_report = generate_full_report(all_trades, self.start_capital)
-                    cum_file = os.path.join(summary_dir, 'quant_report_cumulative.txt')
-                    with open(cum_file, 'w', encoding='utf-8') as f:
-                        f.write(cum_report)
-                    print(f"  📊 Cumulative report saved to: daily_summaries/quant_report_cumulative.txt")
-            except Exception as e:
-                print(f"  ⚠️ Could not generate quant report: {e}")
-        except Exception as e:
-            print(f"  ⚠️ Could not save daily summary: {e}")
+            if hasattr(self, '_oi_collector'):
+                self._oi_collector.flush_all()
+                print(f"  💾 OI snapshots flushed to parquet for ML training")
+        except Exception:
+            pass
+        
+        print(f"\n  💾 All trade data logged to Trade Ledger (trade_ledger/)")
 
 
 def main():
@@ -5463,12 +6418,31 @@ def main():
         _source = os.environ.get('TRADING_MODE', 'PAPER').strip().upper()
         print(f"  📋 Mode from .env TRADING_MODE={_source} → {'PAPER' if paper_mode else 'LIVE'}")
     
-    bot = AutonomousTrader(
-        capital=args.capital,
-        paper_mode=paper_mode
-    )
+    import traceback as _main_tb
+    _debug_log = os.path.join(os.path.dirname(__file__), 'bot_debug.log')
     
-    bot.run(scan_interval_minutes=args.interval)
+    def _main_dbg(msg):
+        _ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        _line = f"[{_ts}] {msg}"
+        print(_line)
+        try:
+            with open(_debug_log, 'a', encoding='utf-8') as _f:
+                _f.write(_line + '\n')
+        except Exception:
+            pass
+    
+    _main_dbg("DEBUG main(): creating AutonomousTrader...")
+    try:
+        bot = AutonomousTrader(
+            capital=args.capital,
+            paper_mode=paper_mode
+        )
+        _main_dbg("DEBUG main(): AutonomousTrader created OK, calling run()...")
+        bot.run(scan_interval_minutes=args.interval)
+    except Exception as _e:
+        _main_dbg(f"FATAL main(): {_e}")
+        _main_dbg(f"TRACEBACK:\n{_main_tb.format_exc()}")
+        raise
 
 
 if __name__ == "__main__":
