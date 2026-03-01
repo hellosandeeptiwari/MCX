@@ -352,6 +352,32 @@ def health_check():
         return jsonify({'ok': False, 'msg': str(e)}), 500
 
 
+# ── Watchdog alerts ──────────────────────────────────────────
+WATCHDOG_ALERTS_FILE = LOG_DIR / 'watchdog_alerts.json'
+
+@app.route('/api/alerts')
+def watchdog_alerts():
+    """Return watchdog alerts for today."""
+    try:
+        if WATCHDOG_ALERTS_FILE.exists():
+            with open(WATCHDOG_ALERTS_FILE, 'r') as f:
+                data = json.load(f)
+            return jsonify(data)
+        return jsonify({'count': 0, 'critical': 0, 'warnings': 0, 'alerts': [],
+                        'date': _today(), 'updated': None})
+    except Exception as e:
+        return jsonify({'count': 0, 'alerts': [], 'error': str(e)})
+
+
+@app.route('/api/alerts/watchdog-log')
+def watchdog_log():
+    """Return recent watchdog log lines."""
+    n = int(request.args.get('lines', 100))
+    logfile = str(LOG_DIR / 'watchdog.log')
+    lines = _tail_file(logfile, n)
+    return jsonify({'lines': [l.rstrip() for l in lines]})
+
+
 # ══════════════════════════════════════════════════════════════
 #  Entry point
 # ══════════════════════════════════════════════════════════════

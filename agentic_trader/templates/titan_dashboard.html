@@ -184,10 +184,24 @@ a{color:var(--blue);text-decoration:none}
 <!-- Tabs -->
 <div class="tabs">
   <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="alerts">&#128680; Alerts</button>
   <button class="tab" data-tab="logs">Live Logs</button>
   <button class="tab" data-tab="positions">Positions</button>
   <button class="tab" data-tab="trades">Trade History</button>
   <button class="tab" data-tab="scans">Scan Log</button>
+</div>
+
+<!-- ═══════════════ TAB: ALERTS ═══════════════ -->
+<div id="tab-alerts" class="tab-content">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+    <h3 style="margin:0">Watchdog Alerts</h3>
+    <span id="alerts-badge" style="background:#333;padding:2px 10px;border-radius:12px;font-size:.75rem">—</span>
+    <button onclick="loadAlerts()" style="background:#2563eb;color:#fff;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:.75rem">Refresh</button>
+    <span id="alerts-updated" style="color:#888;font-size:.72rem;margin-left:auto"></span>
+  </div>
+  <div id="alerts-list" style="font-family:'JetBrains Mono',monospace;font-size:.78rem;line-height:1.7;max-height:65vh;overflow-y:auto">
+    <div style="color:#888;padding:20px;text-align:center">Watchdog monitors logs during market hours (9:10 AM – 3:35 PM).<br>Alerts will appear here when issues are detected.</div>
+  </div>
 </div>
 
 <!-- ═══════════════ TAB: OVERVIEW ═══════════════ -->
@@ -219,6 +233,10 @@ a{color:var(--blue);text-decoration:none}
     <div class="card">
       <div class="label">Max Daily Loss</div>
       <div class="value" id="kpi-maxloss">—</div>
+    </div>
+    <div class="card" style="cursor:pointer" onclick="document.querySelector('[data-tab=alerts]').click()">
+      <div class="label">Watchdog Alerts</div>
+      <div class="value" id="overview-alerts-badge" style="font-size:1rem">—</div>
     </div>
   </div>
 
@@ -454,6 +472,7 @@ $$('.tabs .tab[data-tab]').forEach(btn => {
     if(btn.dataset.tab === 'positions') loadPositions();
     if(btn.dataset.tab === 'trades') loadTradeHistory();
     if(btn.dataset.tab === 'scans') loadScans();
+    if(btn.dataset.tab === 'alerts') loadAlerts();
   });
 });
 
@@ -764,6 +783,48 @@ async function loadDayTrades(dateStr) {
   }).join('');
 }
 
+// ── WATCHDOG ALERTS ──────────────────────────────────
+async function loadAlerts() {
+  const data = await api('/api/alerts');
+  if(!data) return;
+
+  const alerts = Array.isArray(data.alerts) ? data.alerts : [];
+  const badge = $('#alerts-badge');
+  const list  = $('#alerts-list');
+  const ts    = $('#alerts-updated');
+
+  // Count by severity
+  const crit = alerts.filter(a => a.level === 'CRITICAL').length;
+  const warn = alerts.filter(a => a.level === 'WARNING').length;
+
+  if(!alerts.length) {
+    badge.textContent = '0';
+    badge.style.background = '#166534';
+    list.innerHTML = '<div style="color:#888;padding:20px;text-align:center">✅ No alerts — all clear during today\'s session.</div>';
+  } else {
+    badge.textContent = `${crit} critical · ${warn} warning`;
+    badge.style.background = crit > 0 ? '#991b1b' : '#92400e';
+    list.innerHTML = alerts.slice().reverse().map(a => {
+      const color = a.level === 'CRITICAL' ? '#ef4444' : '#f59e0b';
+      const icon  = a.level === 'CRITICAL' ? '🔴' : '🟡';
+      const time  = (a.timestamp || '').split(' ').pop() || '';
+      return `<div style="border-left:3px solid ${color};padding:4px 10px;margin-bottom:6px;background:rgba(255,255,255,.03);border-radius:0 6px 6px 0">
+        <span style="color:${color};font-weight:600">${icon} ${a.level}</span>
+        <span style="color:#888;margin-left:8px">${time}</span>
+        <div style="color:#ccc;margin-top:2px">${a.message || ''}</div>
+      </div>`;
+    }).join('');
+  }
+  ts.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+
+  // Also update overview badge if exists
+  const ovBadge = document.getElementById('overview-alerts-badge');
+  if(ovBadge) {
+    ovBadge.textContent = alerts.length ? `${crit}🔴 ${warn}🟡` : '✅';
+    ovBadge.style.background = crit > 0 ? '#991b1b' : alerts.length ? '#92400e' : '#166534';
+  }
+}
+
 // ── SCAN LOG ─────────────────────────────────────────
 async function loadScans() {
   const data = await api('/api/scans?limit=300');
@@ -804,7 +865,9 @@ async function loadScans() {
 //  INIT & AUTO-REFRESH
 // ══════════════════════════════════════════════════════
 loadOverview();
+loadAlerts();
 setInterval(loadOverview, 30000);  // Refresh overview every 30s
+setInterval(loadAlerts, 60000);    // Refresh alerts every 60s
 
 </script>
 </body>
