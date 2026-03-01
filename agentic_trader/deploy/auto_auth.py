@@ -6,7 +6,7 @@ Runs daily before market open. Uses Selenium (headless Chrome) to:
 2. Enter user_id + password
 3. Enter TOTP (generated from secret)
 4. Capture access_token from redirect URL
-5. Save to .env + zerodha_token.json
+5. Save to .env
 
 Required .env variables:
   ZERODHA_USER_ID=AB1234
@@ -37,22 +37,19 @@ except ImportError:
 
 
 def check_existing_token():
-    """Check if today's token already exists and is valid."""
-    token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'zerodha_token.json')
+    """Check if current .env token is valid."""
     try:
-        with open(token_path, 'r') as f:
-            data = json.load(f)
-        if data.get('date') == str(datetime.now().date()) and data.get('access_token'):
-            # Verify it works
+        access_token = os.environ.get('ZERODHA_ACCESS_TOKEN', '')
+        if access_token:
             from kiteconnect import KiteConnect
             api_key = os.environ.get('ZERODHA_API_KEY', '')
             kite = KiteConnect(api_key=api_key)
-            kite.set_access_token(data['access_token'])
+            kite.set_access_token(access_token)
             profile = kite.profile()
-            print(f"✅ Valid token exists for today. User: {profile.get('user_name')}")
+            print(f"✅ Valid token in .env. User: {profile.get('user_name')}")
             return True
     except Exception as e:
-        print(f"⚠️ Existing token invalid: {e}")
+        print(f"⚠️ .env token invalid: {e}")
     return False
 
 
@@ -204,19 +201,10 @@ def auto_login():
 
 
 def _save_token(access_token):
-    """Save access token to zerodha_token.json and .env"""
+    """Save access token to .env file"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 1. Save to zerodha_token.json (parent of agentic_trader)
-    token_path = os.path.join(base_dir, '..', '..', 'zerodha_token.json')
-    with open(token_path, 'w') as f:
-        json.dump({
-            'access_token': access_token,
-            'date': str(datetime.now().date())
-        }, f)
-    print(f"   Saved to zerodha_token.json")
-
-    # 2. Update .env
+    # Update .env
     env_path = os.path.join(base_dir, '..', '.env')
     if os.path.exists(env_path):
         with open(env_path, 'r') as f:
@@ -238,7 +226,7 @@ def _save_token(access_token):
             f.writelines(new_lines)
         print(f"   Updated .env ZERODHA_ACCESS_TOKEN")
 
-    # 3. Also set in current process environment
+    # Also set in current process environment
     os.environ['ZERODHA_ACCESS_TOKEN'] = access_token
 
 

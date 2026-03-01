@@ -29,22 +29,21 @@ try:
     data = kite.generate_session(request_token, api_secret=api_secret)
     access_token = data["access_token"]
     
-    # Save token
-    token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
-    with open(token_path, 'w') as f:
-        json.dump({'access_token': access_token, 'date': str(__import__('datetime').datetime.now().date())}, f)
-    
-    # Also update .env
+    # Save token to .env
     env_path = os.path.join(os.path.dirname(__file__), '.env')
     if os.path.exists(env_path):
         with open(env_path, 'r') as f:
             lines = f.readlines()
+        updated = False
         with open(env_path, 'w') as f:
             for line in lines:
                 if line.startswith('ZERODHA_ACCESS_TOKEN='):
                     f.write(f'ZERODHA_ACCESS_TOKEN={access_token}\n')
+                    updated = True
                 else:
                     f.write(line)
+            if not updated:
+                f.write(f'ZERODHA_ACCESS_TOKEN={access_token}\n')
     
     kite.set_access_token(access_token)
     profile = kite.profile()

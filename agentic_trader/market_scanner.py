@@ -158,7 +158,7 @@ class MarketScanner:
             if v["name"] not in self._exclude
         ]
         self._fo_cache_time = now
-        print(f"📡 Scanner: Loaded {len(self._fo_stocks)} F&O stocks from NFO instruments")
+        # print(f"📡 Scanner: Loaded {len(self._fo_stocks)} F&O stocks from NFO instruments")
 
     def get_lot_map(self) -> Dict[str, int]:
         """Return {symbol: lot_size} for all F&O stocks discovered from Kite API."""

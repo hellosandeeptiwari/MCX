@@ -26,12 +26,12 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS, FULL_FNO_SCAN, calc_brokerage
+from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS, FULL_FNO_SCAN, BREAKOUT_WATCHER, calc_brokerage
 from llm_agent import TradingAgent
 from zerodha_tools import get_tools, reset_tools
 from market_scanner import get_market_scanner
 from options_trader import update_fno_lot_sizes
-from exit_manager import get_exit_manager, calculate_structure_sl
+from exit_manager import get_exit_manager, calculate_structure_sl, check_underlying_adverse
 from execution_guard import get_execution_guard
 from risk_governor import get_risk_governor, SystemState
 from correlation_guard import get_correlation_guard
@@ -39,6 +39,7 @@ from regime_score import get_regime_scorer
 from position_reconciliation import get_position_reconciliation
 from data_health_gate import get_data_health_gate
 from trade_ledger import get_trade_ledger
+from state_db import get_state_db
 
 
 class AutonomousTrader:
@@ -60,6 +61,7 @@ class AutonomousTrader:
         self.paper_mode = paper_mode
         self.start_capital = capital
         self.daily_pnl = 0
+        self._profit_target_hit = False  # Kill-all profit switch
         
         # Set module-level PAPER_MODE in config for brokerage calculation
         import config as _cfg
@@ -204,20 +206,21 @@ class AutonomousTrader:
         except Exception as e:
             print(f"  ⚠️ GTT startup cleanup skipped: {e}")
         
-        print("\n  ✅ Bot initialized!")
-        print("  🟢 Auto-execution: ON")
-        print("  ⚡ Real-time monitoring: ENABLED (every 3 sec)")
-        print("  📊 Exit Manager: ACTIVE")
-        print("  🛡️ Execution Guard: ACTIVE")
-        print("  ⚖️ Risk Governor: ACTIVE")
-        print("  🔗 Correlation Guard: ACTIVE")
-        print("  📈 Regime Scorer: ACTIVE")
-        print("  🔄 Position Reconciliation: ACTIVE (every 10s)")
-        print("  🛡️ Data Health Gate: ACTIVE")
-        print("  📊 Options Trading: ACTIVE (F&O stocks)")
-        print("  🛡️ GTT Safety Net: ACTIVE (server-side SL+target)")
-        print("  📦 Autoslice: ACTIVE (freeze qty protection)")
-        print("  ⚡ IOC Validity: ACTIVE (spread legs)")
+        # print("\n  ✅ Bot initialized!")
+        # print("  🟢 Auto-execution: ON")
+        # print("  ⚡ Real-time monitoring: ENABLED (every 3 sec)")
+        # print("  📊 Exit Manager: ACTIVE")
+        # print("  🛡️ Execution Guard: ACTIVE")
+        # print("  ⚖️ Risk Governor: ACTIVE")
+        # print("  🔗 Correlation Guard: ACTIVE")
+        # print("  📈 Regime Scorer: ACTIVE")
+        # print("  🔄 Position Reconciliation: ACTIVE (every 10s)")
+        # print("  🛡️ Data Health Gate: ACTIVE")
+        # print("  📊 Options Trading: ACTIVE (F&O stocks)")
+        # print("  🛡️ GTT Safety Net: ACTIVE (server-side SL+target)")
+        # print("  📦 Autoslice: ACTIVE (freeze qty protection)")
+        # print("  ⚡ IOC Validity: ACTIVE (spread legs)")
+        print(f"  ✅ All subsystems initialized")
         
         # === NEW: Decision Log + Elite Auto-Fire + Adaptive Scan ===
         from config import DECISION_LOG, ELITE_AUTO_FIRE, ADAPTIVE_SCAN, DYNAMIC_MAX_PICKS, DOWN_RISK_GATING
@@ -226,12 +229,15 @@ class AutonomousTrader:
         self._adaptive_scan_cfg = ADAPTIVE_SCAN
         self._dynamic_max_picks_cfg = DYNAMIC_MAX_PICKS
         self._auto_fired_this_session = set()   # Symbols auto-fired today (no re-fire)
+        self._watcher_fired_this_session = set()    # All symbols traded via breakout watcher today
+        self._last_watcher_scan_time = 0             # Cooldown between watcher focused scans (epoch)
+        self._last_market_breadth = 'MIXED'          # Cached market breadth from last scan_and_trade
         self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
         
-        if ELITE_AUTO_FIRE.get('enabled'): print("  🎯 Elite Auto-Fire: ACTIVE (score ≥78 → instant execution)")
-        if DYNAMIC_MAX_PICKS.get('enabled'): print(f"  📊 Dynamic Max Picks: ACTIVE (3→5 when signals are hot)")
-        if ADAPTIVE_SCAN.get('enabled'): print(f"  ⏱️ Adaptive Scan: ACTIVE ({ADAPTIVE_SCAN['fast_interval_minutes']}min/{ADAPTIVE_SCAN['normal_interval_minutes']}min/{ADAPTIVE_SCAN['slow_interval_minutes']}min)")
-        if DECISION_LOG.get('enabled'): print(f"  📝 Decision Log: ACTIVE ({DECISION_LOG['file']})")
+        # if ELITE_AUTO_FIRE.get('enabled'): print("  🎯 Elite Auto-Fire: ACTIVE (score ≥78 → instant execution)")
+        # if DYNAMIC_MAX_PICKS.get('enabled'): print(f"  📊 Dynamic Max Picks: ACTIVE (3→5 when signals are hot)")
+        # if ADAPTIVE_SCAN.get('enabled'): print(f"  ⏱️ Adaptive Scan: ACTIVE ({ADAPTIVE_SCAN['fast_interval_minutes']}min/{ADAPTIVE_SCAN['normal_interval_minutes']}min/{ADAPTIVE_SCAN['slow_interval_minutes']}min)")
+        # if DECISION_LOG.get('enabled'): print(f"  📝 Decision Log: ACTIVE ({DECISION_LOG['file']})")
         
         # === DOWN-RISK SOFT SCORING: Reward safe / penalise risky ===
         self._down_risk_cfg = DOWN_RISK_GATING
@@ -245,6 +251,18 @@ class AutonomousTrader:
         self._gmm_sniper_trades_today = 0
         self._gmm_sniper_date = datetime.now().date()
         self._gmm_sniper_symbols = set()
+        # TEST_GMM: Pure DR model play (bypass ALL gates)
+        from config import TEST_GMM
+        self._test_gmm_cfg = TEST_GMM
+        self._test_gmm_trades_today = 0
+        self._test_gmm_date = datetime.now().date()
+        self._test_gmm_symbols = set()
+        # TEST_XGB: Pure XGBoost model play (bypass GMM/smart_score)
+        from config import TEST_XGB
+        self._test_xgb_cfg = TEST_XGB
+        self._test_xgb_trades_today = 0
+        self._test_xgb_date = datetime.now().date()
+        self._test_xgb_symbols = set()
         # GMM Contrarian (DR_FLIP) state
         self._dr_flip_symbols = set()
         self._dr_flip_trades_today = 0
@@ -253,7 +271,8 @@ class AutonomousTrader:
             from config import ML_OVERRIDE_GATES
             self._ml_ovr_cfg = ML_OVERRIDE_GATES
         except ImportError:
-            self._ml_ovr_cfg = {'min_move_prob': 0.58, 'max_dr_score': 0.12,
+            self._ml_ovr_cfg = {'min_move_prob': 0.58, 'max_updr_score': 0.12,
+                                'max_downdr_score': 0.09,
                                 'min_directional_prob': 0.40, 'max_concurrent_open': 3}
         # _gmm_flip_count_today removed — GMM now used as veto/boost, not flip
         # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
@@ -267,17 +286,19 @@ class AutonomousTrader:
         except Exception as _snp_init_err:
             print(f"  ⚠️ Sniper Strategies init error: {_snp_init_err}")
             self._sniper_engine = None
-        if DOWN_RISK_GATING.get('enabled'):
-            print(f"  🛡️ Down-Risk Graduated Scoring: ACTIVE (boost +{DOWN_RISK_GATING.get('clean_boost', 8)} / caution −{DOWN_RISK_GATING.get('mid_risk_penalty', 8)} / block −{DOWN_RISK_GATING.get('high_risk_penalty', 15)})")
-            print(f"  📊 Model Tracker: ACTIVE ({DOWN_RISK_GATING.get('model_tracker_trades', 7)} exclusive trades/day for model evaluation)")
-        if GMM_SNIPER.get('enabled'):
-            print(f"  🎯 GMM Sniper: ACTIVE ({GMM_SNIPER.get('max_sniper_trades_per_day', 5)}/day, {GMM_SNIPER.get('lot_multiplier', 2.0)}x lots, dr<{GMM_SNIPER.get('max_dr_score', 0.10)})")
-        if getattr(self, '_sniper_engine', None):
-            _se_status = self._sniper_engine.get_status()
-            if _se_status['oi_unwinding']['enabled']:
-                print(f"  🔫 Sniper-OIUnwinding: ACTIVE ({_se_status['oi_unwinding']['max_per_day']}/day, OI reversal at S/R)")
-            if _se_status['pcr_extreme']['enabled']:
-                print(f"  🔫 Sniper-PCRExtreme: ACTIVE ({_se_status['pcr_extreme']['max_per_day']}/day, PCR contrarian fade)")
+        # if DOWN_RISK_GATING.get('enabled'):
+        #     print(f"  🛡️ Down-Risk Graduated Scoring: ACTIVE (boost +{DOWN_RISK_GATING.get('clean_boost', 8)} / caution −{DOWN_RISK_GATING.get('mid_risk_penalty', 8)} / block −{DOWN_RISK_GATING.get('high_risk_penalty', 15)})")
+        #     print(f"  📊 Model Tracker: ACTIVE ({DOWN_RISK_GATING.get('model_tracker_trades', 7)} exclusive trades/day for model evaluation)")
+        # if GMM_SNIPER.get('enabled'):
+        #     print(f"  🎯 GMM Sniper: ACTIVE ({GMM_SNIPER.get('max_sniper_trades_per_day', 5)}/day, {GMM_SNIPER.get('lot_multiplier', 2.0)}x lots, dr<{GMM_SNIPER.get('max_dr_score', 0.10)})")
+        # if TEST_GMM.get('enabled'):
+        #     print(f"  🧪 TEST_GMM: ACTIVE ({TEST_GMM.get('max_trades_per_day', 4)}/day, pure GMM play, dr<{TEST_GMM.get('max_dr_score', 0.06)})")
+        # if getattr(self, '_sniper_engine', None):
+        #     _se_status = self._sniper_engine.get_status()
+        #     if _se_status['oi_unwinding']['enabled']:
+        #         print(f"  🔫 Sniper-OIUnwinding: ACTIVE ({_se_status['oi_unwinding']['max_per_day']}/day, OI reversal at S/R)")
+        #     if _se_status['pcr_extreme']['enabled']:
+        #         print(f"  🔫 Sniper-PCRExtreme: ACTIVE ({_se_status['pcr_extreme']['max_per_day']}/day, PCR contrarian fade)")
         
         # === ML MOVE PREDICTOR ===
         self._ml_predictor = None
@@ -285,9 +306,11 @@ class AutonomousTrader:
             from ml_models.predictor import MovePredictor
             self._ml_predictor = MovePredictor()
             if self._ml_predictor.ready:
-                print("  🧠 ML Move Predictor: ACTIVE (XGBoost score booster)")
+                # print("  🧠 ML Move Predictor: ACTIVE (XGBoost score booster)")
+                pass
             else:
-                print("  🧠 ML Move Predictor: STANDBY (no trained model yet)")
+                # print("  🧠 ML Move Predictor: STANDBY (no trained model yet)")
+                pass
                 self._ml_predictor = None
         except Exception as e:
             print(f"  🧠 ML Move Predictor: DISABLED ({e})")
@@ -316,13 +339,13 @@ class AutonomousTrader:
                                 self._hist_5min_cache[_sym_name] = _df
                         except Exception:
                             pass
-                print(f"  📊 Historical 5-min candles: {len(self._hist_5min_cache)} stocks + {'✓' if self._nifty_5min_df is not None else '✗'} NIFTY50")
+                # print(f"  📊 Historical 5-min candles: {len(self._hist_5min_cache)} stocks + {'✓' if self._nifty_5min_df is not None else '✗'} NIFTY50")
             # Load NIFTY50 daily candles
             _nifty_daily_path = os.path.join(_daily_dir, 'NIFTY50.parquet')
             if os.path.exists(_nifty_daily_path):
                 self._nifty_daily_df = _pd_hist.read_parquet(_nifty_daily_path)
                 self._nifty_daily_df['date'] = _pd_hist.to_datetime(self._nifty_daily_df['date'])
-                print(f"  📊 NIFTY50 daily context: ✓ ({len(self._nifty_daily_df)} days)")
+                # print(f"  📊 NIFTY50 daily context: ✓ ({len(self._nifty_daily_df)} days)")
         except Exception as _hist_e:
             print(f"  ⚠ Historical 5-min load: {_hist_e}")
         
@@ -389,7 +412,7 @@ class AutonomousTrader:
                                     print(f"  ⚠️ NIFTY50 5-min refresh failed: {_rs_err}")
                         if _refreshed > 0:
                             _new_last = next(iter(self._hist_5min_cache.values()))['date'].max()
-                            print(f"  ✅ 5-min parquets refreshed: {_refreshed}/{len(_all_syms)} stocks (now up to {str(_new_last)[:10]})")
+                            # print(f"  ✅ 5-min parquets refreshed: {_refreshed}/{len(_all_syms)} stocks (now up to {str(_new_last)[:10]})")
                         else:
                             print(f"  ⚠️ 5-min parquet refresh: 0 stocks updated (Kite API may be unavailable)")
                         
@@ -414,7 +437,7 @@ class AutonomousTrader:
                                         _nd_combined = _nd_combined.drop_duplicates(subset='date').sort_values('date').reset_index(drop=True)
                                         _nd_combined.to_parquet(_nifty_daily_path, index=False)
                                         self._nifty_daily_df = _nd_combined
-                                        print(f"  ✅ NIFTY daily refreshed: {len(_nd_combined)} days (last={_nd_combined['date'].max()})")
+                                        # print(f"  ✅ NIFTY daily refreshed: {len(_nd_combined)} days (last={_nd_combined['date'].max()})")
                         except Exception as _nd_err:
                             print(f"  ⚠️ NIFTY daily refresh: {_nd_err}")
                     except ImportError:
@@ -422,12 +445,13 @@ class AutonomousTrader:
                     except Exception as _5m_err:
                         print(f"  ⚠️ 5-min parquet refresh error: {_5m_err}")
                 else:
-                    print(f"  ✅ 5-min parquets: fresh (last={_last_date.date()}, {_gap}d ago)")
+                    # print(f"  ✅ 5-min parquets: fresh (last={_last_date.date()}, {_gap}d ago)")
+                    pass
         except Exception as _5m_chk_e:
             print(f"  ⚠ 5-min freshness check: {_5m_chk_e}")
         
         # === AUTO-REFRESH STALE OI DATA ===
-        # If futures OI parquets are >3 days old, refresh them proactively.
+        # If futures OI parquets are >1 day old, refresh them on every startup.
         try:
             import pandas as _pd_oi_chk
             _oi_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'futures_oi')
@@ -439,20 +463,22 @@ class AutonomousTrader:
                 for _sf in _sample_files:
                     _sdf = _pd_oi_chk.read_parquet(os.path.join(_oi_dir, _sf))
                     _last = _pd_oi_chk.Timestamp(_sdf['date'].max())
-                    if (_pd_oi_chk.Timestamp.now() - _last).days > 3:
+                    if (_pd_oi_chk.Timestamp.now() - _last).days > 1:
                         _oi_stale = True
                         break
             if _oi_stale:
-                print("  ⚠️ Futures OI data stale (>3 days) — auto-refreshing...")
+                _gap = (_pd_oi_chk.Timestamp.now() - _last).days if '_last' in dir() else '?'
+                print(f"  ⚠️ Futures OI data stale ({_gap}d old) — auto-refreshing...")
                 from dhan_futures_oi import FuturesOIFetcher
                 _oi_fetcher = FuturesOIFetcher()
                 if _oi_fetcher.ready:
                     _oi_fetcher.backfill_all(months_back=1)
-                    print("  ✅ OI data refreshed")
+                    # print("  ✅ OI data refreshed")
                 else:
                     print("  ⚠️ DhanHQ not ready — OI refresh skipped (check DHAN_ACCESS_TOKEN in .env)")
             else:
-                print("  ✅ Futures OI data: fresh")
+                # print("  ✅ Futures OI data: fresh")
+                pass
         except Exception as _oi_chk_e:
             print(f"  ⚠ OI freshness check: {_oi_chk_e}")
         
@@ -468,33 +494,68 @@ class AutonomousTrader:
             )
             self._oi_analyzer = get_options_flow_analyzer(_ot_init.chain_fetcher)
             if self._oi_analyzer and self._oi_analyzer.ready:
-                print("  📊 OI Flow Analyzer: ACTIVE (real-time PCR/IV/MaxPain overlay)")
+                # print("  📊 OI Flow Analyzer: ACTIVE (real-time PCR/IV/MaxPain overlay)")
+                pass
             else:
-                print("  📊 OI Flow Analyzer: STANDBY (no chain fetcher)")
+                # print("  📊 OI Flow Analyzer: STANDBY (no chain fetcher)")
                 self._oi_analyzer = None
         except Exception as e:
             print(f"  📊 OI Flow Analyzer: DISABLED ({e})")
         
         print("="*60)
     
+    # ========== HELPERS ==========
+    @staticmethod
+    def _dr_tag(regime) -> str:
+        """Return 'Down_Flag' or 'UP_Flag' based on GMM regime used."""
+        if isinstance(regime, dict):
+            regime = regime.get('ml_gmm_regime_used', 'UP')
+        if regime == 'BOTH':
+            return 'UP+Down'
+        return 'Down_Flag' if regime == 'DOWN' else 'UP_Flag'
+    
     # ========== ML_OVERRIDE_WGMM GATE CHECK ==========
     def _ml_override_allowed(self, sym_clean: str, ml: dict, dr_score: float,
-                             path: str = 'MODEL_TRACKER') -> tuple:
+                             path: str = 'MODEL_TRACKER', p_score: float = 0.0) -> tuple:
         """Check tightened ML_OVERRIDE_WGMM gates. Returns (allowed: bool, reason: str).
         Call BEFORE flipping direction.
         
-        DR SCORE INTERPRETATION (correct):
-          High dr in DOWN regime = stock WILL go DOWN (confirms DOWN)
-          High dr in UP regime = stock WILL go UP (confirms UP)
-          → ML_OVERRIDE fires when XGB opposes AND GMM confirms XGB via high dr
+        DR SCORE INTERPRETATION (correct — anomaly-based, dual-regime):
+          UP_Flag=True (high up_score) = hidden DOWN risk (crash) → confirms SELL, opposes BUY
+          Down_Flag=True (high down_score) = hidden UP risk (bounce) → confirms BUY, opposes SELL
+          gmm_confirms_direction = True means NO anomaly = clean from BOTH models
+          → ML_OVERRIDE fires when XGB opposes AND GMM confirms XGB via gmm_confirms
+        
+        DIRECTIONAL DR SCORE:
+          Gate 3 uses the score that CONFIRMS the XGB flip direction, not max(both):
+            XGB=UP (flip to BUY)  → use down_score (bounce confirms BUY)
+            XGB=DOWN (flip to SELL) → use up_score (crash confirms SELL)
+          max(both) would be misleading — the opposing regime's score doesn't help.
         
         Gates:
           1. Concurrent open position limit
           2. ml_move_prob minimum (higher bar than general gate)
-          3. dr_score MINIMUM — need HIGH dr to confirm XGB's opposing direction
+          3. Directional dr_score MINIMUM — confirming regime must show signal
           4. XGB directional probability minimum
+          5. Smart score floor — blocks weak-conviction overrides
         """
         cfg = self._ml_ovr_cfg
+        
+        # Resolve directional DR score: pick the regime that CONFIRMS the flip
+        # XGB=UP → flip to BUY → down_score (bounce) confirms BUY
+        # XGB=DOWN → flip to SELL → up_score (crash) confirms SELL
+        _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
+        _up_score = ml.get('ml_up_score', dr_score)
+        _down_score = ml.get('ml_down_score', dr_score)
+        if _xgb_signal == 'UP':
+            _confirm_dr = _down_score   # bounce signal confirms BUY
+            _confirm_tag = 'down_score'
+        elif _xgb_signal == 'DOWN':
+            _confirm_dr = _up_score     # crash signal confirms SELL
+            _confirm_tag = 'up_score'
+        else:
+            _confirm_dr = dr_score      # fallback to max(both)
+            _confirm_tag = 'dr_score'
         
         # Gate 1: Max concurrent open ML_OVERRIDE_WGMM positions
         _max_concurrent = cfg.get('max_concurrent_open', 3)
@@ -512,14 +573,16 @@ class AutonomousTrader:
         if _move_prob < _min_move:
             return False, f"move_prob {_move_prob:.2f} < {_min_move}"
         
-        # Gate 3: dr_score MINIMUM — high dr confirms XGB's direction is real
-        _min_dr = cfg.get('min_dr_score', 0.15)
-        if dr_score < _min_dr:
-            return False, f"dr_score {dr_score:.3f} < {_min_dr} (need high dr to confirm XGB)"
+        # Gate 3: Directional dr_score MINIMUM — only for non-SNIPER paths
+        # Uses the CONFIRMING regime score, not max(both).
+        # Sniper already enforces BOTH GMM regimes clean — skip there.
+        if path != 'SNIPER':
+            _min_dr = cfg.get('min_dr_score', 0.15)
+            if _confirm_dr < _min_dr:
+                return False, f"{_confirm_tag} {_confirm_dr:.3f} < {_min_dr} (need confirming regime signal)"
         
         # Gate 4: XGB directional probability
         _min_dir_prob = cfg.get('min_directional_prob', 0.40)
-        _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
         if _xgb_signal == 'UP':
             _dir_prob = ml.get('ml_prob_up', 0.0)
         elif _xgb_signal == 'DOWN':
@@ -528,6 +591,19 @@ class AutonomousTrader:
             _dir_prob = 0.0
         if _dir_prob < _min_dir_prob:
             return False, f"dir_prob({_xgb_signal}) {_dir_prob:.2f} < {_min_dir_prob}"
+        
+        # Gate 5: Smart score floor — estimate smart_score from available data
+        # Uses confirming dr_score for safety (higher confirm = more edge = higher safety)
+        _min_smart = cfg.get('min_smart_score', 58)
+        if _min_smart > 0 and p_score > 0:
+            _ml_conf = ml.get('ml_confidence', 0.0)
+            _est_conviction = _move_prob * max(_ml_conf, 0.01) * 40.0
+            _est_safety = _confirm_dr * 20.0 + 5.0   # higher confirming anomaly = more edge
+            _est_technical = min(p_score, 100) * 0.20
+            _est_move_bonus = _move_prob * 15.0
+            _est_smart = _est_conviction + _est_safety + _est_technical + _est_move_bonus
+            if _est_smart < _min_smart:
+                return False, f"smart_score {_est_smart:.1f} < {_min_smart} floor"
         
         return True, "all gates passed"
     
@@ -588,8 +664,8 @@ class AutonomousTrader:
                 continue
             # Get direction from the decision's signal analysis
             direction = None
-            if hasattr(decision, 'direction') and decision.direction:
-                direction = decision.direction
+            if hasattr(decision, 'recommended_direction') and decision.recommended_direction not in ('HOLD', None, ''):
+                direction = decision.recommended_direction
             else:
                 # Fallback: infer from market data
                 data = market_data.get(sym, {})
@@ -716,10 +792,13 @@ class AutonomousTrader:
                     },
                     'gmm_model': {
                         'down_risk_score': _elite_ml.get('ml_down_risk_score', 0),
-                        'down_risk_flag': _elite_ml.get('ml_down_risk_flag', False),
+                        'up_flag': _elite_ml.get('ml_up_flag', False),
+                        'down_flag': _elite_ml.get('ml_down_flag', False),
+                        'up_score': _elite_ml.get('ml_up_score', 0),
+                        'down_score': _elite_ml.get('ml_down_score', 0),
                         'down_risk_bucket': _elite_ml.get('ml_down_risk_bucket', 'LOW'),
                         'gmm_confirms_direction': _elite_ml.get('ml_gmm_confirms_direction', False),
-                        'gmm_regime_used': _elite_ml.get('ml_gmm_regime_used', None),
+                        'gmm_regime_used': _elite_ml.get('ml_gmm_regime_used', 'BOTH'),
                         'gmm_action': 'ELITE_AUTO',
                     },
                     'scored_direction': direction,
@@ -730,6 +809,7 @@ class AutonomousTrader:
                     direction=direction,
                     strike_selection="ATM",
                     rationale=f"ELITE AUTO-FIRE: Score {score:.0f} (threshold {threshold}) — bypassing GPT for immediate execution",
+                    setup_type="ELITE",
                     ml_data=_elite_ml_data
                 )
                 if result and result.get('success'):
@@ -754,6 +834,557 @@ class AutonomousTrader:
             print(f"\n   🎯 ELITE AUTO-FIRED: {len(auto_fired)} trades — {', '.join(auto_fired)}")
         
         return auto_fired
+    
+    # ========== BREAKOUT WATCHER QUEUE DRAIN ==========
+    def _process_breakout_triggers(self):
+        """
+        Drain the breakout watcher queue and feed triggered stocks through
+        the FULL scan_and_trade pipeline.  The watcher is DETECTION ONLY —
+        all safety gates (scoring, ML, OI, sector, DR, setup validation,
+        follow-through, ADX, OI-conflict, ML-flat veto) run identically to
+        a normal 5-min scan cycle.  No shortcuts.  No bypasses.
+        
+        Called from the main loop every ~1 second.
+        """
+        if not BREAKOUT_WATCHER.get('enabled', False):
+            return
+        
+        ticker = getattr(self.tools, 'ticker', None)
+        if not ticker or not hasattr(ticker, 'breakout_watcher') or not ticker.breakout_watcher:
+            return
+        
+        # Cooldown check BEFORE draining — keeps triggers in queue until we can process
+        import time as _wt
+        if _wt.time() - self._last_watcher_scan_time < 20:
+            return
+        
+        watcher = ticker.breakout_watcher
+        triggers = watcher.drain_queue()
+        if not triggers:
+            return
+        
+        # Filter: skip already-held, already-fired, already-processed
+        actionable = []
+        _skip_reasons = []
+        for t in triggers:
+            sym = t['symbol']
+            if self.tools.is_symbol_in_active_trades(sym):
+                _skip_reasons.append(f"{sym.replace('NSE:', '')}=already-held")
+                continue
+            if sym in self._auto_fired_this_session:
+                _skip_reasons.append(f"{sym.replace('NSE:', '')}=already-fired")
+                continue
+            if sym in self._watcher_fired_this_session:
+                _skip_reasons.append(f"{sym.replace('NSE:', '')}=watcher-fired")
+                continue
+            if not self.risk_governor.is_trading_allowed():
+                _skip_reasons.append("risk-governor-blocked")
+                break
+            actionable.append(t)
+        
+        if not actionable:
+            if _skip_reasons:
+                print(f"   ⚡ Watcher drained {len(triggers)} trigger(s) but all filtered: {', '.join(_skip_reasons)}")
+            return
+        
+        # Process up to 3 triggers per drain
+        _batch = actionable[:3]
+        for t in _batch:
+            print(f"\n   ⚡ BREAKOUT WATCHER: {t['symbol']} — {t['trigger_type']} "
+                  f"({t.get('move_pct', 0):+.1f}%) at {t.get('detected_time', '?')}")
+        
+        # Run the FULL pipeline for these symbols (identical gates as scan_and_trade)
+        self._watcher_focused_scan(_batch)
+        self._last_watcher_scan_time = _wt.time()
+    
+    # ========== WATCHER FOCUSED SCAN (FULL PIPELINE) ==========
+    def _watcher_focused_scan(self, triggers: list):
+        """
+        Run the IDENTICAL pipeline as scan_and_trade for watcher-detected stocks.
+        
+        ALL gates present in scan_and_trade are replicated here:
+          ✅ Market data fetch (candles, indicators)
+          ✅ Intraday scoring (IntradaySignal + scorer)
+          ✅ Market breadth (from last scan, not hardcoded MIXED)
+          ✅ ML predictions (XGB + GMM via get_titan_signals)
+          ✅ OI flow overlay (adjusts ML with live options chain)
+          ✅ OI cross-validation (penalises direction conflict)
+          ✅ Sector index cross-validation (penalises against-sector trades)
+          ✅ Down-risk soft scoring (±5 nudge from GMM DR model)
+          ✅ Setup validation (ORB / VWAP / EMA / RSI)
+          ✅ Follow-through candle gate (no stale breakouts)
+          ✅ ADX trend strength gate (≥25)
+          ✅ OI conflict veto (institutions vs direction)
+          ✅ ML flat veto (high P(flat) blocks auto-fire)
+          ✅ Position limit (regime-aware)
+        
+        The ONLY difference from a 5-min scan:
+          - Universe is limited to watcher-triggered symbols (speed)
+          - Score threshold is min_score (default 66) instead of 78 (ELITE)
+          - GPT analysis is skipped (watcher trigger + full gates = sufficient)
+        
+        No shortcuts.  No bypasses.  Full pipeline parity.
+        """
+        _ts = datetime.now().strftime('%H:%M:%S')
+        _trigger_map = {t['symbol']: t for t in triggers}
+        _symbols = [t['symbol'] for t in triggers]
+        
+        try:
+            # ================================================================
+            # 1) MARKET DATA — fresh candles + indicators for triggered stocks
+            #    force_fresh=True bypasses 10-min indicator cache so RSI/VWAP/ADX
+            #    are computed from live candles (watcher only processes 1-3 stocks)
+            # ================================================================
+            market_data = self.tools.get_market_data(_symbols, force_fresh=True)
+            _sorted_data = [(s, d) for s, d in market_data.items()
+                            if isinstance(d, dict) and 'ltp' in d]
+            if not _sorted_data:
+                print(f"      ⚠️ Watcher scan: no market data — skipping")
+                return
+            
+            # ================================================================
+            # 2) SCORING — identical IntradaySignal + scorer as scan_and_trade
+            # ================================================================
+            from options_trader import get_intraday_scorer, IntradaySignal
+            _scorer = get_intraday_scorer()
+            
+            # Use cached market breadth from last full scan (not hardcoded)
+            _breadth = getattr(self, '_last_market_breadth', 'MIXED')
+            
+            _pre_scores = {}
+            _cycle_decisions = {}
+            
+            for _sym, _d in _sorted_data:
+                _d['market_breadth'] = _breadth
+                try:
+                    _sig = IntradaySignal(
+                        symbol=_sym,
+                        orb_signal=_d.get('orb_signal', 'INSIDE_ORB'),
+                        vwap_position=_d.get('price_vs_vwap', _d.get('vwap_position', 'AT_VWAP')),
+                        vwap_trend=_d.get('vwap_slope', _d.get('vwap_trend', 'FLAT')),
+                        ema_regime=_d.get('ema_regime', 'NORMAL'),
+                        volume_regime=_d.get('volume_regime', 'NORMAL'),
+                        rsi=_d.get('rsi_14', 50.0),
+                        price_momentum=_d.get('momentum_15m', 0.0),
+                        htf_alignment=_d.get('htf_alignment', 'NEUTRAL'),
+                        chop_zone=_d.get('chop_zone', False),
+                        follow_through_candles=_d.get('follow_through_candles', 0),
+                        range_expansion_ratio=_d.get('range_expansion_ratio', 0.0),
+                        vwap_slope_steepening=_d.get('vwap_slope_steepening', False),
+                        atr=_d.get('atr_14', 0.0)
+                    )
+                    _dec = _scorer.score_intraday_signal(_sig, market_data=_d, caller_direction=None)
+                    _pre_scores[_sym] = _dec.confidence_score
+                    _cycle_decisions[_sym] = {
+                        'decision': _dec,
+                        'direction': None,
+                        'score': _dec.confidence_score,
+                        'raw_score': _dec.confidence_score,
+                    }
+                except Exception:
+                    pass
+            
+            if not _pre_scores:
+                print(f"      ⚠️ Watcher scan: scoring failed for all symbols")
+                return
+            
+            # ================================================================
+            # 3) ML PREDICTIONS — same get_titan_signals as scan_and_trade
+            # ================================================================
+            _ml_results = {}
+            try:
+                if self._ml_predictor:
+                    import pandas as _pd_ml
+                    _candle_cache = getattr(self.tools, '_candle_cache', {})
+                    _daily_cache = getattr(self.tools, '_daily_cache', {})
+                    _futures_oi_cache = getattr(self, '_futures_oi_data', {}) or {}
+                    _sector_5min_cache = getattr(self, '_sector_5min_cache', {})
+                    _sector_daily_cache = getattr(self, '_sector_daily_cache', {})
+                    _nifty_5min = getattr(self, '_nifty_5min_df', None)
+                    _nifty_daily = getattr(self, '_nifty_daily_df', None)
+                    _hist_5min_cache = getattr(self, '_hist_5min_cache', {})
+                    
+                    try:
+                        from ml_models.feature_engineering import get_sector_for_symbol as _get_sector
+                    except ImportError:
+                        _get_sector = lambda s: ''
+                    
+                    for _sym in list(_pre_scores.keys()):
+                        try:
+                            _sym_clean = _sym.replace('NSE:', '')
+                            _live_intraday = _candle_cache.get(_sym)
+                            _daily_df = _daily_cache.get(_sym)
+                            _hist_5min = _hist_5min_cache.get(_sym_clean)
+                            
+                            # Build best possible 5-min candle series (same logic as scan_and_trade)
+                            _ml_candles = None
+                            if _hist_5min is not None:
+                                if _live_intraday is not None and len(_live_intraday) >= 2:
+                                    try:
+                                        _live_copy = _live_intraday.copy()
+                                        _live_copy['date'] = _pd_ml.to_datetime(_live_copy['date'])
+                                        if _live_copy['date'].dt.tz is not None:
+                                            _live_copy['date'] = _live_copy['date'].dt.tz_localize(None)
+                                        _hist_copy = _hist_5min.copy()
+                                        if _hist_copy['date'].dt.tz is not None:
+                                            _hist_copy['date'] = _hist_copy['date'].dt.tz_localize(None)
+                                        _gap_days = (_live_copy['date'].min() - _hist_copy['date'].max()).days
+                                        if _gap_days > 3:
+                                            _ml_candles = _hist_5min.tail(500)
+                                        else:
+                                            _hist_tail = _hist_copy.tail(500)
+                                            _live_start = _live_copy['date'].min()
+                                            _hist_tail = _hist_tail[_hist_tail['date'] < _live_start]
+                                            _common_cols = [c for c in ['date','open','high','low','close','volume']
+                                                           if c in _hist_tail.columns and c in _live_copy.columns]
+                                            _ml_candles = _pd_ml.concat(
+                                                [_hist_tail[_common_cols], _live_copy[_common_cols]],
+                                                ignore_index=True)
+                                    except Exception:
+                                        _ml_candles = _hist_5min.tail(500)
+                                else:
+                                    _ml_candles = _hist_5min.tail(500)
+                            elif _live_intraday is not None and len(_live_intraday) >= 50:
+                                _ml_candles = _live_intraday
+                            
+                            if _ml_candles is None or len(_ml_candles) < 50:
+                                continue
+                            
+                            _fut_oi = _futures_oi_cache.get(_sym_clean)
+                            _sec_name = _get_sector(_sym_clean)
+                            _sec_5m = _sector_5min_cache.get(_sec_name) if _sec_name else None
+                            _sec_dl = _sector_daily_cache.get(_sec_name) if _sec_name else None
+                            
+                            _pred = self._ml_predictor.get_titan_signals(
+                                _ml_candles,
+                                daily_df=_daily_df,
+                                futures_oi_df=_fut_oi,
+                                nifty_5min_df=_nifty_5min,
+                                nifty_daily_df=_nifty_daily,
+                                sector_5min_df=_sec_5m,
+                                sector_daily_df=_sec_dl
+                            )
+                            if _pred:
+                                if _pred.get('ml_score_boost', 0) != 0:
+                                    _pre_scores[_sym] += _pred['ml_score_boost']
+                                if _pred.get('ml_signal') != 'UNKNOWN':
+                                    _ml_results[_sym] = _pred
+                                    if _sym in _cycle_decisions:
+                                        _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                                        _cycle_decisions[_sym]['ml_prediction'] = _pred
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # ML failed — continue without it (fail-safe)
+            
+            # ================================================================
+            # 4) OI FLOW OVERLAY — adjusts ML with live options chain data
+            # ================================================================
+            _oi_results = {}
+            try:
+                if self._oi_analyzer:
+                    for _sym in list(_pre_scores.keys()):
+                        try:
+                            _oi_data = self._oi_analyzer.analyze(_sym)
+                            if _oi_data:
+                                _oi_results[_sym] = _oi_data
+                                if self._ml_predictor and _sym in _ml_results:
+                                    self._ml_predictor.apply_oi_overlay(_ml_results[_sym], _oi_data)
+                                    if _sym in _cycle_decisions:
+                                        _cycle_decisions[_sym]['ml_prediction'] = _ml_results[_sym]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            
+            # ================================================================
+            # 5) OI CROSS-VALIDATION — penalise direction conflicts
+            # ================================================================
+            for _oi_sym, _oi_data in _oi_results.items():
+                try:
+                    _oi_bias = _oi_data.get('flow_bias', 'NEUTRAL')
+                    _oi_conf = _oi_data.get('flow_confidence', 0.0)
+                    if _oi_bias == 'NEUTRAL' or _oi_conf < 0.55:
+                        continue
+                    _cd = _cycle_decisions.get(_oi_sym)
+                    if not _cd or not _cd.get('decision'):
+                        continue
+                    _scored_dir = _cd['decision'].recommended_direction
+                    if _scored_dir == 'HOLD':
+                        continue
+                    _oi_dir = 'BUY' if _oi_bias == 'BULLISH' else 'SELL'
+                    if _scored_dir != _oi_dir:
+                        _oi_penalty = -5 if _oi_conf >= 0.70 else -3
+                        _pre_scores[_oi_sym] += _oi_penalty
+                        if _oi_sym in _cycle_decisions:
+                            _cycle_decisions[_oi_sym]['score'] = _pre_scores[_oi_sym]
+                        print(f"      📊 OI cross-val: {_oi_sym.replace('NSE:', '')} "
+                              f"penalised {_oi_penalty} (OI {_oi_bias} vs scored {_scored_dir})")
+                except Exception:
+                    pass
+            
+            # ================================================================
+            # 6) SECTOR INDEX CROSS-VALIDATION — penalise against-sector trades
+            # ================================================================
+            _sec_changes = getattr(self, '_sector_index_changes_cache', {})
+            _stock_to_sector = getattr(self, '_stock_to_sector', {})
+            
+            for _sym, _score in list(_pre_scores.items()):
+                try:
+                    _stock_name = _sym.replace('NSE:', '')
+                    _sec_match = _stock_to_sector.get(_stock_name)
+                    if not _sec_match:
+                        continue
+                    _sec_name, _sec_index = _sec_match
+                    _sec_chg = _sec_changes.get(_sec_index)
+                    if _sec_chg is None:
+                        continue
+                    _cd = _cycle_decisions.get(_sym)
+                    if not _cd or not _cd.get('decision'):
+                        continue
+                    _scored_dir = _cd['decision'].recommended_direction
+                    if _scored_dir == 'HOLD':
+                        continue
+                    _stk_data = market_data.get(_sym, {})
+                    _stk_chg = _stk_data.get('change_pct', 0) if isinstance(_stk_data, dict) else 0
+                    
+                    if _sec_chg <= -1.0 and _scored_dir == 'BUY':
+                        if _stk_chg > 0 and abs(_stk_chg) >= abs(_sec_chg) * 2:
+                            continue
+                        _sec_penalty = -5 if _sec_chg <= -2.0 else -3
+                        _pre_scores[_sym] += _sec_penalty
+                        if _sym in _cycle_decisions:
+                            _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                        print(f"      🏭 Sector cross-val: {_stock_name} penalised {_sec_penalty} "
+                              f"(sector {_sec_chg:+.1f}% vs BUY)")
+                    elif _sec_chg >= 1.0 and _scored_dir == 'SELL':
+                        if _stk_chg < 0 and abs(_stk_chg) >= abs(_sec_chg) * 2:
+                            continue
+                        _sec_penalty = -5 if _sec_chg >= 2.0 else -3
+                        _pre_scores[_sym] += _sec_penalty
+                        if _sym in _cycle_decisions:
+                            _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
+                        print(f"      🏭 Sector cross-val: {_stock_name} penalised {_sec_penalty} "
+                              f"(sector {_sec_chg:+.1f}% vs SELL)")
+                except Exception:
+                    pass
+            
+            # ================================================================
+            # 7) DOWN-RISK SOFT SCORING — ±5 nudge from GMM DR model
+            # ================================================================
+            try:
+                self._apply_down_risk_soft_scores(_ml_results, _pre_scores)
+            except Exception:
+                pass
+            
+            # ================================================================
+            # 8) GATE-CHECKED EXECUTION — same gates as ELITE auto-fire
+            #    Setup validation, FT, ADX, OI conflict, ML flat veto
+            #    Score threshold: min_score (default 66) from BREAKOUT_WATCHER config
+            # ================================================================
+            _min_score = BREAKOUT_WATCHER.get('min_score', 66)
+            _max_per_scan = 2  # Rate limit: max 2 watcher trades per focused scan
+            _fired_count = 0
+            
+            for _sym, _score in sorted(_pre_scores.items(), key=lambda x: x[1], reverse=True):
+                if _fired_count >= _max_per_scan:
+                    break
+                
+                _trig = _trigger_map.get(_sym, {})
+                _trigger_type = _trig.get('trigger_type', '?')
+                _move_pct = _trig.get('move_pct', 0)
+                _data = market_data.get(_sym, {})
+                if not isinstance(_data, dict):
+                    continue
+                
+                _cached = _cycle_decisions.get(_sym, {})
+                _decision = _cached.get('decision')
+                if not _decision:
+                    continue
+                
+                # Score from decision (includes ML boost, OI penalty, sector penalty, DR nudge)
+                _final_score = _pre_scores.get(_sym, 0)
+                
+                # --- Direction from scorer (authoritative, not from trigger) ---
+                direction = None
+                if hasattr(_decision, 'recommended_direction') and _decision.recommended_direction not in ('HOLD', None, ''):
+                    direction = _decision.recommended_direction
+                if not direction:
+                    # Fallback: infer from trigger
+                    if _trigger_type in ('PRICE_SPIKE_UP', 'NEW_DAY_HIGH'):
+                        direction = 'BUY'
+                    elif _trigger_type in ('PRICE_SPIKE_DOWN', 'NEW_DAY_LOW'):
+                        direction = 'SELL'
+                    else:
+                        direction = 'BUY' if _move_pct > 0 else 'SELL'
+                
+                print(f"      📊 {_sym.replace('NSE:', '')}: Score {_final_score:.0f} | Dir: {direction} | "
+                      f"Trigger: {_trigger_type} ({_move_pct:+.1f}%)")
+                
+                # --- GATE A: Score threshold ---
+                if _final_score < _min_score:
+                    print(f"      ⛔ Score {_final_score:.0f} < {_min_score} — blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_SCORE',
+                                      reason=f'Breakout {_trigger_type} but score {_final_score:.0f} < {_min_score}',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE B: Chop zone filter ---
+                if _data.get('chop_zone', False):
+                    print(f"      ⛔ Chop zone — blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_CHOP_ZONE',
+                                      reason=f'Breakout {_trigger_type} in chop zone: {_data.get("chop_reason", "")}',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE C: Setup validation (same as ELITE) ---
+                orb = _data.get('orb_signal', 'INSIDE_ORB')
+                vwap = _data.get('price_vs_vwap', 'AT_VWAP')
+                vol = _data.get('volume_regime', 'NORMAL')
+                ema = _data.get('ema_regime', 'NORMAL')
+                has_setup = (
+                    orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') or
+                    (vwap in ('ABOVE_VWAP', 'BELOW_VWAP') and vol in ('HIGH', 'EXPLOSIVE')) or
+                    ema == 'COMPRESSED' or
+                    _data.get('rsi_14', 50) < 30 or _data.get('rsi_14', 50) > 70
+                )
+                if not has_setup:
+                    print(f"      ⛔ No valid setup — blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_SETUP',
+                                      reason=f'Breakout {_trigger_type} but no ORB/VWAP/EMA/RSI setup',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE D: Follow-through candle gate (same as ELITE) ---
+                ft_candles = _data.get('follow_through_candles', 0)
+                orb_hold = _data.get('orb_hold_candles', 0)
+                if ft_candles == 0 and orb_hold > 2:
+                    print(f"      ⛔ FT=0, ORB hold={orb_hold} — stale breakout, blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_FOLLOWTHROUGH',
+                                      reason=f'FT=0, ORB hold={orb_hold} candles — stale breakout',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE E: ADX trend strength gate (same as ELITE: ≥25) ---
+                adx_val = _data.get('adx', 20)
+                if adx_val < 25:
+                    print(f"      ⛔ ADX={adx_val:.0f} < 25 — weak trend, blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_WEAK_ADX',
+                                      reason=f'ADX={adx_val:.0f} < 25',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE F: OI conflict veto (same as ELITE) ---
+                oi_signal = _data.get('oi_signal', 'NEUTRAL')
+                if direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
+                    print(f"      ⛔ OI conflict: BUY vs SHORT_BUILDUP — blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_CONFLICT',
+                                      reason=f'BUY direction but OI={oi_signal}',
+                                      direction=direction)
+                    continue
+                if direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
+                    print(f"      ⛔ OI conflict: SELL vs LONG_BUILDUP — blocked")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_CONFLICT',
+                                      reason=f'SELL direction but OI={oi_signal}',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE G: ML flat veto (same as ELITE) ---
+                try:
+                    _cached_ml = _cycle_decisions.get(_sym, {}).get('ml_prediction', {})
+                    if _cached_ml.get('ml_elite_ok') is False:
+                        _ml_flat_p = _cached_ml.get('ml_prob_flat', 0)
+                        print(f"      ⛔ ML flat veto: P(flat)={_ml_flat_p:.0%} — blocked")
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_ML_FLAT',
+                                          reason=f'ML FLAT ({_ml_flat_p:.0%} flat prob)',
+                                          direction=direction)
+                        continue
+                except Exception:
+                    pass
+                
+                # --- GATE H: Position limit (regime-aware, same as ELITE) ---
+                active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+                if _breadth == 'MIXED':
+                    _max_pos = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
+                elif _breadth in ('BULLISH', 'BEARISH'):
+                    _max_pos = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
+                else:
+                    _max_pos = HARD_RULES['MAX_POSITIONS']
+                if len(active_positions) >= _max_pos:
+                    print(f"      ⛔ Position limit: {len(active_positions)} >= {_max_pos} ({_breadth}) — blocked")
+                    break
+                
+                # === ALL GATES PASSED — Execute trade ===
+                print(f"      ✅ ALL GATES PASSED — executing watcher trade")
+                
+                # Build ML data payload (same format as ELITE auto-fire)
+                _elite_ml = _ml_results.get(_sym, {})
+                _ml_data = {
+                    'smart_score': _final_score,
+                    'p_score': _final_score,
+                    'dr_score': _elite_ml.get('ml_down_risk_score', 0),
+                    'ml_move_prob': _elite_ml.get('ml_move_prob', 0),
+                    'ml_confidence': _elite_ml.get('ml_confidence', 0),
+                    'xgb_model': {
+                        'signal': _elite_ml.get('ml_signal', 'UNKNOWN'),
+                        'move_prob': _elite_ml.get('ml_move_prob', 0),
+                        'prob_up': _elite_ml.get('ml_prob_up', 0),
+                        'prob_down': _elite_ml.get('ml_prob_down', 0),
+                        'prob_flat': _elite_ml.get('ml_prob_flat', 0),
+                        'direction_bias': _elite_ml.get('ml_direction_bias', 0),
+                        'confidence': _elite_ml.get('ml_confidence', 0),
+                        'score_boost': _elite_ml.get('ml_score_boost', 0),
+                        'direction_hint': _elite_ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'model_type': _elite_ml.get('ml_model_type', 'unknown'),
+                        'sizing_factor': _elite_ml.get('ml_sizing_factor', 1.0),
+                    },
+                    'gmm_model': {
+                        'down_risk_score': _elite_ml.get('ml_down_risk_score', 0),
+                        'up_flag': _elite_ml.get('ml_up_flag', False),
+                        'down_flag': _elite_ml.get('ml_down_flag', False),
+                        'up_score': _elite_ml.get('ml_up_score', 0),
+                        'down_score': _elite_ml.get('ml_down_score', 0),
+                        'down_risk_bucket': _elite_ml.get('ml_down_risk_bucket', 'LOW'),
+                        'gmm_confirms_direction': _elite_ml.get('ml_gmm_confirms_direction', False),
+                        'gmm_regime_used': _elite_ml.get('ml_gmm_regime_used', 'BOTH'),
+                        'gmm_action': 'WATCHER_BREAKOUT',
+                    },
+                    'scored_direction': direction,
+                    'xgb_disagrees': False,
+                } if _elite_ml else {}
+                
+                _setup_type = 'ORB_BREAKOUT' if 'DAY' in _trigger_type or 'SPIKE' in _trigger_type else 'WATCHER'
+                result = self.tools.place_option_order(
+                    underlying=_sym,
+                    direction=direction,
+                    strike_selection="ATM",
+                    rationale=(f"WATCHER→FULL_PIPELINE: {_trigger_type} ({_move_pct:+.1f}%) — "
+                              f"Score {_final_score:.0f}, all gates passed (setup+FT+ADX+OI+ML+sector+DR)"),
+                    setup_type=_setup_type,
+                    ml_data=_ml_data
+                )
+                
+                if result and result.get('success'):
+                    print(f"      ✅ WATCHER TRADE: {_sym.replace('NSE:', '')} ({direction}) "
+                          f"score={_final_score:.0f} trigger={_trigger_type}")
+                    self._watcher_fired_this_session.add(_sym)
+                    self._auto_fired_this_session.add(_sym)  # Prevent ELITE re-fire
+                    _fired_count += 1
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_FIRED',
+                                      reason=(f'Breakout {_trigger_type} ({_move_pct:+.1f}%) — '
+                                             f'FULL PIPELINE: score+ML+OI+sector+DR+setup+FT+ADX all passed'),
+                                      direction=direction, setup=_setup_type)
+                else:
+                    _err = result.get('error', 'unknown') if result else 'no result'
+                    print(f"      ⚠️ Watcher trade failed for {_sym.replace('NSE:', '')}: {_err}")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_TRADE_FAILED',
+                                      reason=f'{_trigger_type}: {str(_err)[:80]}',
+                                      direction=direction)
+        
+        except Exception as _e:
+            print(f"      ❌ Watcher focused scan error: {_e}")
+            import traceback
+            traceback.print_exc()
     
     # ========== DYNAMIC MAX PICKS ==========
     def _compute_max_picks(self, pre_scores: dict, breadth: str) -> int:
@@ -792,7 +1423,7 @@ class AutonomousTrader:
             self._model_tracker_symbols = set()
             self._dr_flip_symbols = set()
             self._dr_flip_trades_today = 0
-            print(f"📅 New trading day — model-tracker counter reset")
+            # print(f"📅 New trading day — model-tracker counter reset")
     
     def _apply_down_risk_soft_scores(self, ml_results: dict, pre_scores: dict):
         """Apply DIRECTION-AWARE graduated score adjustments based on GMM anomaly.
@@ -826,13 +1457,16 @@ class AutonomousTrader:
         
         for sym in list(pre_scores.keys()):
             ml = ml_results.get(sym, {})
-            dr_flag = ml.get('ml_down_risk_flag', None)
             dr_score = ml.get('ml_down_risk_score', None)
             
             if dr_score is None:
                 continue  # No down-risk prediction for this symbol
             
-            gmm_regime = ml.get('ml_gmm_regime_used', 'UP')
+            # Dual-regime: read independent UP and DOWN scores + flags
+            _up_score = ml.get('ml_up_score', dr_score)
+            _down_score = ml.get('ml_down_score', dr_score)
+            _up_flag = ml.get('ml_up_flag', False)
+            _down_flag = ml.get('ml_down_flag', False)
             
             # Get trade direction from IntradayScorer (if available)
             _cd = _cycle_decs.get(sym, {})
@@ -841,52 +1475,67 @@ class AutonomousTrader:
             if _decision and hasattr(_decision, 'recommended_direction'):
                 direction = _decision.recommended_direction
             
-            # Determine if dr signal OPPOSES or CONFIRMS trade direction
-            # UP regime: high dr = crash likely → opposes BUY, confirms SELL
-            # DOWN regime: high dr = bear trap (rally) → opposes SELL, confirms BUY
-            dr_opposes_trade = True  # default: treat as opposing (conservative)
-            if direction and direction != 'HOLD':
-                if gmm_regime == 'UP':
-                    # UP regime detects hidden crash risk
-                    dr_opposes_trade = (direction == 'BUY')   # crash hurts CE
-                elif gmm_regime == 'DOWN':
-                    # DOWN regime detects bear trap (hidden rally)
-                    dr_opposes_trade = (direction == 'SELL')   # rally hurts PE
-            
             _sym_diag = sym.replace('NSE:', '')
             _dir_tag = direction or '?'
             
-            # Score-graduated response — direction-aware
-            if dr_score > high_thresh:
-                if dr_opposes_trade:
-                    # High dr OPPOSES trade → strong penalty (crash hurts CE / trap hurts PE)
-                    pre_scores[sym] -= high_penalty
-                    adjustments.append(f"🔴 {_sym_diag} −{high_penalty} (HIGH_{gmm_regime} vs {_dir_tag} dr={dr_score:.3f})")
-                else:
-                    # High dr CONFIRMS trade → BOOST (crash helps PE / trap helps CE)
+            # Dual-regime directional scoring:
+            #   UP_Flag (crash risk)   → opposes BUY, confirms SELL
+            #   Down_Flag (bounce risk) → opposes SELL, confirms BUY
+            #   Both clean → genuine pattern → boost
+            #   Both flagged → conflicting → penalize
+            if direction and direction != 'HOLD':
+                if direction == 'BUY':
+                    # BUY: Down_Flag confirms (bounce=UP), UP_Flag opposes (crash)
+                    _confirm_flag = _down_flag
+                    _oppose_flag = _up_flag
+                    _confirm_score = _down_score
+                    _oppose_score = _up_score
+                    _confirm_lbl = 'Down_Flag(bounce)'
+                    _oppose_lbl = 'UP_Flag(crash)'
+                else:  # SELL
+                    # SELL: UP_Flag confirms (crash=DOWN), Down_Flag opposes (bounce)
+                    _confirm_flag = _up_flag
+                    _oppose_flag = _down_flag
+                    _confirm_score = _up_score
+                    _oppose_score = _down_score
+                    _confirm_lbl = 'UP_Flag(crash)'
+                    _oppose_lbl = 'Down_Flag(bounce)'
+                
+                if _confirm_flag and not _oppose_flag:
+                    # Anomaly CONFIRMS trade → BOOST (this is the 2x edge)
                     pre_scores[sym] += clean_boost
-                    adjustments.append(f"🟣 {_sym_diag} +{clean_boost} (DR_CONFIRMS_{_dir_tag} dr={dr_score:.3f})")
-            elif dr_flag:
-                if dr_opposes_trade:
-                    # Flagged + opposes → moderate penalty
+                    adjustments.append(f"🟣 {_sym_diag} +{clean_boost} ({_confirm_lbl} CONFIRMS {_dir_tag} score={_confirm_score:.3f})")
+                elif _oppose_flag and not _confirm_flag:
+                    # Anomaly OPPOSES trade → strong penalty
+                    pre_scores[sym] -= high_penalty
+                    adjustments.append(f"🔴 {_sym_diag} −{high_penalty} ({_oppose_lbl} OPPOSES {_dir_tag} score={_oppose_score:.3f})")
+                elif _confirm_flag and _oppose_flag:
+                    # BOTH flagged (conflicting/extreme vol) → penalize
                     pre_scores[sym] -= mid_penalty
-                    adjustments.append(f"🟠 {_sym_diag} −{mid_penalty} (CAUTION_{gmm_regime} vs {_dir_tag} dr={dr_score:.3f})")
-                else:
-                    # Flagged but confirms trade direction → small boost
+                    adjustments.append(f"🟠 {_sym_diag} −{mid_penalty} (BOTH_FLAGS {_dir_tag} UP={_up_score:.3f} DN={_down_score:.3f})")
+                elif _confirm_score > high_thresh:
+                    # High confirming score (not flagged yet) → small boost
                     _small_boost = clean_boost // 2
                     pre_scores[sym] += _small_boost
-                    adjustments.append(f"🔵 {_sym_diag} +{_small_boost} (FLAG_CONFIRMS_{_dir_tag} dr={dr_score:.3f})")
-            elif dr_score < clean_thresh:
-                # Low dr = genuine clean pattern in this regime
-                # Clean + aligned regime → boost (stock moving genuinely in scored direction)
-                pre_scores[sym] += clean_boost
-                adjustments.append(f"🟢 {_sym_diag} +{clean_boost} (CLEAN_{gmm_regime}_{_dir_tag} dr={dr_score:.3f})")
-            # else: neutral zone — no adjustment
+                    adjustments.append(f"🔵 {_sym_diag} +{_small_boost} (HIGH_{_confirm_lbl} {_dir_tag} score={_confirm_score:.3f})")
+                elif _oppose_score > high_thresh:
+                    # High opposing score (not flagged yet) → caution penalty
+                    pre_scores[sym] -= mid_penalty
+                    adjustments.append(f"🟠 {_sym_diag} −{mid_penalty} (HIGH_{_oppose_lbl} vs {_dir_tag} score={_oppose_score:.3f})")
+                elif max(_up_score, _down_score) < clean_thresh:
+                    # Both very low → genuine clean pattern → boost
+                    pre_scores[sym] += clean_boost
+                    adjustments.append(f"🟢 {_sym_diag} +{clean_boost} (CLEAN {_dir_tag} UP={_up_score:.3f} DN={_down_score:.3f})")
+                # else: neutral zone — no adjustment
+            else:
+                # No direction / HOLD — skip scoring (can't determine confirm/oppose)
+                pass
         
         if adjustments:
-            print(f"   🛡️ GMM GRADUATED SCORE: {len(adjustments)} adjusted — {' | '.join(adjustments[:8])}")
-            if len(adjustments) > 8:
-                print(f"      ... and {len(adjustments) - 8} more")
+            # print(f"   🛡️ GMM GRADUATED SCORE: {len(adjustments)} adjusted — {' | '.join(adjustments[:8])}")
+            # if len(adjustments) > 8:
+            #     print(f"      ... and {len(adjustments) - 8} more")
+            pass
     
     def _place_model_tracker_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
         """Place up to N exclusive model-tracker trades using GMM veto/boost selection.
@@ -959,70 +1608,102 @@ class AutonomousTrader:
             if direction == 'HOLD':
                 continue  # Scorer couldn't determine direction → skip
             
-            # ── DUAL-REGIME GMM VETO/BOOST LOGIC ──
-            # CRITICAL: We must check the ACTUAL XGB signal (ml_signal), not gmm_regime.
-            # Reason: FLAT signals (very common — ~30-50% of stocks) get routed to
-            # UP regime by default in predictor. Using gmm_regime would incorrectly
-            # treat all FLAT signals as "XGB says UP", creating a massive BUY bias.
+            # ══════════════════════════════════════════════════════════════
+            # 18-CASE DECISION MATRIX (3 XGB × 2 Titan × 3 GMM states)
+            # ══════════════════════════════════════════════════════════════
+            # Now predictor.py runs BOTH regime models → independent UP_Flag + Down_Flag.
             #
-            # DR SCORE INTERPRETATION:
-            #   High dr in DOWN regime = stock WILL go DOWN (confirms DOWN direction)
-            #   High dr in UP regime = stock WILL go UP (confirms UP direction)
-            #   Low dr = uncertain, no strong GMM signal
+            # GMM states:
+            #   Clean       = both False  → no anomaly edge → BLOCK
+            #   UP_Flag     = crash risk  → predicts DOWN   → confirms SELL, opposes BUY
+            #   Down_Flag   = bounce risk → predicts UP     → confirms BUY, opposes SELL
+            #   Both True   = conflicting → extreme vol     → BLOCK
             #
-            # Logic:
-            #   XGB=FLAT/UNKNOWN → no directional opinion → ALLOW (no boost, no block)
-            #   XGB aligns + high dr (flag) → GMM confirms aligned direction → ALL_AGREE BOOST
-            #   XGB aligns + low dr (clean) → GMM uncertain → just ALLOW as MODEL_TRACKER
-            #   XGB opposes + high dr (flag) → GMM confirms XGB's direction → ML_OVERRIDE FLIP
-            #   XGB opposes + low dr (clean) → GMM uncertain → XGB alone opposes → ALLOW Titan
+            # RULE: Only trade when anomaly CONFIRMS trade direction.
+            #   BUY needs Down_Flag (bounce=UP). SELL needs UP_Flag (crash=DOWN).
+            #   If XGB also aligns → ALL_AGREE. Else → GMM_CONTRARIAN.
+            #   Clean / opposing anomaly / conflicting → BLOCK.
+            # ══════════════════════════════════════════════════════════════
             trade_type = 'MODEL_TRACKER'
-            gmm_action = 'ALLOW'  # default
+            gmm_action = 'ALLOW'  # default (will be overridden or continue'd)
             _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
-            gmm_regime = ml.get('ml_gmm_regime_used', 'UP')
-            
-            if _xgb_signal in ('FLAT', 'UNKNOWN'):
-                # XGB has no directional opinion → GMM regime is just default routing
-                # Cannot use GMM to BOOST or BLOCK directionally → ALLOW
-                gmm_action = 'ALLOW'
-            elif (_xgb_signal == 'UP' and direction == 'BUY') or (_xgb_signal == 'DOWN' and direction == 'SELL'):
-                # XGB signal ALIGNS with trade direction
-                if dr_flag:
-                    # HIGH dr confirms the aligned direction → ALL 3 systems agree
-                    # XGB says direction + GMM confirms with high dr + Titan agrees → BOOST
-                    gmm_action = 'BOOST'
-                    trade_type = 'ALL_AGREE'
-                else:
-                    # LOW dr = GMM uncertain about direction → only XGB + Titan agree
-                    # Still proceed but as standard MODEL_TRACKER (no extra boost)
-                    gmm_action = 'ALLOW'
+            gmm_regime = ml.get('ml_gmm_regime_used', 'BOTH')
+            _up_flag = ml.get('ml_up_flag', False)
+            _down_flag = ml.get('ml_down_flag', False)
+            _up_score = ml.get('ml_up_score', ml.get('ml_down_risk_score', 0.0))
+            _down_score = ml.get('ml_down_score', ml.get('ml_down_risk_score', 0.0))
+
+            # ── Step A: Determine if anomaly confirms trade direction ──
+            # BUY needs Down_Flag (bounce=UP to confirm), SELL needs UP_Flag (crash=DOWN to confirm)
+            if direction == 'BUY':
+                _anomaly_confirms = _down_flag and not _up_flag   # bounce confirms BUY
+                _anomaly_opposes  = _up_flag                       # crash opposes BUY
+                _confirm_score = _down_score
+                _confirm_tag = 'Down_Flag(bounce)'
+            else:  # SELL
+                _anomaly_confirms = _up_flag and not _down_flag    # crash confirms SELL
+                _anomaly_opposes  = _down_flag                      # bounce opposes SELL
+                _confirm_score = _up_score
+                _confirm_tag = 'UP_Flag(crash)'
+
+            _is_clean = not _up_flag and not _down_flag
+            _is_conflicting = _up_flag and _down_flag
+
+            # ── Step B: Decision ──
+            # BLOCK cases: Clean (1,4,7,10,13,16), opposing anomaly (2,6,8,12,14,18),
+            #              conflicting (both flags True)
+            if _is_clean or _anomaly_opposes or _is_conflicting:
+                # No anomaly edge, or anomaly opposes trade, or conflicting → BLOCK
+                continue
+
+            # At this point: anomaly CONFIRMS trade direction (6 surviving cases: 3,5,9,11,15,17)
+            # ── Step C: XGB alignment decides trade type ──
+            _xgb_aligns = ((_xgb_signal == 'UP' and direction == 'BUY') or
+                           (_xgb_signal == 'DOWN' and direction == 'SELL'))
+
+            # ── Confirm score floor: anomaly must be strong enough ──
+            _min_confirm = self._down_risk_cfg.get('min_confirm_score', 0.0)
+            if _confirm_score < _min_confirm:
+                continue  # Anomaly too weak — borderline flag
+
+            if _xgb_aligns:
+                # Cases 3, 11: Anomaly + XGB + Titan TRIPLE ALIGN → ALL_AGREE
+                trade_type = 'ALL_AGREE'
+                gmm_action = 'BOOST'
+                sym_clean_tmp = sym.replace('NSE:', '')
+                print(f"      ✅ ALL_AGREE: {sym_clean_tmp} — XGB={_xgb_signal} + Titan={direction} + "
+                      f"{_confirm_tag}={_confirm_score:.3f} → BOOST")
+                self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ALL_AGREE',
+                                  reason=f"XGB={_xgb_signal} + Titan={direction} + {_confirm_tag}={_confirm_score:.3f}",
+                                  direction=direction)
             else:
-                # XGB signal OPPOSES trade direction (UP vs SELL, DOWN vs BUY)
-                if dr_flag:
-                    # HIGH dr confirms XGB's opposing direction → XGB + GMM both oppose Titan
-                    # This is the STRONGEST opposition signal → FLIP to XGB direction
-                    sym_clean_tmp = sym.replace('NSE:', '')
-                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym_clean_tmp, ml, dr_score, path='MODEL_TRACKER')
-                    if not _ovr_ok:
-                        print(f"      🚫 ML_OVR BLOCKED: {sym_clean_tmp} — {_ovr_reason}")
-                        continue
-                    # XGB + GMM confirm opposing direction → FLIP
-                    old_direction = direction
-                    direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
-                    gmm_action = 'BOOST'
-                    trade_type = 'ML_OVERRIDE_WGMM'
-                    print(f"      🔄 ML_OVERRIDE_WGMM: {sym_clean_tmp} — XGB={_xgb_signal} + GMM confirms "
-                          f"(dr={dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
-                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ML_OVERRIDE_WGMM',
-                                      reason=f"XGB={_xgb_signal} + GMM dr={dr_score:.3f} confirms → flipped {old_direction}→{direction}",
-                                      direction=direction)
-                else:
-                    # LOW dr = GMM uncertain → XGB alone opposes → weak opposition
-                    # Let Titan's direction stand, soft scoring will penalize for XGB opposition
-                    gmm_action = 'ALLOW'
-                    sym_clean_tmp = sym.replace('NSE:', '')
-                    print(f"      ⚠️ XGB opposes ({_xgb_signal}) but GMM uncertain (dr={dr_score:.3f}) "
-                          f"→ ALLOW Titan {direction} (soft penalty via scoring)")
+                # Cases 5, 9, 15, 17: Anomaly confirms Titan, XGB opposes/flat → GMM_CONTRARIAN
+                from config import GMM_CONTRARIAN as _contr_cfg
+                _contr_ok = False
+                _contr_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+                if _contr_cfg.get('enabled', False) and _confirm_score >= _contr_cfg.get('min_dr_score', 0.15):
+                    _contr_today = getattr(self, '_dr_flip_trades_today', 0)
+                    _contr_max_day = _contr_cfg.get('max_trades_per_day', 4)
+                    _contr_open = sum(1 for t in (getattr(self.tools, 'paper_positions', []) or [])
+                                     if t.get('setup_type') in ('DR_FLIP', 'GMM_CONTRARIAN') and t.get('status', 'OPEN') == 'OPEN')
+                    _contr_max_concurrent = _contr_cfg.get('max_concurrent_open', 3)
+                    _contr_min_gate = _contr_cfg.get('min_gate_prob', 0.50)
+
+                    if (_contr_today < _contr_max_day
+                        and _contr_open < _contr_max_concurrent
+                        and _contr_move_prob >= _contr_min_gate):
+                        _contr_ok = True
+                        trade_type = 'GMM_CONTRARIAN'
+                        gmm_action = 'BOOST'
+                        sym_clean_tmp = sym.replace('NSE:', '')
+                        print(f"      🎯 GMM_CONTRARIAN: {sym_clean_tmp} — XGB={_xgb_signal} but "
+                              f"{_confirm_tag}={_confirm_score:.3f} confirms {direction} | P(MOVE)={_contr_move_prob:.2f}")
+                        self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'GMM_CONTRARIAN',
+                                          reason=f"XGB={_xgb_signal} but {_confirm_tag}={_confirm_score:.3f} confirms {direction}",
+                                          direction=direction)
+
+                if not _contr_ok:
+                    continue  # GMM_CONTRARIAN gates failed → BLOCK
             
             # Gather available ML metrics (Gate model still runs)
             ml_confidence = ml.get('ml_confidence', 0.0)  # Gate confidence
@@ -1030,100 +1711,10 @@ class AutonomousTrader:
             p_score = pre_scores.get(sym, 0)
             sym_clean = sym.replace('NSE:', '')
             sector = _get_sector_mt(sym_clean)
-            
-            # ── HARD DR_SCORE GATE → GMM CONTRARIAN FLIP (Feb 24 fix) ──
-            # Instead of just blocking high-dr trades, FLIP direction:
-            #   BUY + high dr = "fake rally, crash likely" → SELL (buy PUT)
-            #   SELL + high dr = "bear trap, bounce likely" → BUY (buy CALL)
-            # The GMM anomaly IS the signal.
-            _mt_max_dr = self._down_risk_cfg.get('max_dr_score', 0.12)
-            if dr_score > _mt_max_dr:
-                # Check if GMM_CONTRARIAN (DR_FLIP) is enabled and conditions met
-                from config import GMM_CONTRARIAN as _dr_flip_cfg
-                _flip_ok = False
-                if _dr_flip_cfg.get('enabled', False) and dr_score >= _dr_flip_cfg.get('min_dr_score', 0.15):
-                    # Check daily limit
-                    _flip_today = getattr(self, '_dr_flip_trades_today', 0)
-                    _flip_max_day = _dr_flip_cfg.get('max_trades_per_day', 4)
-                    # Check concurrent open limit
-                    _flip_open = sum(1 for t in (getattr(self.tools, 'paper_positions', []) or [])
-                                    if t.get('setup_type') == 'DR_FLIP' and t.get('status', 'OPEN') == 'OPEN')
-                    _flip_max_concurrent = _dr_flip_cfg.get('max_concurrent_open', 3)
-                    # Check Gate P(MOVE)
-                    _flip_min_gate = _dr_flip_cfg.get('min_gate_prob', 0.50)
-                    
-                    if _flip_today >= _flip_max_day:
-                        print(f"      🚫 DR_FLIP DAILY LIMIT: {sym_clean} — {_flip_today}/{_flip_max_day} flips today")
-                    elif _flip_open >= _flip_max_concurrent:
-                        print(f"      🚫 DR_FLIP CONCURRENT LIMIT: {sym_clean} — {_flip_open}/{_flip_max_concurrent} open")
-                    elif ml_move_prob < _flip_min_gate:
-                        print(f"      🚫 DR_FLIP GATE LOW: {sym_clean} — P(MOVE)={ml_move_prob:.2f} < {_flip_min_gate}")
-                    else:
-                        # XGB safety: don't flip INTO a direction XGB strongly opposes
-                        _flip_dir = 'SELL' if direction == 'BUY' else 'BUY'
-                        _xgb_blocks_flip = False
-                        if _flip_dir == 'BUY' and _xgb_signal == 'DOWN' and ml.get('ml_prob_down', 0) > 0.55:
-                            _xgb_blocks_flip = True
-                        elif _flip_dir == 'SELL' and _xgb_signal == 'UP' and ml.get('ml_prob_up', 0) > 0.55:
-                            _xgb_blocks_flip = True
-                        
-                        if _xgb_blocks_flip:
-                            print(f"      🚫 DR_FLIP XGB CONFLICT: {sym_clean} — XGB={_xgb_signal} strongly opposes flip to {_flip_dir}")
-                        else:
-                            _flip_ok = True
-                            old_dir = direction
-                            direction = _flip_dir
-                            trade_type = 'DR_FLIP'
-                            gmm_action = 'CONTRARIAN'
-                            if not hasattr(self, '_dr_flip_symbols'):
-                                self._dr_flip_symbols = set()
-                            self._dr_flip_symbols.add(sym)
-                            print(f"      🔀 GMM CONTRARIAN FLIP: {sym_clean} — dr={dr_score:.3f} (HIGH) → "
-                                  f"FLIPPED {old_dir}→{direction} | P(MOVE)={ml_move_prob:.2f}")
-                            self._log_decision(cycle_time, sym, p_score, 'DR_FLIP',
-                                              reason=f"GMM dr={dr_score:.3f} too high for {old_dir} → contrarian {direction}",
-                                              direction=direction)
-                
-                if not _flip_ok:
-                    # Still blocked if flip didn't fire
-                    # Skip ALL_AGREE — high dr was already handled (GMM + XGB + Titan aligned)
-                    # Skip ML_OVERRIDE_WGMM — high dr was used to confirm the flip
-                    if dr_score > _mt_max_dr and trade_type not in ('DR_FLIP', 'ALL_AGREE', 'ML_OVERRIDE_WGMM'):
-                        print(f"      🚫 MODEL-TRACKER DR GATE: {sym_clean} — dr={dr_score:.3f} > {_mt_max_dr} → BLOCKED")
-                        continue
-            
+
             # ── Gate floor: P(MOVE) must be meaningful ──
             if ml_move_prob < 0.40:
                 continue  # Gate says stock unlikely to move — skip
-            
-            # ── ML DIRECTION CONFLICT FILTER ──
-            # Check if XGBoost ML signal disagrees with scored direction
-            # SKIP for DR_FLIP trades — contrarian direction naturally opposes XGB
-            from config import ML_DIRECTION_CONFLICT
-            _dir_conflict_cfg = ML_DIRECTION_CONFLICT
-            _xgb_disagrees = False
-            if _dir_conflict_cfg.get('enabled', False) and trade_type not in ('DR_FLIP', 'ML_OVERRIDE_WGMM'):
-                _ml_signal = ml.get('ml_signal', 'UNKNOWN')
-                if direction == 'BUY' and _ml_signal == 'DOWN' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
-                    _xgb_disagrees = True
-                elif direction == 'SELL' and _ml_signal == 'UP' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
-                    _xgb_disagrees = True
-                
-                if _xgb_disagrees:
-                    _gmm_caution = dr_score > _dir_conflict_cfg.get('gmm_caution_threshold', 0.15)
-                    if _gmm_caution:
-                        # HARD BLOCK: Both XGBoost AND GMM disagree with scored direction
-                        print(f"      🚫 DIRECTION CONFLICT BLOCK: {sym_clean} — XGB={_ml_signal} vs scored={direction}, "
-                              f"GMM dr={dr_score:.3f} > {_dir_conflict_cfg.get('gmm_caution_threshold', 0.15)} → BOTH disagree")
-                        self._log_decision(cycle_time, sym, p_score, 'ML_DIRECTION_BLOCK',
-                                          reason=f"XGB={_ml_signal} + GMM dr={dr_score:.3f} vs scored={direction}",
-                                          direction=direction)
-                        continue
-                    else:
-                        # SOFT PENALTY: Only XGB disagrees, GMM is clean — penalize score
-                        _xgb_penalty = _dir_conflict_cfg.get('xgb_penalty', 15)
-                        print(f"      ⚠️ XGB DIRECTION CONFLICT: {sym_clean} — XGB={_ml_signal} vs scored={direction}, "
-                              f"GMM clean (dr={dr_score:.3f}) → −{_xgb_penalty} penalty")
             
             # ── Composite smart score (dual-regime GMM-aware) ──
             # Weight 1: Conviction = Gate P(MOVE) × ML confidence (0-40 pts)
@@ -1131,10 +1722,9 @@ class AutonomousTrader:
             # p_score already represented in Weight 3 (technical)
             conviction = ml_move_prob * max(ml_confidence, 0.01) * 40.0
             
-            # Weight 2: Safety / GMM-awareness (0-25 pts)
-            # Both CE and PE get BOOST when GMM confirms — symmetric treatment
-            # Lower anomaly score = more genuine pattern = higher safety score
-            safety = (1.0 - min(dr_score, 1.0)) * 20.0 + 5.0  # up to 25 pts (boosted)
+            # Weight 2: Anomaly conviction (0-25 pts)
+            # Higher confirming anomaly score = stronger edge = higher score
+            safety = min(_confirm_score, 1.0) * 20.0 + 5.0  # up to 25 pts
             
             # Weight 3: Technical strength = pre_score normalized (0-100 → 0-20 pts)
             technical = min(p_score, 100) * 0.20
@@ -1145,9 +1735,47 @@ class AutonomousTrader:
             
             smart_score = conviction + safety + technical + move_bonus
             
-            # Apply XGB direction conflict penalty (soft gate — only XGB disagrees, GMM clean)
-            if _dir_conflict_cfg.get('enabled', False) and _xgb_disagrees:
-                smart_score -= _dir_conflict_cfg.get('xgb_penalty', 15)
+            # ── ALIGNMENT BONUS: triple/dual-agree gets extra conviction ──
+            # ALL_AGREE (XGB + Titan + GMM anomaly) = strongest possible signal → +15 pts
+            # GMM_CONTRARIAN (Titan + GMM anomaly, XGB flat/opposed) = strong GMM edge → +10 pts
+            if trade_type == 'ALL_AGREE':
+                smart_score += 15.0
+            elif trade_type == 'GMM_CONTRARIAN':
+                smart_score += 10.0
+            
+            # ── SECTOR BREADTH PENALTY: penalize trades against sector direction ──
+            # Uses sector index % changes cached from prior cycle.
+            # If NIFTY METAL is bullish (+1%+) and trade is SELL → penalize.
+            # If NIFTY IT is bearish (-1%+) and trade is BUY → penalize.
+            _sector_penalty_applied = 0
+            _sec_idx_chg_cache = getattr(self, '_sector_index_changes_cache', {})
+            if _sec_idx_chg_cache and sector:
+                # Map sector label (from STOCK_SECTOR_MAP) → NIFTY index symbol
+                _sector_to_nifty = {
+                    'METAL': 'NSE:NIFTY METAL', 'IT': 'NSE:NIFTY IT',
+                    'BANK': 'NSE:NIFTY BANK', 'AUTO': 'NSE:NIFTY AUTO',
+                    'PHARMA': 'NSE:NIFTY PHARMA', 'ENERGY': 'NSE:NIFTY ENERGY',
+                    'FMCG': 'NSE:NIFTY FMCG', 'REALTY': 'NSE:NIFTY REALTY',
+                    'INFRA': 'NSE:NIFTY INFRA',
+                }
+                _nifty_idx = _sector_to_nifty.get(sector)
+                if _nifty_idx:
+                    _sec_pct = _sec_idx_chg_cache.get(_nifty_idx)
+                    if _sec_pct is not None:
+                        from config import SECTOR_BREADTH_PENALTY
+                        _sbp_cfg = SECTOR_BREADTH_PENALTY
+                        _sbp_threshold = _sbp_cfg.get('threshold_pct', 1.0)
+                        _sbp_penalty = _sbp_cfg.get('penalty', 10)
+                        # Sector BULLISH but trade is SELL → counter-sector
+                        if _sec_pct >= _sbp_threshold and direction == 'SELL':
+                            smart_score -= _sbp_penalty
+                            _sector_penalty_applied = _sbp_penalty
+                            # print(f"      🏭 SECTOR BREADTH: {sym_clean} SELL vs {sector} +{_sec_pct:.1f}% → −{_sbp_penalty} penalty")
+                        # Sector BEARISH but trade is BUY → counter-sector
+                        elif _sec_pct <= -_sbp_threshold and direction == 'BUY':
+                            smart_score -= _sbp_penalty
+                            _sector_penalty_applied = _sbp_penalty
+                            # print(f"      🏭 SECTOR BREADTH: {sym_clean} BUY vs {sector} {_sec_pct:+.1f}% → −{_sbp_penalty} penalty")
             
             raw_candidates.append({
                 'sym': sym,
@@ -1159,6 +1787,13 @@ class AutonomousTrader:
                 'smart_score': round(smart_score, 2),
                 'dr_score': dr_score,
                 'dr_flag': dr_flag,
+                'up_flag': ml.get('ml_up_flag', False),
+                'down_flag': ml.get('ml_down_flag', False),
+                'up_score': _up_score,
+                'down_score': _down_score,
+                'confirm_score': _confirm_score,
+                'confirm_tag': _confirm_tag,
+                'gmm_regime': gmm_regime,
                 'ml_confidence': ml_confidence,
                 'ml_move_prob': ml_move_prob,
                 'p_score': p_score,
@@ -1183,15 +1818,21 @@ class AutonomousTrader:
                         'sizing_factor': ml.get('ml_sizing_factor', 1.0),
                     },
                     'gmm_model': {
+                        'up_flag': ml.get('ml_up_flag', False),
+                        'down_flag': ml.get('ml_down_flag', False),
+                        'up_score': _up_score,
+                        'down_score': _down_score,
+                        'confirm_score': _confirm_score,
+                        'confirm_tag': _confirm_tag,
                         'down_risk_score': dr_score,
                         'down_risk_flag': dr_flag,
                         'down_risk_bucket': ml.get('ml_down_risk_bucket', 'LOW'),
                         'gmm_confirms_direction': ml.get('ml_gmm_confirms_direction', False),
-                        'gmm_regime_used': ml.get('ml_gmm_regime_used', None),
+                        'gmm_regime_used': ml.get('ml_gmm_regime_used', 'BOTH'),
                         'gmm_action': gmm_action,
                     },
                     'scored_direction': direction,
-                    'xgb_disagrees': _xgb_disagrees,
+                    'xgb_signal': _xgb_signal,
                 },
             })
         
@@ -1206,14 +1847,22 @@ class AutonomousTrader:
         sector_counts = {}
         selected = []
         
+        _mt_min_smart = self._down_risk_cfg.get('min_smart_score', 55)
+        _mt_smart_rejected = []
         for cand in raw_candidates:
             if len(selected) >= budget:
                 break
+            if cand['smart_score'] < _mt_min_smart:
+                _mt_smart_rejected.append(f"{cand['sym_clean']}({cand['smart_score']:.1f})")
+                continue  # Below smart score floor
             sec = cand['sector']
             if sector_counts.get(sec, 0) >= MAX_PER_SECTOR:
                 continue  # Sector full — skip to next
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
             selected.append(cand)
+        if _mt_smart_rejected:
+            print(f"      🚫 MT SMART FLOOR: {len(_mt_smart_rejected)} blocked (< {_mt_min_smart}) — {', '.join(_mt_smart_rejected[:5])}")
+
         
         # Print selection summary
         if selected:
@@ -1226,9 +1875,9 @@ class AutonomousTrader:
             print(f"      Sectors: {', '.join(sorted(sectors_used))}")
             for i, c in enumerate(selected, 1):
                 _type_tag = f" [{c['trade_type']}]" if c['trade_type'] != 'MODEL_TRACKER' else ''
-                _gmm_tag = f" dr={c['dr_score']:.3f}"
+                _gmm_tag = f" {c.get('confirm_tag', '?')}={c.get('confirm_score', 0):.3f}"
                 print(f"      #{i} {c['sym_clean']:<12s} {c['direction']:<4s} smart={c['smart_score']:5.1f} "
-                      f"(gate={c['ml_move_prob']:.2f}, dr={c['dr_score']:.3f}, "
+                      f"(gate={c['ml_move_prob']:.2f}, UP={c.get('up_score', 0):.3f}, DN={c.get('down_score', 0):.3f}, "
                       f"tech={c['p_score']:.0f}) [{c['sector']}]{_type_tag}{_gmm_tag}")
         
         # ── Step 4: Place trades ──
@@ -1241,18 +1890,22 @@ class AutonomousTrader:
                 _type_label = f" [{trade_type}]" if trade_type != 'MODEL_TRACKER' else ''
                 print(f"\n   📊 MODEL-TRACKER TRADE: {cand['sym_clean']} ({direction}, smart={cand['smart_score']:.1f}){_type_label}")
                 
-                # TODO: Wire score_tier_override='premium' for ALL_AGREE to increase lots
-                # For now, ALL_AGREE gets higher smart_score → naturally higher entry score
+                # ALL_AGREE = strongest conviction (all 3 models) → amplified lot sizing
+                _lot_mult = 1.0
+                if trade_type == 'ALL_AGREE':
+                    _lot_mult = self._down_risk_cfg.get('all_agree_lot_multiplier', 1.5)
+                    print(f"   🚀 ALL_AGREE AMPLIFIED: {_lot_mult}x lots (strongest conviction)")
                 
                 result = self.tools.place_option_order(
                     underlying=sym,
                     direction=direction,
                     strike_selection="ATM",
                     use_intraday_scoring=False,  # Bypass scorer — model-tracker evaluates independently
+                    lot_multiplier=_lot_mult,
                     rationale=(f"{trade_type} smart-pick #{selected.index(cand)+1}: "
-                              f"smart={cand['smart_score']:.1f}, dr={cand['dr_score']:.3f}, "
+                              f"smart={cand['smart_score']:.1f}, {cand.get('confirm_tag', '?')}={cand.get('confirm_score', 0):.3f}, "
                               f"gate={cand['ml_move_prob']:.2f}, gmm_action={cand['gmm_action']}, "
-                              f"sector={cand['sector']}"),
+                              f"sector={cand['sector']}, lots={_lot_mult}x"),
                     setup_type=trade_type,
                     ml_data=cand.get('ml_data', {}),
                     sector=cand.get('sector', ''),
@@ -1261,13 +1914,13 @@ class AutonomousTrader:
                     print(f"   ✅ MODEL-TRACKER PLACED: {cand['sym_clean']} ({direction}) [smart={cand['smart_score']:.1f}]{_type_label}")
                     self._model_tracker_symbols.add(sym)
                     self._model_tracker_trades_today += 1
-                    # Track DR_FLIP trades separately
-                    if trade_type == 'DR_FLIP':
+                    # Track GMM_CONTRARIAN / DR_FLIP trades for daily limit
+                    if trade_type in ('DR_FLIP', 'GMM_CONTRARIAN'):
                         self._dr_flip_trades_today += 1
                     placed.append(cand['sym_clean'])
                     self._log_decision(cycle_time, sym, cand['p_score'], f'{trade_type}_PLACED',
                                       reason=(f"Smart pick: score={cand['smart_score']:.1f}, "
-                                             f"dr={cand['dr_score']:.3f}, gate={cand['ml_move_prob']:.2f}, "
+                                             f"{cand.get('confirm_tag', '?')}={cand.get('confirm_score', 0):.3f}, gate={cand['ml_move_prob']:.2f}, "
                                              f"gmm_action={cand['gmm_action']}, sector={cand['sector']}"),
                                       direction=direction, setup=trade_type)
                 else:
@@ -1291,7 +1944,7 @@ class AutonomousTrader:
         conviction. Separate budget from model-tracker trades.
         
         Selection criteria (all must pass):
-          1. GMM down_risk_score < max_dr_score (very clean, stricter than 0.15)
+          1. GMM down_risk_score < max_updr/downdr_score (regime-proportional gate)
           2. Smart score >= min_smart_score
           3. XGB gate P(move) >= min_gate_prob (higher floor than model-tracker)
           4. GMM confirms direction (not flagged)
@@ -1317,11 +1970,12 @@ class AutonomousTrader:
         
         lot_multiplier = cfg.get('lot_multiplier', 2.0)
         min_smart = cfg.get('min_smart_score', 55)
-        max_dr = cfg.get('max_dr_score', 0.10)
+        max_dr_up = cfg.get('max_updr_score', 0.10)
+        max_dr_down = cfg.get('max_downdr_score', 0.08)
         min_gate = cfg.get('min_gate_prob', 0.55)
         score_tier = cfg.get('score_tier', 'premium')
         
-        print(f"\n   🎯 SNIPER SCAN: gates → dr<{max_dr}, smart>={min_smart}, gate>={min_gate} | {self._gmm_sniper_trades_today}/{max_per_day} used")
+        print(f"\n   🎯 SNIPER SCAN: gates → UPDR<{max_dr_up}/DownDR<{max_dr_down}, smart>={min_smart}, gate>={min_gate} | {self._gmm_sniper_trades_today}/{max_per_day} used")
         
         # Import sector mapping
         try:
@@ -1357,16 +2011,22 @@ class AutonomousTrader:
                 _sniper_reject_counts['active_pos'] += 1
                 continue
             
-            # Strict GMM cleanliness gate
-            if dr_score > max_dr:
+            # Strict GMM cleanliness gate — BOTH regimes must be clean
+            # Predictor now returns independent up_score + down_score
+            _snp_up_score = ml.get('ml_up_score', ml.get('ml_down_risk_score', 0.0))
+            _snp_down_score = ml.get('ml_down_score', ml.get('ml_down_risk_score', 0.0))
+            _snp_up_flag = ml.get('ml_up_flag', False)
+            _snp_down_flag = ml.get('ml_down_flag', False)
+            if _snp_up_score > max_dr_up or _snp_down_score > max_dr_down:
                 _sniper_reject_counts['dr_high'] += 1
-                if dr_score <= max_dr + 0.05:  # Near miss
-                    _sniper_near_misses.append(f"{sym_diag}(dr={dr_score:.3f}>max {max_dr})")
+                _tag = f"UP={_snp_up_score:.3f}/{max_dr_up}, DN={_snp_down_score:.3f}/{max_dr_down}"
+                if (_snp_up_score <= max_dr_up + 0.05) and (_snp_down_score <= max_dr_down + 0.05):  # Near miss
+                    _sniper_near_misses.append(f"{sym_diag}({_tag})")
                 continue
-            if dr_flag:
+            if _snp_up_flag or _snp_down_flag:
                 _sniper_reject_counts['dr_flagged'] += 1
-                _sniper_near_misses.append(f"{sym_diag}(dr={dr_score:.3f} FLAGGED)")
-                continue  # Must not be flagged
+                _sniper_near_misses.append(f"{sym_diag}(UP_Flag={_snp_up_flag} Down_Flag={_snp_down_flag} UP={_snp_up_score:.3f} DN={_snp_down_score:.3f})")
+                continue  # BOTH must be clean (no flags)
             
             # Get direction from IntradayScorer
             _cd = _cycle_decs.get(sym, {})
@@ -1391,26 +2051,26 @@ class AutonomousTrader:
                 pass  # No XGB directional opinion — proceed on GMM cleanliness + IntradayScorer
             elif (_xgb_signal == 'UP' and direction == 'SELL') or (_xgb_signal == 'DOWN' and direction == 'BUY'):
                 # XGB actively opposes trade direction
-                # DR INTERPRETATION: high dr confirms XGB direction is real
+                # FIXED: use gmm_confirms_direction (clean = confirms XGB), not raw dr_flag
                 sym_clean_tmp = sym.replace('NSE:', '')
-                _sniper_dr_flag = ml.get('ml_down_risk_flag', False)
-                if _sniper_dr_flag:
-                    # HIGH dr → GMM confirms XGB opposing direction → check ML_OVERRIDE gates → FLIP
-                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym_clean_tmp, ml, dr_score, path='SNIPER')
+                _sniper_gmm_confirms = ml.get('ml_gmm_confirms_direction', False)
+                if _sniper_gmm_confirms:
+                    # GMM clean (no anomaly) → confirms XGB direction → check ML_OVERRIDE gates → FLIP
+                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym_clean_tmp, ml, dr_score, path='SNIPER', p_score=pre_scores.get(sym, 0))
                     if not _ovr_ok:
-                        print(f"      🚫 SNIPER ML_OVR BLOCKED: {sym_clean_tmp} — {_ovr_reason} (dr={dr_score:.3f})")
+                        print(f"      🚫 SNIPER ML_OVR BLOCKED: {sym_clean_tmp} — {_ovr_reason} ({self._dr_tag(ml)}={dr_score:.3f})")
                         _sniper_reject_counts['xgb_block'] += 1
                         continue
                     old_direction = direction
                     direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
                     _sniper_was_flipped = True
-                    print(f"      🔄 SNIPER ML_OVERRIDE_WGMM: {sym_clean_tmp} — XGB={_xgb_signal} + GMM confirms "
-                          f"(dr={dr_score:.4f}) → FLIPPED {old_direction}→{direction}")
+                    print(f"      🔄 SNIPER ML_OVERRIDE_WGMM: {sym_clean_tmp} — XGB={_xgb_signal} + GMM clean "
+                          f"({self._dr_tag(ml)}={dr_score:.4f}) → FLIPPED {old_direction}→{direction}")
                 else:
-                    # LOW dr → GMM uncertain about XGB's opposing direction → weak opposition
+                    # GMM flagged anomaly → hidden risk in XGB's direction too → unreliable
                     # Sniper needs full alignment — block on unconfirmed XGB opposition
                     print(f"      🚫 SNIPER XGB_OPPOSE: {sym_clean_tmp} — XGB={_xgb_signal} vs {direction}, "
-                          f"GMM uncertain (dr={dr_score:.3f}) → BLOCK")
+                          f"GMM anomaly ({self._dr_tag(ml)}={dr_score:.3f}) → BLOCK")
                     _sniper_reject_counts['xgb_block'] += 1
                     continue
             
@@ -1418,7 +2078,7 @@ class AutonomousTrader:
             ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
             if ml_move_prob < min_gate:
                 _sniper_reject_counts['gate_low'] += 1
-                _sniper_near_misses.append(f"{sym_diag}(gate={ml_move_prob:.2f}<{min_gate}, dr={dr_score:.3f})")
+                _sniper_near_misses.append(f"{sym_diag}(gate={ml_move_prob:.2f}<{min_gate}, {self._dr_tag(ml)}={dr_score:.3f})")
                 continue
             
             # ── ML DIRECTION CONFLICT FILTER (Sniper) ──
@@ -1437,12 +2097,12 @@ class AutonomousTrader:
                     _gmm_caution = dr_score > _dir_conflict_cfg.get('gmm_caution_threshold', 0.15)
                     if _gmm_caution:
                         print(f"      🚫 SNIPER DIRECTION BLOCK: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
-                              f"GMM dr={dr_score:.3f} → BOTH disagree")
+                              f"GMM {self._dr_tag(ml)}={dr_score:.3f} → BOTH disagree")
                         _sniper_reject_counts['dir_block'] += 1
                         continue
                     else:
                         print(f"      ⚠️ SNIPER XGB CONFLICT: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
-                              f"GMM clean (dr={dr_score:.3f}) → −{_dir_conflict_cfg.get('xgb_penalty', 15)} penalty")
+                              f"GMM clean ({self._dr_tag(ml)}={dr_score:.3f}) → −{_dir_conflict_cfg.get('xgb_penalty', 15)} penalty")
             
             # Compute smart score (same formula as model-tracker)
             p_score = pre_scores.get(sym, 0)
@@ -1458,7 +2118,7 @@ class AutonomousTrader:
             
             if smart_score < min_smart:
                 _sniper_reject_counts['smart_low'] += 1
-                _sniper_near_misses.append(f"{sym_diag}(smart={smart_score:.1f}<{min_smart}, dr={dr_score:.3f}, gate={ml_move_prob:.2f})")
+                _sniper_near_misses.append(f"{sym_diag}(smart={smart_score:.1f}<{min_smart}, {self._dr_tag(ml)}={dr_score:.3f}, gate={ml_move_prob:.2f})")
                 continue
             
             sym_clean = sym.replace('NSE:', '')
@@ -1471,6 +2131,8 @@ class AutonomousTrader:
                 'sector': sector,
                 'smart_score': round(smart_score, 2),
                 'dr_score': dr_score,
+                'up_score': _snp_up_score,
+                'down_score': _snp_down_score,
                 'ml_move_prob': ml_move_prob,
                 'p_score': p_score,
                 'was_flipped': _sniper_was_flipped,
@@ -1495,15 +2157,18 @@ class AutonomousTrader:
                         'sizing_factor': ml.get('ml_sizing_factor', 1.0),
                     },
                     'gmm_model': {
+                        'up_flag': _snp_up_flag,
+                        'down_flag': _snp_down_flag,
+                        'up_score': _snp_up_score,
+                        'down_score': _snp_down_score,
                         'down_risk_score': dr_score,
-                        'down_risk_flag': ml.get('ml_down_risk_flag', False),
                         'down_risk_bucket': ml.get('ml_down_risk_bucket', 'LOW'),
                         'gmm_confirms_direction': ml.get('ml_gmm_confirms_direction', False),
-                        'gmm_regime_used': ml.get('ml_gmm_regime_used', None),
+                        'gmm_regime_used': 'BOTH',
                         'gmm_action': 'BOOST',
                     },
                     'scored_direction': direction,
-                    'xgb_disagrees': _xgb_disagrees,
+                    'xgb_signal': _xgb_signal,
                 },
             })
         
@@ -1514,25 +2179,25 @@ class AutonomousTrader:
         print(f"   🎯 SNIPER RESULT: {_passed} candidates from {_total_syms} symbols | Rejected: {_reject_str or 'none'}")
         if candidates:
             for i, c in enumerate(candidates[:5]):
-                print(f"      #{i+1} {c['sym_clean']} {c['direction']} | dr={c['dr_score']:.4f} smart={c['smart_score']:.1f} gate={c['ml_move_prob']:.2f} | {c['sector']}")
+                print(f"      #{i+1} {c['sym_clean']} {c['direction']} | UP={c.get('up_score',0):.4f} DN={c.get('down_score',0):.4f} smart={c['smart_score']:.1f} gate={c['ml_move_prob']:.2f} | {c['sector']}")
         if _sniper_near_misses and not candidates:
             print(f"      Near misses: {' | '.join(_sniper_near_misses[:6])}")
         
         if not candidates:
             return None
         
-        # Pick the ONE with lowest dr_score (most confident CLEAN signal)
+        # Pick the ONE with lowest max(up_score, down_score) = cleanest from BOTH models
         # Tiebreak by highest smart_score
         candidates.sort(key=lambda c: (c['dr_score'], -c['smart_score']))
         pick = candidates[0]
         
         print(f"\n   🎯 GMM SNIPER: {pick['sym_clean']} ({pick['direction']}) "
-              f"| dr={pick['dr_score']:.4f} | smart={pick['smart_score']:.1f} "
+              f"| UP={pick.get('up_score',0):.4f} DN={pick.get('down_score',0):.4f} | smart={pick['smart_score']:.1f} "
               f"| gate={pick['ml_move_prob']:.2f} | {pick['sector']} "
               f"| {lot_multiplier}x lots")
         if len(candidates) > 1:
             runner_up = candidates[1]
-            print(f"      Runner-up: {runner_up['sym_clean']} (dr={runner_up['dr_score']:.4f}, smart={runner_up['smart_score']:.1f})")
+            print(f"      Runner-up: {runner_up['sym_clean']} (UP={runner_up.get('up_score',0):.4f} DN={runner_up.get('down_score',0):.4f}, smart={runner_up['smart_score']:.1f})")
         
         # Place with lot_multiplier
         _sniper_setup = 'ML_OVERRIDE_WGMM' if pick.get('was_flipped') else 'GMM_SNIPER'
@@ -1545,7 +2210,7 @@ class AutonomousTrader:
                 strike_selection="ATM",
                 use_intraday_scoring=False,
                 lot_multiplier=lot_multiplier,
-                rationale=(f"{_sniper_setup}: dr={pick['dr_score']:.4f}, smart={pick['smart_score']:.1f}, "
+                rationale=(f"{_sniper_setup}: UP={pick.get('up_score',0):.4f} DN={pick.get('down_score',0):.4f}, smart={pick['smart_score']:.1f}, "
                           f"gate={pick['ml_move_prob']:.2f}, sector={pick['sector']}, "
                           f"lots={lot_multiplier}x"),
                 setup_type=_sniper_setup,
@@ -1557,10 +2222,10 @@ class AutonomousTrader:
                 self._gmm_sniper_trades_today += 1
                 self._gmm_sniper_symbols.add(pick['sym'])
                 print(f"   ✅ GMM SNIPER PLACED: {pick['sym_clean']} ({pick['direction']}) "
-                      f"[{lot_multiplier}x lots] dr={pick['dr_score']:.4f}")
+                      f"[{lot_multiplier}x lots] UP={pick.get('up_score',0):.4f} DN={pick.get('down_score',0):.4f}")
                 
                 self._log_decision(cycle_time, pick['sym'], pick['p_score'], 'GMM_SNIPER_PLACED',
-                                  reason=(f"Sniper: dr={pick['dr_score']:.4f}, smart={pick['smart_score']:.1f}, "
+                                  reason=(f"Sniper: UP={pick.get('up_score',0):.4f} DN={pick.get('down_score',0):.4f}, smart={pick['smart_score']:.1f}, "
                                          f"gate={pick['ml_move_prob']:.2f}, lots={lot_multiplier}x"),
                                   direction=pick['direction'], setup='GMM_SNIPER')
                 
@@ -1574,6 +2239,435 @@ class AutonomousTrader:
             print(f"   ❌ GMM Sniper error for {pick['sym_clean']}: {e}")
         
         return None
+
+    # ========== TEST_GMM: PURE DR MODEL PLAY ==========
+    def _place_test_gmm_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
+        """Place trades based on GMM Regime Divergence.
+        
+        When UP and DOWN GMM models DIVERGE — one sees anomaly, the other doesn't —
+        the cross-regime disagreement IS the directional signal:
+        
+          HIGH down_score + LOW up_score → hidden bounce/UP risk → BUY CALL
+          HIGH up_score + LOW down_score → hidden crash risk     → BUY PUT
+        
+        Pure GMM play — no XGB involvement. Direction comes solely from regime divergence.
+        DOWN model (AUROC=0.62) is more reliable → CALL side gets easier thresholds.
+        UP model (AUROC=0.56) is weaker → PUT side needs higher anomaly bar.
+        
+        Tagged as 'TEST_GMM' for P&L tracking.
+        """
+        cfg = self._test_gmm_cfg
+        if not cfg.get('enabled', False):
+            return []
+        
+        # Reset on new day
+        today = datetime.now().date()
+        if today != self._test_gmm_date:
+            self._test_gmm_trades_today = 0
+            self._test_gmm_date = today
+            self._test_gmm_symbols = set()
+        
+        max_per_day = cfg.get('max_trades_per_day', 3)
+        budget = max_per_day - self._test_gmm_trades_today
+        if budget <= 0:
+            return []
+        
+        # Regime divergence thresholds
+        call_min_dn = cfg.get('call_min_down_score', 0.20)
+        call_max_up = cfg.get('call_max_up_score', 0.14)
+        put_min_up = cfg.get('put_min_up_score', 0.18)
+        put_max_dn = cfg.get('put_max_down_score', 0.14)
+        min_gap = cfg.get('min_divergence_gap', 0.06)
+        
+        # Flag-based conviction gates
+        require_signaling_flag = cfg.get('require_signaling_flag', True)
+        require_clean_no_flag = cfg.get('require_clean_no_flag', True)
+        
+        # Quality gates
+        require_xgb = cfg.get('require_xgb_agree', True)
+        min_gate = cfg.get('min_gate_prob', 0.50)
+        max_gate = cfg.get('max_gate_prob', 1.0)          # Cap: high gate = confirmed momentum, bad for contrarian
+        max_confidence = cfg.get('max_ml_confidence', 1.0) # Cap: high XGB confidence = fighting real trend
+        min_smart = cfg.get('min_smart_score', 45)
+        lot_mult = cfg.get('lot_multiplier', 1.5)
+        
+        # Build candidate pool — regime divergence plays
+        candidates = []
+        active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', [])
+                      if p.get('status', 'OPEN') == 'OPEN'}
+        
+        for sym in ml_results:
+            ml = ml_results[sym]
+            dr_score = ml.get('ml_down_risk_score', None)
+            if dr_score is None:
+                continue
+            
+            up_score = ml.get('ml_up_score', dr_score)
+            down_score = ml.get('ml_down_score', dr_score)
+            up_flag = ml.get('ml_up_flag', False)
+            down_flag = ml.get('ml_down_flag', False)
+            
+            # REGIME DIVERGENCE CHECK (score + flag conviction):
+            # BUY CALL: DOWN model HIGH (bullish anomaly) + UP model LOW (no crash)
+            call_ok = (down_score >= call_min_dn) and (up_score <= call_max_up) and ((down_score - up_score) >= min_gap)
+            # BUY PUT: UP model HIGH (bearish anomaly) + DOWN model LOW (no bounce)
+            put_ok = (up_score >= put_min_up) and (down_score <= put_max_dn) and ((up_score - down_score) >= min_gap)
+            
+            if not call_ok and not put_ok:
+                continue
+            
+            # FLAG CONVICTION: signaling regime must fire its own model-calibrated flag
+            if require_signaling_flag:
+                if call_ok and not down_flag:
+                    call_ok = False  # DOWN model score high but didn't breach its own threshold
+                if put_ok and not up_flag:
+                    put_ok = False   # UP model score high but didn't breach its own threshold
+                if not call_ok and not put_ok:
+                    continue
+            
+            # CLEAN SIDE: opposite regime must NOT flag (no conflicting anomaly)
+            if require_clean_no_flag:
+                if call_ok and up_flag:
+                    call_ok = False  # UP model also firing = confused signal, skip
+                if put_ok and down_flag:
+                    put_ok = False   # DOWN model also firing = confused signal, skip
+                if not call_ok and not put_ok:
+                    continue
+            
+            # Determine direction from regime divergence
+            if call_ok and not put_ok:
+                direction = 'BUY'
+                side_tag = 'CALL'
+                divergence_score = down_score - up_score
+            elif put_ok and not call_ok:
+                direction = 'SELL'
+                side_tag = 'PUT'
+                divergence_score = up_score - down_score
+            else:
+                # Both pass (rare) — pick stronger divergence
+                call_div = down_score - up_score
+                put_div = up_score - down_score
+                if call_div >= put_div:
+                    direction, side_tag, divergence_score = 'BUY', 'CALL', call_div
+                else:
+                    direction, side_tag, divergence_score = 'SELL', 'PUT', put_div
+            
+            # Gate: XGB P(MOVE) floor & ceiling
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+            if ml_move_prob < min_gate:
+                continue
+            if max_gate < 1.0 and ml_move_prob > max_gate:
+                continue  # Too-high gate = confirmed momentum, contrarian divergence play fails
+            
+            # Gate: XGB confidence ceiling — high confidence = fighting real trend
+            ml_conf = ml.get('ml_confidence', 0.0)
+            if max_confidence < 1.0 and ml_conf > max_confidence:
+                continue
+            
+            # Gate: XGB direction agreement (or neutral)
+            if require_xgb:
+                xgb_hint = ml.get('ml_direction_hint', 'NEUTRAL')
+                prob_up = ml.get('ml_prob_up', 0.33)
+                prob_down = ml.get('ml_prob_down', 0.33)
+                # Hard block: XGB strongly opposes our divergence direction
+                if direction == 'BUY' and xgb_hint == 'DOWN':
+                    continue
+                if direction == 'SELL' and xgb_hint == 'UP':
+                    continue
+                # Soft block: XGB leans opposite by 30%+ probability margin
+                if direction == 'BUY' and prob_down > prob_up * 1.3:
+                    continue
+                if direction == 'SELL' and prob_up > prob_down * 1.3:
+                    continue
+            
+            # Gate: minimum smart score (low bar — divergence IS the signal)
+            p_score = pre_scores.get(sym, 0)
+            if min_smart > 0 and p_score < min_smart:
+                continue
+            
+            sym_clean = sym.replace('NSE:', '')
+            
+            # Skip if already traded today (any path)
+            if sym in self._test_gmm_symbols:
+                continue
+            if sym in self._model_tracker_symbols or sym in self._gmm_sniper_symbols:
+                continue
+            if sym in active_syms:
+                continue
+            
+            candidates.append({
+                'sym': sym,
+                'sym_clean': sym_clean,
+                'direction': direction,
+                'side_tag': side_tag,
+                'up_score': up_score,
+                'down_score': down_score,
+                'divergence_score': divergence_score,
+                'dr_score': dr_score,
+                'gmm_regime': ml.get('ml_gmm_regime_used', 'UP'),
+                'ml_move_prob': ml_move_prob,
+                'p_score': p_score,
+                'ml_data': {
+                    'smart_score': p_score,
+                    'p_score': p_score,
+                    'dr_score': dr_score,
+                    'ml_move_prob': ml_move_prob,
+                    'ml_confidence': ml.get('ml_confidence', 0),
+                    'xgb_model': {
+                        'signal': ml.get('ml_signal', 'UNKNOWN'),
+                        'move_prob': ml.get('ml_move_prob', 0),
+                        'prob_up': ml.get('ml_prob_up', 0),
+                        'prob_down': ml.get('ml_prob_down', 0),
+                        'prob_flat': ml.get('ml_prob_flat', 0),
+                        'direction_bias': ml.get('ml_direction_bias', 0),
+                        'confidence': ml.get('ml_confidence', 0),
+                        'score_boost': ml.get('ml_score_boost', 0),
+                        'direction_hint': ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'model_type': ml.get('ml_model_type', 'unknown'),
+                        'sizing_factor': ml.get('ml_sizing_factor', 1.0),
+                    },
+                    'gmm_model': {
+                        'down_risk_score': dr_score,
+                        'down_risk_flag': ml.get('ml_down_risk_flag', False),
+                        'up_flag': ml.get('ml_up_flag', False),
+                        'down_flag': ml.get('ml_down_flag', False),
+                        'up_score': up_score,
+                        'down_score': down_score,
+                        'down_risk_bucket': ml.get('ml_down_risk_bucket', 'LOW'),
+                        'gmm_confirms_direction': ml.get('ml_gmm_confirms_direction', True),
+                        'gmm_regime_used': ml.get('ml_gmm_regime_used', 'BOTH'),
+                        'gmm_action': f'TEST_GMM_DIVERGE_{side_tag}',
+                        'divergence_score': round(divergence_score, 4),
+                    },
+                    'scored_direction': direction,
+                    'xgb_disagrees': False,
+                },
+            })
+        
+        if not candidates:
+            return []
+        
+        # Sort by divergence strength (largest gap → highest priority)
+        candidates.sort(key=lambda c: c['divergence_score'], reverse=True)
+        
+        # Take up to budget
+        selected = candidates[:budget]
+        
+        # Place trades
+        placed = []
+        for cand in selected:
+            _dir_label = 'BUY(CALL)' if cand['direction'] == 'BUY' else 'SELL(PUT)'
+            try:
+                result = self.tools.place_option_order(
+                    underlying=cand['sym'],
+                    direction=cand['direction'],
+                    strike_selection="ATM",
+                    use_intraday_scoring=False,
+                    lot_multiplier=lot_mult,
+                    rationale=(f"TEST_GMM_DIVERGE_{cand['side_tag']}: UP={cand['up_score']:.3f} "
+                              f"DN={cand['down_score']:.3f} gap={cand['divergence_score']:.3f} "
+                              f"gate={cand['ml_move_prob']:.2f} — regime divergence play"),
+                    setup_type='TEST_GMM',
+                    ml_data=cand.get('ml_data', {}),
+                    sector='',
+                )
+                if result and result.get('success'):
+                    self._test_gmm_trades_today += 1
+                    self._test_gmm_symbols.add(cand['sym'])
+                    placed.append(cand['sym_clean'])
+                    self._log_decision(cycle_time, cand['sym'], cand['p_score'], 'TEST_GMM_PLACED',
+                                      reason=(f"Diverge {cand['side_tag']}: UP={cand['up_score']:.3f} "
+                                              f"DN={cand['down_score']:.3f} gap={cand['divergence_score']:.3f}"),
+                                      direction=cand['direction'], setup='TEST_GMM')
+                else:
+                    error = result.get('error', 'unknown') if result else 'no result'
+                    print(f"   ⚠️ TEST_GMM failed: {cand['sym_clean']}: {error}")
+            except Exception as e:
+                print(f"   ❌ TEST_GMM error: {cand['sym_clean']}: {e}")
+        
+        if placed:
+            remaining = max_per_day - self._test_gmm_trades_today
+        
+        return placed
+
+    def _place_test_xgb_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
+        """Place trades purely based on XGBoost model — bypass GMM, smart_score, all other gates.
+        
+        Direction from XGB directional probabilities (prob_up vs prob_down).
+        Conviction from gate model P(MOVE).
+        No GMM/DR gating, no smart_score, no IntradayScorer direction.
+        Pure XGB conviction play for testing XGB accuracy in isolation.
+        
+        Tagged as 'TEST_XGB' for P&L tracking.
+        """
+        cfg = self._test_xgb_cfg
+        if not cfg.get('enabled', False):
+            return []
+        
+        # Reset on new day
+        today = datetime.now().date()
+        if today != self._test_xgb_date:
+            self._test_xgb_trades_today = 0
+            self._test_xgb_date = today
+            self._test_xgb_symbols = set()
+        
+        max_per_day = cfg.get('max_trades_per_day', 3)
+        budget = max_per_day - self._test_xgb_trades_today
+        if budget <= 0:
+            return []
+        
+        # XGB conviction thresholds
+        min_move = cfg.get('min_move_prob', 0.58)
+        min_dir_prob = cfg.get('min_directional_prob', 0.42)
+        min_dir_margin = cfg.get('min_directional_margin', 0.10)
+        lot_mult = cfg.get('lot_multiplier', 1.0)
+        
+        # Build candidate pool — pure XGB plays
+        candidates = []
+        active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', [])
+                      if p.get('status', 'OPEN') == 'OPEN'}
+        
+        for sym in ml_results:
+            ml = ml_results[sym]
+            
+            # Gate: P(MOVE) must be strong
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+            if ml_move_prob < min_move:
+                continue
+            
+            # Direction: from prob_up vs prob_down
+            prob_up = ml.get('ml_prob_up', 0.33)
+            prob_down = ml.get('ml_prob_down', 0.33)
+            margin = abs(prob_up - prob_down)
+            
+            # Must have clear directional lean
+            if margin < min_dir_margin:
+                continue
+            
+            if prob_up > prob_down and prob_up >= min_dir_prob:
+                direction = 'BUY'
+                side_tag = 'CALL'
+                conviction = prob_up
+            elif prob_down > prob_up and prob_down >= min_dir_prob:
+                direction = 'SELL'
+                side_tag = 'PUT'
+                conviction = prob_down
+            else:
+                continue
+            
+            sym_clean = sym.replace('NSE:', '')
+            
+            # Skip if already traded today (any path)
+            if sym in self._test_xgb_symbols:
+                continue
+            if sym in self._model_tracker_symbols or sym in self._gmm_sniper_symbols:
+                continue
+            if sym in self._test_gmm_symbols:
+                continue
+            if sym in active_syms:
+                continue
+            
+            dr_score = ml.get('ml_down_risk_score', 0)
+            p_score = pre_scores.get(sym, 0)
+            
+            candidates.append({
+                'sym': sym,
+                'sym_clean': sym_clean,
+                'direction': direction,
+                'side_tag': side_tag,
+                'ml_move_prob': ml_move_prob,
+                'prob_up': prob_up,
+                'prob_down': prob_down,
+                'conviction': conviction,
+                'margin': margin,
+                'dr_score': dr_score,
+                'p_score': p_score,
+                'ml_data': {
+                    'smart_score': 0,  # Not used — pure XGB play
+                    'p_score': p_score,
+                    'dr_score': dr_score,
+                    'ml_move_prob': ml_move_prob,
+                    'ml_confidence': ml.get('ml_confidence', 0),
+                    'xgb_model': {
+                        'signal': ml.get('ml_signal', 'UNKNOWN'),
+                        'move_prob': ml_move_prob,
+                        'prob_up': prob_up,
+                        'prob_down': prob_down,
+                        'prob_flat': ml.get('ml_prob_flat', 0),
+                        'direction_bias': ml.get('ml_direction_bias', 0),
+                        'confidence': ml.get('ml_confidence', 0),
+                        'score_boost': ml.get('ml_score_boost', 0),
+                        'direction_hint': ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'model_type': ml.get('ml_model_type', 'unknown'),
+                        'sizing_factor': ml.get('ml_sizing_factor', 1.0),
+                    },
+                    'gmm_model': {
+                        'down_risk_score': dr_score,
+                        'down_risk_flag': ml.get('ml_down_risk_flag', False),
+                        'up_flag': ml.get('ml_up_flag', False),
+                        'down_flag': ml.get('ml_down_flag', False),
+                        'up_score': ml.get('ml_up_score', dr_score),
+                        'down_score': ml.get('ml_down_score', dr_score),
+                        'down_risk_bucket': ml.get('ml_down_risk_bucket', 'LOW'),
+                        'gmm_confirms_direction': ml.get('ml_gmm_confirms_direction', True),
+                        'gmm_regime_used': ml.get('ml_gmm_regime_used', 'BOTH'),
+                        'gmm_action': f'TEST_XGB_{side_tag}',
+                    },
+                    'scored_direction': direction,
+                    'xgb_disagrees': False,
+                },
+            })
+        
+        if not candidates:
+            return []
+        
+        # Sort by XGB conviction: highest P(MOVE) * directional_margin first
+        candidates.sort(key=lambda c: c['ml_move_prob'] * c['margin'], reverse=True)
+        
+        # Take up to budget
+        selected = candidates[:budget]
+        
+        # Place trades
+        placed = []
+        for cand in selected:
+            _dir_label = 'BUY(CALL)' if cand['direction'] == 'BUY' else 'SELL(PUT)'
+            try:
+                # Pass pre-fetched market_data so IV crush gate can compute RV (ATR-based)
+                _sym_md = market_data.get(cand['sym'], {})
+                if not _sym_md:
+                    _sym_md = market_data.get(cand['sym_clean'], {})
+                result = self.tools.place_option_order(
+                    underlying=cand['sym'],
+                    direction=cand['direction'],
+                    strike_selection="ATM",
+                    use_intraday_scoring=False,
+                    lot_multiplier=lot_mult,
+                    rationale=(f"TEST_XGB_{cand['side_tag']}: P(MOVE)={cand['ml_move_prob']:.2f} "
+                              f"P(UP)={cand['prob_up']:.2f} P(DN)={cand['prob_down']:.2f} "
+                              f"margin={cand['margin']:.2f} — pure XGB play"),
+                    setup_type='TEST_XGB',
+                    ml_data=cand.get('ml_data', {}),
+                    sector='',
+                    pre_fetched_market_data=_sym_md if _sym_md else None,
+                )
+                if result and result.get('success'):
+                    self._test_xgb_trades_today += 1
+                    self._test_xgb_symbols.add(cand['sym'])
+                    placed.append(cand['sym_clean'])
+                    self._log_decision(cycle_time, cand['sym'], cand['p_score'], 'TEST_XGB_PLACED',
+                                      reason=(f"XGB {cand['side_tag']}: P(MOVE)={cand['ml_move_prob']:.2f} "
+                                              f"margin={cand['margin']:.2f}"),
+                                      direction=cand['direction'], setup='TEST_XGB')
+                else:
+                    error = result.get('error', 'unknown') if result else 'no result'
+                    print(f"   \u26a0\ufe0f TEST_XGB failed: {cand['sym_clean']}: {error}")
+            except Exception as e:
+                print(f"   \u274c TEST_XGB error: {cand['sym_clean']}: {e}")
+        
+        if placed:
+            remaining = max_per_day - self._test_xgb_trades_today
+        
+        return placed
 
     # ========== ADAPTIVE SCAN INTERVAL ==========
     def _adapt_scan_interval(self, pre_scores: dict):
@@ -1652,19 +2746,23 @@ class AutonomousTrader:
                               extra={'change_pct': round(chg, 2)})
     
     def _save_orb_state(self):
-        """Persist ORB trade tracking to disk for restart safety"""
+        """Persist ORB trade tracking to SQLite for restart safety"""
         try:
-            state = {
-                'date': str(self.orb_tracking_date),
-                'trades': self.orb_trades_today
-            }
-            atomic_json_save(self._orb_state_file, state, indent=0)
+            get_state_db().save_orb_trades(self.orb_trades_today)
         except Exception as e:
             print(f"⚠️ Failed to save ORB state: {e}")
 
     def _load_orb_state(self):
-        """Load persisted ORB state; returns empty if file missing or stale date"""
+        """Load persisted ORB state from SQLite; returns empty if missing or stale"""
         today = datetime.now().date()
+        try:
+            trades = get_state_db().load_orb_trades(str(today))
+            if trades is not None:
+                count = sum(1 for s in trades.values() for d, v in s.items() if v)
+                return trades, today
+        except Exception as e:
+            print(f"⚠️ Failed to load ORB state from SQLite: {e}")
+        # Fallback: legacy JSON
         try:
             if os.path.exists(self._orb_state_file):
                 with open(self._orb_state_file, 'r') as f:
@@ -1672,12 +2770,9 @@ class AutonomousTrader:
                 saved_date = state.get('date', '')
                 if saved_date == str(today):
                     trades = state.get('trades', {})
-                    count = sum(1 for s in trades.values() for d, v in s.items() if v)
-                    if count:
-                        print(f"📊 ORB state restored: {count} direction(s) already traded today")
                     return trades, today
         except Exception as e:
-            print(f"⚠️ Failed to load ORB state: {e}")
+            print(f"⚠️ Failed to load ORB state from JSON: {e}")
         return {}, today
 
     def _reset_orb_tracker_if_new_day(self):
@@ -1687,7 +2782,7 @@ class AutonomousTrader:
             self.orb_trades_today = {}
             self.orb_tracking_date = today
             self._save_orb_state()
-            print(f"📅 New trading day - ORB tracker reset")
+            # print(f"📅 New trading day - ORB tracker reset")
     
     def _is_orb_trade_allowed(self, symbol: str, direction: str) -> bool:
         """Check if ORB trade is allowed (once per direction per symbol per day)"""
@@ -1789,7 +2884,8 @@ class AutonomousTrader:
                 registered += 1
         
         if registered:
-            print(f"📊 Exit Manager: Synced {registered} existing positions for exit management")
+            # print(f"📊 Exit Manager: Synced {registered} existing positions for exit management")
+            pass
     
     def _mark_orb_trade_taken(self, symbol: str, direction: str):
         """Mark ORB direction as used for symbol today"""
@@ -1798,7 +2894,7 @@ class AutonomousTrader:
             self.orb_trades_today[symbol] = {"UP": False, "DOWN": False}
         self.orb_trades_today[symbol][direction] = True
         self._save_orb_state()
-        print(f"📊 ORB {direction} marked as taken for {symbol} today")
+        # print(f"📊 ORB {direction} marked as taken for {symbol} today")
     
     def start_realtime_monitor(self):
         """Start the real-time position monitor in a separate thread"""
@@ -1808,14 +2904,14 @@ class AutonomousTrader:
         self.monitor_running = True
         self.monitor_thread = threading.Thread(target=self._realtime_monitor_loop, daemon=True)
         self.monitor_thread.start()
-        print("⚡ Real-time monitor started")
+        # print("⚡ Real-time monitor started")
     
     def stop_realtime_monitor(self):
         """Stop the real-time monitor"""
         self.monitor_running = False
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
-        print("⚡ Real-time monitor stopped")
+        # print("⚡ Real-time monitor stopped")
     
     def _proactive_loss_hedge_check(self):
         """Proactive loss-based hedge: every 60s check open naked options.
@@ -1926,7 +3022,8 @@ class AutonomousTrader:
                 except Exception as e:
                     print(f"   ⚠️ PLH exception: {e}")
             elif log_checks and loss_pct > 3:  # Log positions approaching trigger
-                print(f"   [PLH] {symbol} loss {loss_pct:.1f}% (trigger at {loss_trigger}%)")
+                # print(f"   [PLH] {symbol} loss {loss_pct:.1f}% (trigger at {loss_trigger}%)")
+                pass
 
         if hedged_this_cycle:
             print(f"\n🛡️ PROACTIVE HEDGE CYCLE: converted {len(hedged_this_cycle)} positions")
@@ -1935,11 +3032,21 @@ class AutonomousTrader:
         """Continuous loop that checks positions every few seconds"""
         candle_timer = 0  # Track time for candle increment
         _proactive_hedge_timer = 0  # Track time for proactive hedge check
+        _profit_target_timer = 0  # Track time for profit target check (every 60s)
         while self.monitor_running:
             try:
                 if self.is_trading_hours():
                     self._check_positions_realtime()
                     self._check_eod_exit()  # Check if need to exit before close
+
+                    # === PORTFOLIO PROFIT TARGET (every 60s) ===
+                    _profit_target_timer += self.monitor_interval
+                    if _profit_target_timer >= 60:
+                        _profit_target_timer = 0
+                        try:
+                            self._check_portfolio_profit_target()
+                        except Exception as _pt_err:
+                            print(f"   \u26a0\ufe0f Profit target check error: {_pt_err}")
                     
                     # === PROACTIVE LOSS HEDGE (every 60s) ===
                     _proactive_hedge_timer += self.monitor_interval
@@ -2134,6 +3241,288 @@ class AutonomousTrader:
                     unrealized = self.risk_governor._calc_unrealized_pnl(open_pos)
                     self.risk_governor.record_trade_result(trade['symbol'], pnl, pnl > 0, unrealized_pnl=unrealized)
                     self.risk_governor.update_capital(self.capital)
+
+                # ── EOD DB maintenance (runs once after all positions closed) ──
+                self._eod_db_maintenance()
+
+    def _eod_db_maintenance(self):
+        """Run after EOD close: WAL checkpoint + purge stale data (>30 days)."""
+        if getattr(self, '_eod_maintenance_done', False):
+            return
+        self._eod_maintenance_done = True
+        try:
+            from state_db import get_state_db
+            db = get_state_db()
+            # Checkpoint WAL → merge into main DB file
+            db.checkpoint()
+            # Purge data older than 30 days
+            cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            with db._lock:
+                for tbl in ['active_trades', 'exit_states', 'order_idempotency',
+                            'data_health', 'reconciliation_state', 'orb_trades', 'risk_state']:
+                    db._conn.execute(f"DELETE FROM [{tbl}] WHERE date < ?", (cutoff,))
+                # slippage_log: keep last 500
+                db._conn.execute(
+                    "DELETE FROM slippage_log WHERE id NOT IN (SELECT id FROM slippage_log ORDER BY id DESC LIMIT 500)"
+                )
+                # daily_state: keep last 30 days
+                db._conn.execute("DELETE FROM daily_state WHERE date < ?", (cutoff,))
+                db._conn.commit()
+            print(f"🗄️ EOD DB maintenance: checkpoint + purge (cutoff {cutoff})")
+        except Exception as e:
+            print(f"⚠️ EOD DB maintenance error: {e}")
+
+    def _check_portfolio_profit_target(self):
+        """KILL-ALL PROFIT SWITCH: Close ALL positions when cumulative unrealized P&L >= 15% of capital.
+        
+        Uses _compute_live_unrealized_pnl() for real-time unrealized P&L.
+        Runs every 60s in background. After booking profit, resets so next scan can continue.
+        """
+        if self._profit_target_hit:
+            return  # Close-all already in progress this cycle
+        
+        from config import HARD_RULES
+        target_pct = HARD_RULES.get('PORTFOLIO_PROFIT_TARGET', 0.15)
+        target_amount = self.start_capital * target_pct
+        
+        unrealized = self._compute_live_unrealized_pnl()
+        if unrealized < target_amount:
+            return  # Not yet at target
+        
+        # ═══ PROFIT TARGET HIT — CLOSE EVERYTHING ═══
+        self._profit_target_hit = True
+        print(f"\n{'='*70}")
+        print(f"💰💰💰 PORTFOLIO PROFIT TARGET HIT! Unrealized: ₹{unrealized:+,.0f} >= {target_pct*100:.0f}% of ₹{self.start_capital:,.0f} (₹{target_amount:,.0f})")
+        print(f"💰💰💰 CLOSING ALL POSITIONS TO BOOK PROFIT")
+        print(f"{'='*70}\n")
+        
+        with self.tools._positions_lock:
+            active_trades = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        
+        if not active_trades:
+            return
+        
+        # Separate trade types (same pattern as _check_eod_exit)
+        regular_trades = [t for t in active_trades if not t.get('is_credit_spread', False) and not t.get('is_debit_spread', False) and not t.get('is_iron_condor', False)]
+        spread_trades_pt = [t for t in active_trades if t.get('is_credit_spread', False)]
+        debit_spread_trades_pt = [t for t in active_trades if t.get('is_debit_spread', False)]
+        ic_trades_pt = [t for t in active_trades if t.get('is_iron_condor', False)]
+        
+        # Collect all symbols for quotes
+        all_symbols = [t['symbol'] for t in regular_trades]
+        for st in spread_trades_pt:
+            sold_sym = st.get('sold_symbol', ''); hedge_sym = st.get('hedge_symbol', '')
+            if sold_sym: all_symbols.append(sold_sym)
+            if hedge_sym: all_symbols.append(hedge_sym)
+        for dt in debit_spread_trades_pt:
+            buy_sym = dt.get('buy_symbol', ''); sell_sym = dt.get('sell_symbol', '')
+            if buy_sym: all_symbols.append(buy_sym)
+            if sell_sym: all_symbols.append(sell_sym)
+        for ict in ic_trades_pt:
+            for leg in ['sold_ce_symbol', 'hedge_ce_symbol', 'sold_pe_symbol', 'hedge_pe_symbol']:
+                sym = ict.get(leg, '')
+                if sym: all_symbols.append(sym)
+        
+        if not all_symbols:
+            return
+        
+        try:
+            if self.tools.ticker and self.tools.ticker.connected:
+                ltp_data = self.tools.ticker.get_ltp_batch(all_symbols)
+                quotes = {sym: {'last_price': ltp} for sym, ltp in ltp_data.items()}
+                missing = [s for s in all_symbols if s not in quotes]
+                if missing:
+                    quotes.update(self.tools.kite.ltp(missing))
+            else:
+                quotes = self.tools.kite.ltp(all_symbols)
+        except Exception as _pt_err:
+            print(f"   ⚠️ Profit target quotes failed: {_pt_err}")
+            self._profit_target_hit = False  # Allow retry next cycle
+            return
+        
+        total_booked = 0
+        
+        # --- Close regular trades ---
+        for trade in regular_trades:
+            symbol = trade['symbol']
+            if symbol not in quotes:
+                continue
+            ltp = quotes[symbol]['last_price']
+            entry = trade['avg_price']; qty = trade['quantity']; side = trade['side']
+            pnl = (ltp - entry) * qty if side == 'BUY' else (entry - ltp) * qty
+            pnl -= calc_brokerage(entry, ltp, qty)
+            print(f"   💰 PROFIT EXIT: {symbol} @ ₹{ltp:.2f} | P&L: ₹{pnl:+,.2f}")
+            self.tools.update_trade_status(symbol, 'PROFIT_TARGET_EXIT', ltp, pnl,
+                                           exit_detail={'exit_reason': 'PORTFOLIO_PROFIT_TARGET', 'exit_type': 'PROFIT_TARGET_KILL_ALL'})
+            with self._pnl_lock:
+                self.daily_pnl += pnl; self.capital += pnl
+            total_booked += pnl
+        
+        # --- Close credit spreads ---
+        for trade in spread_trades_pt:
+            sold_sym = trade.get('sold_symbol', ''); hedge_sym = trade.get('hedge_symbol', '')
+            qty = trade['quantity']; net_credit = trade.get('net_credit', 0)
+            sold_ltp = quotes.get(sold_sym, {}).get('last_price', 0) if sold_sym else 0
+            hedge_ltp = quotes.get(hedge_sym, {}).get('last_price', 0) if hedge_sym else 0
+            current_debit = sold_ltp - hedge_ltp
+            pnl = (net_credit - current_debit) * qty
+            pnl -= calc_brokerage(net_credit, current_debit, qty)
+            print(f"   💰 PROFIT EXIT SPREAD: {trade['symbol']} | P&L: ₹{pnl:+,.2f}")
+            self.tools.update_trade_status(trade['symbol'], 'PROFIT_TARGET_EXIT', current_debit, pnl,
+                                           exit_detail={'exit_reason': 'PORTFOLIO_PROFIT_TARGET', 'exit_type': 'PROFIT_TARGET_KILL_ALL'})
+            with self._pnl_lock:
+                self.daily_pnl += pnl; self.capital += pnl
+            total_booked += pnl
+        
+        # --- Close debit spreads ---
+        for trade in debit_spread_trades_pt:
+            buy_sym = trade.get('buy_symbol', ''); sell_sym = trade.get('sell_symbol', '')
+            qty = trade['quantity']; net_debit = trade.get('net_debit', 0)
+            buy_ltp = quotes.get(buy_sym, {}).get('last_price', 0) if buy_sym else 0
+            sell_ltp = quotes.get(sell_sym, {}).get('last_price', 0) if sell_sym else 0
+            current_value = buy_ltp - sell_ltp
+            pnl = (current_value - net_debit) * qty
+            pnl -= calc_brokerage(net_debit, current_value, qty)
+            print(f"   💰 PROFIT EXIT DEBIT SPREAD: {trade['symbol']} | P&L: ₹{pnl:+,.2f}")
+            self.tools.update_trade_status(trade['symbol'], 'PROFIT_TARGET_EXIT', current_value, pnl,
+                                           exit_detail={'exit_reason': 'PORTFOLIO_PROFIT_TARGET', 'exit_type': 'PROFIT_TARGET_KILL_ALL'})
+            with self._pnl_lock:
+                self.daily_pnl += pnl; self.capital += pnl
+            total_booked += pnl
+        
+        # --- Close iron condors ---
+        for trade in ic_trades_pt:
+            qty = trade['quantity']; total_credit = trade.get('total_credit', 0)
+            s_ce = quotes.get(trade.get('sold_ce_symbol', ''), {}).get('last_price', 0)
+            h_ce = quotes.get(trade.get('hedge_ce_symbol', ''), {}).get('last_price', 0)
+            s_pe = quotes.get(trade.get('sold_pe_symbol', ''), {}).get('last_price', 0)
+            h_pe = quotes.get(trade.get('hedge_pe_symbol', ''), {}).get('last_price', 0)
+            current_debit = (s_ce - h_ce) + (s_pe - h_pe)
+            pnl = (total_credit - current_debit) * qty
+            pnl -= calc_brokerage(total_credit, current_debit, qty)
+            print(f"   💰 PROFIT EXIT IC: {trade['symbol']} | P&L: ₹{pnl:+,.2f}")
+            self.tools.update_trade_status(trade['symbol'], 'PROFIT_TARGET_EXIT', current_debit, pnl,
+                                           exit_detail={'exit_reason': 'PORTFOLIO_PROFIT_TARGET', 'exit_type': 'PROFIT_TARGET_KILL_ALL', 'strategy': 'IRON_CONDOR'})
+            with self._pnl_lock:
+                self.daily_pnl += pnl; self.capital += pnl
+            total_booked += pnl
+        
+        print(f"\n{'='*70}")
+        print(f"💰 PORTFOLIO PROFIT TARGET COMPLETE — {len(active_trades)} positions closed")
+        print(f"💰 Total Booked: ₹{total_booked:+,.0f} | Daily P&L: ₹{self.daily_pnl:+,.0f} | Capital: ₹{self.capital:,.0f}")
+        print(f"💰 Profit booked. Next scan cycle will continue as normal.")
+        print(f"{'='*70}\n")
+
+        # Log summary event to centralized trade ledger
+        try:
+            from trade_ledger import get_trade_ledger
+            get_trade_ledger().log_scan_decision(
+                symbol='PORTFOLIO',
+                action='PROFIT_TARGET_KILL_ALL',
+                reason=f"Unrealized ₹{unrealized:+,.0f} >= {target_pct*100:.0f}% of ₹{self.start_capital:,.0f}. "
+                       f"Closed {len(active_trades)} positions. Booked ₹{total_booked:+,.0f}. "
+                       f"Daily P&L: ₹{self.daily_pnl:+,.0f}",
+                source='PROFIT_TARGET',
+                direction='KILL_ALL',
+                smart_score=0,
+                dr_score=0,
+            )
+        except Exception as _ledger_err:
+            print(f"   ⚠️ Ledger log error: {_ledger_err}")
+
+        # Reset flag so the next scan cycle can take fresh entries
+        self._profit_target_hit = False
+
+    def _compute_live_unrealized_pnl(self) -> float:
+        """Compute total unrealized P&L from all open positions using live ticker quotes.
+        
+        Uses the same WebSocket cache that the real-time monitor uses.
+        Returns 0.0 if no positions or no ticker available.
+        """
+        try:
+            with self.tools._positions_lock:
+                active = [t.copy() for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+            if not active:
+                # print(f"   [RG-UNREAL] no active positions → 0")
+                return 0.0
+            
+            # Collect all symbols needed for LTP
+            all_symbols = set()
+            for t in active:
+                if t.get('is_iron_condor'):
+                    for k in ('sold_ce_symbol', 'hedge_ce_symbol', 'sold_pe_symbol', 'hedge_pe_symbol'):
+                        s = t.get(k, '')
+                        if s: all_symbols.add(s)
+                elif t.get('is_credit_spread'):
+                    for k in ('sold_symbol', 'hedge_symbol'):
+                        s = t.get(k, '')
+                        if s: all_symbols.add(s)
+                elif t.get('is_debit_spread'):
+                    for k in ('buy_symbol', 'sell_symbol'):
+                        s = t.get(k, '')
+                        if s: all_symbols.add(s)
+                else:
+                    all_symbols.add(t['symbol'])
+            
+            all_symbols.discard('')
+            if not all_symbols:
+                # print(f"   [RG-UNREAL] no symbols from {len(active)} positions → 0")
+                return 0.0
+            
+            # Fetch LTPs from WebSocket cache
+            quotes = {}
+            _ticker_ok = self.tools.ticker and self.tools.ticker.connected
+            if _ticker_ok:
+                ltp_data = self.tools.ticker.get_ltp_batch(list(all_symbols))
+                quotes = {sym: {'last_price': ltp} for sym, ltp in ltp_data.items()}
+            else:
+                try:
+                    quotes = self.tools.kite.ltp(list(all_symbols))
+                except Exception:
+                    # print(f"   [RG-UNREAL] ticker not connected, kite.ltp failed → 0")
+                    return 0.0
+            
+            if not quotes:
+                # print(f"   [RG-UNREAL] no quotes for {all_symbols} (ticker={'Y' if _ticker_ok else 'N'}) → 0")
+                return 0.0
+            
+            # Compute total unrealized P&L (mirrors _check_positions_realtime logic)
+            total = 0.0
+            for t in active:
+                if t.get('is_credit_spread'):
+                    sold_ltp = quotes.get(t.get('sold_symbol', ''), {}).get('last_price', 0)
+                    hedge_ltp = quotes.get(t.get('hedge_symbol', ''), {}).get('last_price', 0)
+                    if sold_ltp and hedge_ltp:
+                        current_debit = sold_ltp - hedge_ltp
+                        total += (t.get('net_credit', 0) - current_debit) * t['quantity']
+                elif t.get('is_debit_spread'):
+                    buy_ltp = quotes.get(t.get('buy_symbol', ''), {}).get('last_price', 0)
+                    sell_ltp = quotes.get(t.get('sell_symbol', ''), {}).get('last_price', 0)
+                    if buy_ltp and sell_ltp:
+                        current_value = buy_ltp - sell_ltp
+                        total += (current_value - t.get('net_debit', 0)) * t['quantity']
+                elif t.get('is_iron_condor'):
+                    s_ce = quotes.get(t.get('sold_ce_symbol', ''), {}).get('last_price', 0)
+                    h_ce = quotes.get(t.get('hedge_ce_symbol', ''), {}).get('last_price', 0)
+                    s_pe = quotes.get(t.get('sold_pe_symbol', ''), {}).get('last_price', 0)
+                    h_pe = quotes.get(t.get('hedge_pe_symbol', ''), {}).get('last_price', 0)
+                    if all([s_ce, h_ce, s_pe, h_pe]):
+                        ic_debit = (s_ce - h_ce) + (s_pe - h_pe)
+                        total += (t.get('total_credit', 0) - ic_debit) * t['quantity']
+                else:
+                    sym = t['symbol']
+                    ltp = quotes.get(sym, {}).get('last_price', 0)
+                    if ltp > 0:
+                        entry = t.get('avg_price', 0)
+                        qty = t.get('quantity', 0)
+                        if t.get('side', 'BUY') == 'BUY':
+                            total += (ltp - entry) * qty
+                        else:
+                            total += (entry - ltp) * qty
+            return total
+        except Exception as _unreal_err:
+            # print(f"   [RG-UNREAL] exception: {_unreal_err}")
+            return 0.0
     
     def _check_positions_realtime(self):
         """Check all positions for target/stoploss hits using Exit Manager"""
@@ -2355,6 +3744,7 @@ class AutonomousTrader:
                                             em_state.highest_price = buy_ltp  # Current high
                                             em_state.trailing_active = False
                                             em_state.breakeven_applied = False
+                                            em_state.candles_since_entry = 0  # Fresh start after unwind
                                             em_state.net_debit = 0
                                             em_state.spread_width = 0
                                             # Move state to new key
@@ -2405,7 +3795,8 @@ class AutonomousTrader:
                             trade.get('is_option', False) and
                             not trade.get('is_debit_spread', False) and
                             not trade.get('is_credit_spread', False) and
-                            not trade.get('hedged_from_tie', False)
+                            not trade.get('hedged_from_tie', False) and
+                            not trade.get('hedge_unwound', False)  # Don't re-hedge unwound positions
                         )
                         if is_naked_option:
                             from thesis_validator import ThesisResult, should_hedge_instead_of_exit
@@ -2421,8 +3812,18 @@ class AutonomousTrader:
                             _tie_entry = trade.get('avg_price', 0)
                             _tie_loss_pct = ((_tie_entry - _tie_ltp) / _tie_entry * 100) if _tie_entry > 0 and _tie_ltp > 0 else 999
                             _max_hedge_loss = _thp_tie_cfg.get('max_hedge_loss_pct', 12)
+                            # Underlying confirmation gate — don't hedge if underlying moving against us
+                            _thp_can_hedge = True
+                            _thp_ul_reason = ''
+                            _thp_em = self.exit_manager.get_trade_state(symbol)
+                            if _thp_em:
+                                _thp_ul_adverse, _thp_ul_reason = check_underlying_adverse(_thp_em, underlying_prices.get(symbol, 0))
+                                if _thp_ul_adverse:
+                                    _thp_can_hedge = False
                             if _tie_loss_pct > _max_hedge_loss:
                                 print(f"\n📉 THP: {symbol} — loss {_tie_loss_pct:.1f}% > {_max_hedge_loss}% cap — too deep to hedge, exiting")
+                            elif not _thp_can_hedge:
+                                print(f"\n   🔴 THP: {symbol} — {_thp_ul_reason} — exiting instead of hedging")
                             elif should_hedge_instead_of_exit(_tie_result):
                                 print(f"\n🛡️ THP INTERCEPT: {symbol} — {tie_check_name} is hedgeable ({_tie_loss_pct:.1f}% loss), attempting spread conversion")
                                 try:
@@ -2472,7 +3873,8 @@ class AutonomousTrader:
                             trade.get('is_option', False) and
                             not trade.get('is_debit_spread', False) and
                             not trade.get('is_credit_spread', False) and
-                            not trade.get('hedged_from_tie', False)
+                            not trade.get('hedged_from_tie', False) and
+                            not trade.get('hedge_unwound', False)  # Don't re-hedge unwound positions
                         )
                         _thp_enabled = _thp_cfg.get('enabled', False) and _thp_cfg.get('hedge_time_stop', False)
                         if _is_naked_opt and _thp_enabled:
@@ -2481,7 +3883,15 @@ class AutonomousTrader:
                             _ts_entry = trade.get('avg_price', 0)
                             _ts_loss_pct = ((_ts_entry - _ts_ltp) / _ts_entry * 100) if _ts_entry > 0 and _ts_ltp > 0 else 999
                             _max_loss_for_hedge = _thp_cfg.get('max_hedge_loss_pct', 12)
-                            if _ts_loss_pct <= _max_loss_for_hedge:
+                            # Underlying confirmation gate
+                            _ts_can_hedge = True
+                            _ts_em = self.exit_manager.get_trade_state(symbol)
+                            if _ts_em:
+                                _ts_adverse, _ts_ul_rsn = check_underlying_adverse(_ts_em, underlying_prices.get(symbol, 0))
+                                if _ts_adverse:
+                                    _ts_can_hedge = False
+                                    print(f"   🔴 THP: {symbol} — {_ts_ul_rsn} — exiting instead of hedging")
+                            if _ts_loss_pct <= _max_loss_for_hedge and _ts_can_hedge:
                                 print(f"\n🛡️ THP TIME_STOP INTERCEPT: {symbol} — dead trade ({_ts_loss_pct:.1f}% loss), hedging instead of exiting")
                                 try:
                                     hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="TIME_STOP_HEDGE")
@@ -2529,7 +3939,8 @@ class AutonomousTrader:
                             trade.get('is_option', False) and
                             not trade.get('is_debit_spread', False) and
                             not trade.get('is_credit_spread', False) and
-                            not trade.get('hedged_from_tie', False)
+                            not trade.get('hedged_from_tie', False) and
+                            not trade.get('hedge_unwound', False)  # Don't re-hedge unwound positions
                         )
                         _thp_sl_enabled = _thp_sl_cfg.get('enabled', False)
                         if _is_naked_opt_sl and _thp_sl_enabled:
@@ -2537,7 +3948,15 @@ class AutonomousTrader:
                             _sl_entry = trade.get('avg_price', 0)
                             _sl_loss_pct = ((_sl_entry - _sl_ltp) / _sl_entry * 100) if _sl_entry > 0 and _sl_ltp > 0 else 999
                             _max_sl_hedge_loss = _thp_sl_cfg.get('max_hedge_loss_pct', 20)
-                            if _sl_loss_pct <= _max_sl_hedge_loss:
+                            # Underlying confirmation gate
+                            _sl_can_hedge = True
+                            _sl_em = self.exit_manager.get_trade_state(symbol)
+                            if _sl_em:
+                                _sl_adverse, _sl_ul_rsn = check_underlying_adverse(_sl_em, underlying_prices.get(symbol, 0))
+                                if _sl_adverse:
+                                    _sl_can_hedge = False
+                                    print(f"   🔴 THP: {symbol} — {_sl_ul_rsn} — exiting at SL instead of hedging")
+                            if _sl_loss_pct <= _max_sl_hedge_loss and _sl_can_hedge:
                                 print(f"\n🛡️ THP SL_HIT INTERCEPT: {symbol} — SL hit ({_sl_loss_pct:.1f}% loss), converting to spread instead of exiting")
                                 try:
                                     hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="SL_HIT_HEDGE")
@@ -3304,12 +4723,17 @@ class AutonomousTrader:
         
         _scan_dbg("SCAN: passed check_daily_loss_limit()")
         
+        # (Profit target check runs in background every 60s — no scan gate needed)
+        
         # === RISK GOVERNOR CHECK ===
-        _rg_allowed = self.risk_governor.is_trading_allowed()
-        _scan_dbg(f"SCAN: risk_governor.is_trading_allowed() = {_rg_allowed}")
+        # Compute live unrealized P&L from ticker quotes and pass to risk governor.
+        # Positions don't have LTP data — only the ticker WebSocket has live prices.
+        _rg_unrealized = self._compute_live_unrealized_pnl()
+        _rg_allowed = self.risk_governor.is_trading_allowed(unrealized_pnl=_rg_unrealized)
+        _scan_dbg(f"SCAN: risk_governor.is_trading_allowed() = {_rg_allowed} (unrealized={_rg_unrealized:+,.0f})")
         if not _rg_allowed:
             _scan_dbg(f"SCAN: EXIT - risk governor blocked")
-            print(self.risk_governor.get_status())
+            print(self.risk_governor.get_status(unrealized_pnl=_rg_unrealized))
             return
         
         _scan_dbg("SCAN: all pre-checks passed, proceeding to scan...")
@@ -3349,7 +4773,7 @@ class AutonomousTrader:
         except Exception as _exp_err:
             print(f"   ⚠️ Expiry detection error: {_exp_err}")
         
-        print(self.risk_governor.get_status())
+        print(self.risk_governor.get_status(self.tools.paper_positions if hasattr(self, 'tools') and self.tools else []))
         self._rejected_this_cycle = set()  # Reset rejected symbols for new scan
         
         # === HOT WATCHLIST: Clean stale entries & display ===
@@ -3426,7 +4850,7 @@ class AutonomousTrader:
                     
                     # Pre-filter: use scanner results to only include stocks with meaningful movement
                     _min_change = FULL_FNO_SCAN.get('min_change_pct_filter', 0.3)
-                    _max_indicator_stocks = FULL_FNO_SCAN.get('max_indicator_stocks', 50)
+                    _max_indicator_stocks = FULL_FNO_SCAN.get('max_indicator_stocks', 40)
                     
                     # ALL F&O stocks compete equally — no curated set gets guaranteed inclusion
                     _full_universe = set()
@@ -3449,7 +4873,7 @@ class AutonomousTrader:
                         _all_vols = sorted([r.volume for r in _all_raw if r.volume > 0])
                         _vol_p75 = _all_vols[int(len(_all_vols) * 0.75)] if _all_vols else 0
                         
-                        print(f"   🔍 Quality gate input: {len(_all_raw)} raw stocks, min_change={_min_change}%, vol_p75={_vol_p75:,.0f}")
+                        # print(f"   🔍 Quality gate input: {len(_all_raw)} raw stocks, min_change={_min_change}%, vol_p75={_vol_p75:,.0f}")
                         
                         for r in _all_raw:
                             if abs(r.change_pct) < _min_change:
@@ -3485,8 +4909,8 @@ class AutonomousTrader:
                         _dropped = _after_min - len(_quality_candidates)
                         
                         # ALWAYS print gate stats for diagnostics
-                        print(f"   🔍 Quality gate: {_after_min} above min_change → {len(_quality_candidates)} passed, {_dropped} dropped")
-                        print(f"      Gate A (≥1.0% chg): {_gate_a_count} | Gate B (day extreme): {_gate_b_count} | Gate C (vol top25): {_gate_c_count}")
+                        # print(f"   🔍 Quality gate: {_after_min} above min_change → {len(_quality_candidates)} passed, {_dropped} dropped")
+                        # print(f"      Gate A (≥1.0% chg): {_gate_a_count} | Gate B (day extreme): {_gate_b_count} | Gate C (vol top25): {_gate_c_count}")
                         
                         if _quality_candidates:
                             # Rank by scorer-aligned composite (matters when >50 quality candidates)
@@ -3514,15 +4938,15 @@ class AutonomousTrader:
                                 _full_universe.add(_r.nse_symbol)
                             
                             # Show top 5 selected with reasons
-                            print(f"      Top 5 selected:")
-                            for _i, _r in enumerate(_selected[:5]):
-                                _dr2 = _r.day_high - _r.day_low
-                                _pos2 = ((_r.ltp - _r.day_low) / _dr2 * 100) if _dr2 > 0 else 50
-                                _gates = []
-                                if abs(_r.change_pct) >= 1.0: _gates.append("A:chg")
-                                if _dr2 > 0 and (_pos2 >= 85 or _pos2 <= 15): _gates.append("B:ext")
-                                if _r.volume >= _vol_p75 and _vol_p75 > 0: _gates.append("C:vol")
-                                print(f"        {_i+1}. {_r.symbol} chg={_r.change_pct:+.1f}% dayPos={_pos2:.0f}% vol={_r.volume:,.0f} gates=[{','.join(_gates)}]")
+                            # print(f"      Top 5 selected:")
+                            # for _i, _r in enumerate(_selected[:5]):
+                            #     _dr2 = _r.day_high - _r.day_low
+                            #     _pos2 = ((_r.ltp - _r.day_low) / _dr2 * 100) if _dr2 > 0 else 50
+                            #     _gates = []
+                            #     if abs(_r.change_pct) >= 1.0: _gates.append("A:chg")
+                            #     if _dr2 > 0 and (_pos2 >= 85 or _pos2 <= 15): _gates.append("B:ext")
+                            #     if _r.volume >= _vol_p75 and _vol_p75 > 0: _gates.append("C:vol")
+                            #     print(f"        {_i+1}. {_r.symbol} chg={_r.change_pct:+.1f}% dayPos={_pos2:.0f}% vol={_r.volume:,.0f} gates=[{','.join(_gates)}]")
                     
                     # Always include stocks we already hold (need exit monitoring)
                     for _t in self.tools.paper_positions:
@@ -3533,7 +4957,7 @@ class AutonomousTrader:
                     
                     scan_universe = list(_full_universe)
                     _skipped = len(_all_fo) - len(scan_universe)
-                    print(f"   📡 FULL F&O SCAN: {len(scan_universe)} stocks passing filter (skipped {_skipped} flat/illiquid from {len(_all_fo)} total)")
+                    print(f"   📡 Pre-score: {len(_quality_candidates)} quality → top {_max_indicator_stocks} selected → {len(scan_universe)} universe (skipped {_skipped} flat/illiquid from {len(_all_fo)} F&O)")
                     
                 except Exception as _e:
                     _all_fo_syms = set()
@@ -3552,13 +4976,38 @@ class AutonomousTrader:
                     _all_fo = self.market_scanner.get_all_fo_symbols()
                     _all_fo_syms = set(_all_fo)
                     if len(self._wildcard_symbols) > 0:
-                        print(f"   📡 Scan universe: {len(APPROVED_UNIVERSE)} curated + {len(self._wildcard_symbols)} wildcards = {len(scan_universe)} total (from {len(_all_fo)} F&O)")
+                        # print(f"   📡 Scan universe: {len(APPROVED_UNIVERSE)} curated + {len(self._wildcard_symbols)} wildcards = {len(scan_universe)} total (from {len(_all_fo)} F&O)")
+                        pass
                 except Exception as _e:
                     _all_fo_syms = set()
                     print(f"   ⚠️ Could not get F&O universe: {_e}")
             
             # Get fresh market data for fixed universe + wild-cards
-            market_data = self.tools.get_market_data(scan_universe)
+            # Split into 2 batches with watcher drain between them so breakout
+            # triggers don't starve during the ~60-120s indicator calculation.
+            # Each batch uses its own kite.quote() + ThreadPoolExecutor (finishes
+            # cleanly before the drain fires — no nested API calls).
+            if BREAKOUT_WATCHER.get('enabled', False) and len(scan_universe) > 10:
+                _mid = len(scan_universe) // 2
+                print(f"   📡 Market data: batch 1/{2} ({_mid} stocks)...")
+                market_data = self.tools.get_market_data(scan_universe[:_mid])
+                # === WATCHER MID-SCAN DRAIN (between market data batches) ===
+                try:
+                    self._process_breakout_triggers()
+                except Exception:
+                    pass
+                print(f"   📡 Market data: batch 2/{2} ({len(scan_universe) - _mid} stocks)...")
+                market_data.update(self.tools.get_market_data(scan_universe[_mid:]))
+            else:
+                market_data = self.tools.get_market_data(scan_universe)
+            
+            print(f"   📡 Market data: {len(market_data)} stocks fetched")
+            # === WATCHER MID-SCAN DRAIN #1 (after all market data) ===
+            try:
+                if BREAKOUT_WATCHER.get('enabled', False):
+                    self._process_breakout_triggers()
+            except Exception:
+                pass
             
             # Get volume analysis for EOD predictions
             volume_analysis = self.tools.get_volume_analysis(scan_universe)
@@ -3604,12 +5053,16 @@ class AutonomousTrader:
             _pre_up = sum(1 for s, d in sorted_data if isinstance(d, dict) and d.get('change_pct', 0) > 0.5)
             _pre_down = sum(1 for s, d in sorted_data if isinstance(d, dict) and d.get('change_pct', 0) < -0.5)
             _pre_breadth = "BULLISH" if _pre_up > _pre_down * 1.5 else "BEARISH" if _pre_down > _pre_up * 1.5 else "MIXED"
+            self._last_market_breadth = _pre_breadth  # Cache for watcher focused scans
             
             try:
                 from options_trader import get_intraday_scorer, IntradaySignal
                 _scorer = get_intraday_scorer()
                 for _sym, _d in sorted_data:
                     if not isinstance(_d, dict) or 'ltp' not in _d:
+                        continue
+                    # Skip symbols already traded by breakout watcher this cycle
+                    if _sym in self._watcher_fired_this_session:
                         continue
                     # Inject market breadth into market_data for regime-aware ORB scoring
                     _d['market_breadth'] = _pre_breadth
@@ -3650,13 +5103,13 @@ class AutonomousTrader:
                 self.tools._cached_cycle_decisions = _cycle_decisions
                 
                 # Log score distribution
-                _scored_above_49 = sum(1 for s in _pre_scores.values() if s >= 49)
+                _scored_above_52 = sum(1 for s in _pre_scores.values() if s >= 52)
                 _scored_above_45 = sum(1 for s in _pre_scores.values() if s >= 45)
-                print(f"   📊 SCORED {len(_pre_scores)} F&O stocks: {_scored_above_49} score ≥49, {_scored_above_45} score ≥45")
-                _top10 = sorted(_pre_scores.items(), key=lambda x: x[1], reverse=True)[:10]
-                if _top10:
-                    _top10_str = " | ".join(f"{s.replace('NSE:', '')}={v:.0f}" for s, v in _top10)
-                    print(f"   🏆 TOP 10: {_top10_str}")
+                print(f"   📊 Scored {len(_pre_scores)} stocks: {_scored_above_52} ≥52 (tradeable), {_scored_above_45} ≥45")
+                _top5 = sorted(_pre_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+                if _top5:
+                    _top5_str = " | ".join(f"{s.replace('NSE:', '')}={v:.0f}" for s, v in _top5)
+                    print(f"   🏆 Top 5: {_top5_str}")
                 
                 # === ML MOVE PREDICTOR: Full Titan Integration (FAIL-SAFE) ===
                 # All ML is wrapped in try/except. If model crashes, _ml_results
@@ -3711,7 +5164,8 @@ class AutonomousTrader:
                                         _sdd['date'] = _pd_sector.to_datetime(_sdd['date'])
                                         self._sector_daily_cache[_sn] = _sdd
                                 if self._sector_5min_cache:
-                                    print(f"   📊 Sector indices loaded: {', '.join(sorted(self._sector_5min_cache.keys()))}")
+                                    # print(f"   📊 Sector indices loaded: {', '.join(sorted(self._sector_5min_cache.keys()))}")
+                                    pass
                             except Exception as _sec_e:
                                 print(f"   ⚠ Sector index load: {_sec_e}")
                         
@@ -3798,10 +5252,12 @@ class AutonomousTrader:
                         
                         from concurrent.futures import ThreadPoolExecutor, as_completed
                         _ml_predictions = {}  # symbol -> prediction dict
-                        # === PERF: Only run ML for stocks with score >= 40 ===
-                        # Max ML boost is +10, pass threshold is 52. Score 40 + boost 10 = 50 (close).
-                        # Stocks below 40 won't trade regardless of ML result.
-                        _ML_SCORE_THRESHOLD = 40
+                        # === PERF: Run ML on ALL stocks for GMM DR scores ===
+                        # Sniper/TEST_GMM need ml_down_risk_score on every stock.
+                        # ML runs in parallel (8 threads, ~50ms/stock) so 50 stocks ≈ 300ms.
+                        # Previously threshold=40 caused 46/50 stocks to have no DR score,
+                        # blocking sniper entirely (no_ml=46).
+                        _ML_SCORE_THRESHOLD = 0
                         _ml_eligible = [s for s in list(_pre_scores.keys()) if _pre_scores.get(s, 0) >= _ML_SCORE_THRESHOLD]
                         _ml_skipped = len(_pre_scores) - len(_ml_eligible)
                         with ThreadPoolExecutor(max_workers=8) as _ml_executor:
@@ -3831,12 +5287,21 @@ class AutonomousTrader:
                             print(f"   🧠 ML: {len(_ml_results)} analyzed | {_ml_boosted} score-adjusted | {_ml_up} UP | {_ml_down} DOWN | {_ml_flat} FLAT | {_ml_caution} CAUTION{_skip_note}")
                         else:
                             _eligible = sum(1 for s in _pre_scores if (_candle_cache.get(s) is not None and len(_candle_cache.get(s, [])) >= 50) or (_daily_cache.get(s) is not None and len(_daily_cache.get(s, [])) >= 50))
-                            print(f"   🧠 ML: NO predictions (candle_cache={_candle_count}, daily_cache={_daily_count}, eligible={_eligible}/{len(_pre_scores)})")
+                            # print(f"   🧠 ML: NO predictions (candle_cache={_candle_count}, daily_cache={_daily_count}, eligible={_eligible}/{len(_pre_scores)})")
+                            pass
                 except Exception as _ml_err:
                     print(f"   ⚠️ ML predictor error (non-fatal, continuing without ML): {_ml_err}")
                 
                 # Store ML results for downstream use (GPT prompt, sizing, etc.)
                 self._cycle_ml_results = _ml_results
+                
+                # === WATCHER MID-SCAN DRAIN #2 (after ML, ~120-180s into scan) ===
+                try:
+                    if BREAKOUT_WATCHER.get('enabled', False):
+                        print(f"   ⚡ Watcher mid-scan drain (post-ML)...")
+                        self._process_breakout_triggers()
+                except Exception:
+                    pass
                 
                 # === OI FLOW OVERLAY: Adjust ML predictions with live options chain data ===
                 # Only analyze top-scoring F&O stocks to minimize API calls (max 15)
@@ -3844,14 +5309,16 @@ class AutonomousTrader:
                 _oi_results = {}
                 try:
                     if self._oi_analyzer and _ml_results:
-                        # Pick top stocks worth analyzing OI for (scored >=45 + have ML data)
+                        # Pick top stocks worth analyzing OI for (scored >=30 + have ML data)
+                        # Widened from 15→30 and pre_score 45→30 so sniper strategies
+                        # (OI Unwinding, PCR Extreme) see more of the universe.
                         _oi_candidates = [
                             sym for sym in list(_pre_scores.keys())
-                            if _pre_scores.get(sym, 0) >= 45 and sym in _ml_results
+                            if _pre_scores.get(sym, 0) >= 30 and sym in _ml_results
                         ]
-                        # Sort by score descending, limit to 15 to save API calls
+                        # Sort by score descending, limit to 30 to balance API cost vs sniper coverage
                         _oi_candidates.sort(key=lambda s: _pre_scores.get(s, 0), reverse=True)
-                        _oi_candidates = _oi_candidates[:15]
+                        _oi_candidates = _oi_candidates[:30]
                         
                         _oi_adjusted_count = 0
                         
@@ -3878,8 +5345,10 @@ class AutonomousTrader:
                         # Apply OI overlay to ML predictions (single-threaded — modifies shared dicts)
                         for _oi_sym, _oi_data in _oi_raw.items():
                             try:
-                                if _oi_data.get('flow_bias') != 'NEUTRAL':
-                                    _oi_results[_oi_sym] = _oi_data
+                                # Include ALL OI data in _oi_results so sniper strategies
+                                # (OIUnwinding, PCRExtreme) can see stocks with NEUTRAL flow_bias
+                                # that still have valid PCR/unwinding signals.
+                                _oi_results[_oi_sym] = _oi_data
                                 if self._ml_predictor and _oi_sym in _ml_results:
                                     self._ml_predictor.apply_oi_overlay(_ml_results[_oi_sym], _oi_data)
                                     if _ml_results[_oi_sym].get('oi_adjusted'):
@@ -3890,9 +5359,25 @@ class AutonomousTrader:
                                 pass
                         
                         if _oi_adjusted_count > 0 or _oi_results:
-                            print(f"   📊 OI: {len(_oi_candidates)} analyzed | {len(_oi_results)} directional | {_oi_adjusted_count} ML-adjusted")
+                            _directional = sum(1 for d in _oi_results.values() if d.get('flow_bias') != 'NEUTRAL')
+                            _has_unwinding = sum(1 for d in _oi_results.values()
+                                                 if d.get('nse_oi_buildup') in ('LONG_UNWINDING', 'SHORT_COVERING'))
+                            _has_pcr_extreme = sum(1 for d in _oi_results.values()
+                                                   if d.get('pcr_oi') and (d['pcr_oi'] >= 1.2 or d['pcr_oi'] <= 0.7))
+                            print(f"   📊 OI: {len(_oi_candidates)} analyzed | {len(_oi_results)} with data | "
+                                  f"{_directional} directional | {_oi_adjusted_count} ML-adjusted"
+                                  f"{f' | {_has_unwinding} unwinding' if _has_unwinding else ''}"
+                                  f"{f' | {_has_pcr_extreme} PCR-extreme' if _has_pcr_extreme else ''}")
                 except Exception as _oi_err:
                     print(f"   ⚠️ OI analyzer error (non-fatal): {_oi_err}")
+                
+                # === WATCHER MID-SCAN DRAIN #3 (after OI, ~180-240s into scan) ===
+                try:
+                    if BREAKOUT_WATCHER.get('enabled', False):
+                        print(f"   ⚡ Watcher mid-scan drain (post-OI)...")
+                        self._process_breakout_triggers()
+                except Exception:
+                    pass
                 
                 # === OI CROSS-VALIDATION ON SCORES ===
                 # If OI says BEARISH but scored direction is BUY (or vice versa),
@@ -3925,7 +5410,8 @@ class AutonomousTrader:
                     except Exception:
                         pass
                 if _oi_score_adjusted > 0:
-                    print(f"   📊 OI CROSS-VAL: {_oi_score_adjusted} stocks penalized for direction conflict")
+                    # print(f"   📊 OI CROSS-VAL: {_oi_score_adjusted} stocks penalized for direction conflict")
+                    pass
 
                 # === SECTOR INDEX CROSS-VALIDATION ON SCORES ===
                 # If sector index (NIFTY METAL, NIFTY IT, etc.) is bearish but stock
@@ -3988,6 +5474,7 @@ class AutonomousTrader:
                 for _sec_name, _sec_info in _sector_stock_map.items():
                     for _stk in _sec_info['stocks']:
                         _stock_to_sector[_stk] = (_sec_name, _sec_info['index'])
+                self._stock_to_sector = _stock_to_sector  # Cache for watcher focused scans
 
                 # Fetch sector index change% from ticker
                 _sector_index_changes = {}
@@ -4063,11 +5550,13 @@ class AutonomousTrader:
                         pass
 
                 if _sector_score_adjusted > 0:
-                    print(f"   🏭 SECTOR CROSS-VAL: {_sector_score_adjusted} stocks penalized — {', '.join(_sector_penalized_details[:5])}")
+                    # print(f"   🏭 SECTOR CROSS-VAL: {_sector_score_adjusted} stocks penalized — {', '.join(_sector_penalized_details[:5])}")
+                    pass
                 elif _sector_index_changes:
                     _bearish_secs = [f"{k.replace('NSE:NIFTY ', '')}:{v:+.1f}%" for k, v in _sector_index_changes.items() if v <= -1.0]
                     if _bearish_secs:
-                        print(f"   🏭 SECTOR INDEX: Bearish sectors: {', '.join(_bearish_secs)} (no scored stocks conflicting)")
+                        # print(f"   🏭 SECTOR INDEX: Bearish sectors: {', '.join(_bearish_secs)} (no scored stocks conflicting)")
+                        pass
 
                 # Cache sector index changes for GPT prompt section
                 self._sector_index_changes_cache = _sector_index_changes
@@ -4075,6 +5564,36 @@ class AutonomousTrader:
                 # Store OI results for GPT prompt
                 self._cycle_oi_results = _oi_results
                 
+                # === DR SCORE LEADERBOARD: Show highest & lowest DR scores ===
+                try:
+                    _dr_entries = []
+                    for _dr_sym, _dr_ml in _ml_results.items():
+                        _dr_val = _dr_ml.get('ml_down_risk_score')
+                        if _dr_val is not None:
+                            _dr_regime = _dr_ml.get('ml_gmm_regime_used', 'UP')
+                            _dr_flag_active = _dr_ml.get('ml_up_flag', False) if _dr_regime == 'UP' else _dr_ml.get('ml_down_flag', False)
+                            _dr_entries.append((_dr_sym.replace('NSE:', ''), _dr_val, _dr_flag_active))
+                    if _dr_entries:
+                        _dr_entries.sort(key=lambda x: x[1])
+                        _dr_lowest = _dr_entries[:2]
+                        _dr_highest = _dr_entries[-2:][::-1]
+                        _low_str = ' | '.join(f"{s} {d:.4f}{'⚑' if f else ''}" for s, d, f in _dr_lowest)
+                        _high_str = ' | '.join(f"{s} {d:.4f}{'⚑' if f else ''}" for s, d, f in _dr_highest)
+                        # print(f"\n   📊 DR SCORE LEADERBOARD ({len(_dr_entries)} stocks):")
+                        # print(f"      🟢 LOWEST  (safest): {_low_str}")
+                        # print(f"      🔴 HIGHEST (riskiest): {_high_str}")
+                        # Count extreme zones
+                        _ultra_low = [s for s, d, f in _dr_entries if d < 0.06]
+                        _ultra_high = [s for s, d, f in _dr_entries if d > 0.75]
+                        if _ultra_low:
+                            # print(f"      🧪 TEST_GMM ZONE (dr<6%): {', '.join(_ultra_low)} ({len(_ultra_low)} stocks)")
+                            pass
+                        if _ultra_high:
+                            # print(f"      ⚡ EXTREME HIGH (dr>75%): {', '.join(_ultra_high)} ({len(_ultra_high)} stocks)")
+                            pass
+                except Exception as _lb_err:
+                    print(f"   ⚠️ DR leaderboard error (non-fatal): {_lb_err}")
+
                 # === DOWN-RISK SOFT SCORING: Adjust pre_scores ±5 based on model ===
                 # Must happen after ML predictions are merged so ml_down_risk_score is available.
                 # Does NOT block any trades — just nudges scores for natural prioritisation.
@@ -4104,11 +5623,45 @@ class AutonomousTrader:
                     print(f"   ⚠️ GMM Sniper error (non-fatal): {_snp_err}")
                     _sniper_placed = None
                 
+                # === TEST_GMM: Pure DR model play (bypass ALL gates) ===
+                # DR < 6% = model extremely confident no downside → BUY CALL
+                # No risk gates, no scores, no XGB — pure GMM conviction play.
+                try:
+                    _test_gmm_placed = self._place_test_gmm_trades(
+                        _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
+                    )
+                except Exception as _tg_err:
+                    print(f"   ⚠️ TEST_GMM error (non-fatal): {_tg_err}")
+                    _test_gmm_placed = []
+
+                # === TEST_XGB: Pure XGBoost play (bypass GMM, smart_score) ===
+                # High P(MOVE) + clear directional lean → pure XGB conviction trade.
+                try:
+                    _test_xgb_placed = self._place_test_xgb_trades(
+                        _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
+                    )
+                except Exception as _tx_err:
+                    print(f"   ⚠️ TEST_XGB error (non-fatal): {_tx_err}")
+                    _test_xgb_placed = []
+
                 # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
                 # Scans OI data for high-edge reversal / contrarian setups.
                 # Independent from GMM Sniper — these use OI flow signals + GMM confirmation.
                 try:
                     if getattr(self, '_sniper_engine', None) and _oi_results and _ml_results:
+                        # --- Diagnostic: show OI data availability for snipers ---
+                        _snp_unwind_syms = [s.replace('NSE:', '') for s, d in _oi_results.items()
+                                            if d.get('nse_oi_buildup') in ('LONG_UNWINDING', 'SHORT_COVERING')]
+                        _snp_pcr_ext = [(s.replace('NSE:', ''), d.get('pcr_oi', 0))
+                                        for s, d in _oi_results.items()
+                                        if d.get('pcr_oi') and (d['pcr_oi'] >= 1.2 or d['pcr_oi'] <= 0.7)]
+                        if _snp_unwind_syms or _snp_pcr_ext:
+                            _diag_parts = []
+                            if _snp_unwind_syms:
+                                _diag_parts.append(f"Unwinding: {', '.join(_snp_unwind_syms[:5])}")
+                            if _snp_pcr_ext:
+                                _diag_parts.append(f"PCR↗↘: {', '.join(f'{s}({p:.2f})' for s, p in _snp_pcr_ext[:5])}")
+                            print(f"   🔎 Sniper data: {' | '.join(_diag_parts)}")
                         _active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', [])
                                        if p.get('status', 'OPEN') == 'OPEN'}
                         _cycle_time_now = datetime.now().strftime('%H:%M:%S')
@@ -4125,19 +5678,20 @@ class AutonomousTrader:
                             try:
                                 _oiu_cfg = getattr(self._sniper_engine, '_oi_cfg', {})
                                 _oiu_lot_mult = _oiu_cfg.get('lot_multiplier', 1.5)
+                                _oiu_dr_lbl = self._dr_tag(_oiu_cand.get('ml_data', {}).get('gmm_model', {}).get('gmm_regime_used', 'UP'))
                                 print(f"\n   🔫 SNIPER-OIUnwinding: {_oiu_cand['sym_clean']} ({_oiu_cand['direction']}) "
                                       f"| {_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f} "
                                       f"| chg={_oiu_cand.get('change_pct', 0):+.1f}% RSI={_oiu_cand.get('rsi', 50):.0f} "
                                       f"| exhaust={_oiu_cand.get('exhaustion_score', 0):.2f} "
                                       f"| spot→SR {_oiu_cand['dist_from_sr_pct']:.1f}% "
-                                      f"| dr={_oiu_cand['dr_score']:.4f} | smart={_oiu_cand['smart_score']:.1f} "
+                                      f"| {_oiu_dr_lbl}={_oiu_cand['dr_score']:.4f} | smart={_oiu_cand['smart_score']:.1f} "
                                       f"| {_oiu_lot_mult}x lots")
                                 _oiu_result = self.tools.place_option_order(
                                     underlying=_oiu_cand['sym'], direction=_oiu_cand['direction'],
                                     strike_selection="ATM", use_intraday_scoring=False,
                                     lot_multiplier=_oiu_lot_mult,
                                     rationale=(f"SNIPER_OI_UNWINDING: {_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f}, "
-                                              f"spot→SR={_oiu_cand['dist_from_sr_pct']:.1f}%, dr={_oiu_cand['dr_score']:.4f}, "
+                                              f"spot→SR={_oiu_cand['dist_from_sr_pct']:.1f}%, {_oiu_dr_lbl}={_oiu_cand['dr_score']:.4f}, "
                                               f"smart={_oiu_cand['smart_score']:.1f}, lots={_oiu_lot_mult}x"),
                                     setup_type='SNIPER_OI_UNWINDING',
                                     ml_data=_oiu_cand.get('ml_data', {}),
@@ -4148,7 +5702,7 @@ class AutonomousTrader:
                                     print(f"   ✅ SNIPER-OIUnwinding PLACED: {_oiu_cand['sym_clean']} ({_oiu_cand['direction']})")
                                     self._log_decision(_cycle_time_now, _oiu_cand['sym'], _oiu_cand['p_score'],
                                                       'SNIPER_OI_UNWINDING_PLACED',
-                                                      reason=f"OI={_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f}, dr={_oiu_cand['dr_score']:.4f}",
+                                                      reason=f"OI={_oiu_cand['oi_buildup']} str={_oiu_cand['oi_strength']:.2f}, {_oiu_dr_lbl}={_oiu_cand['dr_score']:.4f}",
                                                       direction=_oiu_cand['direction'], setup='SNIPER_OI_UNWINDING')
                                 else:
                                     _oiu_err = _oiu_result.get('error', 'unknown') if _oiu_result else 'no result'
@@ -4172,19 +5726,20 @@ class AutonomousTrader:
                             try:
                                 _pcr_cfg_val = getattr(self._sniper_engine, '_pcr_cfg', {})
                                 _pcr_lot_mult = _pcr_cfg_val.get('lot_multiplier', 1.5)
+                                _pcr_dr_lbl = self._dr_tag(_pcr_cand.get('ml_data', {}).get('gmm_model', {}).get('gmm_regime_used', 'UP'))
                                 _pcr_thr_info = f"thr={_pcr_cand.get('adaptive_oversold_thr', 1.35):.2f}/{_pcr_cand.get('adaptive_overbought_thr', 0.65):.2f}"
                                 _pcr_idx_tag = ' IDX✓' if _pcr_cand.get('index_agrees') else ''
                                 print(f"\n   🔫 SNIPER-PCRExtreme: {_pcr_cand['sym_clean']} ({_pcr_cand['direction']}) "
                                       f"| PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}) "
                                       f"| edge={_pcr_cand['pcr_edge']:.3f} {_pcr_thr_info}{_pcr_idx_tag} "
-                                      f"| dr={_pcr_cand['dr_score']:.4f} | smart={_pcr_cand['smart_score']:.1f} "
+                                      f"| {_pcr_dr_lbl}={_pcr_cand['dr_score']:.4f} | smart={_pcr_cand['smart_score']:.1f} "
                                       f"| {_pcr_lot_mult}x lots")
                                 _pcr_result = self.tools.place_option_order(
                                     underlying=_pcr_cand['sym'], direction=_pcr_cand['direction'],
                                     strike_selection="ATM", use_intraday_scoring=False,
                                     lot_multiplier=_pcr_lot_mult,
                                     rationale=(f"SNIPER_PCR_EXTREME: PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}), "
-                                              f"edge={_pcr_cand['pcr_edge']:.3f}, dr={_pcr_cand['dr_score']:.4f}, "
+                                              f"edge={_pcr_cand['pcr_edge']:.3f}, {_pcr_dr_lbl}={_pcr_cand['dr_score']:.4f}, "
                                               f"smart={_pcr_cand['smart_score']:.1f}, lots={_pcr_lot_mult}x"),
                                     setup_type='SNIPER_PCR_EXTREME',
                                     ml_data=_pcr_cand.get('ml_data', {}),
@@ -4195,7 +5750,7 @@ class AutonomousTrader:
                                           f"PCR={_pcr_cand['blended_pcr']:.3f}")
                                     self._log_decision(_cycle_time_now, _pcr_cand['sym'], _pcr_cand['p_score'],
                                                       'SNIPER_PCR_EXTREME_PLACED',
-                                                      reason=f"PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}), dr={_pcr_cand['dr_score']:.4f}",
+                                                      reason=f"PCR={_pcr_cand['blended_pcr']:.3f} ({_pcr_cand['pcr_regime']}), {_pcr_dr_lbl}={_pcr_cand['dr_score']:.4f}",
                                                       direction=_pcr_cand['direction'], setup='SNIPER_PCR_EXTREME')
                                 else:
                                     _pcr_err = _pcr_result.get('error', 'unknown') if _pcr_result else 'no result'
@@ -4264,7 +5819,8 @@ class AutonomousTrader:
                                         _dhan_f.write(json.dumps(_dhan_snap) + '\n')
                                         _dhan_logged += 1
                             if _dhan_logged > 0:
-                                print(f"   📋 DhanHQ OI snapshots logged: {_dhan_logged} stocks")
+                                # print(f"   📋 DhanHQ OI snapshots logged: {_dhan_logged} stocks")
+                                pass
                         
                         # Also log dedicated NSE snapshots (full strike-level data)
                         if self._oi_analyzer and hasattr(self._oi_analyzer, 'get_nse_snapshot'):
@@ -4280,7 +5836,8 @@ class AutonomousTrader:
                                         _nse_f.write(json.dumps(_nse_snap) + '\n')
                                         _nse_logged += 1
                             if _nse_logged > 0:
-                                print(f"   📋 NSE OI snapshots logged: {_nse_logged} stocks")
+                                # print(f"   📋 NSE OI snapshots logged: {_nse_logged} stocks")
+                                pass
                 except Exception:
                     pass  # Logging failure is never fatal
                 
@@ -4656,7 +6213,8 @@ class AutonomousTrader:
                     if chop_zone:
                         setup = f"⚠️CHOP-ZONE({chop_reason})"
                         if symbol in self._wildcard_symbols:
-                            print(f"   ⭐ WILDCARD CHOP-BLOCKED: {symbol} — {chop_reason}")
+                            # print(f"   ⭐ WILDCARD CHOP-BLOCKED: {symbol} — {chop_reason}")
+                            pass
                         # Decision log: chop rejection
                         self._log_decision(_cycle_time, symbol, _pre_scores.get(symbol, 0),
                                           'CHOP_FILTERED', reason=chop_reason)
@@ -4802,6 +6360,7 @@ class AutonomousTrader:
             # Filter to ONLY NFO-verified stocks (scanner loaded from actual instruments)
             fno_nfo_verified = _all_fo_syms  # Only symbols actually in NFO instruments file
             fno_opportunities = []
+            self._cycle_detected_setups = {}  # Store detected setup per symbol for GPT execution
             for symbol, data in sorted_data:
                 if isinstance(data, dict) and 'ltp' in data and symbol in fno_prefer_set and symbol in fno_nfo_verified:
                     if self.tools.is_symbol_in_active_trades(symbol):
@@ -4889,9 +6448,9 @@ class AutonomousTrader:
                         # by 12 (average micro contribution for liquid F&O stocks) to avoid
                         # filtering out stocks that would pass at trade time.
                         _micro_absent_offset = 12
-                        # GPT-selected minimum: score + micro offset must reach 60
-                        # (raw score ~48+ since micro adds ~12)
-                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 60:
+                        # GPT-selected minimum: score + micro offset must reach 66
+                        # (raw score ~54+ since micro adds ~12) [was 60, tightened Feb 27 +6pts]
+                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 66:
                             continue
                         # Append ML signal tag if available (fail-safe: empty string if not)
                         _ml_tag = ""
@@ -4910,6 +6469,8 @@ class AutonomousTrader:
                         except Exception:
                             pass
                         
+                        # Store detected setup_type for downstream GPT execution routing
+                        self._cycle_detected_setups[symbol] = setup_type
                         fno_opportunities.append(
                             f"  🎯 {symbol}: {setup_type} → place_option_order(underlying=\"{symbol}\", direction=\"{direction}\", strike_selection=\"ATM\") [{opt_type}]{_fno_score_tag}{_ml_tag}{_oi_tag}{wc_tag}"
                         )
@@ -4989,11 +6550,11 @@ class AutonomousTrader:
                                 _ds_max_dir = max(_ds_prob_up, _ds_prob_down)
                                 if _ds_ml_signal in ('UP', 'DOWN') and _ds_max_dir >= 0.50:
                                     ds_priority += 20  # Strong directional ML confirmation
-                                    print(f"      🧠 ML BOOST: {symbol} {_ds_ml_signal} prob={_ds_max_dir:.0%} → +20 priority")
+                                    # print(f"      🧠 ML BOOST: {symbol} {_ds_ml_signal} prob={_ds_max_dir:.0%} → +20 priority")
                                 elif _ds_ml_signal in ('UP', 'DOWN') and _ds_max_dir >= 0.40:
                                     ds_priority += 10  # Moderate ML confirmation
                                 elif _ds_ml_signal == 'FLAT' and _ds_prob_flat >= 0.70:
-                                    print(f"      🧠 ML SKIP: {symbol} FLAT prob={_ds_prob_flat:.0%} → skipping debit spread")
+                                    # print(f"      🧠 ML SKIP: {symbol} FLAT prob={_ds_prob_flat:.0%} → skipping debit spread")
                                     continue  # Soft skip — stock likely flat
                             except Exception:
                                 pass  # ML crash → no impact, proceed normally
@@ -5026,7 +6587,7 @@ class AutonomousTrader:
                                     if not is_liquid:
                                         print(f"   ❌ LIQUIDITY PRE-CHECK FAILED for {symbol}: {liq_reason}")
                                         continue
-                                    print(f"   ✅ Liquidity OK: {liq_reason}")
+                                    # print(f"   ✅ Liquidity OK: {liq_reason}")
                                 except Exception as liq_e:
                                     print(f"   ⚠️ Liquidity check skipped (error: {liq_e}) — proceeding anyway")
                                 
@@ -5040,14 +6601,16 @@ class AutonomousTrader:
                                     print(f"   ✅ PROACTIVE DEBIT SPREAD PLACED on {symbol}!")
                                     debit_spread_placed.append(symbol)
                                 else:
-                                    print(f"   ℹ️ Debit spread not viable for {symbol}: {result.get('error', 'unknown')}")
+                                    # print(f"   ℹ️ Debit spread not viable for {symbol}: {result.get('error', 'unknown')}")
+                                    pass
                             except Exception as e:
                                 print(f"   ⚠️ Debit spread attempt failed for {symbol}: {e}")
                         
                         if debit_spread_placed:
                             print(f"\n   🚀 PROACTIVE DEBIT SPREADS PLACED: {', '.join(debit_spread_placed)}")
                         elif debit_candidates:
-                            print(f"\n   ℹ️ {len(debit_candidates)} debit spread candidates found, none viable this cycle")
+                            # print(f"\n   ℹ️ {len(debit_candidates)} debit spread candidates found, none viable this cycle")
+                            pass
             except Exception as e:
                 print(f"   ⚠️ Proactive debit spread scan error: {e}")
             
@@ -5087,7 +6650,7 @@ class AutonomousTrader:
                                         idx_dte = (exp_d - today_date).days
                                         if idx_dte <= idx_max_dte:
                                             self._ic_eligible_today = True
-                                            print(f"   🦅 IC eligible today: {idx_sym} expiry {idx_expiry} (DTE={idx_dte}, max={idx_max_dte})")
+                                            # print(f"   🦅 IC eligible today: {idx_sym} expiry {idx_expiry} (DTE={idx_dte}, max={idx_max_dte})")
                                             break
                                 except Exception:
                                     pass
@@ -5102,12 +6665,12 @@ class AutonomousTrader:
                                         stk_dte = (exp_d - today_date).days
                                         if stk_dte <= stk_max_dte:
                                             self._ic_eligible_today = True
-                                            print(f"   🦅 IC eligible today: Stocks expiry {stk_expiry} (DTE={stk_dte}, max={stk_max_dte})")
+                                            # print(f"   🦅 IC eligible today: Stocks expiry {stk_expiry} (DTE={stk_dte}, max={stk_max_dte})")
                                 except Exception:
                                     pass
                             
                             if not self._ic_eligible_today:
-                                print(f"   🦅 IC SKIPPED TODAY: No expiry within DTE limits (index max={idx_max_dte}, stock max={stk_max_dte})")
+                                print(f"   🦅 IC SKIPPED: Not expiry day (index max_dte={idx_max_dte}, stock max_dte={stk_max_dte})")
                         except Exception as dte_err:
                             print(f"   ⚠️ IC DTE pre-check failed: {dte_err} — will skip IC scan")
                             self._ic_eligible_today = False
@@ -5144,7 +6707,7 @@ class AutonomousTrader:
                                 rsi_range = IRON_CONDOR_CONFIG.get('prefer_rsi_range', [38, 62])
                                 
                                 if idx_change > max_move:
-                                    print(f"   🦅 IC SKIP {idx_symbol}: moved {idx_change:.1f}% (>{max_move}%)")
+                                    # print(f"   🦅 IC SKIP {idx_symbol}: moved {idx_change:.1f}% (>{max_move}%)")
                                     continue
                                 
                                 # Assign a synthetic "choppy" score for IC (lower = choppier = better for IC)
@@ -5328,8 +6891,8 @@ class AutonomousTrader:
                             for symbol, data, ic_quality, mapped_score, reasons in stock_ic_candidates[:max_stock_ic]:
                                 try:
                                     reasons_str = " | ".join(reasons[:5])
-                                    print(f"\n   🦅 STOCK IC SCAN: {symbol} | Quality: {ic_quality}/100 | Chg: {abs(data.get('change_pct', 0)):.2f}% | RSI: {data.get('rsi_14', 50):.0f}")
-                                    print(f"      IC Factors: {reasons_str}")
+                                    # print(f"\n   🦅 STOCK IC SCAN: {symbol} | Quality: {ic_quality}/100 | Chg: {abs(data.get('change_pct', 0)):.2f}% | RSI: {data.get('rsi_14', 50):.0f}")
+                                    # print(f"      IC Factors: {reasons_str}")
                                     
                                     exec_result = self.tools.place_iron_condor(
                                         underlying=symbol,
@@ -5415,7 +6978,8 @@ class AutonomousTrader:
             # === DYNAMIC MAX PICKS: Scale GPT picks with signal quality ===
             _dynamic_max = self._compute_max_picks(_pre_scores, _breadth)
             if _dynamic_max != 3:
-                print(f"   📊 DYNAMIC PICKS: GPT allowed up to {_dynamic_max} trades (signal quality {'HIGH' if _dynamic_max > 3 else 'LOW'})")
+                # print(f"   📊 DYNAMIC PICKS: GPT allowed up to {_dynamic_max} trades (signal quality {'HIGH' if _dynamic_max > 3 else 'LOW'})")
+                pass
             
             # === AUTO-FIRED MESSAGE: Tell GPT which stocks were already executed ===
             if _auto_fired_syms:
@@ -5653,7 +7217,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                 _scored_dir = _cd['decision'].recommended_direction
                                 if _scored_dir in ('BUY', 'SELL'):
                                     direction = _scored_dir
-                                    print(f"   🔄 Using scored direction for {sym}: {direction} (GPT text unparseable)")
+                                    # print(f"   🔄 Using scored direction for {sym}: {direction} (GPT text unparseable)")
                         if not direction:
                             print(f"   ⚠️ Could not parse direction for {sym} from GPT response, skipping")
                             continue
@@ -5669,6 +7233,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                             _gpt_ml_signal = _gpt_ml.get('ml_signal', 'UNKNOWN')
                             _gpt_move_prob = _gpt_ml.get('ml_move_prob', _gpt_ml.get('ml_p_move', 0.0))
                             _gpt_dr_score = _gpt_ml.get('ml_down_risk_score', 0.0)
+                            _gpt_dr_lbl = self._dr_tag(_gpt_ml)
                             _gpt_xgb_disagrees = False
                             if direction == 'BUY' and _gpt_ml_signal == 'DOWN' and _gpt_move_prob >= _gpt_dir_cfg.get('min_xgb_confidence', 0.55):
                                 _gpt_xgb_disagrees = True
@@ -5677,27 +7242,41 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                             
                             if _gpt_xgb_disagrees:
                                 # XGB actively opposes GPT trade direction.
-                                # DR INTERPRETATION: high dr confirms XGB's direction is real
-                                _gpt_dr_flag = _gpt_ml.get('ml_down_risk_flag', False)
-                                if _gpt_dr_flag:
-                                    # HIGH dr → GMM confirms XGB's opposing direction
+                                # FIXED: use gmm_confirms (clean = confirms XGB), not raw dr_flag
+                                _gpt_gmm_confirms = _gpt_ml.get('ml_gmm_confirms_direction', False)
+                                if _gpt_gmm_confirms:
+                                    # GMM clean (no anomaly) → confirms XGB's opposing direction
                                     # XGB + GMM both oppose → either FLIP or BLOCK
-                                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym, _gpt_ml, _gpt_dr_score, path='GPT')
+                                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym, _gpt_ml, _gpt_dr_score, path='GPT', p_score=_pre_scores.get(f'NSE:{sym}', 0))
                                     if _ovr_ok:
                                         # Gates passed → FLIP to XGB direction
                                         old_direction = direction
                                         direction = 'BUY' if _gpt_ml_signal == 'UP' else 'SELL'
                                         _gpt_was_flipped = True
-                                        print(f"   🔄 GPT ML_OVERRIDE_WGMM: {sym} — XGB={_gpt_ml_signal} + GMM confirms "
-                                              f"(dr={_gpt_dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
+                                        print(f"   🔄 GPT ML_OVERRIDE_WGMM: {sym} — XGB={_gpt_ml_signal} + GMM clean "
+                                              f"({_gpt_dr_lbl}={_gpt_dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
                                     else:
                                         # Gates failed → BLOCK (XGB+GMM both oppose but gates not met)
                                         print(f"   🚫 GPT ML_OVR BLOCKED: {sym} — {_ovr_reason}")
                                         continue
                                 else:
-                                    # LOW dr → GMM uncertain → XGB alone opposes → allow with warning
-                                    print(f"   ⚠️ GPT XGB CONFLICT: {sym} — XGB={_gpt_ml_signal} vs GPT={direction}, "
-                                          f"GMM uncertain (dr={_gpt_dr_score:.3f}) → allowing with caution")
+                                    # GMM anomaly → check if anomaly actually CONFIRMS GPT direction
+                                    _gpt_up_flag = _gpt_ml.get('ml_up_flag', False)
+                                    _gpt_down_flag = _gpt_ml.get('ml_down_flag', False)
+                                    _gpt_anomaly_confirms = False
+                                    if direction == 'BUY' and _gpt_down_flag and not _gpt_up_flag:
+                                        _gpt_anomaly_confirms = True  # bounce confirms BUY
+                                    elif direction == 'SELL' and _gpt_up_flag and not _gpt_down_flag:
+                                        _gpt_anomaly_confirms = True  # crash confirms SELL
+                                    
+                                    if _gpt_anomaly_confirms:
+                                        print(f"   🎯 GPT GMM_CONTRARIAN: {sym} — XGB={_gpt_ml_signal} opposes but "
+                                              f"anomaly CONFIRMS GPT={direction} (UP={_gpt_ml.get('ml_up_score',0):.3f} DN={_gpt_ml.get('ml_down_score',0):.3f})")
+                                    else:
+                                        # Anomaly opposes or conflicting → BLOCK
+                                        print(f"   🚫 GPT ANOMALY_OPPOSE: {sym} — anomaly does NOT confirm {direction} "
+                                              f"(UP_Flag={_gpt_up_flag} Down_Flag={_gpt_down_flag}) → BLOCK")
+                                        continue
                         
                         try:
                             # Build ML data for GPT direct-place trades
@@ -5724,15 +7303,22 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                 'gmm_model': {
                                     'down_risk_score': _gpt_ml_full.get('ml_down_risk_score', 0),
                                     'down_risk_flag': _gpt_ml_full.get('ml_down_risk_flag', False),
+                                    'up_flag': _gpt_ml_full.get('ml_up_flag', False),
+                                    'down_flag': _gpt_ml_full.get('ml_down_flag', False),
+                                    'up_score': _gpt_ml_full.get('ml_up_score', 0),
+                                    'down_score': _gpt_ml_full.get('ml_down_score', 0),
                                     'down_risk_bucket': _gpt_ml_full.get('ml_down_risk_bucket', 'LOW'),
                                     'gmm_confirms_direction': _gpt_ml_full.get('ml_gmm_confirms_direction', False),
-                                    'gmm_regime_used': _gpt_ml_full.get('ml_gmm_regime_used', None),
+                                    'gmm_regime_used': _gpt_ml_full.get('ml_gmm_regime_used', 'BOTH'),
                                     'gmm_action': 'GPT_DIRECT',
                                 },
                                 'scored_direction': direction,
                                 'xgb_disagrees': _gpt_xgb_disagrees if '_gpt_xgb_disagrees' in dir() else False,
                             } if _gpt_ml_full else {}
-                            _gpt_setup_type = 'ML_OVERRIDE_WGMM' if _gpt_was_flipped else 'GPT'
+                            # Use detected setup_type from scanning (ORB_BREAKOUT, VWAP_TREND, etc.)
+                            # so routing in place_option_order can reverse for ORB/ELITE
+                            _detected_setup = getattr(self, '_cycle_detected_setups', {}).get(f'NSE:{sym}', '') or getattr(self, '_cycle_detected_setups', {}).get(sym, '')
+                            _gpt_setup_type = 'ML_OVERRIDE_WGMM' if _gpt_was_flipped else (_detected_setup or 'GPT')
                             # ML_OVERRIDE gates already checked before flip above
                             
                             if sym in fno_prefer_set:
@@ -5875,9 +7461,28 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                 _ts = self.tools.ticker.stats
                 _ws_status = "🟢 LIVE" if _ts['connected'] else "🔴 REST"
                 _fut_count = len(getattr(self.tools.ticker, '_futures_map', {}))
-                print(f"🔌 Ticker: {_ws_status} | Sub:{_ts['subscribed']}(+{_fut_count} futures) | Hits:{_ts['cache_hits']} | Fallbacks:{_ts['fallbacks']} | Ticks:{_ts['ticks']}")
+                # print(f"🔌 Ticker: {_ws_status} | Sub:{_ts['subscribed']}(+{_fut_count} futures) | Hits:{_ts['cache_hits']} | Fallbacks:{_ts['fallbacks']} | Ticks:{_ts['ticks']}")
             
             print(f"⏱️ Cycle: {_cycle_elapsed:.0f}s | Next scan in ~{getattr(self, '_normal_interval', 5)}min")
+            
+            # --- DR SCORE RECAP (end of cycle so it's always visible in terminal) ---
+            try:
+                _dr_recap = []
+                for _rs2, _ml2 in _ml_results.items():
+                    _dv = _ml2.get('ml_down_risk_score')
+                    if _dv is not None:
+                        _dr_recap.append((_rs2.replace('NSE:', ''), _dv))
+                if _dr_recap:
+                    _dr_recap.sort(key=lambda x: x[1])
+                    _lo = _dr_recap[:2]
+                    _hi = _dr_recap[-2:][::-1]
+                    _lo_s = ' | '.join(f"{s} {d:.4f}" for s, d in _lo)
+                    _hi_s = ' | '.join(f"{s} {d:.4f}" for s, d in _hi)
+                    # print(f"📊 DR: LOW={_lo_s} | HIGH={_hi_s}")
+            except Exception:
+                pass
+            
+            print("=" * 95)
             
             # === ADAPTIVE SCAN INTERVAL: Adjust next scan based on signal quality ===
             self._adapt_scan_interval(_pre_scores)
@@ -6209,6 +7814,16 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                     _dbg(f"ERROR: schedule.run_pending() failed: {_e}")
                     _dbg(f"TRACEBACK:\n{_tb.format_exc()}")
                 
+                # === BREAKOUT WATCHER: Drain queue every 1 second ===
+                # This runs between scan cycles — sub-second detection latency.
+                # All trade logic stays single-threaded (no race conditions).
+                try:
+                    if self.is_trading_hours() and BREAKOUT_WATCHER.get('enabled', False):
+                        self._process_breakout_triggers()
+                except Exception as _bw_e:
+                    if _loop_count % 300 == 0:  # Log watcher errors every 5 min (not spammy)
+                        _dbg(f"WARN: breakout watcher drain error: {_bw_e}")
+                
                 # Check if we need to switch from early session to normal interval
                 if not self._switched_to_normal:
                     _check_now = datetime.now()
@@ -6220,7 +7835,15 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                 
                 _loop_count += 1
                 if _loop_count % 60 == 0:  # Log heartbeat every 60s
-                    _dbg(f"HEARTBEAT: loop iteration {_loop_count}, system_state={getattr(self.risk_governor.state, 'system_state', '?')}")
+                    _watcher_stats = ''
+                    try:
+                        _tw = getattr(self.tools, 'ticker', None)
+                        if _tw and hasattr(_tw, 'breakout_watcher') and _tw.breakout_watcher:
+                            _ws = _tw.breakout_watcher.stats
+                            _watcher_stats = f" | watcher: queued={_ws.get('queued', 0)} fired={len(self._watcher_fired_this_session)}"
+                    except Exception:
+                        pass
+                    _dbg(f"HEARTBEAT: loop iteration {_loop_count}, system_state={getattr(self.risk_governor.state, 'system_state', '?')}{_watcher_stats}")
                 
                 time.sleep(1)
         except KeyboardInterrupt:

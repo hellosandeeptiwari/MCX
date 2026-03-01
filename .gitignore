@@ -8,12 +8,33 @@ __pycache__/
 zerodha_token.json
 *.env
 .env
+agentic_trader/.env
+
+# SQLite database (state is per-machine)
+*.db
+*.db-wal
+*.db-shm
+
+# Migrated JSON backups
+*.json.migrated
 
 # Logs and temporary data
 *.log
+logs/
 trade_log.json
 active_trades.json
 trade_history.json
+
+# ML models & large data (deploy separately)
+agentic_trader/ml_models/saved_models/
+agentic_trader/ml_models/data/
+*.parquet
+*.pkl
+*.joblib
+*.jsonl
+
+# Docker volumes
+grafana-data/
 
 # IDE
 .vscode/
@@ -22,3 +43,8 @@ trade_history.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Deploy temp files
+deploy/_ec2_details.json
+deploy/_launch_ec2.py
+deploy/_deploy_to_ec2.py

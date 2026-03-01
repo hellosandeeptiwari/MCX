@@ -91,6 +91,7 @@ def calc_brokerage(entry_price, exit_price, quantity):
 HARD_RULES = {
     "RISK_PER_TRADE": 0.07,         # 7% base risk per trade (tiered: 7% premium, 5% std, 4% base)
     "MAX_DAILY_LOSS": 0.20,         # 20% max daily loss
+    "PORTFOLIO_PROFIT_TARGET": 0.15,  # 15% unrealized profit → KILL ALL & book profit
     "MAX_POSITIONS": 80,            # Max simultaneous positions (spreads count as 1)
     "MAX_POSITIONS_MIXED": 80,       # Max positions in MIXED regime
     "MAX_POSITIONS_TRENDING": 80,    # Max positions in BULLISH/BEARISH regime
@@ -149,7 +150,7 @@ AUTOSLICE_ENABLED = True
 # This happens BEFORE the GPT prompt is built, so GPT only sees remaining setups.
 ELITE_AUTO_FIRE = {
     "enabled": True,
-    "elite_threshold": 65,            # Score ≥ this → auto-fire
+    "elite_threshold": 76,            # Score ≥ this → auto-fire [was 70, tightened Feb 27 +6pts]
     "max_auto_fires_per_cycle": 3,    # Max auto-fired trades per scan cycle
     "require_setup": True,            # Must have a valid setup (ORB/VWAP/MOMENTUM), not just high score
     "log_all": True,                  # Log every auto-fire decision to scan_decisions.json
@@ -189,9 +190,9 @@ ADAPTIVE_SCAN = {
 DOWN_RISK_GATING = {
     "enabled": True,
     # Direction-aware graduated soft scoring
-    # GBM outputs P(adverse) ∈ [0,1]. UP flag threshold ≈ 0.22, DOWN ≈ 0.32.
-    # If dr OPPOSES trade direction → PENALIZE (crash hurts CE, trap hurts PE)
-    # If dr CONFIRMS trade direction → BOOST (crash helps PE, trap helps CE)
+    # VAE+GMM+GBM anomaly score ∈ [0,1]. UP_Flag threshold ≈ 0.19, Down_Flag ≈ 0.23 (v5 actual).
+    # UP_Flag=True (UP regime): hidden crash risk → opposes CE/BUY, confirms PE/SELL
+    # Down_Flag=True (DOWN regime): hidden bounce risk → opposes PE/SELL, confirms CE/BUY
     "high_risk_threshold": 0.40,      # Score > this → strong penalty/boost depending on direction
     "high_risk_penalty": 15,          # Points deducted when high-dr OPPOSES trade direction
     "mid_risk_penalty": 8,            # Points deducted when flagged + opposes direction
@@ -199,11 +200,15 @@ DOWN_RISK_GATING = {
     "clean_boost": 8,                 # Points added for clean/genuine pattern or dr-confirms-direction
     "model_tracker_trades": 14,       # Exclusive model-only trades per day for tracking
     "log_rejections": True,           # Log score adjustments for diagnostics
-    # === HARD DR_SCORE GATE FOR MODEL-TRACKER ===
-    # Blocks ANY model-tracker candidate with dr_score above this — no exceptions.
-    # Prevents high-anomaly trades like PETRONET (dr=0.186), TORNTPHARM (dr=0.141).
-    # Sniper uses 0.10; model-tracker slightly looser but still strict.
-    "max_dr_score": 0.12,             # HARD cap — dr_score above this = BLOCKED (or DR_FLIP)
+    # === CONFIRM SCORE FLOOR FOR MODEL-TRACKER ===
+    # 18-case matrix gates on flags, but ALL_AGREE also needs minimum anomaly strength.
+    # Flag=True guarantees score > model threshold (UP≈0.19, DOWN≈0.23).
+    # Floor must be BELOW these thresholds so flagged stocks aren't double-filtered.
+    "min_confirm_score": 0.0,          # Flag gate is sufficient — smart_score safety weight handles quality ranking
+    "min_smart_score": 50,             # Lowered from 55 — alignment bonus (+15/+10) already boosts quality trades
+    # === ALL_AGREE AMPLIFIED BET ===
+    # All 3 models agree (Titan + GMM + XGB) = strongest conviction → amplified lot sizing
+    "all_agree_lot_multiplier": 1.5,   # 1.5x lots for ALL_AGREE (strongest conviction)
 }
 
 # === ML DIRECTION CONFLICT FILTER ===
@@ -222,29 +227,104 @@ ML_DIRECTION_CONFLICT = {
 # Extra gates for ML_OVERRIDE_WGMM (XGB+GMM override Titan direction) trades.
 # These are ON TOP OF the normal gating — ML_OVERRIDE_WGMM only fires when ALL pass.
 #
-# DR SCORE INTERPRETATION (correct):
-#   High dr in DOWN regime = stock WILL go DOWN (confirms DOWN direction)
-#   High dr in UP regime = stock WILL go UP (confirms UP direction)
-#   → ML_OVERRIDE needs HIGH dr to confirm that XGB's opposing direction is real
+# DR SCORE INTERPRETATION (correct — anomaly-based):
+#   UP_Flag=True (UP regime, high dr) = hidden DOWN risk (crash likely) → opposes BUY/CE
+#   Down_Flag=True (DOWN regime, high dr) = hidden UP risk (bounce likely) → opposes SELL/PE
+#   gmm_confirms_direction = True means NO anomaly = clean pattern = safe
+#   → ML_OVERRIDE fires when XGB opposes AND gmm_confirms_direction=True
 ML_OVERRIDE_GATES = {
-    "min_move_prob": 0.58,            # XGB gate P(MOVE) floor for overrides (vs 0.40 general)
-    "min_dr_score": 0.15,             # GMM must show strong directional confirmation (high dr = confirmed)
+    "min_move_prob": 0.56,            # XGB gate P(MOVE) floor — 0.52 was coin-flip noise, 0.56 ensures real conviction
+    "min_dr_score": 0.15,             # GMM must show clean signal (low dr = confirmed direction, high dr = anomaly)
     "min_directional_prob": 0.40,     # XGB prob_up/prob_down must show real conviction
     "max_concurrent_open": 3,         # Max simultaneously open ML_OVERRIDE_WGMM positions
+    "min_smart_score": 55,            # Smart score floor (was 58)
 }
 
 # === GMM CONTRARIAN (DR_FLIP) — Feb 24 fix ===
 # When GMM dr_score is VERY HIGH for XGB=FLAT stocks (default regime routing):
-# The high dr is a strong directional signal that Titan may be wrong.
+# The high dr is a strong anomaly signal — hidden risk that Titan may be wrong.
 # Safety: requires high Gate P(MOVE) + XGB must not strongly disagree with flipped dir.
 GMM_CONTRARIAN = {
     "enabled": True,
-    "min_dr_score": 0.15,              # Only flip when dr is convincingly high (not borderline)
-    "min_gate_prob": 0.50,             # Gate must confirm stock is moving (P(MOVE) >= 0.50)
+    "min_dr_score": 0.27,              # Anomaly floor — stronger signal required (top ~15-20% anomalies only)
+    "min_gate_prob": 0.65,             # P(MOVE) floor — contrarian needs strong gate conviction to override direction
     "max_concurrent_open": 3,          # Max simultaneously open DR_FLIP positions
     "max_trades_per_day": 4,           # Conservative daily limit — these are contrarian
     "lot_multiplier": 1.0,             # Standard lots (not boosted — contrarian = careful)
     "score_tier": "standard",          # Standard risk tier, not premium
+}
+
+# === TEST_GMM: Regime Divergence Strategy ===
+# Fires when UP and DOWN GMM models DIVERGE: one sees anomaly, the other doesn't.
+# The cross-regime disagreement IS the directional signal.
+#
+# SEMANTICS (anomaly-based, from model training):
+#   HIGH down_score = DOWN regime anomaly = hidden UP/bounce risk → BULLISH
+#   HIGH up_score   = UP regime anomaly   = hidden crash risk    → BEARISH
+#   LOW score = no anomaly = neutral (NO directional info)
+#
+# BUY CALL: DOWN model flags (bullish anomaly) + UP model clean (no crash risk)
+# BUY PUT:  UP model flags (bearish anomaly) + DOWN model clean (no bounce risk)
+#
+# Unique vs other strategies:
+#   GMM_CONTRARIAN = single high DR + XGB=FLAT → flip direction
+#   GMM_SNIPER     = both DRs clean + high conviction → amplified bet
+#   TEST_GMM       = cross-regime DIVERGENCE + XGB agrees → directional bet
+#
+# Model quality: DOWN AUROC=0.62 (decent, CALL side stronger)
+#                UP   AUROC=0.56 (weaker, PUT side needs higher bar)
+TEST_GMM = {
+    "enabled": True,
+    # CALL side (uses DOWN model, AUROC=0.62 — decent signal)
+    "call_min_down_score": 0.25,         # DOWN regime must show strong anomaly (raised from 0.20)
+    "call_max_up_score": 0.10,           # UP regime must be very clean (tightened from 0.14)
+    # PUT side (uses UP model, AUROC=0.56 — weaker, needs tighter bar)
+    "put_min_up_score": 0.22,            # UP regime must show strong anomaly (raised from 0.18)
+    "put_max_down_score": 0.10,          # DOWN regime must be very clean (tightened from 0.14)
+    # Divergence quality
+    "min_divergence_gap": 0.12,          # |high_score - low_score| minimum (raised from 0.10 — tighter quality filter)
+    # FLAG-based conviction gates (model-calibrated thresholds)
+    "require_signaling_flag": True,      # Signaling regime must FIRE its own anomaly flag
+    "require_clean_no_flag": True,       # Clean regime must NOT fire its flag (no conflicting signal)
+    # Pure GMM play — NO XGB involvement
+    "require_xgb_agree": False,          # No XGB gating — pure regime divergence signal
+    "min_gate_prob": 0.0,                # No P(MOVE) requirement — bypass XGB entirely
+    "max_gate_prob": 0.75,               # Cap P(MOVE) — too-high gate = confirmed momentum, contrarian fails
+    "max_ml_confidence": 0.55,           # Cap XGB confidence — high confidence = fighting real trend
+    "min_smart_score": 0,                # No smart score — divergence IS the signal
+    "max_trades_per_day": 3,             # Conservative — quality over quantity
+    "lot_multiplier": 1.5,               # Slight boost — divergence is unique differentiated signal
+    "score_tier": "standard",
+}
+
+# === TEST_XGB: Pure XGBoost Model Play (bypass GMM, smart_score, all other gates) ===
+# Fires purely on XGB directional conviction: high P(MOVE) + clear directional lean.
+# No GMM/DR gating, no smart_score, no IntradayScorer — pure XGB signal.
+# Direction from prob_up vs prob_down; conviction from ml_move_prob (gate model).
+#
+# Unique vs other strategies:
+#   MODEL_TRACKER = XGB + GMM + smart_score combined
+#   ML_OVERRIDE   = XGB overrides Titan direction when GMM agrees
+#   TEST_GMM      = pure GMM regime divergence, no XGB
+#   TEST_XGB      = pure XGB conviction, no GMM
+TEST_XGB = {
+    "enabled": True,
+    "min_move_prob": 0.58,               # P(MOVE) floor — gate model must be confident
+    "min_directional_prob": 0.42,        # prob_up or prob_down must exceed this for direction
+    "min_directional_margin": 0.10,      # |prob_up - prob_down| minimum for clear lean
+    "max_trades_per_day": 3,             # Conservative cap
+    "lot_multiplier": 1.0,               # Standard lots — testing phase
+    "score_tier": "standard",
+    # --- IV Crush Overrides (tighter than global IV_CRUSH_GATE) ---
+    # SIEMENS PE had IV=33% but RV was low → IV/RV was high → IV crush killed it (-9.3% in 35min).
+    # Global gate: block@2.0x, reduce@1.5x, abs 60%/45% — way too loose for pure XGB plays.
+    # XGB was right on direction, so fix belongs in options layer, not XGB caps.
+    "iv_crush_overrides": {
+        "iv_rv_ratio_hard_block": 1.4,    # Block if IV/RV > 1.4x (global: 2.0x)
+        "iv_rv_ratio_reduce_lots": 1.2,   # Halve lots if IV/RV > 1.2x (global: 1.5x)
+        "max_atm_iv_pct": 45,             # Absolute IV cap (global: 60%)
+        "reduce_atm_iv_pct": 35,          # Reduce lots above this (global: 45%)
+    },
 }
 
 # === GMM SNIPER TRADE (1 high-conviction trade per scan cycle) ===
@@ -253,14 +333,23 @@ GMM_CONTRARIAN = {
 # Separate budget from model-tracker trades.
 GMM_SNIPER = {
     "enabled": True,
-    "max_sniper_trades_per_day": 5,    # Max GMM sniper trades per day
-    "lot_multiplier": 2.0,             # 2x normal lot size
-    "min_smart_score": 52,             # Minimum smart score to qualify (relaxed from 55)
-    "max_dr_score": 0.10,              # Must be very clean (stricter than 0.15)
-    "min_gate_prob": 0.50,             # XGB gate floor for sniper (slightly relaxed from 0.55)
+    "max_sniper_trades_per_day": 8,    # Max GMM sniper trades per day
+    "lot_multiplier": 5.0,             # 5x normal lot size (was 3.0x, +2 lots Feb 26)
+    "min_smart_score": 58,             # Smart score floor for 5x lots — needs real conviction (was 52)
+    "max_updr_score": 0.12,            # Must be very clean — UP regime (threshold 0.25)
+    "max_downdr_score": 0.10,           # Relaxed 0.09→0.10 — was too strict, 0 trades fired (threshold 0.25)
+    "min_gate_prob": 0.55,             # XGB gate floor — 5x lots needs strong P(MOVE) (was 0.50)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 300000,        # ₹3 Lakh reserved exclusively for sniper trades
     "max_exposure_pct": 90,            # Max % of sniper capital usable (₹2.7L)
+}
+
+# === SECTOR BREADTH PENALTY ===
+# Penalizes smart_score when trade direction conflicts with sector index.
+# E.g., buying a METAL stock when NIFTY METAL is down >1% → penalty applied.
+SECTOR_BREADTH_PENALTY = {
+    "threshold_pct": 1.0,              # Sector must move ≥1% to trigger penalty
+    "penalty": 10,                     # Smart score deduction for counter-sector trades
 }
 
 # === SNIPER: OI UNWINDING REVERSAL (Sniper-OIUnwinding) ===
@@ -273,14 +362,15 @@ SNIPER_OI_UNWINDING = {
     "lot_multiplier": 1.5,              # 1.5x lots (conviction but conservative)
     # --- OI Unwinding Detection ---
     "required_buildups": ["LONG_UNWINDING", "SHORT_COVERING"],
-    "min_buildup_strength": 0.45,       # OI buildup signal strength >= 0.45
-    "min_oi_change_pct": 8.0,           # Dominant OI side must have changed >= 8%
+    "min_buildup_strength": 0.35,       # OI buildup signal strength >= 0.35 (relaxed from 0.45)
+    "min_oi_change_pct": 6.0,           # Dominant OI side must have changed >= 6% (relaxed from 8%)
     # --- Price Reversal at S/R ---
-    "max_distance_from_sr_pct": 1.5,    # Spot must be within 1.5% of OI support/resistance
+    "max_distance_from_sr_pct": 2.5,    # Spot must be within 2.5% of OI support/resistance (relaxed from 1.5%)
     # --- GMM Quality Gate ---
-    "max_dr_score": 0.15,               # GMM down-risk must be clean
-    "min_gate_prob": 0.45,              # XGB gate P(move) floor
-    "min_smart_score": 50,              # Minimum smart_score
+    "max_updr_score": 0.18,              # GMM clean — UP regime (relaxed from 0.15, aligned with PCR extreme)
+    "max_downdr_score": 0.15,            # GMM clean — DOWN regime (relaxed from 0.12)
+    "min_gate_prob": 0.40,              # XGB gate P(move) floor (relaxed from 0.45)
+    "min_smart_score": 50,              # Minimum smart_score — restored quality floor (45 was too loose)
     # --- Timing ---
     "earliest_entry": "09:45",          # Wait for OI data to settle
     "no_entry_after": "14:30",          # No entries after 2:30 PM
@@ -300,13 +390,15 @@ SNIPER_PCR_EXTREME = {
     "lot_multiplier": 1.5,              # 1.5x lots
     # --- PCR Extreme Detection ---
     "pcr_oversold_threshold": 1.35,     # PCR >= 1.35 → market oversold → BUY
-    "pcr_overbought_threshold": 0.65,   # PCR <= 0.65 → market overbought → SELL
+    "pcr_overbought_threshold": 0.60,   # PCR <= 0.60 → market overbought → SELL (0.55 too tight, kills strategy)
+    "min_pcr_edge": 0.05,               # Min distance beyond threshold — blocks hair-trigger entries (ABCAPITAL edge=0.01 lesson)
     # --- Index PCR (Macro Confirmation) ---
     "use_index_pcr": True,              # Also check NIFTY PCR for macro regime
     "index_symbol": "NIFTY",            # Index to check
     "index_pcr_weight": 0.4,            # Blend: 60% stock PCR + 40% index PCR
     # --- GMM Quality Gate ---
-    "max_dr_score": 0.18,               # Slightly relaxed — PCR is strong standalone signal
+    "max_updr_score": 0.18,              # Slightly relaxed — PCR is strong standalone signal (UP regime, threshold 0.25)
+    "max_downdr_score": 0.14,            # PCR strong standalone — DOWN regime (threshold 0.25)
     "min_gate_prob": 0.40,              # XGB gate P(move) floor
     "min_smart_score": 45,              # Lower floor — PCR extreme itself is high-edge
     # --- Timing ---
@@ -419,12 +511,12 @@ CREDIT_SPREAD_CONFIG = {
     "min_credit_pct": 15,            # Minimum credit as % of spread width (was 20% — too strict, filtered viable setups)
     "preferred_credit_pct": 25,      # Preferred credit >= 25% of max risk (was 30%)
     "min_iv_percentile": 20,         # Sell options when IV is above 20th percentile (was 30% — relaxed for more entries)
-    "min_score_threshold": 50,       # Minimum intraday score to enter spread (was 57 — credit spreads need less conviction)
+    "min_score_threshold": 65,       # Minimum intraday score to enter credit spread [raised from 50]
     # --- Risk Management ---
     "sl_multiplier": 2.0,            # Exit if loss reaches 2× credit received
     "target_pct": 65,                # Exit when 65% of max credit is captured (time decay)
     "time_decay_exit_minutes": 90,   # If < 90 min to close, exit at whatever P&L
-    "max_days_to_expiry": 21,        # Stock options are monthly — accept up to 21 DTE
+    "max_days_to_expiry": 15,        # Block credit spreads beyond 15 DTE — theta decays too slowly, ties up margin
     "min_days_to_expiry": 2,         # Don't sell with <2 DTE (gamma risk)
     "max_sold_delta": 0.40,          # Sold leg delta must be ≤ 0.40 (was 0.35 — slight relaxation for more entries)
     # --- Expiry Management ---
@@ -432,7 +524,7 @@ CREDIT_SPREAD_CONFIG = {
     "rollover_at_dte": 1,            # Roll or close when 1 DTE remaining
     # --- Fallback to Naked Buys ---
     "fallback_to_buy": True,         # If spread not viable, fall back to buying options
-    "buy_only_score_threshold": 60,  # Only buy naked if score >= 60 (RAISED — naked buys face theta, need more conviction)
+    "buy_only_score_threshold": 66,  # Only buy naked if score >= 66 [was 60, tightened Feb 25]
 }
 
 # === CASH EQUITY INTRADAY SCORING CONFIG ===
@@ -456,7 +548,7 @@ DEBIT_SPREAD_CONFIG = {
     # --- Entry Filters (SMART — candle-data driven) ---
     "min_move_pct": 1.2,             # Stock must have moved >1.2% today (was 2.5% — too strict, zero triggers)
     "min_volume_ratio": 1.3,         # Volume must be 1.3× normal (was 1.5 — slightly relaxed)
-    "min_score_threshold": 57,       # Minimum intraday score for debit spread entry (reduced 8%)
+    "min_score_threshold": 65,       # Minimum intraday score for debit spread entry [raised from 57]
     # --- Candle-Smart Gates (mirrors naked buy gates 8-12) ---
     "min_follow_through_candles": 2, # Must have ≥2 follow-through candles (strongest winner signal)
     "min_adx": 28,                   # ADX ≥28 confirms trend strength (winners avg 37)
@@ -492,7 +584,7 @@ DEBIT_SPREAD_CONFIG = {
     "min_oi": 500,                   # Minimum OI on both legs
     # --- Proactive Scanning ---
     "proactive_scan": True,          # Actively scan for debit spread opportunities (not just fallback)
-    "proactive_scan_min_score": 62,  # Minimum score for proactive debit spread
+    "proactive_scan_min_score": 65,  # Minimum score for proactive debit spread [raised from 62]
     "proactive_scan_min_move_pct": 1.5,  # Proactive scan needs slightly stronger move
 }
 
@@ -535,7 +627,7 @@ PROACTIVE_HEDGE_CONFIG = {
     "enabled": True,
     "loss_trigger_pct": 8,            # Convert when loss >= 8% of entry price
     "check_interval_seconds": 60,     # Check every 60 seconds (inside realtime monitor)
-    "max_hedge_loss_pct": 20,         # Don't hedge if already > 20% loss (too deep)
+    "max_hedge_loss_pct": 50,         # Don't hedge if already > 50% loss (was 20% — too tight, let deep losses hedge too)
     "cooldown_seconds": 300,          # After a hedge, wait 5 min before checking same underlying again
     "log_checks": True,               # Log every check cycle to bot_debug.log for diagnostics
 }
@@ -559,6 +651,39 @@ EXPIRY_SHIELD_CONFIG = {
     "speed_gate_pct_0dte": 6.0,        # Need +6% gain in 20 min on 0DTE monthly (was 5%)
 }
 
+# === IV CRUSH GUARD (Entry-Side Gate) ===
+# Prevents buying options with low IV that are vulnerable to further IV compression.
+# Root cause: IOC CE bought at 22.8% IV on a 47/50 bullish day → IV compressed → lost 10.7% despite
+# underlying being directionally correct. Low IV + high breadth = vega trap.
+# Three sub-gates:
+#   1. Minimum IV Floor — reject options with IV below threshold (low IV = no edge from vol)
+#   2. Breadth-Adjusted IV Floor — raise IV floor when market is uniformly bullish/bearish
+#      (extreme breadth = low uncertainty = IV compresses market-wide)
+#   3. Min Premium Floor — reject cheap OTM options where small IV drop = huge % loss
+#   4. Vega/Delta Ratio — reject trades where vega exposure dominates delta (direction bet)
+IV_CRUSH_GUARD = {
+    "enabled": True,
+    # --- Sub-Gate 1: Absolute IV Floor ---
+    # Options with IV below this are already "cheap" — buying them is a bet that IV rises.
+    # For buying options, we need IV to stay flat or rise, not compress further.
+    "min_iv_floor": 0.23,                # 23% — reject options with IV < 23%
+    # --- Sub-Gate 2: Breadth-Adjusted IV Floor ---
+    # When breadth is extreme (most stocks same direction), uncertainty is LOW → IV compresses.
+    # Raise the IV floor dynamically based on how skewed the breadth is.
+    "breadth_extreme_threshold": 0.85,    # If >85% stocks in same direction → "extreme breadth"
+    "breadth_extreme_iv_floor": 0.32,     # Raise IV floor to 32% during extreme breadth
+    # --- Sub-Gate 3: Minimum Premium (OTM penny filter upgrade) ---
+    # Cheap options (<₹8) are disproportionately affected by IV changes:
+    #   ₹1 IV drop on ₹5.49 option = -18.2% vs ₹1 drop on ₹20 = -5%
+    # HARD_RULES.MIN_OPTION_PREMIUM (₹3) catches pennies; this catches "cheap but not penny".
+    "min_premium_for_iv_safety": 8.0,     # ₹8 minimum premium (IV-safety floor)
+    # --- Sub-Gate 4: Vega/Delta Ratio ---
+    # If vega exposure >> delta, the trade is more of a volatility bet than a direction bet.
+    # On low-IV stocks, this catches "looks directional but is really a vega trap".
+    "max_vega_delta_ratio": 0.50,         # Block if |vega/delta| > 0.50 AND IV < min floor
+    "vega_delta_iv_threshold": 0.30,      # Only apply vega/delta check below 30% IV
+}
+
 # === THETA BLEED PREVENTION (Entry-Side Gates) ===
 # Prevents naked option buys that will lose to time decay before direction plays out.
 # Root cause: options bought with high theta-to-premium ratio bleed even if direction is right.
@@ -576,6 +701,55 @@ THETA_ENTRY_GATE = {
     # Require 1.5× the normal score threshold to enter naked buys in afternoon.
     "expiry_day_pm_score_multiplier": 1.5,  # Score must be 1.5× threshold after PM cutoff
     "expiry_day_pm_after": "13:00",         # When PM multiplier kicks in (1 PM)
+}
+
+# === TARGET EXTENSION — LET WINNERS RUN ===
+# Instead of hard-exiting at target, convert to a tight trailing stop.
+# When price reaches trigger_pct of target, skip hard exit and trail with tight retention.
+# This lets winning trades run beyond target when momentum is strong.
+TARGET_EXTENSION = {
+    "enabled": True,
+    "trigger_pct": 0.90,         # Activate at 90% of target distance
+    "trail_retain_pct": 0.65,    # Lock 65% of peak profit in extension zone (35% giveback)
+    "max_extension_r": 5.0,      # Safety cap: force exit at 5R (prevents runaway positions)
+}
+
+# === ASYMMETRIC EXIT INTELLIGENCE ===
+# Reads trade TRAJECTORY, not just snapshots.
+# Losers must prove they deserve to live. Winners must prove they deserve to die.
+ASYMMETRIC_EXIT = {
+    "enabled": True,
+    # --- Premium Velocity Kill (fast-kill steady bleeders) ---
+    "velocity_kill_enabled": True,
+    "velocity_min_candles": 3,          # Need at least 3 candles of data
+    "velocity_threshold_pct": -1.5,     # Kill if avg velocity < -1.5%/candle
+    "velocity_consecutive": 3,          # Must bleed for 3 consecutive candles
+    "velocity_underlying_confirm": True, # Also check underlying isn't recovering
+    # --- Momentum-Gated Partial Profit (don't clip accelerating winners) ---
+    "momentum_gate_enabled": True,
+    "momentum_lookback_candles": 2,     # Compare last 2 candles' avg change
+    "momentum_sustain_ratio": 0.30,     # If last_2 >= first_half * 0.30 → momentum alive, skip partial
+    # --- Underlying Confirmation Gate (for THP / hold decisions) ---
+    "underlying_confirm_enabled": True,
+    "underlying_adverse_pct": 0.15,     # If underlying moved > 0.15% AGAINST direction → don't hold/hedge
+}
+
+# === IV CRUSH ENTRY GATE — BLOCK OVERPRICED OPTIONS AT ENTRY ===
+# Compares ATM IV to realized volatility (approximated from ATR).
+# When IV >> RV, you're overpaying for premium → high IV-crush risk on any mean-reversion.
+# Uses IV/RV ratio (same signal professional vol traders call "volatility risk premium").
+# Morning session gets more lenient thresholds (IV is structurally higher at open).
+IV_CRUSH_GATE = {
+    "enabled": True,
+    # --- IV/RV Ratio Thresholds ---
+    "iv_rv_ratio_hard_block": 2.0,     # Block entry if IV > 2× realized vol
+    "iv_rv_ratio_reduce_lots": 1.5,    # Halve lots if IV > 1.5× realized vol
+    # --- Absolute IV Caps ---
+    "max_atm_iv_pct": 60,              # Hard block: ATM IV > 60% (extreme overpricing)
+    "reduce_atm_iv_pct": 45,           # Halve lots: ATM IV > 45% (elevated overpricing)
+    # --- Morning IV Adjustment ---
+    "morning_iv_premium_until": "11:00",  # Before 11:00 morning IV is structurally inflated
+    "morning_ratio_penalty": 0.2,         # Add 0.2 to ratio thresholds (more lenient in morning)
 }
 
 # === GREEKS-BASED EXIT INTELLIGENCE ===

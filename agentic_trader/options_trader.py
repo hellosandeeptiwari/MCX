@@ -20,6 +20,7 @@ import numpy as np
 from scipy.stats import norm
 from config import HARD_RULES
 from config import AUTOSLICE_ENABLED
+from state_db import get_state_db
 
 # Persistent log file — always in agentic_trader/ regardless of CWD
 TRADE_DECISIONS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trade_decisions.log')
@@ -191,15 +192,15 @@ class IntradayOptionScorer:
     PARTIAL_FILL_PENALTY_RATE = 0.3   # > 30% partials = penalty
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
-    # === TRADE THRESHOLDS (Recalibrated Feb 17 after cross-validation fixes) ===
-    BLOCK_THRESHOLD = 58         # < 58 = BLOCK (naked option buy minimum)
-    STANDARD_THRESHOLD = 64      # 64-67 = Standard (ATM/ITM, 1x size)
-    PREMIUM_THRESHOLD = 68       # >= 68 = Premium (ATM/ITM, up to 1.5x)
+    # === TRADE THRESHOLDS (Tightened Feb 25 — SCORE trades losing, +6% across board) ===
+    BLOCK_THRESHOLD = 62         # < 62 = BLOCK (naked option buy minimum) [was 58]
+    STANDARD_THRESHOLD = 68      # 68-71 = Standard (ATM/ITM, 1x size) [was 64]
+    PREMIUM_THRESHOLD = 72       # >= 72 = Premium (ATM/ITM, up to 2.5x) [was 68]
     CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
     # === AGGRESSIVE SIZING REQUIREMENTS (Risk of ruin protection) ===
     # OTM + larger size = blows up even good systems
-    AGGRESSIVE_SIZE_MAX = 1.5           # Max 1.5x for premium tier
+    AGGRESSIVE_SIZE_MAX = 2.5           # Max 2.5x for premium tier
     AGGRESSIVE_ACCEL_MIN = 8            # Acceleration >= 8/10 required
     AGGRESSIVE_MICRO_MIN = 12           # Microstructure >= 12/15 required
     
@@ -2087,12 +2088,26 @@ class IntradayOptionScorer:
     
     def _recommend_expiry(self, score: float, signal: IntradaySignal) -> str:
         """
-        Recommend expiry based on conviction and time
+        Recommend expiry based on conviction, time, and monthly expiry awareness.
+        
+        MONTHLY EXPIRY OVERRIDE: If today is monthly expiry (stock options expire),
+        ALWAYS recommend NEXT_MONTH to avoid 0DTE gamma risk on monthly contracts.
         
         High conviction + early day: CURRENT_WEEK
         Lower conviction: NEXT_WEEK (more time)
         Past 2PM: NEXT_WEEK (avoid theta decay)
         """
+        # === MONTHLY EXPIRY OVERRIDE ===
+        # On monthly expiry day, stock options are 0DTE with extreme gamma.
+        # Force NEXT_MONTH to avoid blowing up on gamma swings.
+        try:
+            from config import EXPIRY_SHIELD_CONFIG
+            if EXPIRY_SHIELD_CONFIG.get('is_monthly_expiry', False):
+                print(f"   🛡️ MONTHLY EXPIRY: Forcing NEXT_MONTH expiry (0DTE monthly gamma too dangerous)")
+                return "NEXT_MONTH"
+        except ImportError:
+            pass
+        
         current_hour = datetime.now().hour
         
         # After 2 PM IST - prefer next week to avoid theta decay
@@ -2146,7 +2161,7 @@ class IntradayOptionScorer:
         import re
         sym_base = re.sub(r'\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC).*', '', sym_base)
         self.symbol_losses_today[sym_base] = self.symbol_losses_today.get(sym_base, 0) + 1
-        print(f"📊 SCORER: Recorded loss #{self.symbol_losses_today[sym_base]} for {sym_base} (max re-entry: {self.MAX_LOSSES_SAME_SYMBOL})")
+        # print(f"📊 SCORER: Recorded loss #{self.symbol_losses_today[sym_base]} for {sym_base} (max re-entry: {self.MAX_LOSSES_SAME_SYMBOL})")
     
     def record_symbol_win(self, symbol: str):
         """Record that a symbol had a winning trade today.
@@ -2158,7 +2173,7 @@ class IntradayOptionScorer:
         # Reset loss counter on a win — the setup works for this symbol
         if sym_base in self.symbol_losses_today:
             self.symbol_losses_today[sym_base] = max(0, self.symbol_losses_today[sym_base] - 1)
-            print(f"📊 SCORER: Win on {sym_base} — loss counter reduced to {self.symbol_losses_today[sym_base]}")
+            # print(f"📊 SCORER: Win on {sym_base} — loss counter reduced to {self.symbol_losses_today[sym_base]}")
 
 
 # Singleton instance
@@ -2197,7 +2212,8 @@ def cleanup_stale_watchlist(max_age_minutes: int = 20):
     for sym in stale:
         del scorer.hot_watchlist[sym]
     if stale:
-        print(f"   🧹 Watchlist cleanup: removed {len(stale)} stale entries: {', '.join(stale)}")
+        # print(f"   🧹 Watchlist cleanup: removed {len(stale)} stale entries: {', '.join(stale)}")
+        pass
 
 
 def build_microstructure_from_contract(
@@ -2329,10 +2345,20 @@ class OptionChain:
     contracts: List[OptionContract]
     timestamp: datetime
     
+    @staticmethod
+    def _expiry_match(a, b) -> bool:
+        """Compare two expiry values regardless of date/datetime type.
+        In Python 3, date(2026,2,24) != datetime(2026,2,24) — this helper normalizes."""
+        if a == b:
+            return True
+        a_date = a.date() if hasattr(a, 'hour') else a  # datetime has .hour, date doesn't
+        b_date = b.date() if hasattr(b, 'hour') else b
+        return a_date == b_date
+
     def get_atm_strike(self, expiry: datetime = None) -> float:
         """Get ATM strike for given expiry"""
         # Round to nearest strike
-        strikes = sorted(set(c.strike for c in self.contracts if expiry is None or c.expiry == expiry))
+        strikes = sorted(set(c.strike for c in self.contracts if expiry is None or self._expiry_match(c.expiry, expiry)))
         if not strikes:
             return 0
         
@@ -2343,7 +2369,7 @@ class OptionChain:
         """Get specific contract"""
         for c in self.contracts:
             if c.strike == strike and c.option_type == option_type:
-                if expiry is None or c.expiry == expiry:
+                if expiry is None or self._expiry_match(c.expiry, expiry):
                     return c
         return None
 
@@ -2588,7 +2614,8 @@ def update_fno_lot_sizes(lot_map: Dict[str, int]) -> int:
                 added += 1
             FNO_LOT_SIZES[symbol] = lot_size
     if added:
-        print(f"📦 Dynamic lot sizes: {added} new symbols added → total {len(FNO_LOT_SIZES)} F&O stocks")
+        # print(f"📦 Dynamic lot sizes: {added} new symbols added → total {len(FNO_LOT_SIZES)} F&O stocks")
+        pass
     return added
 
 
@@ -2967,11 +2994,15 @@ class OptionChainFetcher:
         instruments = self._get_nfo_instruments()
         lot_size = self.get_lot_size(underlying)
         
+        # Normalize expiry to date for instrument matching
+        # Zerodha instruments return expiry as date objects; datetime != date in Python 3
+        expiry_date = expiry.date() if isinstance(expiry, datetime) else expiry
+        
         contracts = []
         option_symbols = []
         
         for inst in instruments:
-            if inst['name'] == symbol and inst['expiry'] == expiry:
+            if inst['name'] == symbol and inst['expiry'] == expiry_date:
                 if inst['instrument_type'] in ['CE', 'PE']:
                     option_symbols.append(f"NFO:{inst['tradingsymbol']}")
         
@@ -3025,7 +3056,7 @@ class OptionChainFetcher:
                             underlying=underlying,
                             strike=strike,
                             option_type=opt_type,
-                            expiry=expiry,
+                            expiry=expiry_date,  # Use normalized date object
                             lot_size=lot_size,
                             ltp=ltp,
                             bid=bid,
@@ -3073,10 +3104,10 @@ class OptionChainFetcher:
         Returns:
             Selected OptionContract
         """
-        # Get sorted strikes
+        # Get sorted strikes (use _expiry_match to handle date/datetime mismatch)
         strikes = sorted(set(c.strike for c in chain.contracts 
                            if c.option_type == option_type and 
-                           (expiry is None or c.expiry == expiry)))
+                           (expiry is None or OptionChain._expiry_match(c.expiry, expiry))))
         
         if not strikes:
             return None
@@ -3119,9 +3150,9 @@ class OptionsPositionSizer:
     Position sizing for options with premium limits and risk management
     
     TIERED SIZING (Feb 12 overhaul):
-      Premium tier (score ≥ 70): 5% risk, min 2 lots, up to 25% capital
-      Standard tier (score ≥ 65): 3.5% risk, min 1 lot, up to 20% capital
-      Base tier (below 65):       2% risk, 1 lot, up to 15% capital
+      Premium tier (score >= 70): 7% risk, min 2 lots, up to 25% capital
+      Standard tier (score >= 65): 5% risk, min 1 lot, up to 20% capital
+      Base tier (below 65):       4% risk, 1 lot, up to 15% capital
     """
     
     def __init__(self, capital: float = 100000):
@@ -3137,9 +3168,9 @@ class OptionsPositionSizer:
         self.risk_per_trade = HARD_RULES.get("RISK_PER_TRADE", 0.035)  # Base 3.5%
         
         # Tiered risk rates
-        self.risk_premium = 0.05    # 5% risk for premium tier (₹25K on ₹5L)
-        self.risk_standard = 0.035  # 3.5% risk for standard tier (₹17.5K on ₹5L)
-        self.risk_base = 0.02       # 2% risk for base tier (₹10K on ₹5L)
+        self.risk_premium = 0.07    # 7% risk for premium tier (₹35K on ₹5L)
+        self.risk_standard = 0.05   # 5% risk for standard tier (₹25K on ₹5L)
+        self.risk_base = 0.04       # 4% risk for base tier (₹20K on ₹5L)
     
     def calculate_position(self, contract: OptionContract, 
                           signal_direction: str,
@@ -3309,37 +3340,43 @@ class OptionsTrader:
             self.kite._routes["orders.place"] = orig_route
     
     def _load_option_positions(self):
-        """Load option positions from active_trades.json"""
+        """Load option positions from SQLite (falls back to active_trades.json)"""
         try:
-            trades_file = os.path.join(os.path.dirname(__file__), 'active_trades.json')
-            if os.path.exists(trades_file):
-                with open(trades_file, 'r') as f:
-                    data = json.load(f)
-                    if data.get('date') == str(datetime.now().date()):
-                        for trade in data.get('active_trades', []):
-                            if trade.get('is_option') and trade.get('status', 'OPEN') == 'OPEN':
-                                # Reconstruct option position from paper trade data
-                                self.positions.append({
-                                    'order_id': trade.get('order_id', ''),
-                                    'symbol': trade['symbol'],
-                                    'underlying': trade.get('underlying', ''),
-                                    'direction': trade.get('side', 'BUY'),
-                                    'option_type': trade.get('option_type', 'CE'),
-                                    'strike': trade.get('strike', 0),
-                                    'expiry': trade.get('expiry', ''),
-                                    'quantity': trade.get('lots', 1),
-                                    'lot_size': trade.get('lot_size', 1),
-                                    'entry_premium': trade.get('avg_price', 0),
-                                    'total_premium': trade.get('total_premium', 0),
-                                    'target_premium': trade.get('target', 0),
-                                    'stoploss_premium': trade.get('stop_loss', 0),
-                                    'breakeven': trade.get('breakeven', 0),
-                                    'greeks': trade.get('greeks', {
-                                        'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'iv': 0
-                                    }),
-                                    'status': 'OPEN',
-                                    'timestamp': trade.get('timestamp', '')
-                                })
+            db = get_state_db()
+            today_str = str(datetime.now().date())
+            positions, _pnl, _cap = db.load_active_trades(today_str)
+            if not positions:
+                # Fallback: try legacy JSON
+                trades_file = os.path.join(os.path.dirname(__file__), 'active_trades.json')
+                if os.path.exists(trades_file):
+                    with open(trades_file, 'r') as f:
+                        data = json.load(f)
+                        if data.get('date') == today_str:
+                            positions = data.get('active_trades', [])
+            for trade in positions:
+                if trade.get('is_option') and trade.get('status', 'OPEN') == 'OPEN':
+                    # Reconstruct option position from paper trade data
+                    self.positions.append({
+                        'order_id': trade.get('order_id', ''),
+                        'symbol': trade['symbol'],
+                        'underlying': trade.get('underlying', ''),
+                        'direction': trade.get('side', 'BUY'),
+                        'option_type': trade.get('option_type', 'CE'),
+                        'strike': trade.get('strike', 0),
+                        'expiry': trade.get('expiry', ''),
+                        'quantity': trade.get('lots', 1),
+                        'lot_size': trade.get('lot_size', 1),
+                        'entry_premium': trade.get('avg_price', 0),
+                        'total_premium': trade.get('total_premium', 0),
+                        'target_premium': trade.get('target', 0),
+                        'stoploss_premium': trade.get('stop_loss', 0),
+                        'breakeven': trade.get('breakeven', 0),
+                        'greeks': trade.get('greeks', {
+                            'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'iv': 0
+                        }),
+                        'status': 'OPEN',
+                        'timestamp': trade.get('timestamp', '')
+                    })
         except Exception as e:
             print(f"⚠️ Error loading option positions: {e}")
     
@@ -3438,6 +3475,107 @@ class OptionsTrader:
         symbol = self.chain_fetcher._nfo_symbol(underlying)
         return symbol in FNO_LOT_SIZES
     
+    def _check_iv_crush_gate(self, chain, contract, market_data: Dict, setup_type: str = "") -> Tuple[str, float]:
+        """
+        IV Crush Entry Gate: Block or reduce position when IV is overpriced.
+        
+        Compares ATM implied volatility to realized volatility (approximated from ATR).
+        When IV >> RV, premium is overpriced and vulnerable to IV crush.
+        
+        Per-setup overrides: strategies like TEST_XGB can define tighter thresholds
+        via 'iv_crush_overrides' in their config dict.
+        
+        Returns:
+            (action, lot_multiplier) where:
+              action: 'PASS' / 'REDUCE' / 'BLOCK'
+              lot_multiplier: 1.0 for PASS, 0.5 for REDUCE, 0.0 for BLOCK
+        """
+        from config import IV_CRUSH_GATE
+        cfg = IV_CRUSH_GATE
+        if not cfg.get('enabled', False):
+            return ('PASS', 1.0)
+        
+        # Per-setup overrides (e.g., TEST_XGB uses tighter IV/RV thresholds)
+        _setup_overrides = {}
+        if setup_type:
+            try:
+                import config as _cfg_mod
+                _setup_cfg = getattr(_cfg_mod, setup_type, {})
+                _setup_overrides = _setup_cfg.get('iv_crush_overrides', {}) if isinstance(_setup_cfg, dict) else {}
+            except Exception:
+                pass
+        
+        # 1. Compute ATM IV from chain (average of ATM CE + PE)
+        atm_iv_pct = 0.0
+        try:
+            atm_strike = chain.get_atm_strike()
+            ce = chain.get_contract(atm_strike, OptionType.CE)
+            pe = chain.get_contract(atm_strike, OptionType.PE)
+            
+            if ce and pe and ce.iv > 0 and pe.iv > 0:
+                atm_iv_pct = (ce.iv + pe.iv) / 2 * 100  # decimal → percentage
+            elif ce and ce.iv > 0:
+                atm_iv_pct = ce.iv * 100
+            elif pe and pe.iv > 0:
+                atm_iv_pct = pe.iv * 100
+            else:
+                atm_iv_pct = contract.iv * 100  # Fallback: selected contract
+        except Exception:
+            atm_iv_pct = contract.iv * 100 if contract.iv > 0 else 0
+        
+        if atm_iv_pct <= 0:
+            return ('PASS', 1.0)  # Can't compute IV → don't block
+        
+        # 2. Compute Realized Vol proxy from ATR-14
+        #    RV ≈ (ATR / spot) × √252 × 100    (annualized %)
+        atr = market_data.get('atr_14', 0)
+        spot = chain.spot_price if chain.spot_price > 0 else market_data.get('ltp', market_data.get('close', 0))
+        
+        rv_pct = 0.0
+        if atr > 0 and spot > 0:
+            rv_pct = (atr / spot) * math.sqrt(252) * 100
+        
+        # 3. Time-of-day adjustment (morning IV is structurally elevated)
+        morning_cutoff = cfg.get('morning_iv_premium_until', '11:00')
+        is_morning = datetime.now().strftime('%H:%M') < morning_cutoff
+        ratio_penalty = cfg.get('morning_ratio_penalty', 0.2) if is_morning else 0.0
+        
+        # 4. Compute IV/RV ratio
+        iv_rv_ratio = atm_iv_pct / rv_pct if rv_pct > 0 else 0.0
+        
+        # Adjusted thresholds (more lenient in morning)
+        # Per-setup overrides take precedence over global config
+        hard_block_ratio = _setup_overrides.get('iv_rv_ratio_hard_block', cfg.get('iv_rv_ratio_hard_block', 2.0)) + ratio_penalty
+        reduce_ratio = _setup_overrides.get('iv_rv_ratio_reduce_lots', cfg.get('iv_rv_ratio_reduce_lots', 1.5)) + ratio_penalty
+        
+        # 5. Absolute IV caps (per-setup overrides take precedence)
+        max_iv = _setup_overrides.get('max_atm_iv_pct', cfg.get('max_atm_iv_pct', 60))
+        reduce_iv = _setup_overrides.get('reduce_atm_iv_pct', cfg.get('reduce_atm_iv_pct', 45))
+        
+        # Decision: absolute IV check first, then ratio check
+        setup_tag = f" [{setup_type}]" if setup_type else ""
+        morning_tag = " [morning-adjusted]" if is_morning else ""
+        rv_tag = f", RV={rv_pct:.1f}%" if rv_pct > 0 else ""
+        
+        if atm_iv_pct > max_iv:
+            print(f"   🚫 IV CRUSH GATE{setup_tag}: ATM IV={atm_iv_pct:.1f}% > {max_iv}% absolute cap — BLOCKED")
+            return ('BLOCK', 0.0)
+        
+        if iv_rv_ratio > 0 and iv_rv_ratio > hard_block_ratio:
+            print(f"   🚫 IV CRUSH GATE{setup_tag}: IV/RV={iv_rv_ratio:.2f}x > {hard_block_ratio:.1f}x{morning_tag} — BLOCKED (ATM_IV={atm_iv_pct:.1f}%{rv_tag})")
+            return ('BLOCK', 0.0)
+        
+        if atm_iv_pct > reduce_iv:
+            print(f"   ⚠️ IV CRUSH GATE{setup_tag}: ATM IV={atm_iv_pct:.1f}% > {reduce_iv}% — lots HALVED")
+            return ('REDUCE', 0.5)
+        
+        if iv_rv_ratio > 0 and iv_rv_ratio > reduce_ratio:
+            print(f"   ⚠️ IV CRUSH GATE{setup_tag}: IV/RV={iv_rv_ratio:.2f}x > {reduce_ratio:.1f}x{morning_tag} — lots HALVED (ATM_IV={atm_iv_pct:.1f}%{rv_tag})")
+            return ('REDUCE', 0.5)
+        
+        # Pass — IV is reasonably priced
+        return ('PASS', 1.0)
+
     def create_option_order_with_intraday(self, underlying: str, direction: str,
                                           market_data: Dict = None,
                                           force_strike: StrikeSelection = None,
@@ -3543,13 +3681,14 @@ class OptionsTrader:
                 # so comparing against ML-boosted score inflates the apparent drop.
                 # Threshold aligned to BLOCK_THRESHOLD (52) after recalibration.
                 _score_drop = cached_raw_score - decision.confidence_score
-                if _score_drop > 15 and decision.confidence_score < self.BLOCK_THRESHOLD:
+                if _score_drop > 15 and decision.confidence_score < scorer.BLOCK_THRESHOLD:
                     print(f"   🚫 RE-SCORE GATE: Score dropped {_score_drop:.0f} pts (raw {cached_raw_score:.0f}→{decision.confidence_score:.0f}) — option quality too poor")
                     self._last_rejected_score = decision.confidence_score
                     self._last_rejected_symbol = underlying
                     return None
             else:
-                print(f"   ✅ USING CACHED score {cached_base_score:.0f} for {underlying} (no microstructure change)")
+                # print(f"   ✅ USING CACHED score {cached_base_score:.0f} for {underlying} (no microstructure change)")
+                pass
         else:
             scorer = get_intraday_scorer()
             decision = scorer.score_intraday_signal(intraday_signal, market_data=market_data, option_data=micro_data, caller_direction=direction)
@@ -3583,22 +3722,10 @@ class OptionsTrader:
         for line in log_lines:
             print(line)
         
-        # Write to persistent log file (always survives)
-        try:
-            with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                f.write('\n'.join(log_lines) + '\n')
-        except Exception:
-            pass  # Never crash on logging failure
-        
         # === CHECK IF SHOULD TRADE ===
         if not decision.should_trade:
             reject_msg = f"   ❌ REJECTED: {underlying} score {decision.confidence_score:.0f} — SKIP"
             print(reject_msg)
-            try:
-                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                    f.write(reject_msg + '\n')
-            except Exception:
-                pass
             # Store rejected score for Iron Condor routing
             self._last_rejected_score = decision.confidence_score
             self._last_rejected_symbol = underlying
@@ -3640,7 +3767,7 @@ class OptionsTrader:
             if expiry is None:
                 print(f"   ⚠️ No expiry found for {underlying}")
                 return None
-            print(f"   📅 Expiry: {expiry}")
+            # print(f"   📅 Expiry: {expiry}")
             
             chain = self.chain_fetcher.fetch_option_chain(underlying, expiry)
             
@@ -3658,6 +3785,11 @@ class OptionsTrader:
                 return None
             
             print(f"   🎯 Selected: {contract.symbol} @ ₹{contract.ltp:.2f}")
+            
+            # === IV CRUSH ENTRY GATE — Block overpriced options ===
+            iv_gate_action, iv_lot_mult = self._check_iv_crush_gate(chain, contract, market_data)
+            if iv_gate_action == 'BLOCK':
+                return None
             
             # === CALCULATE POSITION SIZE (apply intraday multiplier) ===
             # Determine score tier for tiered sizing
@@ -3688,7 +3820,7 @@ class OptionsTrader:
             except Exception:
                 _ml_sizing = 1.0  # Any error → neutral (no sizing change)
             
-            adjusted_lots = max(1, round(sizing['lots'] * decision.position_size_multiplier * _ml_sizing))
+            adjusted_lots = max(1, round(sizing['lots'] * decision.position_size_multiplier * _ml_sizing * iv_lot_mult))
             adjusted_premium = adjusted_lots * sizing['premium_per_lot']
             
             # Tiered capital cap — premium trades get bigger allocation
@@ -3731,6 +3863,8 @@ class OptionsTrader:
                 'microstructure_block': decision.microstructure_block,
                 'position_size_multiplier': round(decision.position_size_multiplier, 2),
                 'ml_sizing_factor': round(_ml_sizing, 2),
+                'iv_gate_action': iv_gate_action,
+                'iv_lot_multiplier': round(iv_lot_mult, 2),
                 'original_lots': sizing['lots'],
                 'adjusted_lots': adjusted_lots,
                 'cap_pct_used': cap_pct,
@@ -3781,7 +3915,7 @@ class OptionsTrader:
                 # Modest target: 40% gain instead of 50-80%
                 _final_sl = contract.ltp * 0.82   # -18% premium loss
                 _final_target = contract.ltp * 1.40  # +40% premium gain
-                print(f"   🔄 REVERSAL TRADE: Tight SL ₹{_final_sl:.2f} (-18%) | Target ₹{_final_target:.2f} (+40%)")
+                # print(f"   🔄 REVERSAL TRADE: Tight SL ₹{_final_sl:.2f} (-18%) | Target ₹{_final_target:.2f} (+40%)")
                 entry_meta['strategy_type'] = 'REVERSAL_TRADE'
 
             plan = OptionOrderPlan(
@@ -3802,23 +3936,6 @@ class OptionsTrader:
             
             print(f"   ✅ Plan: {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f} [{score_tier.upper()}]")
             
-            # Log executed order to persistent file — ENRICHED with full trade character
-            try:
-                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                    f.write(f"   ✅ EXECUTED: {contract.symbol} | {adjusted_lots} lots @ ₹{contract.ltp:.2f} = ₹{adjusted_premium:,.0f}\n")
-                    f.write(f"      Trade ID: {trade_id}\n")
-                    f.write(f"      Tier: {score_tier.upper()} | Score: {decision.confidence_score:.0f} | Trend: {decision.trend_state}\n")
-                    f.write(f"      Sizing: {sizing['lots']} lots × {decision.position_size_multiplier:.1f}x × ML:{_ml_sizing:.2f}x = {adjusted_lots} lots | Cap: {cap_pct*100:.0f}%\n")
-                    f.write(f"      Candles: FT={ft_candles} ADX={adx_val:.1f} ORB={orb_strength_val:.0f}% RangeExp={range_exp_val:.2f}\n")
-                    f.write(f"      Context: ORB={orb_signal_val} Vol={vol_regime_val}({vol_ratio_val:.1f}x) VWAP={vwap_pos} HTF={htf_align} RSI={rsi_val:.0f}\n")
-                    f.write(f"      Micro: score={decision.microstructure_score:.0f} block={decision.microstructure_block} accel={decision.acceleration_score:.1f}\n")
-                    f.write(f"      ML: signal={entry_meta.get('ml_signal', 'N/A')} move_prob={entry_meta.get('ml_move_prob', 'N/A')} sizing={_ml_sizing:.2f}x\n")
-                    f.write(f"      Greeks: {plan.greeks_summary}\n")
-                    f.write(f"      Target: ₹{plan.target_premium:.2f} | SL: ₹{plan.stoploss_premium:.2f}\n")
-                    f.write(f"{'='*70}\n")
-            except Exception:
-                pass
-            
             return (plan, decision)
         except Exception as e:
             import traceback
@@ -3831,7 +3948,8 @@ class OptionsTrader:
                            strike_selection: StrikeSelection = None,
                            expiry_selection: ExpirySelection = None,
                            market_data: Dict = None,
-                           cached_decision: dict = None) -> Optional[OptionOrderPlan]:
+                           cached_decision: dict = None,
+                           setup_type: str = "") -> Optional[OptionOrderPlan]:
         """
         Create an option order plan based on underlying signal
         
@@ -3851,7 +3969,8 @@ class OptionsTrader:
             OptionOrderPlan with all details
         """
         # === IF MARKET DATA PROVIDED, USE INTRADAY SCORING ===
-        if market_data:
+        # When setup_type is set (e.g., TEST_XGB), market_data is for IV gate only — skip intraday scoring
+        if market_data and not setup_type:
             result = self.create_option_order_with_intraday(
                 underlying=underlying,
                 direction=direction,
@@ -3889,22 +4008,32 @@ class OptionsTrader:
             print(f"⚠️ No suitable strike found for {underlying}")
             return None
         
-        # Validate contract
+        # Validate contract — HARD liquidity gate (blocks illiquid strikes)
         if contract.oi < self.config['min_oi']:
-            print(f"⚠️ Low OI ({contract.oi}) for {contract.symbol}")
+            print(f"🚫 BLOCKED: Low OI ({contract.oi} < {self.config['min_oi']}) for {contract.symbol} — skipping illiquid strike")
+            return None
         
         if contract.volume < self.config['min_volume']:
-            print(f"⚠️ Low volume ({contract.volume}) for {contract.symbol}")
+            print(f"🚫 BLOCKED: Low volume ({contract.volume} < {self.config['min_volume']}) for {contract.symbol} — skipping illiquid strike")
+            return None
+        
+        # === IV CRUSH ENTRY GATE — Block overpriced options ===
+        iv_gate_action, iv_lot_mult = self._check_iv_crush_gate(chain, contract, market_data or {}, setup_type=setup_type)
+        if iv_gate_action == 'BLOCK':
+            return None
         
         # Calculate position size
         sizing = self.position_sizer.calculate_position(contract, direction, self.capital)
+        
+        # Apply IV crush lot reduction if needed
+        _iv_adjusted_lots = max(1, round(sizing['lots'] * iv_lot_mult))
         
         # Create order plan
         plan = OptionOrderPlan(
             underlying=underlying,
             direction=direction,
             contract=contract,
-            quantity=sizing['lots'],
+            quantity=_iv_adjusted_lots,
             premium_per_lot=sizing['premium_per_lot'],
             total_premium=sizing['total_premium'],
             max_loss=sizing['max_loss'],
@@ -3952,6 +4081,25 @@ class OptionsTrader:
             print(f"   ⚠️ Credit spreads disabled in config")
             return None
         
+        # === EARLY DTE BAIL-OUT — skip all work if no expiry within DTE window ===
+        # Avoids wasting API bandwidth on chain fetches, scoring, delta calcs
+        # when nearest expiry is outside the allowed 0-3 DTE window.
+        try:
+            _cs_max_dte = CREDIT_SPREAD_CONFIG.get('max_days_to_expiry', 3)
+            _cs_min_dte = CREDIT_SPREAD_CONFIG.get('min_days_to_expiry', 0)
+            _cs_expiry_sel_str = CREDIT_SPREAD_CONFIG.get('prefer_expiry', 'CURRENT_WEEK')
+            _cs_expiry_sel = ExpirySelection[_cs_expiry_sel_str]
+            _cs_expiry = self.chain_fetcher.get_nearest_expiry(underlying, _cs_expiry_sel)
+            if _cs_expiry:
+                from datetime import date as _date
+                _cs_exp_d = _cs_expiry if isinstance(_cs_expiry, _date) and not isinstance(_cs_expiry, datetime) else _cs_expiry.date() if hasattr(_cs_expiry, 'date') else _cs_expiry
+                _cs_dte = (_cs_exp_d - datetime.now().date()).days
+                if _cs_dte < _cs_min_dte or _cs_dte > _cs_max_dte:
+                    # Silently skip — no print spam every cycle
+                    return None
+        except Exception:
+            pass  # Fall through to normal flow if pre-check fails
+        
         spread_width = spread_width_strikes or CREDIT_SPREAD_CONFIG.get('spread_width_strikes', 2)
         symbol = underlying.replace("NSE:", "")
         
@@ -3963,7 +4111,7 @@ class OptionsTrader:
                 # REUSE cached cycle-time decision — skip re-scoring
                 decision = cached_decision['decision']
                 score = cached_decision.get('score', decision.confidence_score)
-                print(f"   ✅ USING CACHED score {score:.0f} for credit spread on {underlying}")
+                # print(f"   ✅ USING CACHED score {score:.0f} for credit spread on {underlying}")
             else:
                 intraday_signal = IntradaySignal(
                     symbol=underlying,
@@ -3988,7 +4136,7 @@ class OptionsTrader:
             
             min_score = CREDIT_SPREAD_CONFIG.get('min_score_threshold', 55)
             if score < min_score:
-                print(f"   ❌ Credit spread REJECTED: {underlying} score {score:.0f} < {min_score}")
+                # print(f"   ❌ Credit spread REJECTED: {underlying} score {score:.0f} < {min_score}")
                 return None
             
             if decision.recommended_direction != "HOLD":
@@ -4004,6 +4152,16 @@ class OptionsTrader:
         try:
             # === GET OPTION CHAIN ===
             expiry_sel_str = CREDIT_SPREAD_CONFIG.get('prefer_expiry', 'CURRENT_WEEK')
+            
+            # === MONTHLY EXPIRY OVERRIDE ===
+            try:
+                from config import EXPIRY_SHIELD_CONFIG as _esc
+                if _esc.get('is_monthly_expiry', False):
+                    expiry_sel_str = "NEXT_MONTH"
+                    print(f"   🛡️ MONTHLY EXPIRY: Credit spread using NEXT_MONTH expiry")
+            except ImportError:
+                pass
+            
             expiry_sel = ExpirySelection[expiry_sel_str]
             expiry = self.chain_fetcher.get_nearest_expiry(underlying, expiry_sel)
             
@@ -4016,8 +4174,8 @@ class OptionsTrader:
             expiry_date = expiry if isinstance(expiry, _date) and not isinstance(expiry, datetime) else expiry.date() if hasattr(expiry, 'date') else expiry
             dte = (expiry_date - datetime.now().date()).days
             
-            min_dte = CREDIT_SPREAD_CONFIG.get('min_days_to_expiry', 2)
-            max_dte = CREDIT_SPREAD_CONFIG.get('max_days_to_expiry', 21)
+            min_dte = CREDIT_SPREAD_CONFIG.get('min_days_to_expiry', 0)
+            max_dte = CREDIT_SPREAD_CONFIG.get('max_days_to_expiry', 3)
             
             if dte < min_dte:
                 print(f"   ⚠️ DTE {dte} < min {min_dte} — gamma risk too high, skipping")
@@ -4035,13 +4193,13 @@ class OptionsTrader:
                 print(f"   ⚠️ No option chain for {underlying}")
                 return None
             
-            print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
+            # print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
             
             # === FIND STRIKES FOR CREDIT SPREAD ===
-            # Get sorted strikes for the option type
+            # Get sorted strikes for the option type (use expiry_date for date/datetime safety)
             all_strikes = sorted(set(
                 c.strike for c in chain.contracts
-                if c.option_type == opt_type and (c.expiry is None or c.expiry == expiry)
+                if c.option_type == opt_type and (c.expiry is None or OptionChain._expiry_match(c.expiry, expiry_date))
             ))
             
             if len(all_strikes) < spread_width + 1:
@@ -4074,7 +4232,7 @@ class OptionsTrader:
                 sold_idx = min(len(all_strikes) - 1, atm_idx + otm_offset)  # N strikes OTM
                 hedge_idx = min(len(all_strikes) - 1, sold_idx + spread_width)  # further OTM
             
-            print(f"   📐 Strike selection: ATM={atm_strike}, sold={all_strikes[sold_idx]} ({otm_offset} strikes OTM), hedge={all_strikes[hedge_idx] if hedge_idx < len(all_strikes) else 'N/A'}")
+            # print(f"   📐 Strike selection: ATM={atm_strike}, sold={all_strikes[sold_idx]} ({otm_offset} strikes OTM), hedge={all_strikes[hedge_idx] if hedge_idx < len(all_strikes) else 'N/A'}")
             
             sold_strike = all_strikes[sold_idx]
             hedge_strike = all_strikes[hedge_idx]
@@ -4124,7 +4282,7 @@ class OptionsTrader:
                 if sold_delta_abs > max_sold_delta:
                     print(f"   ⚠️ Sold leg delta {sold_delta_abs:.2f} > max {max_sold_delta} — too close to ATM, probability too low")
                     return None
-                print(f"   📐 Adjusted sold strike to {sold_strike} (delta={sold_delta_abs:.2f})")
+                # print(f"   📐 Adjusted sold strike to {sold_strike} (delta={sold_delta_abs:.2f})")
             
             if sold_contract is None or hedge_contract is None:
                 print(f"   ⚠️ Lost contract after delta adjustment")
@@ -4178,7 +4336,8 @@ class OptionsTrader:
             lots = max(1, round(lots * _cs_score_mult))
             lots = min(lots, max_lots_config)  # Re-cap after score scaling
             if _cs_score_mult > 1.0:
-                print(f"      💪 Score-based Credit Spread Sizing: score={_cs_score:.0f} → {_cs_score_mult:.2f}x → {lots} lots")
+                # print(f"      💪 Score-based Credit Spread Sizing: score={_cs_score:.0f} → {_cs_score_mult:.2f}x → {lots} lots")
+                pass
             
             # === ML SIZING FACTOR (FAIL-SAFE) ===
             # Credit spreads profit from NO_MOVE (theta decay), so ML NO_MOVE → bigger size
@@ -4198,7 +4357,8 @@ class OptionsTrader:
                     _cs_ml_sizing = max(0.5, min(1.5, _cs_ml_sizing))
                     lots = max(1, round(lots * _cs_ml_sizing))
                     if _cs_ml_sizing != 1.0:
-                        print(f"      🧠 ML Credit Spread Sizing: move_prob={_cs_move_prob:.0%} → {_cs_ml_sizing:.2f}x → {lots} lots")
+                        # print(f"      🧠 ML Credit Spread Sizing: move_prob={_cs_move_prob:.0%} → {_cs_ml_sizing:.2f}x → {lots} lots")
+                        pass
             except Exception:
                 pass  # ML crash → neutral sizing (1.0x)
             
@@ -4272,18 +4432,6 @@ class OptionsTrader:
             print(f"      Max Risk: ₹{max_risk_total:,.0f} | {lots} lots × {lot_size} = {qty_shares} shares")
             print(f"      Target: buy back at ₹{target_credit:.2f} | SL: exit at ₹{stop_loss_debit:.2f}")
             print(f"      Breakeven: ₹{breakeven:.2f} | NetΘ: {net_theta*qty_shares:+.2f}/day (POSITIVE = good)")
-            
-            # Log to persistent file
-            try:
-                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                    f.write(f"\n{'='*70}\n")
-                    f.write(f"📊 CREDIT SPREAD: {spread_type} on {underlying}\n")
-                    f.write(f"   SELL: {sold_contract.symbol}@₹{sold_premium:.2f} | BUY: {hedge_contract.symbol}@₹{hedge_premium:.2f}\n")
-                    f.write(f"   Credit: ₹{net_credit_total:,.0f} | Max Risk: ₹{max_risk_total:,.0f} | DTE: {dte}\n")
-                    f.write(f"   Score: {score:.0f} | Credit%: {credit_pct:.0f}% | Lots: {lots}\n")
-                    f.write(f"{'='*70}\n")
-            except Exception:
-                pass
             
             return plan
             
@@ -4413,23 +4561,103 @@ class OptionsTrader:
                     tag='TITAN_CS'
                 )
                 
-                # Leg 2: BUY the hedge (cap risk) — IOC + autoslice
-                hedge_order_id = self._place_order_autoslice(
-                    variety=self.kite.VARIETY_REGULAR,
-                    exchange=hedge_exchange,
-                    tradingsymbol=hedge_ts,
-                    transaction_type=self.kite.TRANSACTION_TYPE_BUY,
-                    quantity=qty_shares,
-                    product=self.kite.PRODUCT_MIS,
-                    order_type=self.kite.ORDER_TYPE_MARKET,
-                    validity=self.kite.VALIDITY_IOC,
-                    market_protection=-1,
-                    tag='TITAN_CS'
-                )
+                # === VERIFY LEG 1 FILL before placing Leg 2 ===
+                import time as _time
+                _time.sleep(0.8)
+                leg1_filled = False
+                try:
+                    _orders = self.kite.orders()
+                    for _o in _orders:
+                        if str(_o.get('order_id')) == str(sold_order_id) and _o.get('status') == 'COMPLETE':
+                            leg1_filled = True
+                            break
+                except Exception:
+                    leg1_filled = True  # Assume filled, proceed cautiously
                 
+                if not leg1_filled:
+                    # Leg 1 rejected/cancelled — abort, no rollback needed
+                    return {
+                        'success': False,
+                        'error': f"Credit spread Leg 1 (SELL {sold_ts}) did not fill — spread aborted",
+                        'message': f"SELL leg IOC was rejected or cancelled. No position taken."
+                    }
+                
+                # Leg 2: BUY the hedge (cap risk) — IOC + autoslice
+                try:
+                    hedge_order_id = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR,
+                        exchange=hedge_exchange,
+                        tradingsymbol=hedge_ts,
+                        transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                        quantity=qty_shares,
+                        product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET,
+                        validity=self.kite.VALIDITY_IOC,
+                        market_protection=-1,
+                        tag='TITAN_CS'
+                    )
+                except Exception as leg2_err:
+                    # Leg 2 FAILED — ROLLBACK: close Leg 1 immediately
+                    print(f"   🚨 ROLLBACK: Hedge leg failed ({leg2_err}), closing sold leg...")
+                    try:
+                        self._place_order_autoslice(
+                            variety=self.kite.VARIETY_REGULAR,
+                            exchange=sold_exchange,
+                            tradingsymbol=sold_ts,
+                            transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                            quantity=qty_shares,
+                            product=self.kite.PRODUCT_MIS,
+                            order_type=self.kite.ORDER_TYPE_MARKET,
+                            tag='TITAN_CS_ROLLBACK'
+                        )
+                        print(f"   ✅ ROLLBACK complete: sold leg closed")
+                    except Exception as rb_err:
+                        print(f"   🚨 ROLLBACK FAILED: {rb_err} — MANUAL INTERVENTION NEEDED for {sold_ts}")
+                    return {
+                        'success': False,
+                        'error': f"Credit spread hedge leg failed: {leg2_err}. Sold leg has been rolled back.",
+                        'message': f"Spread aborted — hedge leg placement failed"
+                    }
+                
+                # Verify Leg 2 fill
+                _time.sleep(0.5)
+                leg2_filled = False
+                try:
+                    _orders = self.kite.orders()
+                    for _o in _orders:
+                        if str(_o.get('order_id')) == str(hedge_order_id) and _o.get('status') == 'COMPLETE':
+                            leg2_filled = True
+                            break
+                except Exception:
+                    leg2_filled = True  # Assume filled
+                
+                if not leg2_filled:
+                    # Hedge leg didn't fill — ROLLBACK sold leg
+                    print(f"   🚨 ROLLBACK: Hedge leg {hedge_ts} didn't fill, closing sold leg...")
+                    try:
+                        self._place_order_autoslice(
+                            variety=self.kite.VARIETY_REGULAR,
+                            exchange=sold_exchange,
+                            tradingsymbol=sold_ts,
+                            transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                            quantity=qty_shares,
+                            product=self.kite.PRODUCT_MIS,
+                            order_type=self.kite.ORDER_TYPE_MARKET,
+                            tag='TITAN_CS_ROLLBACK'
+                        )
+                        print(f"   ✅ ROLLBACK complete")
+                    except Exception as rb_err:
+                        print(f"   🚨 ROLLBACK FAILED: {rb_err} — MANUAL INTERVENTION for {sold_ts}")
+                    return {
+                        'success': False,
+                        'error': f"Credit spread hedge didn't fill — sold leg rolled back",
+                    }
+                
+                spread_id = f"CS_LIVE_{sold_order_id}"
                 return {
                     'success': True,
                     'paper_trade': False,
+                    'spread_id': spread_id,
                     'sold_order_id': str(sold_order_id),
                     'hedge_order_id': str(hedge_order_id),
                     'message': f"Credit spread placed: SELL {sold_ts} + BUY {hedge_ts}"
@@ -4539,13 +4767,25 @@ class OptionsTrader:
             
             # Mode-specific parameters with fallbacks
             expiry_sel_str = mode_config.get('prefer_expiry', IRON_CONDOR_CONFIG.get('prefer_expiry', 'CURRENT_WEEK' if is_index else 'CURRENT_MONTH'))
+            
+            # === MONTHLY EXPIRY OVERRIDE for stock ICs ===
+            # On monthly expiry, stock IC on 0DTE is extremely dangerous (gamma explosion)
+            if not is_index:
+                try:
+                    from config import EXPIRY_SHIELD_CONFIG as _esc_ic
+                    if _esc_ic.get('is_monthly_expiry', False):
+                        print(f"   🛡️ MONTHLY EXPIRY: Blocking stock iron condor — 0DTE monthly gamma too dangerous")
+                        return None
+                except ImportError:
+                    pass
+            
             min_dte = mode_config.get('min_dte', 0 if is_index else 3)
             max_dte = mode_config.get('max_dte', 2 if is_index else 15)
             prefer_0dte = mode_config.get('prefer_0dte', is_index)
             target_pct = mode_config.get('target_pct', 25 if is_index else 10)
             max_target_pct = mode_config.get('max_target_pct', 40 if is_index else 15)
             
-            print(f"   📊 IC Mode: {mode_label} | DTE: {min_dte}-{max_dte} | Target: {target_pct}%")
+            # print(f"   📊 IC Mode: {mode_label} | DTE: {min_dte}-{max_dte} | Target: {target_pct}%")
             
             # === GET OPTION CHAIN ===
             expiry_sel = ExpirySelection[expiry_sel_str]
@@ -4567,14 +4807,15 @@ class OptionsTrader:
                 return None
             
             if prefer_0dte and dte > 0:
-                print(f"   ⏳ DTE={dte} (not 0DTE, premium decay will be slower intraday)")
+                # print(f"   ⏳ DTE={dte} (not 0DTE, premium decay will be slower intraday)")
+                pass
             
             chain = self.chain_fetcher.fetch_option_chain(underlying, expiry)
             if chain is None or not chain.contracts:
                 print(f"   ⚠️ No option chain for {underlying}")
                 return None
             
-            print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
+            # print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
             
             spot = chain.spot_price or market_data.get('ltp', 0) if market_data else 0
             atm_strike = chain.get_atm_strike(expiry)
@@ -4599,7 +4840,7 @@ class OptionsTrader:
             min_distance_multiplier = IRON_CONDOR_CONFIG.get('min_atr_distance', 1.0)
             min_strike_distance = expected_remaining_move * min_distance_multiplier
             
-            print(f"   📏 ATR: ₹{atr_14:.1f} | Expected remaining move: ₹{expected_remaining_move:.1f} | Min strike distance: ₹{min_strike_distance:.1f}")
+            # print(f"   📏 ATR: ₹{atr_14:.1f} | Expected remaining move: ₹{expected_remaining_move:.1f} | Min strike distance: ₹{min_strike_distance:.1f}")
             
             # === IV ANALYSIS — Check if IV is worth selling ===
             atm_ce = chain.get_contract(atm_strike, OptionType.CE, expiry)
@@ -4625,16 +4866,16 @@ class OptionsTrader:
                 iv_info = f"ATM IV: {avg_atm_iv:.1f}%"
                 if iv_ce > 0 and iv_pe > 0:
                     iv_info += f" (CE:{iv_ce:.1f}% PE:{iv_pe:.1f}%)"
-                print(f"   📊 {iv_info}")
+                # print(f"   📊 {iv_info}")
             
             # === INTELLIGENT STRIKE SELECTION (Delta-based + ATR-validated) ===
             ce_strikes = sorted(set(
                 c.strike for c in chain.contracts
-                if c.option_type == OptionType.CE and (c.expiry is None or c.expiry == expiry)
+                if c.option_type == OptionType.CE and (c.expiry is None or OptionChain._expiry_match(c.expiry, expiry_date))
             ))
             pe_strikes = sorted(set(
                 c.strike for c in chain.contracts
-                if c.option_type == OptionType.PE and (c.expiry is None or c.expiry == expiry)
+                if c.option_type == OptionType.PE and (c.expiry is None or OptionChain._expiry_match(c.expiry, expiry_date))
             ))
             
             wing_width = IRON_CONDOR_CONFIG.get('wing_width_strikes', 2)
@@ -4665,7 +4906,7 @@ class OptionsTrader:
                 ce_otm_offset = mode_config.get('ce_sold_otm_offset', IRON_CONDOR_CONFIG.get('ce_sold_otm_offset', 3))
                 sold_ce_idx = min(len(ce_strikes) - 1, ce_atm_idx + ce_otm_offset)
                 best_sold_ce_strike = ce_strikes[sold_ce_idx]
-                print(f"   ⚠️ CE delta-selection failed, using offset={ce_otm_offset}")
+                # print(f"   ⚠️ CE delta-selection failed, using offset={ce_otm_offset}")
             
             # === SELECT SOLD PE STRIKE ===
             best_sold_pe_strike = None
@@ -4688,7 +4929,7 @@ class OptionsTrader:
                 pe_otm_offset = mode_config.get('pe_sold_otm_offset', IRON_CONDOR_CONFIG.get('pe_sold_otm_offset', 3))
                 sold_pe_idx = max(0, pe_atm_idx - pe_otm_offset)
                 best_sold_pe_strike = pe_strikes[sold_pe_idx]
-                print(f"   ⚠️ PE delta-selection failed, using offset={pe_otm_offset}")
+                # print(f"   ⚠️ PE delta-selection failed, using offset={pe_otm_offset}")
             
             sold_ce_strike = best_sold_ce_strike
             sold_pe_strike = best_sold_pe_strike
@@ -4712,8 +4953,8 @@ class OptionsTrader:
             ce_distance_from_spot = sold_ce_strike - spot
             pe_distance_from_spot = spot - sold_pe_strike
             
-            print(f"   📐 IC Strikes: PE wing [{hedge_pe_strike}/{sold_pe_strike}] — SPOT {spot:.1f} — CE wing [{sold_ce_strike}/{hedge_ce_strike}]")
-            print(f"      CE distance: ₹{ce_distance_from_spot:.1f} ({ce_distance_from_spot/spot*100:.1f}%) | PE distance: ₹{pe_distance_from_spot:.1f} ({pe_distance_from_spot/spot*100:.1f}%)")
+            # print(f"   📐 IC Strikes: PE wing [{hedge_pe_strike}/{sold_pe_strike}] — SPOT {spot:.1f} — CE wing [{sold_ce_strike}/{hedge_ce_strike}]")
+            # print(f"      CE distance: ₹{ce_distance_from_spot:.1f} ({ce_distance_from_spot/spot*100:.1f}%) | PE distance: ₹{pe_distance_from_spot:.1f} ({pe_distance_from_spot/spot*100:.1f}%)")
             
             # Get contracts
             sold_ce = chain.get_contract(sold_ce_strike, OptionType.CE, expiry)
@@ -4739,7 +4980,7 @@ class OptionsTrader:
             if delta_imbalance > max_delta_imbalance:
                 print(f"   ⚠️ IC WARNING: Delta imbalance {delta_imbalance:.2f} (CE Δ:{sold_ce_delta:.2f} vs PE Δ:{sold_pe_delta:.2f}) — wings not symmetric")
             
-            print(f"      Sold CE Δ: {sold_ce_delta:.3f} | Sold PE Δ: {sold_pe_delta:.3f} | Imbalance: {delta_imbalance:.3f}")
+            # print(f"      Sold CE Δ: {sold_ce_delta:.3f} | Sold PE Δ: {sold_pe_delta:.3f} | Imbalance: {delta_imbalance:.3f}")
             
             # === VALIDATE LIQUIDITY (all 4 legs) ===
             min_oi = IRON_CONDOR_CONFIG.get('min_oi_per_leg', 500)
@@ -4887,19 +5128,6 @@ class OptionsTrader:
             print(f"      Profit Zone: ₹{lower_breakeven:.0f} — ₹{upper_breakeven:.0f} (₹{profit_zone:.0f} wide vs ₹{expected_remaining_move:.0f} exp move)")
             print(f"      NetΘ: {net_theta*qty_shares:+.2f}/day | NetΔ: {net_delta*qty_shares:.2f} | IV: {avg_atm_iv:.1f}%")
             
-            # Log to persistent file
-            try:
-                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                    f.write(f"\n{'='*70}\n")
-                    f.write(f"🦅 IRON CONDOR: {underlying} (score: {directional_score:.0f}) [{quality_str}]\n")
-                    f.write(f"   SELL PE: {sold_pe.symbol}@₹{sold_pe.ltp:.2f} Δ:{sold_pe_delta:.2f} | BUY PE: {hedge_pe.symbol}@₹{hedge_pe.ltp:.2f}\n")
-                    f.write(f"   SELL CE: {sold_ce.symbol}@₹{sold_ce.ltp:.2f} Δ:{sold_ce_delta:.2f} | BUY CE: {hedge_ce.symbol}@₹{hedge_ce.ltp:.2f}\n")
-                    f.write(f"   Credit: ₹{total_credit_amount:,.0f} ({credit_pct:.0f}%) | Risk: ₹{max_risk_total:,.0f} | R:R: {rr_ratio:.2f} | DTE: {dte}\n")
-                    f.write(f"   Zone: ₹{lower_breakeven:.0f}-₹{upper_breakeven:.0f} ({profit_zone:.0f} wide) | ATR: ₹{atr_14:.0f} | IV: {avg_atm_iv:.1f}%\n")
-                    f.write(f"{'='*70}\n")
-            except Exception:
-                pass
-            
             return plan
             
         except Exception as e:
@@ -5020,46 +5248,102 @@ class OptionsTrader:
                         'message': f"Iron Condor blocked: margin ₹{margin_check['required_margin']:,.0f} > available ₹{margin_check['available']:,.0f}"
                     }
                 
-                # Leg 1: SELL OTM CE — IOC + autoslice
-                self._place_order_autoslice(
-                    variety=self.kite.VARIETY_REGULAR, exchange='NFO',
-                    tradingsymbol=sold_ce_ts, transaction_type=self.kite.TRANSACTION_TYPE_SELL,
-                    quantity=qty_shares, product=self.kite.PRODUCT_MIS,
-                    order_type=self.kite.ORDER_TYPE_MARKET,
-                    validity=self.kite.VALIDITY_IOC,
-                    market_protection=-1, tag='TITAN_IC'
-                )
-                # Leg 2: BUY further OTM CE (hedge) — IOC + autoslice
-                self._place_order_autoslice(
-                    variety=self.kite.VARIETY_REGULAR, exchange='NFO',
-                    tradingsymbol=hedge_ce_ts, transaction_type=self.kite.TRANSACTION_TYPE_BUY,
-                    quantity=qty_shares, product=self.kite.PRODUCT_MIS,
-                    order_type=self.kite.ORDER_TYPE_MARKET,
-                    validity=self.kite.VALIDITY_IOC,
-                    market_protection=-1, tag='TITAN_IC'
-                )
-                # Leg 3: SELL OTM PE — IOC + autoslice
-                self._place_order_autoslice(
-                    variety=self.kite.VARIETY_REGULAR, exchange='NFO',
-                    tradingsymbol=sold_pe_ts, transaction_type=self.kite.TRANSACTION_TYPE_SELL,
-                    quantity=qty_shares, product=self.kite.PRODUCT_MIS,
-                    order_type=self.kite.ORDER_TYPE_MARKET,
-                    validity=self.kite.VALIDITY_IOC,
-                    market_protection=-1, tag='TITAN_IC'
-                )
-                # Leg 4: BUY further OTM PE (hedge) — IOC + autoslice
-                self._place_order_autoslice(
-                    variety=self.kite.VARIETY_REGULAR, exchange='NFO',
-                    tradingsymbol=hedge_pe_ts, transaction_type=self.kite.TRANSACTION_TYPE_BUY,
-                    quantity=qty_shares, product=self.kite.PRODUCT_MIS,
-                    order_type=self.kite.ORDER_TYPE_MARKET,
-                    validity=self.kite.VALIDITY_IOC,
-                    market_protection=-1, tag='TITAN_IC'
-                )
+                import time as _time
+                filled_legs = []  # Track filled legs for rollback
                 
+                def _rollback_legs(legs_to_close):
+                    """Emergency rollback: close all filled legs"""
+                    for leg_info in legs_to_close:
+                        try:
+                            # Reverse the transaction
+                            reverse_txn = (self.kite.TRANSACTION_TYPE_BUY 
+                                          if leg_info['txn'] == 'SELL' 
+                                          else self.kite.TRANSACTION_TYPE_SELL)
+                            self._place_order_autoslice(
+                                variety=self.kite.VARIETY_REGULAR, exchange='NFO',
+                                tradingsymbol=leg_info['ts'],
+                                transaction_type=reverse_txn,
+                                quantity=qty_shares, product=self.kite.PRODUCT_MIS,
+                                order_type=self.kite.ORDER_TYPE_MARKET,
+                                tag='TITAN_IC_ROLLBACK'
+                            )
+                            print(f"   ✅ Rolled back: {leg_info['ts']}")
+                        except Exception as rb_err:
+                            print(f"   🚨 ROLLBACK FAILED for {leg_info['ts']}: {rb_err} — MANUAL INTERVENTION NEEDED")
+                
+                # Leg 1: SELL OTM CE — IOC + autoslice
+                try:
+                    sold_ce_oid = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR, exchange='NFO',
+                        tradingsymbol=sold_ce_ts, transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                        quantity=qty_shares, product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET,
+                        validity=self.kite.VALIDITY_IOC,
+                        market_protection=-1, tag='TITAN_IC'
+                    )
+                    filled_legs.append({'ts': sold_ce_ts, 'txn': 'SELL', 'oid': sold_ce_oid})
+                except Exception as e:
+                    return {'success': False, 'error': f"IC Leg 1 (SELL CE) failed: {e}. No position taken."}
+                
+                _time.sleep(0.5)
+                
+                # Leg 2: BUY further OTM CE (hedge) — IOC + autoslice
+                try:
+                    hedge_ce_oid = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR, exchange='NFO',
+                        tradingsymbol=hedge_ce_ts, transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                        quantity=qty_shares, product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET,
+                        validity=self.kite.VALIDITY_IOC,
+                        market_protection=-1, tag='TITAN_IC'
+                    )
+                    filled_legs.append({'ts': hedge_ce_ts, 'txn': 'BUY', 'oid': hedge_ce_oid})
+                except Exception as e:
+                    print(f"   🚨 IC Leg 2 failed: {e}. Rolling back...")
+                    _rollback_legs(filled_legs)
+                    return {'success': False, 'error': f"IC aborted at Leg 2: {e}. Rolled back."}
+                
+                _time.sleep(0.3)
+                
+                # Leg 3: SELL OTM PE — IOC + autoslice
+                try:
+                    sold_pe_oid = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR, exchange='NFO',
+                        tradingsymbol=sold_pe_ts, transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                        quantity=qty_shares, product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET,
+                        validity=self.kite.VALIDITY_IOC,
+                        market_protection=-1, tag='TITAN_IC'
+                    )
+                    filled_legs.append({'ts': sold_pe_ts, 'txn': 'SELL', 'oid': sold_pe_oid})
+                except Exception as e:
+                    print(f"   🚨 IC Leg 3 failed: {e}. Rolling back...")
+                    _rollback_legs(filled_legs)
+                    return {'success': False, 'error': f"IC aborted at Leg 3: {e}. Rolled back."}
+                
+                _time.sleep(0.3)
+                
+                # Leg 4: BUY further OTM PE (hedge) — IOC + autoslice
+                try:
+                    hedge_pe_oid = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR, exchange='NFO',
+                        tradingsymbol=hedge_pe_ts, transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                        quantity=qty_shares, product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET,
+                        validity=self.kite.VALIDITY_IOC,
+                        market_protection=-1, tag='TITAN_IC'
+                    )
+                    filled_legs.append({'ts': hedge_pe_ts, 'txn': 'BUY', 'oid': hedge_pe_oid})
+                except Exception as e:
+                    print(f"   🚨 IC Leg 4 failed: {e}. Rolling back...")
+                    _rollback_legs(filled_legs)
+                    return {'success': False, 'error': f"IC aborted at Leg 4: {e}. Rolled back."}
+                
+                condor_id = f"IC_LIVE_{sold_ce_oid}"
                 return {
                     'success': True,
                     'paper_trade': False,
+                    'condor_id': condor_id,
                     'message': f"Iron Condor placed: {plan.underlying} 4 legs"
                 }
             except Exception as e:
@@ -5153,7 +5437,7 @@ class OptionsTrader:
             min_adx = DEBIT_SPREAD_CONFIG.get('min_adx', 28)
             if adx > 0 and adx < min_adx:
                 debit_gate_penalty += 6  # was 8, reduced — base scorer Gate 9 already penalizes ADX
-                print(f"   ⚠️ Debit spread PENALTY [Gate D2]: {underlying} ADX={adx:.1f} < {min_adx} (weak trend, -6 score)")
+                # print(f"   ⚠️ Debit spread PENALTY [Gate D2]: {underlying} ADX={adx:.1f} < {min_adx} (weak trend, -6 score)")
             
             # Gate D3+D4: UNIFIED EXHAUSTION gate — ORB overextension + range expansion
             # Both measure "move already happened" — consolidate to avoid double-penalty.
@@ -5178,13 +5462,13 @@ class OptionsTrader:
                 if orb_triggered and range_triggered:
                     # Both triggered = clearly exhausted, but single penalty (worst of the two + small bump)
                     exhaustion_penalty = 5  # was 6+5=11
-                    print(f"   ⚠️ Debit spread PENALTY [Gate D3+D4]: {underlying} ORB={orb_strength:.0f}% + RangeExp={range_exp:.2f} (exhaustion, -{exhaustion_penalty} score)")
+                    # print(f"   ⚠️ Debit spread PENALTY [Gate D3+D4]: {underlying} ORB={orb_strength:.0f}% + RangeExp={range_exp:.2f} (exhaustion, -{exhaustion_penalty} score)")
                 elif orb_triggered:
                     exhaustion_penalty = 4  # was 6
-                    print(f"   ⚠️ Debit spread PENALTY [Gate D3]: {underlying} ORB={orb_strength:.0f}% > {max_orb}% (overextended, -{exhaustion_penalty} score)")
+                    # print(f"   ⚠️ Debit spread PENALTY [Gate D3]: {underlying} ORB={orb_strength:.0f}% > {max_orb}% (overextended, -{exhaustion_penalty} score)")
                 else:
                     exhaustion_penalty = 4  # was 5
-                    print(f"   ⚠️ Debit spread PENALTY [Gate D4]: {underlying} range expansion={range_exp:.2f} > {max_range_exp} ATR (exhausted, -{exhaustion_penalty} score)")
+                    # print(f"   ⚠️ Debit spread PENALTY [Gate D4]: {underlying} range expansion={range_exp:.2f} > {max_range_exp} ATR (exhausted, -{exhaustion_penalty} score)")
                 debit_gate_penalty += exhaustion_penalty
             
             # Cap total debit gate penalties
@@ -5205,7 +5489,8 @@ class OptionsTrader:
             if debit_gate_penalty > 0:
                 print(f"   ⚠️ Debit spread gate penalties: -{debit_gate_penalty} score for {underlying}")
             else:
-                print(f"   ✅ Debit spread CANDLE GATES PASSED: {underlying} | FT={ft_candles} ADX={adx:.1f} ORB={orb_strength:.0f}% RangeExp={range_exp:.2f}")
+                # print(f"   ✅ Debit spread CANDLE GATES PASSED: {underlying} | FT={ft_candles} ADX={adx:.1f} ORB={orb_strength:.0f}% RangeExp={range_exp:.2f}")
+                pass
         
         # === TREND CONTINUATION CHECK ===
         if DEBIT_SPREAD_CONFIG.get('require_trend_continuation', True) and market_data:
@@ -5234,7 +5519,7 @@ class OptionsTrader:
                 # REUSE cached cycle-time decision — skip re-scoring
                 decision = cached_decision['decision']
                 score = cached_decision.get('score', decision.confidence_score)
-                print(f"   ✅ USING CACHED score {score:.0f} for debit spread on {underlying}")
+                # print(f"   ✅ USING CACHED score {score:.0f} for debit spread on {underlying}")
             else:
                 intraday_signal = IntradaySignal(
                     symbol=underlying,
@@ -5261,7 +5546,7 @@ class OptionsTrader:
             if debit_gate_penalty > 0:
                 score -= debit_gate_penalty
                 raw_score = cached_decision.get('score', decision.confidence_score) if cached_decision else decision.confidence_score
-                print(f"   📉 Debit spread score adjusted: {raw_score:.0f} → {score:.0f} (gate penalties: -{debit_gate_penalty})")
+                # print(f"   📉 Debit spread score adjusted: {raw_score:.0f} → {score:.0f} (gate penalties: -{debit_gate_penalty})")
             
             min_score = DEBIT_SPREAD_CONFIG.get('min_score_threshold', 70)
             if score < min_score:
@@ -5281,6 +5566,16 @@ class OptionsTrader:
         try:
             # === GET OPTION CHAIN ===
             expiry_sel_str = 'CURRENT_WEEK'
+            
+            # === MONTHLY EXPIRY OVERRIDE ===
+            try:
+                from config import EXPIRY_SHIELD_CONFIG as _esc_ds
+                if _esc_ds.get('is_monthly_expiry', False):
+                    expiry_sel_str = "NEXT_MONTH"
+                    print(f"   🛡️ MONTHLY EXPIRY: Debit spread using NEXT_MONTH expiry")
+            except ImportError:
+                pass
+            
             expiry_sel = ExpirySelection[expiry_sel_str]
             expiry = self.chain_fetcher.get_nearest_expiry(underlying, expiry_sel)
             
@@ -5307,12 +5602,12 @@ class OptionsTrader:
                 print(f"   ⚠️ No option chain for {underlying}")
                 return None
             
-            print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
+            # print(f"   📅 Expiry: {expiry} (DTE: {dte}) | Chain: {len(chain.contracts)} contracts")
             
-            # === FIND STRIKES ===
+            # === FIND STRIKES (use expiry_date for date/datetime safety) ===
             all_strikes = sorted(set(
                 c.strike for c in chain.contracts
-                if c.option_type == opt_type and (c.expiry is None or c.expiry == expiry)
+                if c.option_type == opt_type and (c.expiry is None or OptionChain._expiry_match(c.expiry, expiry_date))
             ))
             
             sell_offset = spread_width_strikes or DEBIT_SPREAD_CONFIG.get('sell_strike_offset', 3)
@@ -5348,7 +5643,7 @@ class OptionsTrader:
                 print(f"   ⚠️ Could not find contracts for strikes {buy_strike}/{sell_strike}")
                 return None
             
-            print(f"   📐 Strike selection: ATM={atm_strike}, BUY={buy_strike}, SELL={sell_strike}")
+            # print(f"   📐 Strike selection: ATM={atm_strike}, BUY={buy_strike}, SELL={sell_strike}")
             
             # === VALIDATE LIQUIDITY ===
             min_oi = DEBIT_SPREAD_CONFIG.get('min_oi', 500)
@@ -5424,7 +5719,8 @@ class OptionsTrader:
             lots = max(1, round(lots * _ds_score_mult))
             lots = min(lots, max_lots_config)  # Re-cap after score scaling
             if _ds_score_mult > 1.0:
-                print(f"      💪 Score-based Debit Spread Sizing: score={score:.0f} → {_ds_score_mult:.2f}x → {lots} lots")
+                # print(f"      💪 Score-based Debit Spread Sizing: score={score:.0f} → {_ds_score_mult:.2f}x → {lots} lots")
+                pass
             
             # === ML SIZING FACTOR (FAIL-SAFE) ===
             # Debit spreads profit from MOVE, so ML MOVE → bigger size
@@ -5444,7 +5740,8 @@ class OptionsTrader:
                     _ds_ml_sizing = max(0.5, min(1.5, _ds_ml_sizing))
                     lots = max(1, round(lots * _ds_ml_sizing))
                     if _ds_ml_sizing != 1.0:
-                        print(f"      🧠 ML Debit Spread Sizing: move_prob={_ds_move_prob:.0%} → {_ds_ml_sizing:.2f}x → {lots} lots")
+                        # print(f"      🧠 ML Debit Spread Sizing: move_prob={_ds_move_prob:.0%} → {_ds_ml_sizing:.2f}x → {lots} lots")
+                        pass
             except Exception:
                 pass  # ML crash → neutral sizing (1.0x)
             
@@ -5519,22 +5816,6 @@ class OptionsTrader:
             print(f"      Max Profit: ₹{max_profit_total:,.0f} | Max Loss: ₹{max_loss_total:,.0f}")
             print(f"      Target: spread at ₹{target_value:.2f} | SL: spread at ₹{stop_loss_value:.2f}")
             print(f"      Breakeven: ₹{breakeven:.2f} | NetΔ: {net_delta*qty_shares:+.2f} (directional edge)")
-            
-            # Log with candle gate data
-            ft_log = market_data.get('follow_through_candles', 0) if market_data else 0
-            adx_log = market_data.get('adx_14', market_data.get('adx', 0)) if market_data else 0
-            orb_log = market_data.get('orb_strength_pct', market_data.get('orb_strength', 0)) if market_data else 0
-            try:
-                with open(TRADE_DECISIONS_LOG, 'a', encoding='utf-8') as f:
-                    f.write(f"\n{'='*70}\n")
-                    f.write(f"🚀 DEBIT SPREAD: {spread_type} on {underlying} (move: {move_pct:+.1f}%)\n")
-                    f.write(f"   BUY: {buy_contract.symbol}@₹{buy_premium:.2f} | SELL: {sell_contract.symbol}@₹{sell_premium:.2f}\n")
-                    f.write(f"   Debit: ₹{net_debit_total:,.0f} | Max Profit: ₹{max_profit_total:,.0f} | DTE: {dte}\n")
-                    f.write(f"   Score: {score:.0f} | Tier: {debit_score_tier} | R:R = 1:{profit_risk_ratio:.1f} | Lots: {lots}\n")
-                    f.write(f"   Candle Gates: FT={ft_log} ADX={adx_log:.1f} ORB={orb_log:.0f}%\n")
-                    f.write(f"{'='*70}\n")
-            except Exception:
-                pass
             
             return plan
             
@@ -5663,23 +5944,81 @@ class OptionsTrader:
                     tag='TITAN_DS'
                 )
                 
-                # Leg 2: SELL the further OTM option (reduce cost) — IOC + autoslice
-                sell_order_id = self._place_order_autoslice(
-                    variety=self.kite.VARIETY_REGULAR,
-                    exchange=sell_exchange,
-                    tradingsymbol=sell_ts,
-                    transaction_type=self.kite.TRANSACTION_TYPE_SELL,
-                    quantity=qty_shares,
-                    product=self.kite.PRODUCT_MIS,
-                    order_type=self.kite.ORDER_TYPE_MARKET,
-                    validity=self.kite.VALIDITY_IOC,
-                    market_protection=-1,
-                    tag='TITAN_DS'
-                )
+                # === VERIFY LEG 1 FILL before placing Leg 2 ===
+                import time as _time
+                _time.sleep(0.8)
+                leg1_filled = False
+                try:
+                    _orders = self.kite.orders()
+                    for _o in _orders:
+                        if str(_o.get('order_id')) == str(buy_order_id) and _o.get('status') == 'COMPLETE':
+                            leg1_filled = True
+                            break
+                except Exception:
+                    leg1_filled = True  # Assume filled, proceed cautiously
                 
+                if not leg1_filled:
+                    return {
+                        'success': False,
+                        'error': f"Debit spread Leg 1 (BUY {buy_ts}) did not fill — spread aborted",
+                        'message': f"Buy leg IOC was rejected or cancelled. No position taken."
+                    }
+                
+                # Leg 2: SELL the further OTM option (reduce cost) — IOC + autoslice
+                try:
+                    sell_order_id = self._place_order_autoslice(
+                        variety=self.kite.VARIETY_REGULAR,
+                        exchange=sell_exchange,
+                        tradingsymbol=sell_ts,
+                        transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                        quantity=qty_shares,
+                        product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET,
+                        validity=self.kite.VALIDITY_IOC,
+                        market_protection=-1,
+                        tag='TITAN_DS'
+                    )
+                except Exception as leg2_err:
+                    # Leg 2 FAILED — we still have the buy leg open (naked long, limited risk)
+                    print(f"   ⚠️ Debit spread sell leg failed ({leg2_err}) — buy leg remains as naked long")
+                    return {
+                        'success': True,
+                        'paper_trade': False,
+                        'buy_order_id': str(buy_order_id),
+                        'sell_order_id': None,
+                        'partial_fill': True,
+                        'message': f"Debit spread partial: BUY {buy_ts} filled, SELL {sell_ts} failed — running as naked long"
+                    }
+                
+                # Verify Leg 2 fill
+                _time.sleep(0.5)
+                leg2_filled = False
+                try:
+                    _orders = self.kite.orders()
+                    for _o in _orders:
+                        if str(_o.get('order_id')) == str(sell_order_id) and _o.get('status') == 'COMPLETE':
+                            leg2_filled = True
+                            break
+                except Exception:
+                    leg2_filled = True
+                
+                if not leg2_filled:
+                    # Sell leg didn't fill — still safe (buy leg = naked long, limited risk)
+                    print(f"   ⚠️ Sell leg {sell_ts} didn't fill — running as naked long")
+                    return {
+                        'success': True,
+                        'paper_trade': False,
+                        'buy_order_id': str(buy_order_id),
+                        'sell_order_id': None,
+                        'partial_fill': True,
+                        'message': f"Debit spread partial: BUY filled, SELL didn't fill — naked long"
+                    }
+                
+                spread_id = f"DS_LIVE_{buy_order_id}"
                 return {
                     'success': True,
                     'paper_trade': False,
+                    'spread_id': spread_id,
                     'buy_order_id': str(buy_order_id),
                     'sell_order_id': str(sell_order_id),
                     'message': f"Debit spread placed: BUY {buy_ts} + SELL {sell_ts}"

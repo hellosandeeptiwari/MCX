@@ -36,13 +36,7 @@ def refresh_token(request_token: str):
     access_token = data["access_token"]
     today = date.today().isoformat()
     
-    # 1. Save to zerodha_token.json
-    token_path = os.path.join(os.path.dirname(__file__), "..", "zerodha_token.json")
-    with open(token_path, "w") as f:
-        json.dump({"access_token": access_token, "date": today}, f)
-    print(f"[OK] Saved to zerodha_token.json (date: {today})")
-    
-    # 2. Update .env
+    # 1. Update .env
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_path):
         lines = open(env_path, "r").readlines()
@@ -58,9 +52,9 @@ def refresh_token(request_token: str):
             new_lines.append(f"ZERODHA_ACCESS_TOKEN={access_token}\n")
         with open(env_path, "w") as f:
             f.writelines(new_lines)
-        print("[OK] Updated .env")
+        print(f"[OK] Saved token to .env (date: {today})")
     
-    # 3. Verify login
+    # 2. Verify login
     kite.set_access_token(access_token)
     try:
         profile = kite.profile()

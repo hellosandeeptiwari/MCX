@@ -1,0 +1,36 @@
+# ============================================================
+#  Titan Dashboard — systemd service
+#  Runs Flask dashboard on :5000, proxied by Nginx
+# ============================================================
+[Unit]
+Description=Titan Trading Dashboard (Flask)
+After=network.target titan-bot.service
+
+[Service]
+Type=simple
+User=titan
+Group=titan
+WorkingDirectory=/home/titan/app/agentic_trader
+Environment=PATH=/home/titan/app/.venv/bin:/usr/bin:/bin
+Environment=FLASK_ENV=production
+EnvironmentFile=/home/titan/app/agentic_trader/.env
+
+# Gunicorn for production (pip install gunicorn)
+ExecStart=/home/titan/app/.venv/bin/gunicorn \
+    --bind 127.0.0.1:5000 \
+    --workers 2 \
+    --timeout 60 \
+    dashboard:app
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=append:/home/titan/app/agentic_trader/logs/dashboard.log
+StandardError=append:/home/titan/app/agentic_trader/logs/dashboard-error.log
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/titan/app
+
+[Install]
+WantedBy=multi-user.target

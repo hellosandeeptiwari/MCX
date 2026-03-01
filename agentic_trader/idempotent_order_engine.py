@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict, field
 import hashlib
 import json
 import os
+from state_db import get_state_db
 
 
 @dataclass
@@ -93,46 +94,44 @@ class IdempotentOrderEngine:
         self._check_new_day()
     
     def _load_state(self):
-        """Load persisted order state"""
+        """Load persisted order state from SQLite (falls back to JSON)"""
+        try:
+            ids, records = get_state_db().load_order_records(self.today)
+            if ids:
+                self.placed_order_ids = ids
+                for oid, rec_data in records.items():
+                    self.order_records[oid] = OrderRecord(**rec_data)
+                return
+        except Exception as e:
+            print(f"⚠️ Error loading idempotency state from SQLite: {e}")
+        # Fallback: legacy JSON
         if os.path.exists(self.persistence_file):
             try:
                 with open(self.persistence_file, 'r') as f:
                     data = json.load(f)
-                    
-                    # Only load if same day
                     if data.get('date') == self.today:
                         self.placed_order_ids = set(data.get('placed_order_ids', []))
-                        
-                        # Reconstruct order records
                         for oid, rec_data in data.get('order_records', {}).items():
                             self.order_records[oid] = OrderRecord(**rec_data)
-                        
-                        print(f"📋 Idempotency Engine: Loaded {len(self.placed_order_ids)} order IDs from today")
-                    else:
-                        print(f"📋 Idempotency Engine: New day - starting fresh")
             except Exception as e:
-                print(f"⚠️ Error loading idempotency state: {e}")
+                print(f"⚠️ Error loading idempotency state from JSON: {e}")
     
     def _save_state(self):
-        """Persist order state"""
-        data = {
-            'date': self.today,
-            'placed_order_ids': list(self.placed_order_ids),
-            'order_records': {oid: asdict(rec) for oid, rec in self.order_records.items()}
-        }
-        
-        with open(self.persistence_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        """Persist order state to SQLite (atomic, crash-safe)"""
+        try:
+            db = get_state_db()
+            for oid, rec in self.order_records.items():
+                db.save_order_record(oid, asdict(rec))
+        except Exception as e:
+            print(f"⚠️ Error saving idempotency state: {e}")
     
     def _check_new_day(self):
         """Reset state if new trading day"""
         today = date.today().isoformat()
         if today != self.today:
-            print(f"📅 Idempotency Engine: New day detected - resetting order tracking")
             self.today = today
             self.placed_order_ids = set()
             self.order_records = {}
-            self._save_state()
     
     def create_intent(
         self,
@@ -265,7 +264,7 @@ class IdempotentOrderEngine:
         # Persist
         self._save_state()
         
-        print(f"📋 Idempotency: Recorded order {client_order_id} -> {broker_order_id}")
+        # print(f"📋 Idempotency: Recorded order {client_order_id} -> {broker_order_id}")
         
         return client_order_id
     

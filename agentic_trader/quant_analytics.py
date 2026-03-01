@@ -455,7 +455,7 @@ def compute_score_edge_analysis(trades: List[Dict]) -> Dict:
     scored_trades = [(t.get('entry_score', 0) or 0, t.get('pnl', 0) or 0) for t in trades if t.get('entry_score')]
     
     if len(scored_trades) < 5:
-        return {'correlation': 0, 'bands': [], 'edge_valid': False, 'sample_size': len(scored_trades)}
+        return {'correlation': 0, 'bands': [], 'edge_valid': False, 'sample_size': len(scored_trades), 'verdict': 'INSUFFICIENT DATA'}
     
     scores, pnls = zip(*scored_trades)
     

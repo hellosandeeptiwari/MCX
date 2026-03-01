@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
+from state_db import get_state_db
 
 
 class ReconciliationState(Enum):
@@ -95,10 +96,23 @@ class PositionReconciliation:
         # Load any saved state
         self._load_state()
         
-        print(f"🔄 Position Reconciliation: INITIALIZED (interval: {self.check_interval}s)")
+        # print(f"🔄 Position Reconciliation: INITIALIZED (interval: {self.check_interval}s)")
     
     def _load_state(self):
-        """Load reconciliation state from file"""
+        """Load reconciliation state from SQLite (falls back to JSON)"""
+        try:
+            data = get_state_db().load_reconciliation_state()
+            if data:
+                self.mismatch_count = data.get('mismatch_count', 0)
+                self.mismatch_history = data.get('mismatch_history', [])
+                self.recovery_actions = data.get('recovery_actions', [])
+                if data.get('frozen'):
+                    self.frozen = True
+                    self.state = ReconciliationState.FROZEN
+                return
+        except Exception as e:
+            print(f"⚠️ Error loading reconciliation state from SQLite: {e}")
+        # Fallback: legacy JSON
         try:
             if os.path.exists(self.RECONCILIATION_FILE):
                 with open(self.RECONCILIATION_FILE, 'r') as f:
@@ -111,10 +125,10 @@ class PositionReconciliation:
                             self.frozen = True
                             self.state = ReconciliationState.FROZEN
         except Exception as e:
-            print(f"⚠️ Error loading reconciliation state: {e}")
+            print(f"⚠️ Error loading reconciliation state from JSON: {e}")
     
     def _save_state(self):
-        """Save reconciliation state to file"""
+        """Save reconciliation state to SQLite (atomic, crash-safe)"""
         try:
             data = {
                 'date': str(datetime.now().date()),
@@ -123,11 +137,10 @@ class PositionReconciliation:
                 'frozen': self.frozen,
                 'mismatch_count': self.mismatch_count,
                 'consecutive_mismatches': self.consecutive_mismatches,
-                'mismatch_history': self.mismatch_history[-50:],  # Keep last 50
-                'recovery_actions': self.recovery_actions[-20:]   # Keep last 20
+                'mismatch_history': self.mismatch_history[-50:],
+                'recovery_actions': self.recovery_actions[-20:]
             }
-            with open(self.RECONCILIATION_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
+            get_state_db().save_reconciliation_state(data)
         except Exception as e:
             print(f"⚠️ Error saving reconciliation state: {e}")
     
@@ -139,14 +152,14 @@ class PositionReconciliation:
         self._running = True
         self._thread = threading.Thread(target=self._reconciliation_loop, daemon=True)
         self._thread.start()
-        print(f"🔄 Reconciliation loop STARTED")
+        # print(f"🔄 Reconciliation loop STARTED")
     
     def stop(self):
         """Stop background reconciliation loop"""
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
-        print(f"🔄 Reconciliation loop STOPPED")
+        # print(f"🔄 Reconciliation loop STOPPED")
     
     def _reconciliation_loop(self):
         """Background loop that periodically checks reconciliation"""
@@ -168,7 +181,7 @@ class PositionReconciliation:
     
     def _do_startup_sync(self):
         """Initial sync on startup - handle restart mid-session"""
-        print("🔄 Performing startup reconciliation...")
+        # print("🔄 Performing startup reconciliation...")
         
         with self._lock:
             try:
@@ -176,7 +189,7 @@ class PositionReconciliation:
                 if self.paper_mode:
                     self._load_local_state()
                     self.state = ReconciliationState.SYNCED
-                    print(f"✅ Startup sync complete (paper mode) - {len(self.local_positions)} local positions")
+                    # print(f"✅ Startup sync complete (paper mode) - {len(self.local_positions)} local positions")
                     return
                 
                 # Get broker truth
@@ -213,7 +226,7 @@ class PositionReconciliation:
                 
                 if not orphan_broker_positions and not orphan_local_positions:
                     self.state = ReconciliationState.SYNCED
-                    print("✅ Startup sync complete - all positions match")
+                    # print("✅ Startup sync complete - all positions match")
                 else:
                     self.state = ReconciliationState.MISMATCH_DETECTED
                     print("⚠️ Startup sync found mismatches - entering recovery mode")

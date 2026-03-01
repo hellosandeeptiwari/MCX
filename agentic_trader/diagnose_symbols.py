@@ -14,10 +14,11 @@ from config import APPROVED_UNIVERSE, FNO_CONFIG
 
 # Connect
 kite = KiteConnect(api_key=os.getenv("ZERODHA_API_KEY"))
-token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'zerodha_token.json')
-with open(token_path, 'r') as f:
-    token_data = json.load(f)
-kite.set_access_token(token_data['access_token'])
+access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "")
+if not access_token:
+    print("❌ ZERODHA_ACCESS_TOKEN not set in .env")
+    sys.exit(1)
+kite.set_access_token(access_token)
 
 print("=" * 80)
 print("SYMBOL DIAGNOSTICS - Zerodha API Data Verification")

@@ -1,1 +1,4 @@
-{"date": "2026-02-13", "trades": {"NSE:NATIONALUM": {"UP": false, "DOWN": false}, "NSE:JSWSTEEL": {"UP": false, "DOWN": false}, "NSE:JINDALSTEL": {"UP": false, "DOWN": false}, "NSE:PAYTM": {"UP": false, "DOWN": true}, "NSE:NMDC": {"UP": false, "DOWN": false}, "NSE:MUTHOOTFIN": {"UP": false, "DOWN": false}, "NSE:IDEA": {"UP": false, "DOWN": true}, "NSE:HDFCBANK": {"UP": false, "DOWN": false}, "NSE:AXISBANK": {"UP": false, "DOWN": false}, "NSE:BAJFINANCE": {"UP": false, "DOWN": false}, "NSE:HINDALCO": {"UP": false, "DOWN": false}, "NSE:HINDZINC": {"UP": false, "DOWN": false}, "NSE:ETERNAL": {"UP": false, "DOWN": false}, "NSE:ASHOKLEY": {"UP": false, "DOWN": false}, "NSE:BHEL": {"UP": false, "DOWN": false}, "NSE:INFY": {"UP": false, "DOWN": false}, "NSE:TCS": {"UP": false, "DOWN": false}, "NSE:WIPRO": {"UP": false, "DOWN": false}, "NSE:IEX": {"UP": false, "DOWN": false}}}
+{
+  "date": "2026-02-24",
+  "orb_trades": {}
+}

@@ -1,0 +1,41 @@
+# ============================================================
+#  Titan Trading Bot — systemd service
+#  Auto-starts at boot, restarts on crash, stops at 4 PM IST
+# ============================================================
+[Unit]
+Description=Titan Autonomous Options Trader
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=titan
+Group=titan
+WorkingDirectory=/home/titan/app/agentic_trader
+Environment=PATH=/home/titan/app/.venv/bin:/usr/bin:/bin
+EnvironmentFile=/home/titan/app/agentic_trader/.env
+
+# Main command
+ExecStart=/home/titan/app/.venv/bin/python autonomous_trader.py
+
+# Restart policy: always restart unless manually stopped
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Resource limits
+MemoryMax=1G
+CPUQuota=80%
+
+# Logging
+StandardOutput=append:/home/titan/app/agentic_trader/logs/titan-bot.log
+StandardError=append:/home/titan/app/agentic_trader/logs/titan-bot-error.log
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/titan/app
+
+[Install]
+WantedBy=multi-user.target

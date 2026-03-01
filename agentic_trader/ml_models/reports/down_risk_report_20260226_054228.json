@@ -1,0 +1,162 @@
+{
+  "config": {
+    "input_dim": 84,
+    "latent_dim": 16,
+    "hidden_dims": [
+      64,
+      32
+    ],
+    "dropout": 0.2,
+    "vae_epochs": 100,
+    "vae_batch_size": 512,
+    "vae_lr": 0.002,
+    "vae_kl_weight": 0.5,
+    "vae_kl_warmup_frac": 0.3,
+    "vae_patience": 15,
+    "gmm_n_components": 6,
+    "gmm_covariance_type": "tied",
+    "gmm_max_iter": 300,
+    "flow_n_layers": 4,
+    "flow_hidden_dim": 64,
+    "flow_epochs": 150,
+    "flow_lr": 0.001,
+    "flow_patience": 10,
+    "iforest_n_estimators": 200,
+    "iforest_contamination": "auto",
+    "calibrator_n_estimators": 100,
+    "calibrator_max_depth": 2,
+    "calibrator_lr": 0.05,
+    "calibrator_val_split": 0.6,
+    "down_lookahead": 8,
+    "down_atr_factor": 3.0,
+    "down_fixed_pct": 0.5,
+    "up_atr_factor": 3.0,
+    "target_flag_rate": 0.15,
+    "min_lift": 1.05,
+    "test_days": 20,
+    "val_days": 20
+  },
+  "n_total": 3456953,
+  "n_features": 87,
+  "UP_metrics": {
+    "vae": {
+      "best_val_loss": 0.7020523548126221,
+      "final_epoch": 47,
+      "train_loss_final": 0.6440667261536824
+    },
+    "flow": {
+      "best_val_nll": -47.665889739990234,
+      "final_epoch": 88,
+      "train_mean_nll": -47.6634635925293,
+      "train_std_nll": 2.492602835164795
+    },
+    "threshold": 0.21457749411215132,
+    "base_down_rate": 0.22406825325550067,
+    "val_auroc": 0.5524,
+    "val_avg_precision": 0.2215,
+    "val_flag_rate": 0.1057,
+    "val_down_if_flagged": 0.2293,
+    "val_down_if_not_flagged": 0.1959,
+    "val_lift": 1.15,
+    "val_risk_reduction_pct": 1.8,
+    "val_decile_down_rates": [
+      0.1328762650995756,
+      0.15387076135636596,
+      0.1744127936031984,
+      0.195248942401562,
+      0.21184771906793567,
+      0.23897005641544916,
+      0.22286785379568885,
+      0.2110839445802771,
+      0.22145894667975138,
+      0.2301159562306059
+    ]
+  },
+  "DOWN_metrics": {
+    "vae": {
+      "best_val_loss": 0.7039797306060791,
+      "final_epoch": 47,
+      "train_loss_final": 0.6547750823799221
+    },
+    "flow": {
+      "best_val_nll": -45.96332550048828,
+      "final_epoch": 129,
+      "train_mean_nll": -46.03150177001953,
+      "train_std_nll": 4.340694437490234
+    },
+    "threshold": 0.26612845066583546,
+    "base_down_rate": 0.19034625879097652,
+    "val_auroc": 0.5707,
+    "val_avg_precision": 0.2707,
+    "val_flag_rate": 0.1826,
+    "val_down_if_flagged": 0.2858,
+    "val_down_if_not_flagged": 0.2016,
+    "val_lift": 1.32,
+    "val_risk_reduction_pct": 7.1,
+    "val_decile_down_rates": [
+      0.16485575121768453,
+      0.16947250280583614,
+      0.17716920497415117,
+      0.2030195381882771,
+      0.2076167076167076,
+      0.21775832421447552,
+      0.23262518968133536,
+      0.2360287230721199,
+      0.24934825946940653,
+      0.3177613320999075
+    ]
+  },
+  "test": {
+    "UP": {
+      "test_up_auroc": 0.5483,
+      "test_up_avg_precision": 0.2216,
+      "test_up_flag_rate": 0.3093,
+      "test_up_down_if_flagged": 0.2337,
+      "test_up_down_if_not_flagged": 0.1748,
+      "test_up_lift": 1.21,
+      "test_up_risk_reduction_pct": 9.4,
+      "test_up_decile_down_rates": [
+        0.16582677165354331,
+        0.16243752402921954,
+        0.17564730580825752,
+        0.1714632454923717,
+        0.17982226868792472,
+        0.16996871741397288,
+        0.20013898540653233,
+        0.23498785144047205,
+        0.23054204308547602,
+        0.2387747998607727
+      ]
+    },
+    "up_flag_rate": 0.3093,
+    "up_down_if_flagged": 0.2337,
+    "up_down_if_clean": 0.1748,
+    "up_lift": 1.21,
+    "DOWN": {
+      "test_down_auroc": 0.5622,
+      "test_down_avg_precision": 0.2196,
+      "test_down_flag_rate": 0.2024,
+      "test_down_down_if_flagged": 0.2359,
+      "test_down_down_if_not_flagged": 0.1793,
+      "test_down_lift": 1.24,
+      "test_down_risk_reduction_pct": 6.0,
+      "test_down_decile_down_rates": [
+        0.1316744427164334,
+        0.1578345406023637,
+        0.17086466165413533,
+        0.16782322863403945,
+        0.19004863449307893,
+        0.18393544837704015,
+        0.19955735890815196,
+        0.2354999079359234,
+        0.23050291545189505,
+        0.24214829957257014
+      ]
+    },
+    "down_flag_rate": 0.2024,
+    "down_up_if_flagged": 0.2359,
+    "down_up_if_clean": 0.1793,
+    "down_lift": 1.24
+  },
+  "training_time_sec": 14605.4
+}

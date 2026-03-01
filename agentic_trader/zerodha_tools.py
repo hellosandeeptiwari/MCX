@@ -24,6 +24,7 @@ from idempotent_order_engine import get_idempotent_engine
 from correlation_guard import get_correlation_guard
 from regime_score import get_regime_scorer
 from safe_io import atomic_json_save
+from state_db import get_state_db
 from position_reconciliation import get_position_reconciliation
 from data_health_gate import get_data_health_gate
 from options_trader import get_options_trader, OptionType, StrikeSelection, ExpirySelection, get_intraday_scorer, IntradaySignal
@@ -243,9 +244,17 @@ class ZerodhaTools:
                     _extra_equities = [s for s in _fo_equities if s not in all_symbols]
                     if _extra_equities:
                         self.ticker.subscribe_symbols(_extra_equities, mode='quote')
-                        print(f"🔌 Ticker: Subscribed {len(_extra_equities)} additional F&O equities (full universe)")
+                        # print(f"🔌 Ticker: Subscribed {len(_extra_equities)} additional F&O equities (full universe)")
                 except Exception as e:
                     print(f"⚠️ Ticker: Futures/equity subscription error (non-fatal): {e}")
+                
+                # === ATTACH BREAKOUT WATCHER ===
+                try:
+                    from config import BREAKOUT_WATCHER
+                    if BREAKOUT_WATCHER.get('enabled', False):
+                        self.ticker.attach_breakout_watcher(BREAKOUT_WATCHER)
+                except Exception as e:
+                    print(f"⚠️ Breakout watcher init failed (non-fatal): {e}")
             except Exception as e:
                 print(f"⚠️ Ticker init failed (REST fallback active): {e}")
                 self.ticker = None
@@ -256,27 +265,35 @@ class ZerodhaTools:
         self._subscribe_position_symbols()
     
     def _load_active_trades(self):
-        """Load active trades from JSON file"""
+        """Load active trades from SQLite (falls back to JSON for migration)"""
+        try:
+            today = str(datetime.now().date())
+            positions, pnl, cap = get_state_db().load_active_trades(today)
+            if positions or pnl != 0.0:
+                self.paper_positions = positions
+                self.paper_pnl = pnl
+                if cap > 0:
+                    self.paper_capital = cap
+                return
+        except Exception as e:
+            print(f"⚠️ Error loading trades from SQLite: {e}")
+        # Fallback: legacy JSON
         try:
             if os.path.exists(self.TRADES_FILE):
                 with open(self.TRADES_FILE, 'r') as f:
                     data = json.load(f)
-                    # Only load trades from today
                     today = str(datetime.now().date())
                     if data.get('date') == today:
                         self.paper_positions = data.get('active_trades', [])
                         self.paper_pnl = data.get('realized_pnl', 0)
-                        print(f"📂 Loaded {len(self.paper_positions)} active trades from file")
                     else:
-                        # New day - start fresh
                         self.paper_positions = []
                         self.paper_pnl = 0
-                        print(f"📅 New trading day - starting fresh")
             else:
                 self.paper_positions = []
                 self.paper_pnl = 0
         except Exception as e:
-            print(f"⚠️ Error loading trades: {e}")
+            print(f"⚠️ Error loading trades from JSON: {e}")
             self.paper_positions = []
             self.paper_pnl = 0
     
@@ -310,19 +327,16 @@ class ZerodhaTools:
                     option_syms.add(s)
         if option_syms:
             self.ticker.subscribe_symbols(list(option_syms), mode='quote')
-            print(f"🔌 Ticker: Subscribed {len(option_syms)} option contracts for live PnL")
+            # print(f"🔌 Ticker: Subscribed {len(option_syms)} option contracts for live PnL")
 
     def _save_active_trades(self):
-        """Save active trades to JSON file (caller must hold _positions_lock)"""
+        """Save active trades to SQLite (caller must hold _positions_lock)"""
         try:
-            data = {
-                'date': str(datetime.now().date()),
-                'last_updated': datetime.now().isoformat(),
-                'active_trades': self.paper_positions,
-                'realized_pnl': self.paper_pnl,
-                'paper_capital': self.paper_capital
-            }
-            atomic_json_save(self.TRADES_FILE, data)
+            get_state_db().save_active_trades(
+                self.paper_positions,
+                self.paper_pnl,
+                self.paper_capital,
+            )
         except Exception as e:
             print(f"⚠️ Error saving trades: {e}")
     
@@ -473,8 +487,8 @@ class ZerodhaTools:
                     'gtt_sl_trigger': gtt_sl_trigger, 'gtt_target_trigger': gtt_target_trigger,
                     'tag': tag
                 })
-                print(f"   🛡️ GTT safety net placed: {symbol} trigger_id={trigger_id} "
-                      f"(SL@{gtt_sl_trigger} / Target@{gtt_target_trigger})")
+                # print(f"   🛡️ GTT safety net placed: {symbol} trigger_id={trigger_id} "
+                #       f"(SL@{gtt_sl_trigger} / Target@{gtt_target_trigger})")
             
             return trigger_id
             
@@ -502,7 +516,7 @@ class ZerodhaTools:
             self.kite.delete_gtt(trigger_id)
             if GTT_CONFIG.get('log_gtt_events', True):
                 self._log_gtt_event('CANCELLED', symbol, trigger_id, {'reason': 'trade_exited_normally'})
-                print(f"   🛡️ GTT cancelled: {symbol} trigger_id={trigger_id}")
+                # print(f"   🛡️ GTT cancelled: {symbol} trigger_id={trigger_id}")
             return True
         except Exception as e:
             # GTT may have already triggered or expired
@@ -546,7 +560,8 @@ class ZerodhaTools:
                         print(f"   ⚠️ Failed to cleanup orphaned GTT {gtt['id']}: {e}")
             
             if orphaned > 0:
-                print(f"   🛡️ Cleaned up {orphaned} orphaned GTT(s) from previous session")
+                # print(f"   🛡️ Cleaned up {orphaned} orphaned GTT(s) from previous session")
+                pass
         except Exception as e:
             print(f"   ⚠️ GTT orphan cleanup failed: {e}")
     
@@ -609,6 +624,8 @@ class ZerodhaTools:
                 final_score=position.get('entry_score') or position.get('p_score', 0),
                 dr_score=position.get('dr_score') or 0,
                 dr_flag=position.get('dr_flag', False),
+                up_flag=position.get('up_flag', False),
+                down_flag=position.get('down_flag', False),
                 gate_prob=position.get('ml_move_prob') or 0,
                 gmm_action=position.get('gmm_action', _gm.get('action', '')),
                 ml_direction=position.get('ml_scored_direction', _md.get('scored_direction', '')),
@@ -904,6 +921,8 @@ class ZerodhaTools:
                         'THESIS_INVALID_R_COLLAPSE', 'THESIS_INVALID_NEVER_SHOWED_LIFE',
                         'THESIS_INVALID_IV_CRUSH', 'THESIS_INVALID_UNDERLYING_BOS',
                         'THESIS_INVALID_MAX_PAIN_CEILING',
+                        # Portfolio-level kill-all profit booking
+                        'PROFIT_TARGET_EXIT',
                     }
                     # Catch-all: if exit_price and pnl are set, treat as closed even for unknown statuses
                     is_closed = status in _known_exit_statuses or (exit_price is not None and pnl is not None)
@@ -914,7 +933,7 @@ class ZerodhaTools:
                             from config import HARD_RULES as _HR
                             _cd_mins = _HR.get('REENTRY_COOLDOWN_MINUTES', 20)
                             self._exit_cooldowns[_cooldown_underlying] = datetime.now()
-                            print(f"   ⏳ Cooldown: {_cooldown_underlying} blocked for {_cd_mins} min re-entry")
+                            # print(f"   ⏳ Cooldown: {_cooldown_underlying} blocked for {_cd_mins} min re-entry")
                         
                         # === LIVE MODE: Place real exit order on Zerodha ===
                         if not self.paper_mode and status != 'STOPLOSS_HIT' and status != 'SL_HIT':
@@ -957,7 +976,7 @@ class ZerodhaTools:
                                     order_id=sl_order_id,
                                     quantity=remaining_qty
                                 )
-                                print(f"   📊 Updated SL order qty to {remaining_qty} for {symbol}")
+                                # print(f"   📊 Updated SL order qty to {remaining_qty} for {symbol}")
                             except Exception as e:
                                 print(f"   ⚠️ Failed to modify SL order for {symbol}: {e}")
                     
@@ -981,7 +1000,7 @@ class ZerodhaTools:
                     self.paper_pnl += partial_pnl
                     self._save_active_trades()
                     
-                    print(f"   📊 Partial exit saved: {exit_qty} exited, {remaining_qty} remaining")
+                    # print(f"   📊 Partial exit saved: {exit_qty} exited, {remaining_qty} remaining")
                     return True
         return False
     
@@ -1081,44 +1100,21 @@ class ZerodhaTools:
         return updates
     
     def _load_token(self):
-        """Load access token from file or environment variable"""
-        # 1. Try token file (date-checked)
-        try:
-            token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
-            with open(token_path, 'r') as f:
-                data = json.load(f)
-            
-            if data.get('date') == str(datetime.now().date()):
-                self.access_token = data['access_token']
-                self.kite.set_access_token(self.access_token)
-                print(f"🔑 Loaded today's access token from file")
-                return True
-            else:
-                print(f"⚠️ Token file is stale (date: {data.get('date')}, today: {datetime.now().date()})")
-        except Exception:
-            pass
-        
-        # 2. Try ZERODHA_ACCESS_TOKEN from .env (user manually updated)
+        """Load access token from .env (ZERODHA_ACCESS_TOKEN)"""
         env_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "")
         if env_token:
             self.access_token = env_token
             self.kite.set_access_token(self.access_token)
-            # Test if token is valid
             try:
                 self.kite.profile()
-                print(f"🔑 Using access token from .env (ZERODHA_ACCESS_TOKEN)")
-                # Save to file for consistency
-                token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
-                with open(token_path, 'w') as f:
-                    json.dump({'access_token': env_token, 'date': str(datetime.now().date())}, f)
                 return True
             except Exception:
-                print(f"⚠️ .env access token is invalid/expired")
+                print(f"⚠️ .env ZERODHA_ACCESS_TOKEN is invalid/expired")
                 self.access_token = None
         
-        # 3. No valid token — prompt for authentication
-        print(f"\n⚠️ No valid Kite access token found for today.")
-        print(f"   Starting interactive authentication...\n")
+        # No valid token — prompt for authentication
+        print(f"\n⚠️ No valid Kite access token found.")
+        print(f"   Update ZERODHA_ACCESS_TOKEN in .env, or start interactive auth...\n")
         return self.authenticate()
     
     def authenticate(self):
@@ -1141,16 +1137,11 @@ class ZerodhaTools:
             self.access_token = data["access_token"]
             self.kite.set_access_token(self.access_token)
             
-            # Save token
-            token_path = os.path.join(os.path.dirname(__file__), '..', 'zerodha_token.json')
-            with open(token_path, 'w') as f:
-                json.dump({
-                    'access_token': self.access_token,
-                    'date': str(datetime.now().date())
-                }, f)
+            # Save token to .env
+            self._update_env_token(self.access_token)
             
             print(f"\n✅ Authentication successful!")
-            print(f"   Token saved for today: {datetime.now().date()}")
+            print(f"   Token saved to .env for: {datetime.now().date()}")
             
             # Test the connection
             profile = self.kite.profile()
@@ -1161,6 +1152,31 @@ class ZerodhaTools:
         except Exception as e:
             print(f"\n❌ Authentication failed: {e}")
             return False
+    
+    def _update_env_token(self, access_token):
+        """Update ZERODHA_ACCESS_TOKEN in .env file"""
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        if os.path.exists(env_path):
+            with open(env_path, 'r') as f:
+                lines = f.readlines()
+            
+            updated = False
+            new_lines = []
+            for line in lines:
+                if line.startswith('ZERODHA_ACCESS_TOKEN='):
+                    new_lines.append(f'ZERODHA_ACCESS_TOKEN={access_token}\n')
+                    updated = True
+                else:
+                    new_lines.append(line)
+            
+            if not updated:
+                new_lines.append(f'ZERODHA_ACCESS_TOKEN={access_token}\n')
+            
+            with open(env_path, 'w') as f:
+                f.writelines(new_lines)
+        
+        # Also update current process environment
+        os.environ['ZERODHA_ACCESS_TOKEN'] = access_token
     
     def _rate_limit(self):
         """Enforce API rate limiting using a token-bucket approach (thread-safe).
@@ -1723,10 +1739,14 @@ class ZerodhaTools:
         except Exception as e:
             return {"error": str(e)}
 
-    def get_market_data(self, symbols: List[str]) -> Dict[str, Dict]:
+    def get_market_data(self, symbols: List[str], force_fresh: bool = False) -> Dict[str, Dict]:
         """
         Tool: Get market data for symbols
         Returns OHLCV + technical indicators
+        
+        Args:
+            force_fresh: If True, bypass indicator cache entirely (used by breakout watcher
+                         for 1-3 stocks where fresh RSI/VWAP/ADX is critical).
         """
         # Filter to approved universe + any extra symbols passed by caller (wild-cards)
         valid_symbols = [s for s in symbols if s in APPROVED_UNIVERSE or s.startswith("NSE:")]
@@ -1769,9 +1789,9 @@ class ZerodhaTools:
             
             def _calc_one(sym):
                 try:
-                    return sym, self._calculate_indicators(sym)
+                    return sym, self._calculate_indicators(sym, force_fresh=force_fresh)
                 except Exception as e:
-                    print(f"   ⚠️ Indicator error {sym}: {e}")
+                    # print(f"   ⚠️ Indicator error {sym}: {e}")
                     return sym, None
             
             from config import FULL_FNO_SCAN
@@ -1787,7 +1807,7 @@ class ZerodhaTools:
             _cached = sum(1 for s in _symbols_to_calc if hasattr(self, '_ind_cache') and s in self._ind_cache and (time.time() - self._ind_cache[s][0]) < 300)
             _today_str = datetime.now().strftime('%Y-%m-%d')
             _daily_cached = sum(1 for s in _symbols_to_calc if hasattr(self, '_daily_data_cache') and s in self._daily_data_cache and self._daily_data_cache[s][0] == _today_str)
-            print(f"   ⚡ Indicators: {len(_indicators_map)}/{len(_symbols_to_calc)} stocks in {_elapsed:.1f}s ({_cached} ind-cached, {_daily_cached} daily-cached)")
+            # print(f"   ⚡ Indicators: {len(_indicators_map)}/{len(_symbols_to_calc)} stocks in {_elapsed:.1f}s ({_cached} ind-cached, {_daily_cached} daily-cached)")
             
             # === REBUILD RESULT with indicators ===
             final_result = {}
@@ -1903,22 +1923,26 @@ class ZerodhaTools:
         except Exception as e:
             return {"error": str(e)}
     
-    def _calculate_indicators(self, symbol: str) -> Dict:
+    def _calculate_indicators(self, symbol: str, force_fresh: bool = False) -> Dict:
         """Calculate technical indicators for a symbol using BOTH daily and intraday data.
         
         Results are cached for INDICATOR_CACHE_TTL seconds to avoid redundant
         API calls when the same stock appears in consecutive scan cycles.
+        
+        Args:
+            force_fresh: If True, skip cache lookup (breakout watcher needs live indicators).
         """
         # --- Indicator cache (10-minute TTL — scans every 3-5min, so ~50% cache hit rate) ---
         INDICATOR_CACHE_TTL = 600  # seconds
         if not hasattr(self, '_ind_cache'):
             self._ind_cache: Dict[str, tuple] = {}  # symbol -> (timestamp, result)
         
-        _cached = self._ind_cache.get(symbol)
-        if _cached:
-            _cache_age = time.time() - _cached[0]
-            if _cache_age < INDICATOR_CACHE_TTL:
-                return _cached[1]  # Cache hit — skip API calls
+        if not force_fresh:
+            _cached = self._ind_cache.get(symbol)
+            if _cached:
+                _cache_age = time.time() - _cached[0]
+                if _cache_age < INDICATOR_CACHE_TTL:
+                    return _cached[1]  # Cache hit — skip API calls
         
         self._rate_limit()
         
@@ -1984,7 +2008,7 @@ class ZerodhaTools:
                     except Exception as e:
                         if attempt < 2:
                             wait = (attempt + 1) * 2  # 2s, 4s
-                            print(f"   ⏳ {symbol} daily data retry {attempt+1}/2 (waiting {wait}s)")
+                            # print(f"   ⏳ {symbol} daily data retry {attempt+1}/2 (waiting {wait}s)")
                             time.sleep(wait)
                         else:
                             raise
@@ -2034,7 +2058,7 @@ class ZerodhaTools:
                     except Exception as e:
                         if attempt < 2:
                             wait = (attempt + 1) * 2
-                            print(f"   ⏳ {symbol} intraday data retry {attempt+1}/2 (waiting {wait}s)")
+                            # print(f"   ⏳ {symbol} intraday data retry {attempt+1}/2 (waiting {wait}s)")
                             time.sleep(wait)
                         else:
                             raise
@@ -3007,7 +3031,8 @@ class ZerodhaTools:
                         "action": "Wait for healthy data"
                     }
         except Exception as e:
-            print(f"   ⚠️ Data health check failed: {e}")
+            # print(f"   ⚠️ Data health check failed: {e}")
+            pass
         
         # === IDEMPOTENT ORDER CHECK ===
         idempotent_engine = get_idempotent_engine()
@@ -3042,7 +3067,8 @@ class ZerodhaTools:
                     }
                 }
         except Exception as e:
-            print(f"   ⚠️ Idempotency check failed: {e} - proceeding with caution")
+            # print(f"   ⚠️ Idempotency check failed: {e} - proceeding with caution")
+            pass
         
         # Store intent for later recording
         order['_order_intent'] = order_intent
@@ -3084,7 +3110,8 @@ class ZerodhaTools:
         # Log correlation warnings if any
         if corr_check.warnings:
             for w in corr_check.warnings:
-                print(f"   ⚠️ Correlation: {w}")
+                # print(f"   ⚠️ Correlation: {w}")
+                pass
         
         # === REGIME SCORE CHECK ===
         regime_scorer = get_regime_scorer()
@@ -3117,7 +3144,7 @@ class ZerodhaTools:
                 "breakdown": [{"name": c.name, "points": c.points, "reason": c.reason} for c in regime_result.components]
             }
         
-        print(f"   📊 Regime Score: {regime_result.total_score}/{regime_result.threshold} ({regime_result.confidence})")
+        # print(f"   📊 Regime Score: {regime_result.total_score}/{regime_result.threshold} ({regime_result.confidence})")
         order['_regime_score'] = regime_result.total_score
         order['_regime_confidence'] = regime_result.confidence
         
@@ -3167,11 +3194,12 @@ class ZerodhaTools:
                 if actual_score < cash_min_score:
                     self._scorer_rejected_symbols.add(symbol.replace('NSE:', ''))
                     if CASH_INTRADAY_CONFIG.get('log_rejections', True):
-                        print(f"   🚫 CASH INTRADAY BLOCK: {symbol} score {actual_score:.0f}/{cash_min_score}")
-                        for r in cash_decision.reasons[:5]:
-                            print(f"      {r}")
-                        for w in cash_decision.warnings[:5]:
-                            print(f"      {w}")
+                        # print(f"   🚫 CASH INTRADAY BLOCK: {symbol} score {actual_score:.0f}/{cash_min_score}")
+                        # for r in cash_decision.reasons[:5]:
+                        #     print(f"      {r}")
+                        # for w in cash_decision.warnings[:5]:
+                        #     print(f"      {w}")
+                        pass
                     return {
                         "success": False,
                         "error": f"CASH INTRADAY BLOCK: Score {actual_score:.0f}/{cash_min_score} - signals too weak for entry",
@@ -3186,7 +3214,8 @@ class ZerodhaTools:
                 # Check direction alignment — agent said BUY but signals say SELL (or vice versa)
                 if cash_decision.recommended_direction != "HOLD" and cash_decision.recommended_direction != side:
                     if CASH_INTRADAY_CONFIG.get('log_rejections', True):
-                        print(f"   🚫 CASH DIRECTION CONFLICT: Agent wants {side} but signals say {cash_decision.recommended_direction}")
+                        # print(f"   🚫 CASH DIRECTION CONFLICT: Agent wants {side} but signals say {cash_decision.recommended_direction}")
+                        pass
                     return {
                         "success": False,
                         "error": f"DIRECTION CONFLICT: Agent wants {side} but intraday signals say {cash_decision.recommended_direction} (score: {actual_score:.0f})",
@@ -3196,7 +3225,7 @@ class ZerodhaTools:
                         "action": "SKIP - direction mismatch between analysis and signals"
                     }
                 
-                print(f"   ✅ Cash Intraday Score: {actual_score:.0f}/{cash_min_score} ({cash_decision.recommended_direction}) — PASSED")
+                # print(f"   ✅ Cash Intraday Score: {actual_score:.0f}/{cash_min_score} ({cash_decision.recommended_direction}) — PASSED")
                 order['_intraday_score'] = actual_score
                 order['_intraday_direction'] = cash_decision.recommended_direction
                 
@@ -3260,7 +3289,8 @@ class ZerodhaTools:
             
             # Log warnings if any
             if exec_policy.warnings:
-                print(f"   ⚠️ Execution warnings: {', '.join(exec_policy.warnings)}")
+                # print(f"   ⚠️ Execution warnings: {', '.join(exec_policy.warnings)}")
+                pass
             
             # Store expected entry price for slippage calculation
             expected_entry = ask if side == 'BUY' else bid
@@ -3301,10 +3331,11 @@ class ZerodhaTools:
             order['quantity'] = sizing['quantity']
             
             if original_qty != sizing['quantity']:
-                print(f"   📊 Adaptive sizing: {original_qty} → {sizing['quantity']}")
-                if sizing.get('warnings'):
-                    for w in sizing['warnings']:
-                        print(f"      ⚠️ {w}")
+                # print(f"   📊 Adaptive sizing: {original_qty} → {sizing['quantity']}")
+                # if sizing.get('warnings'):
+                #     for w in sizing['warnings']:
+                #         print(f"      ⚠️ {w}")
+                pass
             
         except Exception as e:
             return {
@@ -3534,7 +3565,8 @@ class ZerodhaTools:
                           lot_multiplier: float = 1.0,
                           setup_type: str = "",
                           ml_data: dict = None,
-                          sector: str = "") -> Dict:
+                          sector: str = "",
+                          pre_fetched_market_data: dict = None) -> Dict:
         """
         Tool: Place an option order instead of equity order
         
@@ -3644,7 +3676,8 @@ class ZerodhaTools:
                         "action": "Wait for healthy data"
                     }
         except Exception as e:
-            print(f"   ⚠️ Data health check failed for option: {e}")
+            # print(f"   ⚠️ Data health check failed for option: {e}")
+            pass
         
         # 5. Correlation guard check
         correlation_guard = get_correlation_guard()
@@ -3677,7 +3710,7 @@ class ZerodhaTools:
             _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
             if _elapsed < _cd_mins:
                 _remaining = round(_cd_mins - _elapsed, 1)
-                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                # print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
                 return {
                     "success": False,
                     "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left of {_cd_mins}-min cooldown)",
@@ -3688,12 +3721,15 @@ class ZerodhaTools:
         
         # === GET INTRADAY MARKET DATA ===
         market_data = {}
-        if use_intraday_scoring:
+        # Use pre-fetched market data if provided (e.g., from TEST_XGB for IV crush gate)
+        if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3:
+            market_data = pre_fetched_market_data
+        elif use_intraday_scoring:
             try:
                 md = self.get_market_data([underlying])
                 if underlying in md and isinstance(md[underlying], dict):
                     market_data = md[underlying]
-                    print(f"   📊 Using intraday signals for {underlying}")
+                    # print(f"   📊 Using intraday signals for {underlying}")
                 else:
                     print(f"   ⚠️ No indicator data for {underlying} — rejecting option order")
                     self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
@@ -3734,22 +3770,29 @@ class ZerodhaTools:
                 _is_spread = False  # Will be determined by routing below
                 _gate_ok, _gate_reason = expiry_entry_gate('naked_option', _is_spread, _expiry_iso)
                 if not _gate_ok:
-                    print(f"   🛡️ {_gate_reason}")
+                    # print(f"   🛡️ {_gate_reason}")
                     return {
                         "success": False,
                         "error": _gate_reason,
                         "action": "EXPIRY SHIELD: Wait or use different expiry"
                     }
                 elif _gate_reason == "EXPIRY_DAY_TRADE":
-                    print(f"   ⚡ Expiry Day Shield: 0DTE entry — SL will be tightened, force-exit by 14:45")
+                    # print(f"   ⚡ Expiry Day Shield: 0DTE entry — SL will be tightened, force-exit by 14:45")
+                    pass
             except Exception as e:
                 print(f"   ⚠️ Expiry shield check failed (proceeding): {e}")
         
+        # === ROUTING REVERSAL: ELITE/ORB go naked-first, spreads as fallback ===
+        # High-conviction directional setups should NOT be capped by credit spreads
+        _naked_first = setup_type in ('ELITE', 'ORB_BREAKOUT')
+        if _naked_first:
+            print(f"   🎯 {setup_type} NAKED-FIRST: Skipping spread auto-route for {underlying} — directional conviction")
+        
         # === AUTO-TRY DEBIT SPREAD FIRST (directional momentum play) ===
         from config import DEBIT_SPREAD_CONFIG
-        if DEBIT_SPREAD_CONFIG.get('enabled', False):
+        if not _naked_first and DEBIT_SPREAD_CONFIG.get('enabled', False):
             try:
-                print(f"   🔄 Auto-trying debit spread FIRST for {underlying} ({direction})...")
+                # print(f"   🔄 Auto-trying debit spread FIRST for {underlying} ({direction})...")
                 debit_result = self.place_debit_spread(
                     underlying=underlying,
                     direction=direction,
@@ -3764,15 +3807,16 @@ class ZerodhaTools:
                     return debit_result
                 else:
                     debit_reason = debit_result.get('error', 'Unknown')
-                    print(f"   🔄 Debit spread not viable ({debit_reason}), checking credit spread...")
+                    # print(f"   🔄 Debit spread not viable ({debit_reason}), checking credit spread...")
             except Exception as e:
-                print(f"   ⚠️ Debit spread attempt failed ({e}), checking credit spread...")
+                # print(f"   ⚠️ Debit spread attempt failed ({e}), checking credit spread...")
+                pass
         
         # === AUTO-TRY CREDIT SPREAD SECOND (theta-positive hedge) ===
         from config import CREDIT_SPREAD_CONFIG
-        if CREDIT_SPREAD_CONFIG.get('enabled', False) and CREDIT_SPREAD_CONFIG.get('primary_strategy', False):
+        if not _naked_first and CREDIT_SPREAD_CONFIG.get('enabled', False) and CREDIT_SPREAD_CONFIG.get('primary_strategy', False):
             try:
-                print(f"   🔄 Auto-trying credit spread for {underlying} ({direction})...")
+                # print(f"   🔄 Auto-trying credit spread for {underlying} ({direction})...")
                 spread_result = self.place_credit_spread(
                     underlying=underlying,
                     direction=direction,
@@ -3788,27 +3832,72 @@ class ZerodhaTools:
                     return spread_result
                 else:
                     fallback_reason = spread_result.get('error', 'Unknown')
-                    print(f"   🔄 Credit spread not viable for {underlying}, falling back to naked buy...")
+                    # print(f"   🔄 Credit spread not viable for {underlying}, falling back to naked buy...")
             except Exception as e:
-                print(f"   ⚠️ Credit spread attempt failed ({e}), falling back to naked buy...")
+                # print(f"   ⚠️ Credit spread attempt failed ({e}), falling back to naked buy...")
+                pass
         
         strike_sel = StrikeSelection[strike_selection.upper()] if strike_selection != "AUTO" else None
         expiry_sel = ExpirySelection[expiry_selection.upper()] if expiry_selection != "AUTO" else None
         
         # === CREATE OPTION ORDER WITH INTRADAY SCORING ===
+        # Pass market_data for IV crush gate even when not using intraday scoring
+        # (e.g., TEST_XGB needs ATR for RV computation in IV/RV ratio check)
+        _md_for_order = market_data if (use_intraday_scoring or pre_fetched_market_data) else None
         plan = options_trader.create_option_order(
             underlying=underlying,
             direction=direction,
             option_type=opt_type,
             strike_selection=strike_sel,
             expiry_selection=expiry_sel,
-            market_data=market_data if use_intraday_scoring else None,
-            cached_decision=_cached
+            market_data=_md_for_order,
+            cached_decision=_cached,
+            setup_type=setup_type
         )
         
         if plan is None:
             # Track rejection so autonomous_trader won't retry this symbol
             self._scorer_rejected_symbols.add(underlying.replace('NSE:', ''))
+            
+            # === ELITE/ORB FALLBACK: Naked failed → now try spreads ===
+            if _naked_first:
+                print(f"   🔄 {setup_type} naked option rejected for {underlying}, trying spread fallback...")
+                # Try debit spread
+                from config import DEBIT_SPREAD_CONFIG as _nf_debit_cfg
+                if _nf_debit_cfg.get('enabled', False):
+                    try:
+                        _nf_debit = self.place_debit_spread(
+                            underlying=underlying, direction=direction,
+                            rationale=rationale or f"{setup_type} fallback: naked rejected, trying debit spread",
+                            pre_fetched_market_data=market_data if market_data else None,
+                            cached_decision=_cached
+                        )
+                        if _nf_debit.get('success'):
+                            print(f"   ✅ {setup_type} debit spread fallback placed for {underlying}!")
+                            _nf_debit['auto_routed'] = True
+                            _nf_debit['original_tool'] = 'place_option_order'
+                            _nf_debit['fallback_from'] = f'{setup_type}_naked_rejected'
+                            return _nf_debit
+                    except Exception:
+                        pass
+                # Try credit spread
+                from config import CREDIT_SPREAD_CONFIG as _nf_credit_cfg
+                if _nf_credit_cfg.get('enabled', False) and _nf_credit_cfg.get('primary_strategy', False):
+                    try:
+                        _nf_credit = self.place_credit_spread(
+                            underlying=underlying, direction=direction,
+                            rationale=rationale or f"{setup_type} fallback: naked rejected, trying credit spread",
+                            pre_fetched_market_data=market_data if market_data else None,
+                            cached_decision=_cached
+                        )
+                        if _nf_credit.get('success'):
+                            print(f"   ✅ {setup_type} credit spread fallback placed for {underlying}!")
+                            _nf_credit['auto_routed'] = True
+                            _nf_credit['original_tool'] = 'place_option_order'
+                            _nf_credit['fallback_from'] = f'{setup_type}_naked_rejected'
+                            return _nf_credit
+                    except Exception:
+                        pass
             
             # === AUTO-TRY IRON CONDOR for LOW-SCORE stocks (choppy theta harvest) ===
             from config import IRON_CONDOR_CONFIG
@@ -3850,7 +3939,8 @@ class ZerodhaTools:
                                     pass
                             self._ic_dte_eligible = ic_dte_ok
                             if not ic_dte_ok:
-                                print(f"   🦅 IC DTE check: No expiry within limits — IC disabled for today")
+                                # print(f"   🦅 IC DTE check: No expiry within limits — IC disabled for today")
+                                pass
                         except Exception:
                             self._ic_dte_eligible = False
                             ic_dte_ok = False
@@ -3858,7 +3948,7 @@ class ZerodhaTools:
                     if not ic_dte_ok:
                         pass  # Silently skip — already printed once
                     else:
-                        print(f"   🦅 Score {rejected_score:.0f} too low for directional, trying IRON CONDOR...")
+                        # print(f"   🦅 Score {rejected_score:.0f} too low for directional, trying IRON CONDOR...")
                         try:
                             ic_result = self.place_iron_condor(
                                 underlying=underlying,
@@ -3873,9 +3963,11 @@ class ZerodhaTools:
                                 ic_result['fallback_from'] = 'directional_rejected'
                                 return ic_result
                             else:
-                                print(f"   🔄 Iron Condor not viable: {ic_result.get('error', 'Unknown')}")
+                                # print(f"   🔄 Iron Condor not viable: {ic_result.get('error', 'Unknown')}")
+                                pass
                         except Exception as e:
-                            print(f"   ⚠️ Iron Condor attempt failed: {e}")
+                            # print(f"   ⚠️ Iron Condor attempt failed: {e}")
+                            pass
             
             return {
                 "success": False,
@@ -3897,13 +3989,104 @@ class ZerodhaTools:
                 "action": "Skip — premium too cheap, excessive unit exposure risk"
             }
         
+        # === IV CRUSH GUARD (Feb 25 fix — IOC 22.8% IV trap) ===
+        # Prevents buying low-IV options that are vulnerable to IV compression,
+        # especially on high-breadth days where uncertainty is already low.
+        # IOC CE bought at 22.8% IV on 47/50 bullish day → IV compressed → -10.7% premium loss.
+        from config import IV_CRUSH_GUARD as _iv_cfg
+        if _iv_cfg.get('enabled', True):
+            try:
+                _opt_iv = plan.contract.iv       # IV as decimal (e.g., 0.228 = 22.8%)
+                _opt_ltp = plan.contract.ltp      # Option premium (₹)
+                _opt_delta = plan.contract.delta   # Delta
+                _opt_vega = plan.contract.vega     # Vega
+                _sym = plan.contract.symbol
+                
+                if _opt_iv is not None and _opt_iv > 0:
+                    # --- Sub-Gate 1: Absolute IV Floor ---
+                    _iv_floor = _iv_cfg.get('min_iv_floor', 0.25)
+                    
+                    # --- Sub-Gate 2: Breadth-Adjusted IV Floor ---
+                    # Check market breadth to raise the IV floor on extreme-breadth days
+                    _effective_iv_floor = _iv_floor
+                    _breadth_label = 'MIXED'
+                    _breadth_ratio = 0.0
+                    try:
+                        _md_iv = self.get_market_data([underlying])
+                        _breadth_label = _md_iv.get(underlying, {}).get('market_breadth', 'MIXED') if isinstance(_md_iv.get(underlying), dict) else 'MIXED'
+                        # Compute breadth ratio from paper_positions context or market data
+                        # Use a lightweight heuristic: BULLISH/BEARISH = extreme, MIXED = normal
+                        if _breadth_label in ('BULLISH', 'BEARISH'):
+                            _breadth_ratio = 0.90  # Assume ~90% when regime is strongly directional
+                        else:
+                            _breadth_ratio = 0.55  # Mixed regime = ~55%
+                    except Exception:
+                        pass
+                    
+                    _extreme_thresh = _iv_cfg.get('breadth_extreme_threshold', 0.85)
+                    if _breadth_ratio >= _extreme_thresh:
+                        _extreme_floor = _iv_cfg.get('breadth_extreme_iv_floor', 0.32)
+                        _effective_iv_floor = max(_effective_iv_floor, _extreme_floor)
+                    
+                    if _opt_iv < _effective_iv_floor:
+                        _iv_pct = _opt_iv * 100
+                        _floor_pct = _effective_iv_floor * 100
+                        _reason = f"IV {_iv_pct:.1f}% < floor {_floor_pct:.0f}%"
+                        if _effective_iv_floor > _iv_floor:
+                            _reason += f" (raised from {_iv_floor*100:.0f}% due to {_breadth_label} breadth)"
+                        # print(f"   🧊 IV CRUSH GUARD BLOCKED: {_sym} — {_reason}")
+                        # print(f"      Low IV = vega trap. Premium will shrink if IV compresses further.")
+                        return {
+                            "success": False,
+                            "error": f"IV CRUSH GUARD: {_reason}. "
+                                     f"Buying options at low IV exposes to vega loss if IV compresses. "
+                                     f"IOC-type trap: direction right but premium falls.",
+                            "action": "Skip — wait for higher IV or use spreads to neutralize vega"
+                        }
+                    
+                    # --- Sub-Gate 3: Premium Floor (IV-safety) ---
+                    _min_prem_iv = _iv_cfg.get('min_premium_for_iv_safety', 8.0)
+                    if _opt_ltp and _opt_ltp < _min_prem_iv and _opt_iv < 0.35:
+                        # print(f"   🧊 IV CRUSH GUARD (PREMIUM): {_sym} — LTP ₹{_opt_ltp:.2f} < ₹{_min_prem_iv:.0f} "
+                        #       f"with IV {_opt_iv*100:.1f}%. Cheap + low IV = amplified vega risk.")
+                        return {
+                            "success": False,
+                            "error": f"IV CRUSH GUARD: Premium ₹{_opt_ltp:.2f} < ₹{_min_prem_iv:.0f} with IV {_opt_iv*100:.1f}%. "
+                                     f"Cheap OTM options suffer disproportionately from IV drops "
+                                     f"(₹1 IV drop on ₹{_opt_ltp:.1f} = {1/_opt_ltp*100:.0f}% loss).",
+                            "action": "Skip — choose deeper ITM or higher-premium strike"
+                        }
+                    
+                    # --- Sub-Gate 4: Vega/Delta Ratio ---
+                    _vd_iv_thresh = _iv_cfg.get('vega_delta_iv_threshold', 0.30)
+                    _max_vd = _iv_cfg.get('max_vega_delta_ratio', 0.50)
+                    if (_opt_iv < _vd_iv_thresh and _opt_delta and abs(_opt_delta) > 0.01 
+                            and _opt_vega and abs(_opt_vega) > 0):
+                        _vd_ratio = abs(_opt_vega) / abs(_opt_delta)
+                        if _vd_ratio > _max_vd:
+                            # print(f"   🧊 IV CRUSH GUARD (VEGA/Δ): {_sym} — |vega/delta|={_vd_ratio:.2f} > {_max_vd:.2f} "
+                            #       f"with IV {_opt_iv*100:.1f}%. This is a vol bet, not a direction bet.")
+                            return {
+                                "success": False,
+                                "error": f"IV CRUSH GUARD: Vega/Delta ratio {_vd_ratio:.2f} > {_max_vd:.2f} at IV {_opt_iv*100:.1f}%. "
+                                         f"Vega dominates delta — trade profits need IV to rise, not just direction.",
+                                "action": "Skip — choose higher-delta (deeper ITM) strike to reduce vega exposure"
+                            }
+                else:
+                    # IV not available — log but don't block
+                    # print(f"   ⚠️ IV CRUSH GUARD: IV not available for {plan.contract.symbol}, skipping IV checks")
+                    pass
+            except Exception as _iv_err:
+                # print(f"   ⚠️ IV Crush Guard check failed (proceeding): {_iv_err}")
+                pass
+        
         # === MAX UNITS GATE (Feb 24 fix) ===
         # Hard cap on total units (lots × lot_size) to prevent outsized notional exposure
         _max_units = _hr.get('MAX_UNITS_PER_TRADE', 30000)
         _total_units = plan.quantity * plan.contract.lot_size
         if _total_units > _max_units:
             _new_lots = max(1, _max_units // plan.contract.lot_size)
-            print(f"   ⚠️ UNITS CAP: {plan.contract.symbol} {_total_units:,} units > {_max_units:,} max → capped to {_new_lots} lots ({_new_lots * plan.contract.lot_size:,} units)")
+            # print(f"   ⚠️ UNITS CAP: {plan.contract.symbol} {_total_units:,} units > {_max_units:,} max → capped to {_new_lots} lots ({_new_lots * plan.contract.lot_size:,} units)")
             plan.quantity = _new_lots
             plan.total_premium = _new_lots * plan.premium_per_lot
             plan.max_loss = plan.total_premium
@@ -3932,8 +4115,8 @@ class ZerodhaTools:
                     _theta_pct = abs(_opt_theta) / _opt_ltp * 100
                     _max_theta_pct = _theta_cfg.get('max_theta_pct_of_premium', 5.0)
                     if _theta_pct > _max_theta_pct:
-                        print(f"   🕐 THETA GATE BLOCKED: {plan.contract.symbol} — daily θ=₹{_opt_theta:.2f} "
-                              f"= {_theta_pct:.1f}% of LTP ₹{_opt_ltp:.2f} (max {_max_theta_pct}%)")
+                        # print(f"   🕐 THETA GATE BLOCKED: {plan.contract.symbol} — daily θ=₹{_opt_theta:.2f} "
+                        #       f"= {_theta_pct:.1f}% of LTP ₹{_opt_ltp:.2f} (max {_max_theta_pct}%)")
                         return {
                             "success": False,
                             "error": f"THETA GATE: Daily theta ₹{_opt_theta:.2f} = {_theta_pct:.1f}% of premium (>{_max_theta_pct}%). "
@@ -3947,8 +4130,8 @@ class ZerodhaTools:
                 from config import EXPIRY_SHIELD_CONFIG as _exp_cfg
                 _is_expiry_day = _exp_cfg.get('is_monthly_expiry', False)
                 if _dte >= 0 and _dte < _min_dte and not _is_expiry_day:
-                    print(f"   🕐 DTE FLOOR BLOCKED: {plan.contract.symbol} — DTE={_dte} < min {_min_dte} "
-                          f"(theta curve steepens quadratically near expiry)")
+                    # print(f"   🕐 DTE FLOOR BLOCKED: {plan.contract.symbol} — DTE={_dte} < min {_min_dte} "
+                    #       f"(theta curve steepens quadratically near expiry)")
                     return {
                         "success": False,
                         "error": f"DTE FLOOR: Option expires in {_dte} day(s), min DTE for naked buy is {_min_dte}. "
@@ -3974,8 +4157,8 @@ class ZerodhaTools:
                             _normal_threshold = 57
                         _raised_threshold = _normal_threshold * _score_mult
                         if _entry_score < _raised_threshold:
-                            print(f"   🕐 EXPIRY PM GATE: {plan.contract.symbol} — Score {_entry_score:.0f} < "
-                                  f"{_raised_threshold:.0f} (normal {_normal_threshold}×{_score_mult} after {_pm_after} on expiry day)")
+                            # print(f"   🕐 EXPIRY PM GATE: {plan.contract.symbol} — Score {_entry_score:.0f} < "
+                            #       f"{_raised_threshold:.0f} (normal {_normal_threshold}×{_score_mult} after {_pm_after} on expiry day)")
                             return {
                                 "success": False,
                                 "error": f"EXPIRY PM GATE: Score {_entry_score:.0f} < {_raised_threshold:.0f} "
@@ -3984,8 +4167,9 @@ class ZerodhaTools:
                                 "action": "Skip — only highest-conviction trades allowed in expiry afternoon"
                             }
                         else:
-                            print(f"   ⚡ EXPIRY PM: Score {_entry_score:.0f} ≥ {_raised_threshold:.0f} "
-                                  f"— passed afternoon theta gate on expiry day")
+                            # print(f"   ⚡ EXPIRY PM: Score {_entry_score:.0f} ≥ {_raised_threshold:.0f} "
+                            #       f"— passed afternoon theta gate on expiry day")
+                            pass
             except Exception as _theta_err:
                 print(f"   ⚠️ Theta entry gate check failed (proceeding): {_theta_err}")
         
@@ -4046,9 +4230,10 @@ class ZerodhaTools:
                 plan.quantity = new_lots
                 plan.total_premium = new_premium
                 plan.max_loss = new_premium
-                print(f"   🎯 LOT MULTIPLIER: {lot_multiplier}x → {original_lots} → {new_lots} lots (₹{new_premium:,.0f})")
+                # print(f"   🎯 LOT MULTIPLIER: {lot_multiplier}x → {original_lots} → {new_lots} lots (₹{new_premium:,.0f})")
             else:
-                print(f"   ⚠️ Lot multiplier {lot_multiplier}x would exceed limits, keeping {original_lots} lots")
+                # print(f"   ⚠️ Lot multiplier {lot_multiplier}x would exceed limits, keeping {original_lots} lots")
+                pass
 
         # Execute the order
         result = options_trader.execute_option_order(plan)
@@ -4294,7 +4479,7 @@ class ZerodhaTools:
             _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
             if _elapsed < _cd_mins:
                 _remaining = round(_cd_mins - _elapsed, 1)
-                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                # print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
                 return {"success": False, "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left)"}
             else:
                 del self._exit_cooldowns[underlying]
@@ -4303,7 +4488,7 @@ class ZerodhaTools:
         market_data = {}
         if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3:
             market_data = pre_fetched_market_data
-            print(f"   📊 Using pre-fetched market data for {underlying} (saved API call)")
+            # print(f"   📊 Using pre-fetched market data for {underlying} (saved API call)")
         else:
             try:
                 md = self.get_market_data([underlying])
@@ -4323,7 +4508,8 @@ class ZerodhaTools:
             if not health_ok:
                 return {"success": False, "error": f"DATA HEALTH BLOCK: {health_reason}"}
         except Exception as e:
-            print(f"   ⚠️ Data health check failed for spread: {e}")
+            # print(f"   ⚠️ Data health check failed for spread: {e}")
+            pass
         
         # === CREATE CREDIT SPREAD PLAN ===
         options_trader = get_options_trader(
@@ -4343,7 +4529,7 @@ class ZerodhaTools:
         if plan is None:
             # Check if we should fall back to naked buy
             if CREDIT_SPREAD_CONFIG.get('fallback_to_buy', True):
-                print(f"   🔄 Credit spread not viable for {underlying}, checking naked buy fallback...")
+                # print(f"   🔄 Credit spread not viable for {underlying}, checking naked buy fallback...")
                 # Only fallback if score is high enough
                 buy_threshold = CREDIT_SPREAD_CONFIG.get('buy_only_score_threshold', 70)
                 # Try regular option order (it has its own scoring)
@@ -4567,7 +4753,7 @@ class ZerodhaTools:
             _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
             if _elapsed < _cd_mins:
                 _remaining = round(_cd_mins - _elapsed, 1)
-                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                # print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
                 return {"success": False, "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left)"}
             else:
                 del self._exit_cooldowns[underlying]
@@ -4576,7 +4762,7 @@ class ZerodhaTools:
         market_data = {}
         if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3:
             market_data = pre_fetched_market_data
-            print(f"   📊 Using pre-fetched market data for {underlying} (saved API call)")
+            # print(f"   📊 Using pre-fetched market data for {underlying} (saved API call)")
         else:
             try:
                 md = self.get_market_data([underlying])
@@ -4594,7 +4780,8 @@ class ZerodhaTools:
             if not health_ok:
                 return {"success": False, "error": f"DATA HEALTH BLOCK: {health_reason}"}
         except Exception as e:
-            print(f"   ⚠️ Data health check failed for debit spread: {e}")
+            # print(f"   ⚠️ Data health check failed for debit spread: {e}")
+            pass
         
         # === CREATE DEBIT SPREAD PLAN ===
         options_trader = get_options_trader(
@@ -4795,7 +4982,13 @@ class ZerodhaTools:
         direction = trade.get('direction', '')
         
         if not all([underlying, option_type_str, buy_strike, buy_entry_price, expiry_str]):
-            return {"success": False, "error": f"Incomplete trade data for hedge: {symbol}"}
+            missing_fields = []
+            if not underlying: missing_fields.append('underlying')
+            if not option_type_str: missing_fields.append('option_type')
+            if not buy_strike: missing_fields.append('strike')
+            if not buy_entry_price: missing_fields.append('avg_price')
+            if not expiry_str: missing_fields.append('expiry')
+            return {"success": False, "error": f"Incomplete trade data for hedge: {symbol} — missing: {missing_fields}"}
         
         # Parse option type
         opt_type = OptionType.CE if option_type_str == 'CE' else OptionType.PE
@@ -4810,9 +5003,16 @@ class ZerodhaTools:
             except Exception:
                 return {"success": False, "error": f"Cannot parse expiry '{expiry_str}'"}
         
+        # CRITICAL: Normalize to date object for Zerodha instrument matching
+        # Zerodha instruments store expiry as datetime.date; datetime != date in Python 3
+        from datetime import date as _date_type
+        expiry_date = expiry.date() if isinstance(expiry, datetime) and not isinstance(expiry, _date_type) else expiry
+        if hasattr(expiry_date, 'hour'):  # Still a datetime, force to date
+            expiry_date = expiry_date.date()
+        
         # Check DTE — on 0DTE, hedging is still valuable to cap max loss
         # but warn that sell leg premium may be thin
-        dte = (expiry.date() - datetime.now().date()).days if hasattr(expiry, 'date') else 0
+        dte = (expiry_date - datetime.now().date()).days
         if dte < 0:
             return {"success": False, "error": f"DTE={dte} — option already expired"}
         if dte == 0:
@@ -4827,18 +5027,27 @@ class ZerodhaTools:
             capital=getattr(self, 'paper_capital', 500000),
             paper_mode=self.paper_mode
         )
-        chain = options_trader.chain_fetcher.fetch_option_chain(underlying, expiry)
+        # Pass expiry_date (date object) to match Zerodha instrument format
+        chain = options_trader.chain_fetcher.fetch_option_chain(underlying, expiry_date)
         if chain is None:
-            return {"success": False, "error": f"Cannot fetch option chain for {underlying}"}
+            return {"success": False, "error": f"Cannot fetch option chain for {underlying} exp={expiry_date} (type={type(expiry_date).__name__})"}
         
         # === FIND SELL LEG ===
         # Get all strikes of the same option type, sorted
+        # Use expiry_date for comparison (contracts may store date or datetime)
         strikes = sorted(set(
             c.strike for c in chain.contracts
-            if c.option_type == opt_type and c.expiry == expiry
+            if c.option_type == opt_type and (
+                c.expiry == expiry_date or 
+                (hasattr(c.expiry, 'date') and c.expiry.date() == expiry_date) or
+                (hasattr(expiry_date, 'date') and c.expiry == expiry_date.date())
+            )
         ))
         if not strikes:
-            return {"success": False, "error": f"No {option_type_str} strikes in chain for {underlying}"}
+            # Enhanced diagnostics — log chain contents for debugging
+            all_expiries = set(str(c.expiry) + f"({type(c.expiry).__name__})" for c in chain.contracts[:5])
+            print(f"   ⚠️ THP chain diag: {len(chain.contracts)} contracts, expiry_date={expiry_date}({type(expiry_date).__name__}), sample expiries={all_expiries}")
+            return {"success": False, "error": f"No {option_type_str} strikes in chain for {underlying} (chain has {len(chain.contracts)} contracts, exp={expiry_date})"}
         
         sell_offset = THESIS_HEDGE_CONFIG.get('sell_strike_offset', 3)
         min_hedge_premium = THESIS_HEDGE_CONFIG.get('min_hedge_premium', 3.0)
@@ -4899,6 +5108,7 @@ class ZerodhaTools:
         print(f"   Spread: width={spread_width} | net_debit=₹{net_debit:.2f}/share | total=₹{net_debit_total:,.0f}")
         
         # === EXECUTE SELL LEG ===
+        import random
         sell_symbol = sell_contract.symbol
         quantity = lots * lot_size_from_trade
         
@@ -5025,6 +5235,7 @@ class ZerodhaTools:
         print(f"   Hedge leg cost: ₹{buyback_cost_per_share:+.2f}/share (₹{buyback_cost_total:+,.0f} total)")
         
         # === EXECUTE BUYBACK ===
+        import random
         if self.paper_mode:
             buyback_order_id = f"PAPER_UNWIND_{random.randint(100000, 999999)}"
             print(f"   📝 PAPER buyback: {sell_symbol} × {quantity} @ ₹{sell_leg_ltp:.2f}")
@@ -5146,7 +5357,7 @@ class ZerodhaTools:
             _elapsed = (datetime.now() - _cd_time).total_seconds() / 60
             if _elapsed < _cd_mins:
                 _remaining = round(_cd_mins - _elapsed, 1)
-                print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
+                # print(f"   ⏳ COOLDOWN BLOCK: {underlying} exited {_elapsed:.1f} min ago, {_remaining} min remaining")
                 return {"success": False, "error": f"COOLDOWN: {underlying} exited {_elapsed:.1f} min ago ({_remaining} min left)"}
             else:
                 del self._exit_cooldowns[underlying]

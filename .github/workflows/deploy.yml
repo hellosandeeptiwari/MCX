@@ -1,0 +1,190 @@
+name: Deploy Titan Bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agentic_trader/**'
+      - 'requirements.txt'
+      - 'deploy/**'
+      - '.github/workflows/**'
+
+  workflow_dispatch:
+    inputs:
+      restart_bot:
+        description: 'Restart the bot after deploy?'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  SERVER_IP: 13.232.89.92
+  SERVER_USER: ubuntu
+  DEPLOY_DIR: /home/ubuntu/titan
+  BOT_SERVICE: titan-bot
+
+jobs:
+  # ── Job 1: Lint & Syntax Check ─────────────────────────────
+  lint:
+    name: Lint & Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install lint tools
+        run: pip install flake8 py-compile-check
+
+      - name: Syntax check all Python files
+        run: |
+          echo "Checking syntax of all Python files..."
+          find agentic_trader -name "*.py" -exec python -m py_compile {} \;
+          echo "✓ All files compile successfully"
+
+      - name: Flake8 (critical errors only)
+        run: |
+          flake8 agentic_trader/ \
+            --count \
+            --select=E9,F63,F7,F82 \
+            --show-source \
+            --statistics
+          echo "✓ No critical lint errors"
+
+  # ── Job 2: Deploy to EC2 ───────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/titan-bot-key.pem
+          chmod 600 ~/.ssh/titan-bot-key.pem
+          ssh-keyscan -H ${{ env.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Create deployment archive
+        run: |
+          echo "Creating deploy archive..."
+          tar czf /tmp/titan-deploy.tar.gz \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='*.db' \
+            --exclude='*.db-wal' \
+            --exclude='*.db-shm' \
+            --exclude='_gmm_cache_*' \
+            --exclude='.env' \
+            --exclude='*.log' \
+            agentic_trader/ \
+            requirements.txt \
+            deploy/
+          ls -lh /tmp/titan-deploy.tar.gz
+
+      - name: Upload to server
+        run: |
+          scp -i ~/.ssh/titan-bot-key.pem \
+            -o StrictHostKeyChecking=no \
+            /tmp/titan-deploy.tar.gz \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_IP }}:/tmp/titan-deploy.tar.gz
+
+      - name: Deploy & restart
+        run: |
+          ssh -i ~/.ssh/titan-bot-key.pem \
+            -o StrictHostKeyChecking=no \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} << 'DEPLOY_SCRIPT'
+
+          set -e
+          echo "═══════════════════════════════════════════"
+          echo "  Titan Bot Deployment - $(date '+%Y-%m-%d %H:%M:%S IST')"
+          echo "═══════════════════════════════════════════"
+
+          DEPLOY_DIR=/home/ubuntu/titan
+          BACKUP_DIR=/home/ubuntu/backups
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          # 1) Backup current code (keep last 5)
+          echo "[1/6] Backing up current code..."
+          mkdir -p $BACKUP_DIR
+          if [ -d "$DEPLOY_DIR/agentic_trader" ]; then
+            tar czf "$BACKUP_DIR/pre-deploy-$TIMESTAMP.tar.gz" \
+              -C $DEPLOY_DIR agentic_trader/ 2>/dev/null || true
+            ls -t $BACKUP_DIR/pre-deploy-*.tar.gz | tail -n +6 | xargs rm -f 2>/dev/null || true
+            echo "  Backup saved: pre-deploy-$TIMESTAMP.tar.gz"
+          fi
+
+          # 2) Save .env before overwrite
+          echo "[2/6] Preserving .env secrets..."
+          cp $DEPLOY_DIR/agentic_trader/.env /tmp/.env.backup 2>/dev/null || true
+
+          # 3) Extract new code
+          echo "[3/6] Extracting new code..."
+          cd $DEPLOY_DIR
+          tar xzf /tmp/titan-deploy.tar.gz
+          rm /tmp/titan-deploy.tar.gz
+
+          # 4) Restore .env
+          echo "[4/6] Restoring .env secrets..."
+          cp /tmp/.env.backup $DEPLOY_DIR/agentic_trader/.env 2>/dev/null || true
+
+          # 5) Update dependencies (only if requirements.txt changed)
+          echo "[5/6] Checking dependencies..."
+          source $DEPLOY_DIR/venv/bin/activate
+          pip install -r $DEPLOY_DIR/requirements.txt -q 2>&1 | tail -3
+
+          # 6) Restart bot service
+          RESTART="${{ github.event.inputs.restart_bot || 'true' }}"
+          if [ "$RESTART" = "true" ]; then
+            echo "[6/6] Restarting titan-bot service..."
+            sudo systemctl restart titan-bot
+            sleep 3
+            sudo systemctl status titan-bot --no-pager | head -10
+          else
+            echo "[6/6] Skipping restart (manual trigger with restart=false)"
+          fi
+
+          echo ""
+          echo "═══════════════════════════════════════════"
+          echo "  ✓ Deployment complete!"
+          echo "═══════════════════════════════════════════"
+
+          DEPLOY_SCRIPT
+
+      - name: Health check
+        run: |
+          sleep 5
+          ssh -i ~/.ssh/titan-bot-key.pem \
+            -o StrictHostKeyChecking=no \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} << 'HEALTH'
+
+          echo "=== Service Status ==="
+          sudo systemctl is-active titan-bot || true
+
+          echo "=== Recent Logs ==="
+          tail -20 /home/ubuntu/titan/logs/titan.log 2>/dev/null || echo "No logs yet"
+
+          echo "=== Disk Usage ==="
+          df -h / | tail -1
+
+          echo "=== Memory ==="
+          free -h | grep Mem
+
+          HEALTH
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed! Check the logs above."
+          echo "To rollback, SSH into server and run:"
+          echo "  ls ~/backups/pre-deploy-*.tar.gz"
+          echo "  cd ~/titan && tar xzf ~/backups/pre-deploy-LATEST.tar.gz"
+          echo "  sudo systemctl restart titan-bot"

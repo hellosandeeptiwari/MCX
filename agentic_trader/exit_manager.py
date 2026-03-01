@@ -12,12 +12,13 @@ Exit Types:
 
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import json
 import os
 import logging
 import threading
 from safe_io import atomic_json_save
+from state_db import get_state_db
 from thesis_validator import check_thesis, ThesisResult
 
 # Structured logger for speed gate evaluations
@@ -83,6 +84,9 @@ class TradeState:
     last_greeks_update: str = ''     # ISO timestamp of last Greeks recompute
     greeks_sl_applied: bool = False  # True once Greeks-adjusted SL has been set
     score_tier: str = 'standard'     # 'premium', 'standard', or 'base'
+    target_extended: bool = False    # True when target zone reached → let winners run
+    premium_history: list = field(default_factory=list)      # Premium at each candle boundary (trajectory tracking)
+    underlying_history: list = field(default_factory=list)   # Underlying LTP at each candle boundary
     _cached_greeks: object = None    # Last full GreeksSnapshot (not serialised)
     
     def to_dict(self) -> Dict:
@@ -110,6 +114,9 @@ class TradeState:
         data.setdefault('last_greeks_update', '')
         data.setdefault('greeks_sl_applied', False)
         data.setdefault('score_tier', 'standard')
+        data.setdefault('target_extended', False)
+        data.setdefault('premium_history', [])
+        data.setdefault('underlying_history', [])
         data.pop('_cached_greeks', None)  # Not serialisable
         return cls(**data)
 
@@ -161,12 +168,24 @@ class ExitManager:
         self._load_persisted_state()
     
     def _load_persisted_state(self):
-        """Restore trade states from disk (crash recovery)"""
+        """Restore trade states from SQLite (falls back to JSON for migration)"""
+        try:
+            data = get_state_db().load_exit_states()
+            if data:
+                for sym, state_dict in data.items():
+                    if not isinstance(state_dict, dict):
+                        continue
+                    self.trade_states[sym] = TradeState.from_dict(state_dict)
+                if self.trade_states:
+                    pass  # Restored N trade states from SQLite
+                return
+        except Exception as e:
+            print(f"⚠️ Exit Manager: Could not restore state from SQLite: {e}")
+        # Fallback: legacy JSON
         try:
             if os.path.exists(self._state_file):
                 with open(self._state_file, 'r') as f:
                     data = json.load(f)
-                # Handle wrapper format: {"date": ..., "trade_states": {...}}
                 if isinstance(data, dict) and 'trade_states' in data:
                     data = data['trade_states']
                 if not isinstance(data, dict):
@@ -175,23 +194,33 @@ class ExitManager:
                     if not isinstance(state_dict, dict):
                         continue
                     self.trade_states[sym] = TradeState.from_dict(state_dict)
-                if self.trade_states:
-                    print(f"📊 Exit Manager: Restored {len(self.trade_states)} trade states from disk")
         except Exception as e:
-            print(f"⚠️ Exit Manager: Could not restore state: {e}")
-    
+            print(f"⚠️ Exit Manager: Could not restore state from JSON: {e}")
+
     def _persist_state(self):
-        """Save trade states to disk for crash recovery"""
+        """Save ALL trade states to SQLite (full rewrite — use for bulk ops only)."""
         try:
             data = {}
             for sym, state in self.trade_states.items():
                 d = state.to_dict()
                 d['entry_time'] = state.entry_time.isoformat()
                 data[sym] = d
-            atomic_json_save(self._state_file, data)
+            get_state_db().save_exit_states(data)
         except Exception as e:
             print(f"⚠️ Exit Manager: Could not persist state: {e}")
-    
+
+    def _persist_single(self, symbol: str):
+        """Save a single symbol's exit state (upsert — 1 SQL op instead of N)."""
+        try:
+            state = self.trade_states.get(symbol)
+            if state is None:
+                return
+            d = state.to_dict()
+            d['entry_time'] = state.entry_time.isoformat()
+            get_state_db().save_exit_state_single(symbol, d)
+        except Exception as e:
+            print(f"⚠️ Exit Manager: Could not persist {symbol}: {e}")
+
     def register_trade(
         self, 
         symbol: str,
@@ -221,8 +250,8 @@ class ExitManager:
             max_premium_gain_pct=0,
         )
         self.trade_states[symbol] = state
-        self._persist_state()
-        print(f"📊 Exit Manager: Registered {symbol} {side} @ {entry_price}")
+        self._persist_single(symbol)
+        # print(f"📊 Exit Manager: Registered {symbol} {side} @ {entry_price}")
         return state
     
     def update_trade(self, symbol: str, current_price: float, underlying_ltp: float = 0.0) -> Optional[ExitSignal]:
@@ -270,6 +299,13 @@ class ExitManager:
             premium_pct = (current_price - state.entry_price) / state.entry_price * 100
             state.max_premium_gain_pct = max(state.max_premium_gain_pct, premium_pct)
         
+        # Record candle-level snapshots for trajectory analysis (one per candle)
+        if state.is_option and state.candles_since_entry > 0:
+            while len(state.premium_history) < state.candles_since_entry:
+                state.premium_history.append(round(current_price, 2))
+            while len(state.underlying_history) < state.candles_since_entry:
+                state.underlying_history.append(round(underlying_ltp, 2) if underlying_ltp > 0 else 0)
+        
         # Check all exit conditions in priority order
         
         # 0.5 GREEKS-BASED DYNAMIC SL ADJUSTMENT (before SL check)
@@ -280,6 +316,12 @@ class ExitManager:
         # 0.7 EXPIRY DAY FORCE-EXIT (0DTE gamma protection)
         if state.is_option and state.expiry_str:
             exit_signal = self._check_expiry_force_exit(state, current_price)
+            if exit_signal:
+                return exit_signal
+        
+        # 0.8 PREMIUM VELOCITY KILL (trajectory-based early exit for steady bleeders)
+        if state.is_option and not state.is_debit_spread and not state.is_credit_spread:
+            exit_signal = self._check_velocity_kill(state, current_price, underlying_ltp)
             if exit_signal:
                 return exit_signal
         
@@ -391,7 +433,65 @@ class ExitManager:
         return None
     
     def _check_target(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
-        """Check if target is hit"""
+        """Check if target is hit — with Target Extension (Let Winners Run).
+        
+        When price reaches within trigger_pct of target, instead of hard-exiting:
+        - Set target_extended = True
+        - Skip hard target exit
+        - Let trailing stop (Extension zone) manage the exit with tight retention
+        This prevents killing winners that have strong momentum beyond target.
+        """
+        from config import TARGET_EXTENSION
+        ext_enabled = TARGET_EXTENSION.get('enabled', True)
+        ext_trigger = TARGET_EXTENSION.get('trigger_pct', 0.90)
+        max_ext_r = TARGET_EXTENSION.get('max_extension_r', 5.0)
+        
+        # If already in extension mode, only check safety cap (max R)
+        if state.target_extended:
+            risk = abs(state.entry_price - state.initial_sl)
+            if risk == 0:
+                risk = state.entry_price * 0.01
+            if state.side == "BUY":
+                r_now = (current_price - state.entry_price) / risk
+            else:
+                r_now = (state.entry_price - current_price) / risk
+            if r_now >= max_ext_r:
+                return ExitSignal(
+                    symbol=state.symbol,
+                    should_exit=True,
+                    exit_type="TARGET_EXTENSION_CAP",
+                    exit_price=current_price,
+                    reason=f"Target extension safety cap at {r_now:.1f}R (max {max_ext_r}R)",
+                    urgency="NORMAL"
+                )
+            return None  # Let trailing stop manage exit
+        
+        # Calculate how far price is toward target
+        if state.side == "BUY":
+            target_distance = state.target - state.entry_price
+            current_progress = current_price - state.entry_price
+        else:
+            target_distance = state.entry_price - state.target
+            current_progress = state.entry_price - current_price
+        
+        if target_distance <= 0:
+            return None
+        
+        progress_pct = current_progress / target_distance  # 0.0 to 1.0+
+        
+        # Check if price is in the extension trigger zone (90%+ of target)
+        if ext_enabled and state.is_option and not state.is_credit_spread and not state.is_debit_spread:
+            if progress_pct >= ext_trigger:
+                # Activate extension mode — skip hard exit, let trailing manage
+                state.target_extended = True
+                state.trailing_active = True  # Ensure trailing is active
+                self._persist_single(state.symbol)
+                print(f"\n🚀 TARGET EXTENSION [{state.symbol}]: Price {current_price} reached "
+                      f"{progress_pct:.0%} of target {state.target} — LET IT RUN!")
+                print(f"   Trailing will use tight 65% retention in Extension zone")
+                return None  # Skip hard exit
+        
+        # Standard hard target exit (non-options, or extension disabled)
         if state.side == "BUY":
             if current_price >= state.target:
                 return ExitSignal(
@@ -432,6 +532,31 @@ class ExitManager:
         premium_pct = (current_price - state.entry_price) / state.entry_price * 100
         
         if state.side == "BUY" and premium_pct >= self.partial_profit_pct:
+            # === MOMENTUM GATE: Don't clip winners with accelerating momentum ===
+            from config import ASYMMETRIC_EXIT as _asym_cfg
+            if _asym_cfg.get('enabled') and _asym_cfg.get('momentum_gate_enabled'):
+                _mh = state.premium_history
+                _m_lookback = _asym_cfg.get('momentum_lookback_candles', 2)
+                _m_ratio = _asym_cfg.get('momentum_sustain_ratio', 0.30)
+                if len(_mh) >= 4:
+                    _entry = state.entry_price
+                    _changes = []
+                    _prev = _entry
+                    for _ph in _mh:
+                        _changes.append((_ph - _prev) / _entry * 100 if _entry > 0 else 0)
+                        _prev = _ph
+                    _mid = max(1, len(_changes) - _m_lookback)
+                    _first_avg = sum(_changes[:_mid]) / _mid if _mid > 0 else 0
+                    _last_avg = sum(_changes[-_m_lookback:]) / _m_lookback if _m_lookback > 0 else 0
+                    if _first_avg > 0 and _last_avg >= _first_avg * _m_ratio:
+                        state.partial_booked = True
+                        state.current_sl = state.entry_price
+                        state.breakeven_applied = True
+                        self._persist_single(state.symbol)
+                        print(f"\n🚀 {state.symbol}: +{premium_pct:.1f}% — momentum alive "
+                              f"(last {_m_lookback}c: +{_last_avg:.1f}%/c vs early: +{_first_avg:.1f}%/c) "
+                              f"— SKIPPING partial, SL→breakeven, letting it run!")
+                        return None
             # Check if we have enough lots to split
             lot_size = self._get_lot_size_for_symbol(state.symbol)
             total_lots = state.quantity // lot_size if lot_size > 0 else 1
@@ -441,7 +566,7 @@ class ExitManager:
                 state.partial_booked = True
                 state.current_sl = state.entry_price
                 state.breakeven_applied = True
-                self._persist_state()
+                self._persist_single(state.symbol)
                 exit_lots = total_lots // 2
                 print(f"💰 {state.symbol}: PARTIAL PROFIT — booking {exit_lots} of {total_lots} lots at +{premium_pct:.1f}% | SL→entry on remainder")
                 
@@ -461,7 +586,7 @@ class ExitManager:
                 state.breakeven_applied = True
                 # Don't force trailing_active — let phased trailing engage naturally
                 # The Run/Harvest zones will handle trailing from here
-                self._persist_state()
+                self._persist_single(state.symbol)
                 print(f"🔒 {state.symbol}: +{premium_pct:.1f}% gain (1 lot) — can't split, SL→breakeven (phased trail will manage)")
                 return None  # No exit signal, just tightened SL
         
@@ -810,6 +935,76 @@ class ExitManager:
         return None
     
     # ═══════════════════════════════════════════════════════════════
+    # PREMIUM VELOCITY KILL — trajectory-based early exit
+    # ═══════════════════════════════════════════════════════════════
+    
+    def _check_velocity_kill(self, state: TradeState, current_price: float, underlying_ltp: float) -> Optional[ExitSignal]:
+        """Kill options bleeding steadily — trajectory-based early exit.
+        
+        Instead of waiting for time_stop/speed_gate, detect steady premium decay:
+        If premium_velocity < threshold for N consecutive candles → exit immediately.
+        A trade losing 1.5%+/candle for 3 candles is steady-state bleeding,
+        NOT about to recover. Can fire as early as candle 3.
+        """
+        from config import ASYMMETRIC_EXIT
+        cfg = ASYMMETRIC_EXIT
+        if not cfg.get('enabled') or not cfg.get('velocity_kill_enabled'):
+            return None
+        
+        min_candles = cfg.get('velocity_min_candles', 3)
+        threshold = cfg.get('velocity_threshold_pct', -1.5)
+        consecutive_needed = cfg.get('velocity_consecutive', 3)
+        check_underlying = cfg.get('velocity_underlying_confirm', True)
+        
+        history = state.premium_history
+        if len(history) < min_candles:
+            return None
+        
+        entry = state.entry_price
+        if entry <= 0:
+            return None
+        
+        # Calculate per-candle velocity (% of entry price)
+        changes = []
+        prev = entry
+        for ph in history:
+            changes.append((ph - prev) / entry * 100)
+            prev = ph
+        
+        # Check last N candles are all bleeding below threshold
+        recent = changes[-consecutive_needed:]
+        if len(recent) < consecutive_needed:
+            return None
+        all_bleeding = all(c <= threshold for c in recent)
+        if not all_bleeding:
+            return None
+        
+        # Underlying confirmation: if underlying is still moving in our favor, give premium time to catch up
+        if check_underlying and underlying_ltp > 0 and len(state.underlying_history) >= 2:
+            ul_prev = state.underlying_history[-2]
+            if ul_prev > 0:
+                opt_type = state.option_type_str
+                ul_dir = (underlying_ltp - ul_prev) / ul_prev * 100
+                # CE benefits from underlying rising; PE from underlying falling
+                if opt_type == 'CE' and ul_dir > 0.05:  # underlying rising > 0.05%
+                    return None  # Underlying supportive, premium may catch up
+                if opt_type == 'PE' and ul_dir < -0.05:  # underlying falling > 0.05%
+                    return None  # Underlying supportive, premium may catch up
+        
+        avg_velocity = sum(recent) / len(recent)
+        total_loss_pct = (current_price - entry) / entry * 100
+        
+        return ExitSignal(
+            symbol=state.symbol,
+            should_exit=True,
+            exit_type="VELOCITY_KILL",
+            exit_price=current_price,
+            reason=f"Steady bleed: {consecutive_needed} candles avg {avg_velocity:.1f}%/candle "
+                   f"(threshold {threshold}%), total {total_loss_pct:.1f}% loss",
+            urgency="IMMEDIATE",
+        )
+    
+    # ═══════════════════════════════════════════════════════════════
     # GREEKS-BASED DYNAMIC EXIT INTELLIGENCE
     # ═══════════════════════════════════════════════════════════════
     
@@ -977,23 +1172,29 @@ class ExitManager:
         if r_multiple >= self.breakeven_trigger_r:
             state.current_sl = state.entry_price
             state.breakeven_applied = True
-            self._persist_state()
+            self._persist_single(state.symbol)
             print(f"🔒 {state.symbol}: Break-even applied (SL moved to {state.entry_price})")
     
     def _apply_trailing_stop(self, state: TradeState, current_price: float, r_multiple: float):
-        """Phased trailing stop: Build → Run → Harvest.
+        """Phased trailing stop: Build → Run → Harvest → Extension.
         
         Build zone (0 → 1.0R): No trailing. Let trade breathe and establish.
         Run zone (1.0R → 2.0R): Wide trail retaining 40% of peak profit (60% giveback).
             Options pull back 10-15% routinely mid-move — this gives room.
         Harvest zone (2.0R+): Tighter trail retaining 55% of peak profit (45% giveback).
             By 2R the trade has delivered meaningful profit — protect it.
+        Extension zone (target_extended): Tightest trail retaining 65% of peak (35% giveback).
+            Winners running past target — lock maximum profit while letting them fly.
         """
-        if r_multiple < self.trailing_start_r:
+        if r_multiple < self.trailing_start_r and not state.target_extended:
             return
         
         # Select retention % based on zone
-        if r_multiple >= self.trailing_harvest_r:
+        if state.target_extended:
+            from config import TARGET_EXTENSION
+            retain_pct = TARGET_EXTENSION.get('trail_retain_pct', 0.65)  # 65% — tightest
+            zone = "EXTENSION"
+        elif r_multiple >= self.trailing_harvest_r:
             retain_pct = self.trailing_harvest_pct  # 55% — tighter
             zone = "HARVEST"
         else:
@@ -1012,7 +1213,7 @@ class ExitManager:
                 old_sl = state.current_sl
                 state.current_sl = rounded_new_sl
                 state.trailing_active = True
-                self._persist_state()
+                self._persist_single(state.symbol)
                 print(f"📈 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
         else:  # SELL
             profit = state.entry_price - state.lowest_price
@@ -1024,14 +1225,14 @@ class ExitManager:
                 old_sl = state.current_sl
                 state.current_sl = rounded_new_sl
                 state.trailing_active = True
-                self._persist_state()
+                self._persist_single(state.symbol)
                 print(f"📉 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
     
     def remove_trade(self, symbol: str):
         """Remove a trade from tracking (after exit) and reset hysteresis"""
         if symbol in self.trade_states:
             del self.trade_states[symbol]
-            self._persist_state()
+            get_state_db().delete_exit_state(symbol)
             print(f"📊 Exit Manager: Removed {symbol} from tracking")
             
             # === RESET HYSTERESIS FOR TREND FOLLOWING + REGIME SCORER ===
@@ -1108,6 +1309,42 @@ def get_exit_manager() -> ExitManager:
     if _exit_manager is None:
         _exit_manager = ExitManager()
     return _exit_manager
+
+
+def check_underlying_adverse(state: 'TradeState', underlying_ltp: float) -> Tuple[bool, str]:
+    """Check if underlying is moving AGAINST the trade direction.
+    
+    Used by THP to decide: hedge (underlying still supportive) or just exit (underlying adverse).
+    Compares current underlying LTP vs 2 candles back for stability (not tick noise).
+    
+    Returns (is_adverse, reason_string).
+    """
+    from config import ASYMMETRIC_EXIT
+    cfg = ASYMMETRIC_EXIT
+    if not cfg.get('enabled') or not cfg.get('underlying_confirm_enabled'):
+        return False, ""
+    
+    threshold = cfg.get('underlying_adverse_pct', 0.15)
+    
+    if underlying_ltp <= 0 or len(state.underlying_history) < 2:
+        return False, ""
+    
+    ref_ul = state.underlying_history[-2]  # 2 candles back for stability
+    if ref_ul <= 0:
+        return False, ""
+    
+    ul_change_pct = (underlying_ltp - ref_ul) / ref_ul * 100
+    opt_type = state.option_type_str
+    
+    is_adverse = False
+    if opt_type == 'CE' and ul_change_pct < -threshold:
+        is_adverse = True  # Underlying dropping → bad for CE
+    elif opt_type == 'PE' and ul_change_pct > threshold:
+        is_adverse = True  # Underlying rising → bad for PE
+    
+    if is_adverse:
+        return True, f"underlying {ul_change_pct:+.2f}% vs 2c ago ({opt_type}), threshold ±{threshold}%"
+    return False, ""
 
 
 def reset_exit_manager():

@@ -1,0 +1,111 @@
+MOVE PREDICTOR TRAINING REPORT (3-CLASS: DOWN/FLAT/UP)
+============================================================
+Date: 2026-02-27T07:57:21.716607
+Train samples: 3,042,539
+Test samples: 277,380
+Accuracy: 0.7893
+Macro F1: 0.2941
+UP F1: 0.0000 | DOWN F1: 0.0002 | FLAT F1: 0.8822
+
+              precision    recall  f1-score   support
+
+        DOWN       0.22      0.00      0.00     25499
+        FLAT       0.79      1.00      0.88    218935
+          UP       0.00      0.00      0.00     32946
+
+    accuracy                           0.79    277380
+   macro avg       0.34      0.33      0.29    277380
+weighted avg       0.64      0.79      0.70    277380
+
+
+Feature Importances:
+  session_bucket             0.057672
+  time_of_day                0.055473
+  nifty_daily_rsi            0.050581
+  dow_sin                    0.046277
+  dow_cos                    0.043610
+  nifty_daily_trend          0.041909
+  nifty_atr_pct              0.040005
+  nifty_rsi_14               0.032348
+  nifty_bb_position          0.028435
+  iv_regime                  0.025943
+  nifty_ema9_slope           0.025762
+  nifty_roc_6                0.025719
+  iv_percentile_30d          0.024893
+  atr_pct                    0.021457
+  iv_rank_30d                0.020169
+  volume_ratio               0.020149
+  orb_x_volume               0.019852
+  oi_regime                  0.018650
+  rsi_14                     0.016581
+  volume_trend               0.016078
+  atr_change_pct             0.015868
+  orb_signal                 0.015862
+  range_expansion            0.015277
+  oi_session_change          0.013990
+  vwap_slope                 0.011091
+  rsi_7                      0.010740
+  day_position               0.010431
+  gap_open_pct               0.008790
+  bb_width                   0.008588
+  net_buying_pressure        0.008471
+  close_vs_prev_range        0.008124
+  price_vs_vwap              0.008104
+  daily_rsi_14               0.007949
+  atr_norm_day_return        0.007830
+  daily_dist_from_high       0.007547
+  roc_24                     0.007175
+  bb_position                0.007107
+  prev_day_return            0.006715
+  daily_move_freq_20d        0.006356
+  first_hour_return          0.006266
+  pcr_oi_regime              0.006236
+  daily_move_freq_10d        0.006054
+  daily_dist_from_low        0.005915
+  ema_spread                 0.005893
+  day_return_pct             0.005823
+  body_ratio                 0.005735
+  lower_wick                 0.005728
+  daily_volume_regime        0.005658
+  volume_momentum            0.005640
+  iv_skew_zscore             0.005568
+  roc_6                      0.005456
+  price_acceleration         0.005323
+  daily_range_pct_20d        0.005203
+  price_vs_ema9              0.005028
+  prev_close_strength        0.004965
+  price_vs_sma20             0.004868
+  daily_trend_strength       0.004865
+  adx_proxy                  0.004711
+  ema9_slope                 0.004652
+  daily_vol_regime           0.004636
+  upper_wick                 0.004427
+  daily_trend_direction      0.004408
+  return_kurtosis_20         0.004328
+  buying_climax              0.004319
+  pressure_x_mom             0.004268
+  cmf_20                     0.004264
+  relative_strength          0.004207
+  return_skew_20             0.004110
+  roc_3                      0.003897
+  roc_12                     0.003846
+  momentum_atr_norm          0.003352
+  oi_acceleration            0.003209
+  consec_up                  0.003102
+  obv_slope                  0.002915
+  trend_consistency          0.002867
+  consec_down                0.002385
+  volume_direction           0.002324
+  oi_velocity_6              0.002282
+  vol_price_divergence       0.001979
+  oi_vs_volume               0.001709
+  macd_hist_pct              0.000000
+  macd_hist_slope            0.000000
+  momentum_alignment         0.000000
+  oi_price_confirm           0.000000
+  fut_oi_change_pct          0.000000
+  fut_oi_buildup             0.000000
+  fut_basis_pct              0.000000
+  fut_oi_5d_trend            0.000000
+  fut_vol_ratio              0.000000
+  oi_change_5m               0.000000

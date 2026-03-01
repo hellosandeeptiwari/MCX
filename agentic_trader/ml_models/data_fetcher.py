@@ -79,26 +79,23 @@ def get_kite_client():
     except Exception:
         pass
     
-    # Fallback: try to create from env vars / saved token file
+    # Fallback: try to create from env vars
     try:
         from kiteconnect import KiteConnect
         api_key = os.environ.get('ZERODHA_API_KEY', '')
-        # .kite_access_token lives in agentic_trader/ (parent of ml_models/)
-        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        access_token_file = os.path.join(parent_dir, '.kite_access_token')
-        access_token = ''
-        if os.path.exists(access_token_file):
-            with open(access_token_file, 'r') as f:
-                access_token = f.read().strip()
+        access_token = os.environ.get('ZERODHA_ACCESS_TOKEN', '')
         
-        if not api_key:
+        if not api_key or not access_token:
             # Try loading from .env
+            parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             env_file = os.path.join(parent_dir, '.env')
             if os.path.exists(env_file):
                 with open(env_file, 'r') as f:
                     for line in f:
-                        if line.startswith('ZERODHA_API_KEY='):
+                        if line.startswith('ZERODHA_API_KEY=') and not api_key:
                             api_key = line.strip().split('=', 1)[1]
+                        elif line.startswith('ZERODHA_ACCESS_TOKEN=') and not access_token:
+                            access_token = line.strip().split('=', 1)[1]
         
         if api_key and access_token:
             kite = KiteConnect(api_key=api_key)

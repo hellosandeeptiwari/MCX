@@ -1,0 +1,162 @@
+{
+  "config": {
+    "input_dim": 84,
+    "latent_dim": 16,
+    "hidden_dims": [
+      64,
+      32
+    ],
+    "dropout": 0.2,
+    "vae_epochs": 100,
+    "vae_batch_size": 512,
+    "vae_lr": 0.002,
+    "vae_kl_weight": 0.5,
+    "vae_kl_warmup_frac": 0.3,
+    "vae_patience": 15,
+    "gmm_n_components": 6,
+    "gmm_covariance_type": "tied",
+    "gmm_max_iter": 300,
+    "flow_n_layers": 6,
+    "flow_hidden_dim": 64,
+    "flow_epochs": 150,
+    "flow_lr": 0.001,
+    "flow_patience": 20,
+    "iforest_n_estimators": 200,
+    "iforest_contamination": 0.05,
+    "calibrator_n_estimators": 100,
+    "calibrator_max_depth": 2,
+    "calibrator_lr": 0.05,
+    "calibrator_val_split": 0.6,
+    "down_lookahead": 8,
+    "down_atr_factor": 3.0,
+    "down_fixed_pct": 0.5,
+    "up_atr_factor": 3.0,
+    "target_flag_rate": 0.15,
+    "min_lift": 1.05,
+    "test_days": 20,
+    "val_days": 20
+  },
+  "n_total": 3456953,
+  "n_features": 87,
+  "UP_metrics": {
+    "vae": {
+      "best_val_loss": 0.7020523548126221,
+      "final_epoch": 47,
+      "train_loss_final": 0.6440667261536824
+    },
+    "flow": {
+      "best_val_nll": -63.858097076416016,
+      "final_epoch": 150,
+      "train_mean_nll": -63.954811096191406,
+      "train_std_nll": 7.686880598531494
+    },
+    "threshold": 0.21078153967402166,
+    "base_down_rate": 0.22406825325550067,
+    "val_auroc": 0.6387,
+    "val_avg_precision": 0.2921,
+    "val_flag_rate": 0.235,
+    "val_down_if_flagged": 0.3065,
+    "val_down_if_not_flagged": 0.1665,
+    "val_lift": 1.54,
+    "val_risk_reduction_pct": 16.5,
+    "val_decile_down_rates": [
+      0.07193778353856124,
+      0.10761889090011519,
+      0.14712606139777923,
+      0.1716198563030699,
+      0.18462291870714986,
+      0.20483107556716174,
+      0.23435201830364438,
+      0.24330502939255388,
+      0.29000653167864143,
+      0.339157413455258
+    ]
+  },
+  "DOWN_metrics": {
+    "vae": {
+      "best_val_loss": 0.7039797306060791,
+      "final_epoch": 47,
+      "train_loss_final": 0.6547750823799221
+    },
+    "flow": {
+      "best_val_nll": -60.284175872802734,
+      "final_epoch": 150,
+      "train_mean_nll": -60.40062713623047,
+      "train_std_nll": 5.8762383560998535
+    },
+    "threshold": 0.23826604431478443,
+    "base_down_rate": 0.19034625879097652,
+    "val_auroc": 0.6269,
+    "val_avg_precision": 0.3181,
+    "val_flag_rate": 0.4087,
+    "val_down_if_flagged": 0.2932,
+    "val_down_if_not_flagged": 0.1643,
+    "val_lift": 1.35,
+    "val_risk_reduction_pct": 24.3,
+    "val_decile_down_rates": [
+      0.12142637565324316,
+      0.13712528823981554,
+      0.14158339738662568,
+      0.1703305149884704,
+      0.21029976940814757,
+      0.21076095311299,
+      0.24700276667691362,
+      0.2528823981552652,
+      0.28865662465416536,
+      0.38960639606396064
+    ]
+  },
+  "test": {
+    "UP": {
+      "test_up_auroc": 0.5862,
+      "test_up_avg_precision": 0.2384,
+      "test_up_flag_rate": 0.3122,
+      "test_up_down_if_flagged": 0.25,
+      "test_up_down_if_not_flagged": 0.1671,
+      "test_up_lift": 1.3,
+      "test_up_risk_reduction_pct": 13.4,
+      "test_up_decile_down_rates": [
+        0.11805555555555555,
+        0.13165217391304349,
+        0.16403127715030408,
+        0.17338429464906185,
+        0.19169273548835591,
+        0.19012860618700034,
+        0.20799304952215464,
+        0.22450043440486533,
+        0.2526498696785404,
+        0.27576020851433536
+      ]
+    },
+    "up_flag_rate": 0.3122,
+    "up_down_if_flagged": 0.25,
+    "up_down_if_clean": 0.1671,
+    "up_lift": 1.3,
+    "DOWN": {
+      "test_down_auroc": 0.6179,
+      "test_down_avg_precision": 0.2604,
+      "test_down_flag_rate": 0.4421,
+      "test_down_down_if_flagged": 0.2548,
+      "test_down_down_if_not_flagged": 0.14,
+      "test_down_lift": 1.34,
+      "test_down_risk_reduction_pct": 26.6,
+      "test_down_decile_down_rates": [
+        0.11699779249448124,
+        0.11389144434222631,
+        0.12532204637467795,
+        0.1532658693652254,
+        0.16666666666666666,
+        0.18833915762368952,
+        0.21667893961708395,
+        0.25354185832566695,
+        0.2724429727740986,
+        0.30014722119985277
+      ]
+    },
+    "down_flag_rate": 0.4421,
+    "down_up_if_flagged": 0.2548,
+    "down_up_if_clean": 0.14,
+    "down_lift": 1.34
+  },
+  "training_time_sec": 25278.1
+}

@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 import json
 import os
+from state_db import get_state_db
 
 
 @dataclass
@@ -98,19 +99,32 @@ class ExecutionGuard:
         self._load_slippage_log()
     
     def _load_slippage_log(self):
-        """Load historical slippage data"""
+        """Load historical slippage data from SQLite (falls back to JSON)"""
+        try:
+            records = get_state_db().load_slippage_log(limit=1000)
+            if records:
+                self.slippage_log = [SlippageRecord(**r) for r in records]
+                return
+        except Exception as e:
+            print(f"⚠️ Error loading slippage from SQLite: {e}")
+        # Fallback: legacy JSON
         if os.path.exists(self.slippage_log_file):
             try:
                 with open(self.slippage_log_file, 'r') as f:
                     data = json.load(f)
                     self.slippage_log = [SlippageRecord(**r) for r in data]
-            except:
+            except Exception:
                 self.slippage_log = []
-    
+
     def _save_slippage_log(self):
-        """Save slippage data"""
-        with open(self.slippage_log_file, 'w') as f:
-            json.dump([asdict(r) for r in self.slippage_log[-1000:]], f, indent=2)
+        """Save slippage data to SQLite (atomic, crash-safe)"""
+        try:
+            if self.slippage_log:
+                # Only log the latest record (append-only model)
+                latest = asdict(self.slippage_log[-1])
+                get_state_db().log_slippage(latest)
+        except Exception as e:
+            print(f"⚠️ Error saving slippage: {e}")
     
     def check_spread(
         self, 

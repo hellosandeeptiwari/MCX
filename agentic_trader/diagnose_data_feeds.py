@@ -54,31 +54,14 @@ def test_credentials():
     except Exception as e:
         record("CREDS", "Kite API Key", "FAIL", str(e))
 
-    # Kite access token
-    try:
-        token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'zerodha_token.json')
-        if os.path.exists(token_file):
-            with open(token_file) as f:
-                td = json.load(f)
-            token = td.get('access_token', '')
-            saved = td.get('saved_at', 'unknown')
-            if token and len(token) > 10:
-                record("CREDS", "Kite Access Token (file)", "PASS", f"Saved: {saved}, token: {token[:6]}...")
-            else:
-                record("CREDS", "Kite Access Token (file)", "FAIL", "Token empty")
-        else:
-            record("CREDS", "Kite Access Token (file)", "WARN", "zerodha_token.json not found")
-    except Exception as e:
-        record("CREDS", "Kite Access Token (file)", "FAIL", str(e))
-
-    # .env token
+    # Kite access token (from .env only)
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
     env_token = os.getenv('ZERODHA_ACCESS_TOKEN', '')
-    if env_token:
+    if env_token and len(env_token) > 10:
         record("CREDS", "Kite Access Token (.env)", "PASS", f"{env_token[:6]}...")
     else:
-        record("CREDS", "Kite Access Token (.env)", "WARN", "Not set in .env (fallback to JSON)")
+        record("CREDS", "Kite Access Token (.env)", "FAIL", "ZERODHA_ACCESS_TOKEN not set or empty in .env")
 
     # DhanHQ
     try:
@@ -111,18 +94,14 @@ def test_kite_rest():
         record("KITE_REST", "Import", "FAIL", str(e))
         return None
 
-    # Load token
+    # Load token from .env
     kite = KiteConnect(api_key=ZERODHA_API_KEY)
-    token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'zerodha_token.json')
     try:
-        if os.path.exists(token_file):
-            with open(token_file) as f:
-                td = json.load(f)
-            kite.set_access_token(td.get('access_token', ''))
-        else:
-            from dotenv import load_dotenv
-            load_dotenv()
-            kite.set_access_token(os.getenv('ZERODHA_ACCESS_TOKEN', ''))
+        access_token = os.getenv('ZERODHA_ACCESS_TOKEN', '')
+        if not access_token:
+            record("KITE_REST", "Token Load", "FAIL", "ZERODHA_ACCESS_TOKEN not set in .env")
+            return None
+        kite.set_access_token(access_token)
     except Exception as e:
         record("KITE_REST", "Token Load", "FAIL", str(e))
         return None
@@ -241,10 +220,10 @@ def test_kite_websocket(kite):
     # Create ticker
     try:
         from config import ZERODHA_API_KEY
-        token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'zerodha_token.json')
-        with open(token_file) as f:
-            td = json.load(f)
-        access_token = td.get('access_token', '')
+        access_token = os.getenv('ZERODHA_ACCESS_TOKEN', '')
+        if not access_token:
+            record("KITE_WS", "Token Load", "FAIL", "ZERODHA_ACCESS_TOKEN not set in .env")
+            return
 
         ticker = TitanTicker(ZERODHA_API_KEY, access_token, kite)
         ticker.start()
@@ -569,26 +548,15 @@ def test_cross_source(kite):
 def test_session_health():
     section_header("7. TOKEN & SESSION HEALTH")
 
-    # Check Kite token age
+    # Check Kite token from .env
     try:
-        token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'zerodha_token.json')
-        if os.path.exists(token_file):
-            with open(token_file) as f:
-                td = json.load(f)
-            saved_at = td.get('saved_at', '')
-            if saved_at:
-                try:
-                    from dateutil import parser as dtparser
-                    saved_dt = dtparser.parse(saved_at)
-                except:
-                    saved_dt = datetime.fromisoformat(saved_at.replace('Z', '+00:00').replace('+00:00', ''))
-                age_hours = (datetime.now() - saved_dt.replace(tzinfo=None)).total_seconds() / 3600
-                status = "PASS" if age_hours < 12 else "WARN" if age_hours < 24 else "FAIL"
-                record("SESSION", "Kite Token Age", status, f"{age_hours:.1f} hours old (saved: {saved_at})")
-            else:
-                record("SESSION", "Kite Token Age", "WARN", "No saved_at timestamp")
+        env_token = os.getenv('ZERODHA_ACCESS_TOKEN', '')
+        if env_token and len(env_token) > 10:
+            record("SESSION", "Kite Token (.env)", "PASS", f"Token present: {env_token[:6]}...")
+        else:
+            record("SESSION", "Kite Token (.env)", "FAIL", "ZERODHA_ACCESS_TOKEN missing or too short")
     except Exception as e:
-        record("SESSION", "Kite Token Age", "WARN", str(e))
+        record("SESSION", "Kite Token (.env)", "WARN", str(e))
 
     # Check DhanHQ token
     try:

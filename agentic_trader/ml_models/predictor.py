@@ -307,7 +307,7 @@ class MovePredictor:
         
         # ── Signal determination (calibrated probabilities, 0-1 range) ──
         # Gate:      calibrated P(MOVE), threshold 0.50
-        # Direction: calibrated P(UP|MOVE), dead zone 0.48-0.52 → coin-flip
+        # Direction: calibrated P(UP|MOVE), dead zone 0.46-0.54 → coin-flip
         #
         # High-confidence thresholds from training analysis:
         # Combined 50%+ → 52-53% precision (usable)
@@ -315,13 +315,14 @@ class MovePredictor:
         #
         # Only assign UP/DOWN when BOTH gate says likely move AND direction
         # model shows genuine edge (outside dead zone).
+        # Dead zone widened to 46-54% to avoid trades where direction is ambiguous.
         
         if p_move >= 0.50:
             # Gate says move likely
-            if p_up_given_move >= 0.52:
+            if p_up_given_move >= 0.54:
                 signal = 'UP'
                 confidence = prob_up
-            elif p_down_given_move >= 0.52:
+            elif p_down_given_move >= 0.54:
                 signal = 'DOWN'
                 confidence = prob_down
             else:
@@ -417,10 +418,11 @@ class MovePredictor:
         prob_move = prob_up + prob_down  # Total directional probability
         
         # Signal determination (3-class)
-        if prob_up >= 0.50:
+        # Dead zone: 46-54% → treat as FLAT (direction too ambiguous)
+        if prob_up >= 0.54:
             signal = 'UP'
             confidence = prob_up
-        elif prob_down >= 0.50:
+        elif prob_down >= 0.54:
             signal = 'DOWN'
             confidence = prob_down
         else:
@@ -647,19 +649,29 @@ class MovePredictor:
             return self._titan_defaults()
     
     def _get_down_risk(self, signal: str, pred: dict) -> dict:
-        """Run anomaly detector for ALL directional signals. Fail-safe: never blocks.
+        """Run BOTH regime anomaly detectors and return independent flags.
 
-        For UP/FLAT: uses UP regime GMM — flags hidden DOWN risk.
-        For DOWN: uses DOWN regime GMM — flags hidden UP risk (bear traps).
-          - DOWN regime anomaly=True → pattern ≠ normal DOWN → bear trap (hidden UP)
-          - DOWN regime anomaly=False → pattern fits genuine DOWN → confirms bearish
+        Runs UP + DOWN regime GMM models simultaneously for every prediction.
+        This enables the full 18-case decision matrix (3 XGB × 2 Titan × 3 GMM).
+
+        Flags:
+          UP_Flag=True  → hidden DOWN risk (crash likely, 2x crash rate lift)
+                          Predicts DOWN. Confirms SELL, opposes BUY.
+          Down_Flag=True → hidden UP risk (bounce likely, 2x bounce rate lift)
+                          Predicts UP. Confirms BUY, opposes SELL.
+          Both False     → Clean (no anomaly edge detected)
+          Both True      → Conflicting (extreme vol) → treated as BLOCK
         """
         defaults = {
-            'ml_down_risk_flag': False,
-            'ml_down_risk_score': 0.5,
-            'ml_down_risk_bucket': 'MEDIUM',
-            'ml_gmm_confirms_direction': False,
-            'ml_gmm_regime_used': None,
+            'ml_up_flag': False,
+            'ml_down_flag': False,
+            'ml_up_score': 0.0,
+            'ml_down_score': 0.0,
+            'ml_down_risk_flag': False,        # legacy compat — True if ANY flag fires
+            'ml_down_risk_score': 0.0,
+            'ml_down_risk_bucket': 'LOW',
+            'ml_gmm_confirms_direction': False, # legacy — True only if clean (both False)
+            'ml_gmm_regime_used': 'BOTH',
             'ml_down_risk_available': False,
         }
 
@@ -677,7 +689,7 @@ class MovePredictor:
                         det = DownRiskDetector()
                         if det.load():
                             self._down_risk_detector = det
-                            self._log("🛡️ Down-Risk Detector: LOADED (VAE+GMM)")
+                            self._log("🛡️ Down-Risk Detector: LOADED (VAE+GMM) — DUAL REGIME")
                         else:
                             self._log("🛡️ Down-Risk Detector: Not trained yet (run down_risk_detector train)")
                     except Exception as e:
@@ -691,36 +703,36 @@ class MovePredictor:
                 if features is None:
                     return defaults
 
-                # Route to appropriate regime model
-                # UP/FLAT signals: use UP regime GMM (detect hidden DOWN risk)
-                # DOWN signals: use DOWN regime GMM (detect hidden UP risk / bear traps)
-                if signal == 'DOWN':
-                    regime_to_use = 'DOWN'
-                else:
-                    regime_to_use = 'UP'  # validated in simulations
-                result = self._down_risk_detector.predict_single(features, regime_to_use)
+                # Run BOTH regime models for full 18-case coverage
+                up_result = self._down_risk_detector.predict_single(features, 'UP')
+                down_result = self._down_risk_detector.predict_single(features, 'DOWN')
 
             # Post-processing outside lock (no shared state)
-            dr_flag = bool(result['down_risk_flag'][0])
-            dr_score = float(result['anomaly_score'][0])
-            dr_bucket = str(result['confidence_bucket'][0])
+            up_flag = bool(up_result['down_risk_flag'][0])
+            up_score = float(up_result['anomaly_score'][0])
+            up_bucket = str(up_result['confidence_bucket'][0])
 
-            # GMM direction-confirmation logic
-            if signal in ('UP', 'FLAT'):
-                # UP regime: flag=True → hidden DOWN risk → does NOT confirm UP
-                gmm_confirms = not dr_flag
-            else:  # signal == 'DOWN'
-                # DOWN regime: flag=True → hidden UP risk (bear trap) → does NOT confirm DOWN
-                # DOWN regime: flag=False → genuine DOWN pattern → confirms DOWN
-                gmm_confirms = not dr_flag
+            down_flag = bool(down_result['down_risk_flag'][0])
+            down_score = float(down_result['anomaly_score'][0])
+
+            # Legacy compat: any flag fires → legacy dr_flag=True
+            any_flag = up_flag or down_flag
+            # Legacy score: max of both (used by downstream dr_score gates)
+            legacy_score = max(up_score, down_score)
+            # Legacy confirms: True only when clean (no anomaly from either model)
+            gmm_confirms = not any_flag
 
             return {
-                'ml_down_risk_flag': dr_flag,
-                'ml_down_risk_score': dr_score,
-                'ml_down_risk_bucket': dr_bucket,
-                'ml_gmm_confirms_direction': gmm_confirms,
-                'ml_gmm_regime_used': regime_to_use,
-                'ml_down_risk_available': True,  # Genuine score computed
+                'ml_up_flag': up_flag,             # UP regime: True = crash risk (predicts DOWN)
+                'ml_down_flag': down_flag,         # DOWN regime: True = bounce risk (predicts UP)
+                'ml_up_score': up_score,           # UP regime anomaly score
+                'ml_down_score': down_score,       # DOWN regime anomaly score
+                'ml_down_risk_flag': any_flag,     # legacy compat — True if ANY flag fires
+                'ml_down_risk_score': legacy_score, # legacy compat — max score
+                'ml_down_risk_bucket': up_bucket,  # legacy compat
+                'ml_gmm_confirms_direction': gmm_confirms, # legacy — True only if clean
+                'ml_gmm_regime_used': 'BOTH',
+                'ml_down_risk_available': True,
             }
         except Exception as e:
             self._log(f"⚠️ Down-Risk scoring failed: {e}")
@@ -750,7 +762,9 @@ class MovePredictor:
             'ml_gpt_summary': '',
             'ml_oi_stale': False,
             'ml_oi_available': False,
-            'ml_down_risk_flag': True,       # Assume risk when ML fails
+            'ml_down_risk_flag': True,       # Assume risk when ML fails (legacy compat)
+            'ml_up_flag': True,              # Assume crash risk when ML fails
+            'ml_down_flag': True,            # Assume bounce risk when ML fails
             'ml_down_risk_score': 0.5,       # Neutral risk, not zero
             'ml_down_risk_bucket': 'MEDIUM', # Neutral bucket, not LOW
             'ml_gmm_confirms_direction': False,

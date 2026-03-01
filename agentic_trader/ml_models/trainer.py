@@ -45,17 +45,17 @@ DEFAULT_PARAMS = {
     'objective': 'multi:softprob',    # 3-class: UP, DOWN, FLAT
     'num_class': 3,
     'eval_metric': 'mlogloss',
-    'max_depth': 6,                  # Deeper for 3-class with 53 features
-    'learning_rate': 0.03,           # Faster convergence (0.01 was too slow)
-    'n_estimators': 2000,            # More room for complex patterns
-    'min_child_weight': 10,          # Less aggressive → let model split more
+    'max_depth': 7,                  # Deeper for 95 features (was 6 for 61)
+    'learning_rate': 0.02,           # Slower LR → better generalization with more features
+    'n_estimators': 3000,            # More room — early stopping finds optimal
+    'min_child_weight': 5,           # Allow subtler OI/IV splits (was 10)
     'subsample': 0.75,               # 75% row sampling per tree
-    'colsample_bytree': 0.75,        # 75% feature sampling per tree
-    'gamma': 1.0,                    # Reduced pruning (was 2.0)
-    'reg_alpha': 0.5,                # Less L1
-    'reg_lambda': 1.5,               # Less L2
+    'colsample_bytree': 0.80,        # 80% feature sampling (was 0.75) — more OI coverage
+    'gamma': 0.5,                    # Less pruning → more splits for new features (was 1.0)
+    'reg_alpha': 0.3,                # Less L1 (was 0.5) — let OI features contribute
+    'reg_lambda': 1.0,               # Less L2 (was 1.5) — reduce feature suppression
     'random_state': 42,
-    'early_stopping_rounds': 80,     # Faster convergence → less patience needed
+    'early_stopping_rounds': 100,    # More patience for slower LR (was 80)
     'verbosity': 1,
 }
 
@@ -114,14 +114,20 @@ def load_and_prepare_data(
     # Try loading OI snapshots for OI context features
     oi_data = {}
     try:
-        from .oi_collector import load_all_oi_snapshots
-        oi_data = load_all_oi_snapshots(symbols)
+        # Load daily options OI features from NSE F&O Bhav Copy data
+        import sys, os
+        _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _parent not in sys.path:
+            sys.path.insert(0, _parent)
+        from download_oi_history import load_all_options_oi_daily
+        oi_data = load_all_options_oi_daily(symbols)
         if oi_data:
-            print(f"   OI context: {len(oi_data)} symbols with snapshots")
+            sample_days = next(iter(oi_data.values()))['trade_date'].nunique()
+            print(f"   Options OI context: {len(oi_data)} symbols with ~{sample_days} trading days")
         else:
-            print(f"   OI context: No snapshots yet (will fill with 0s)")
-    except Exception:
-        pass
+            print(f"   Options OI context: No data yet (run download_oi_history.py)")
+    except Exception as e:
+        print(f"   Options OI context: Load failed ({e}), filling with 0s")
     
     # Try loading futures OI features (from DhanHQ backfill)
     futures_oi_data = {}
@@ -135,6 +141,29 @@ def load_and_prepare_data(
             print(f"   Futures OI context: No data yet (will fill with 0s)")
     except Exception as e:
         print(f"   Futures OI context: Load failed ({e}), filling with 0s")
+    
+    # Load intraday 5-min futures OI (from DhanHQ intraday backfill)
+    intraday_oi_data = {}
+    try:
+        from dhan_futures_oi import load_futures_oi_intraday
+        intraday_oi_dir = DATA_DIR.parent / 'futures_oi'
+        if intraday_oi_dir.exists():
+            intraday_files = list(intraday_oi_dir.glob('*_intraday_oi.parquet'))
+            for fpath in intraday_files:
+                sym = fpath.stem.replace('_intraday_oi', '')
+                if sym in symbols or not symbols:
+                    idf = pd.read_parquet(fpath)
+                    idf['date'] = pd.to_datetime(idf['date'])
+                    intraday_oi_data[sym] = idf
+            if intraday_oi_data:
+                sample_candles = next(iter(intraday_oi_data.values())).shape[0]
+                print(f"   Intraday OI 5-min: {len(intraday_oi_data)} symbols with ~{sample_candles} candles")
+            else:
+                print(f"   Intraday OI 5-min: No data yet (run dhan_futures_oi.py --intraday)")
+        else:
+            print(f"   Intraday OI 5-min: Directory not found")
+    except Exception as e:
+        print(f"   Intraday OI 5-min: Load failed ({e}), filling with 0s")
     
     # Load NIFTY50 market context data (shared across all symbols)
     nifty_5min_df = None
@@ -193,10 +222,13 @@ def load_and_prepare_data(
             print(f"  ⚠ {sym}: only {len(df)} candles, skipping")
             continue
         
-        # Compute features (with daily + OI + futures OI + NIFTY + sector context if available)
+        # Compute features (with daily + OI + futures OI + intraday OI + IV + NIFTY + sector context)
         daily_df = daily_data.get(sym)
         oi_df = oi_data.get(sym)
         futures_oi_df = futures_oi_data.get(sym)
+        intraday_oi_df = intraday_oi_data.get(sym)
+        # Use the same options OI data for IV regime features
+        options_oi_iv_df = oi_data.get(sym)
         
         # Resolve sector index data for this stock
         sector_name = get_sector_for_symbol(sym)
@@ -204,6 +236,7 @@ def load_and_prepare_data(
         sector_daily_df = sector_daily_data.get(sector_name) if sector_name else None
         
         df = compute_features(df, symbol=sym, daily_df=daily_df, oi_df=oi_df, futures_oi_df=futures_oi_df,
+                              intraday_oi_df=intraday_oi_df, options_oi_iv_df=options_oi_iv_df,
                               nifty_5min_df=nifty_5min_df, nifty_daily_df=nifty_daily_df,
                               sector_5min_df=sector_5min_df, sector_daily_df=sector_daily_df)
         if df.empty:

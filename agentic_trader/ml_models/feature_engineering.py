@@ -17,13 +17,19 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-# Suppress divide-by-zero warnings from ATR/range calculations (handled by np.where guards)
+# Suppress noisy warnings during feature computation (safe to ignore):
+# - RuntimeWarning: divide-by-zero and invalid-value in ATR/range calcs (handled by np.where guards)
+# - PerformanceWarning: DataFrame fragmentation from many column inserts (unavoidable in feature pipeline)
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='divide by zero')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value')
+warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 
 def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame = None,
                       oi_df: pd.DataFrame = None,
                       futures_oi_df: pd.DataFrame = None,
+                      intraday_oi_df: pd.DataFrame = None,
+                      options_oi_iv_df: pd.DataFrame = None,
                       nifty_5min_df: pd.DataFrame = None,
                       nifty_daily_df: pd.DataFrame = None,
                       sector_5min_df: pd.DataFrame = None,
@@ -241,16 +247,41 @@ def compute_features(df: pd.DataFrame, symbol: str = "", daily_df: pd.DataFrame 
         for col in _get_daily_feature_names():
             df[col] = 0.0
     
-    # === OI CONTEXT FEATURES (REMOVED from model — always zero historically) ===
-    # Option chain OI features require live snapshots and have no historical data.
-    # They were always zero-importance. Kept _add_oi_context() for future live use.
-    # No longer included in get_feature_names() or model training.
+    # === OPTIONS OI CONTEXT FEATURES (from NSE F&O Bhav Copy daily data) ===
+    # Historical daily option OI features: PCR, IV skew, max pain, OI buildup.
+    # Downloaded via download_oi_history.py from NSE archives.
+    # Each candle gets PREVIOUS day's EOD option OI (no lookahead).
+    if oi_df is not None and len(oi_df) > 0:
+        df = _add_options_oi_context(df, oi_df)
+    else:
+        for col in _get_oi_feature_names():
+            df[col] = 0.0
     
     # === FUTURES OI FEATURES (from DhanHQ historical futures data) ===
     if futures_oi_df is not None and len(futures_oi_df) > 0:
         df = _add_futures_oi_context(df, futures_oi_df)
     else:
         for col in _get_futures_oi_feature_names():
+            df[col] = 0.0
+    
+    # === INTRADAY 5-MIN FUTURES OI FEATURES (from DhanHQ intraday backfill) ===
+    # True 5-min OI: each candle gets a unique OI value reflecting real-time
+    # institutional position changes. Much more discriminative than daily OI
+    # which was constant per day and degraded both models.
+    if intraday_oi_df is not None and len(intraday_oi_df) > 0:
+        df = _add_intraday_oi_context(df, intraday_oi_df)
+    else:
+        for col in _get_intraday_oi_feature_names():
+            df[col] = 0.0
+    
+    # === IV REGIME FEATURES (from NSE Bhav Copy daily option chain data) ===
+    # Daily IV is appropriate as a regime signal (unlike OI which is a flow signal).
+    # IV percentile & IV rank are naturally daily features — they classify the
+    # volatility regime (high IV = expect big moves, low IV = range-bound).
+    if options_oi_iv_df is not None and len(options_oi_iv_df) > 0:
+        df = _add_iv_regime_context(df, options_oi_iv_df)
+    else:
+        for col in _get_iv_regime_feature_names():
             df[col] = 0.0
     
     # === DIRECTION-DISCRIMINATIVE FEATURES ===
@@ -677,16 +708,21 @@ def _get_daily_feature_names() -> list:
 
 
 def _get_oi_feature_names() -> list:
-    """Feature names from options OI context (DhanHQ/NSE)."""
+    """Feature names from options OI context (NSE F&O Bhav Copy daily data).
+    
+    These map to per-stock daily features computed from NSE option chain data
+    via download_oi_history.py. Each 5-min candle gets the PREVIOUS day's
+    EOD option OI snapshot (no lookahead).
+    """
     return [
         'oi_pcr',                 # Put-Call ratio by OI (>1 bearish, <1 bullish)
-        'oi_pcr_change',          # PCR change from previous close OI
-        'oi_buildup_strength',    # -1 (forte short) to +1 (forte long)
+        'oi_pcr_change',          # PCR computed from OI change direction
+        'oi_buildup_strength',    # -1 (short buildup) to +1 (long buildup)
         'oi_spot_vs_max_pain',    # (spot - max_pain) / spot * 100
         'oi_iv_skew',             # ATM put IV - call IV (>0 bearish fear)
         'oi_atm_iv',              # ATM average IV (high = expected big move)
-        'oi_atm_delta',           # ATM call delta (market direction expectation)
         'oi_call_resistance_dist', # Distance from top-call-OI strike (% of spot)
+        'oi_put_support_dist',    # Distance from top-put-OI strike (% of spot)
     ]
 
 
@@ -698,6 +734,39 @@ def _get_futures_oi_feature_names() -> list:
         'fut_basis_pct',       # Futures premium/discount vs spot (%)
         'fut_oi_5d_trend',     # 5-day OI trend (%)
         'fut_vol_ratio',       # Futures volume / Equity volume
+    ]
+
+
+def _get_intraday_oi_feature_names() -> list:
+    """Feature names from 5-min intraday futures OI (DhanHQ backfill).
+    
+    Unlike daily OI (same value for all 75 candles/day = no signal),
+    these have a UNIQUE OI value per 5-min candle reflecting real-time
+    institutional position changes.
+    """
+    return [
+        'oi_change_5m',           # OI % change per candle (building/unwinding)
+        'oi_velocity_6',          # Rate of OI change over last 6 candles (30 min)
+        'oi_session_change',      # Cumulative OI % change since day open
+        'oi_vs_volume',           # OI change / volume (conviction measure, higher = stronger)
+        'oi_acceleration',        # 2nd derivative: is OI buildup accelerating or decelerating?
+        'oi_regime',              # OI relative to 20-candle MA: >1 = above avg, <1 = below
+    ]
+
+
+def _get_iv_regime_feature_names() -> list:
+    """Feature names from daily IV regime context (NSE Bhav Copy).
+    
+    Daily IV is naturally a slow-moving regime signal - it classifies the
+    volatility environment, not per-candle flow. High IV rank means options
+    are expensive (expect big moves), low IV rank = range-bound.
+    """
+    return [
+        'iv_rank_30d',           # IV Rank: (current IV - 30d min) / (30d max - 30d min)
+        'iv_percentile_30d',     # IV Percentile: % of last 30 days with IV below current
+        'iv_skew_zscore',        # IV skew z-score: how extreme is today's put-call IV gap?
+        'iv_regime',             # Categorical: 0=low (<25pct), 1=mid, 2=high (>75pct)
+        'pcr_oi_regime',         # PCR regime: normalized PCR vs 30d history
     ]
 
 
@@ -853,7 +922,21 @@ def get_feature_names() -> list:
         'atr_change_pct',
         # Temporal microstructure
         'dow_sin', 'dow_cos', 'session_bucket',
-    ] + _get_direction_feature_names() + _get_interaction_feature_names() + _get_structure_feature_names() + _get_daily_feature_names() + _get_futures_oi_feature_names() + _get_nifty_feature_names() + _get_sector_feature_names()
+    ] + _get_direction_feature_names() + _get_interaction_feature_names() + _get_structure_feature_names() + _get_daily_feature_names() + _get_futures_oi_feature_names() + _get_nifty_feature_names()
+    # NOTE: Daily OI features (_get_oi_feature_names) degraded BOTH models:
+    #   GMM v5.1: UP AUROC 0.6445→0.5608, DOWN AUROC 0.6446→0.6229
+    #   XGBoost v5.1: Model collapsed to all-FLAT (UP F1=0, DOWN F1=0, macro_F1=0.294)
+    # Cause: daily OI was forward-filled to 75 identical candles/day = zero intraday signal.
+    #
+    # Intraday OI + IV Regime features (_get_intraday_oi_feature_names + _get_iv_regime_feature_names)
+    # also collapsed XGBoost to all-FLAT (macro_F1=0.294, UP/DOWN F1=0.000).
+    # Root cause: DhanHQ intraday OI only covers ~90 days (Dec 2025-Feb 2026) while
+    # training data spans ~250 days (Sep 2025-Feb 2026). 64% of training samples had
+    # all-zero intraday OI features, creating a dominant "zero → FLAT" pattern that
+    # overwhelmed the directional signal. iv_regime did reach top 10 features (0.026 importance)
+    # but wasn't sufficient to overcome the noise from sparse intraday OI coverage.
+    #
+    # Sector features (_get_sector_feature_names) also excluded — no signal in either model.
 
 
 def _orb_direction(df: pd.DataFrame) -> np.ndarray:
@@ -1250,6 +1333,108 @@ def _add_oi_context(intraday_df: pd.DataFrame, oi_df: pd.DataFrame) -> pd.DataFr
     return result
 
 
+def _add_options_oi_context(intraday_df: pd.DataFrame, oi_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge daily options OI features onto each 5-min candle.
+    
+    For each trading day in intraday_df, uses the PREVIOUS day's option OI
+    features to avoid lookahead bias (same logic as _add_futures_oi_context).
+    
+    Data comes from NSE F&O Bhav Copy daily data downloaded via
+    download_oi_history.py. Contains per-stock: PCR, IV skew, max pain,
+    OI buildup strength, call resistance, put support.
+    
+    Args:
+        intraday_df: 5-min candle DataFrame (already has 'date' column)
+        oi_df: Daily options OI DataFrame with columns:
+            trade_date, symbol, pcr_oi, pcr_oi_change, oi_buildup_strength,
+            spot_vs_max_pain, iv_skew, atm_iv, call_resistance_dist, put_support_dist
+    
+    Returns:
+        intraday_df with 8 new option OI context columns added
+    """
+    oi_features = _get_oi_feature_names()
+    
+    if oi_df is None or len(oi_df) == 0:
+        for col in oi_features:
+            intraday_df[col] = 0.0
+        return intraday_df
+    
+    oi = oi_df.copy()
+    
+    # Normalize the date column
+    if 'trade_date' in oi.columns:
+        oi['_date'] = pd.to_datetime(oi['trade_date']).dt.date
+    elif 'date' in oi.columns:
+        oi['_date'] = pd.to_datetime(oi['date']).dt.date
+    else:
+        for col in oi_features:
+            intraday_df[col] = 0.0
+        return intraday_df
+    
+    oi = oi.sort_values('_date').reset_index(drop=True)
+    
+    # Map downloaded column names to feature names
+    col_map = {
+        'pcr_oi': 'oi_pcr',
+        'pcr_oi_change': 'oi_pcr_change',
+        'oi_buildup_strength': 'oi_buildup_strength',
+        'spot_vs_max_pain': 'oi_spot_vs_max_pain',
+        'iv_skew': 'oi_iv_skew',
+        'atm_iv': 'oi_atm_iv',
+        'call_resistance_dist': 'oi_call_resistance_dist',
+        'put_support_dist': 'oi_put_support_dist',
+    }
+    
+    # Build lookup: for each date, store the PREVIOUS day's features (no lookahead)
+    context_by_date = {}
+    sorted_oi_dates = oi['_date'].unique()
+    
+    for i in range(1, len(oi)):
+        current_date = oi['_date'].iloc[i]
+        prev_row = oi.iloc[i - 1]
+        
+        feat_dict = {}
+        for src_col, feat_name in col_map.items():
+            if src_col in oi.columns and pd.notna(prev_row.get(src_col)):
+                feat_dict[feat_name] = float(prev_row[src_col])
+            else:
+                feat_dict[feat_name] = 0.0
+        context_by_date[current_date] = feat_dict
+    
+    # Forward-fill: for dates after last OI date, use latest row
+    _last_oi_context = None
+    if len(oi) > 0:
+        _last_row = oi.iloc[-1]
+        _last_oi_context = {
+            feat_name: float(_last_row.get(src_col, 0)) if pd.notna(_last_row.get(src_col)) else 0.0
+            for src_col, feat_name in col_map.items()
+        }
+    
+    # Map onto each 5-min candle
+    result = intraday_df.copy()
+    result['_date'] = result['date'].dt.date
+    
+    def _lookup(d, c):
+        val = context_by_date.get(d, {}).get(c)
+        if val is not None:
+            return val
+        # Forward-fill for dates beyond OI coverage
+        if _last_oi_context is not None and len(sorted_oi_dates) > 0 and d > sorted_oi_dates[-1]:
+            return _last_oi_context.get(c, 0.0)
+        return 0.0
+    
+    for col in oi_features:
+        result[col] = result['_date'].map(lambda d, c=col: _lookup(d, c))
+    
+    result.drop(columns=['_date'], inplace=True, errors='ignore')
+    
+    # Replace inf/nan
+    for col in oi_features:
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return result
+
+
 def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
                        nifty_daily_df: pd.DataFrame = None) -> pd.DataFrame:
     """Merge NIFTY50 market context features onto each 5-min candle.
@@ -1497,6 +1682,270 @@ def _add_futures_oi_context(intraday_df: pd.DataFrame, futures_oi_df: pd.DataFra
     
     # Replace inf/nan
     for col in fut_features:
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+#  INTRADAY 5-MIN FUTURES OI CONTEXT
+# ══════════════════════════════════════════════════════════════
+
+def _add_intraday_oi_context(intraday_df: pd.DataFrame, oi_intra_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge 5-min intraday futures OI features onto each price candle.
+    
+    Uses merge_asof to align OI candles with price candles by timestamp.
+    Then computes derived features capturing OI flow dynamics:
+      - Per-candle OI change (building vs unwinding)
+      - OI velocity (rate over 30 min)
+      - Session-level cumulative OI change
+      - OI/volume conviction ratio
+      - OI acceleration (2nd derivative)
+      - OI regime (vs 20-candle MA)
+    
+    Args:
+        intraday_df: 5-min price candles (with 'date' column)
+        oi_intra_df: 5-min futures OI candles with columns:
+            date, open, high, low, close, volume, fut_oi, symbol
+    
+    Returns:
+        intraday_df with 6 new intraday OI columns
+    """
+    feat_names = _get_intraday_oi_feature_names()
+    result = intraday_df.copy()
+    
+    if oi_intra_df is None or len(oi_intra_df) == 0:
+        for col in feat_names:
+            result[col] = 0.0
+        return result
+    
+    oi = oi_intra_df.copy()
+    oi['date'] = pd.to_datetime(oi['date'])
+    oi = oi.sort_values('date').reset_index(drop=True)
+    
+    # Filter out zero-OI rows (contract not yet active)
+    oi = oi[oi['fut_oi'] > 0].reset_index(drop=True)
+    
+    if len(oi) < 10:
+        for col in feat_names:
+            result[col] = 0.0
+        return result
+    
+    # --- Compute OI-derived features on the OI dataframe first ---
+    oi_vals = oi['fut_oi'].values.astype(float)
+    oi_vol = oi['volume'].values.astype(float)
+    
+    # 1. OI % change per candle
+    oi_pct = np.zeros(len(oi_vals))
+    oi_pct[1:] = np.where(oi_vals[:-1] > 0,
+                           (oi_vals[1:] - oi_vals[:-1]) / oi_vals[:-1] * 100,
+                           0.0)
+    oi['oi_change_5m'] = np.clip(oi_pct, -10, 10)
+    
+    # 2. OI velocity over 6 candles (30 min)
+    oi_vel = np.zeros(len(oi_vals))
+    oi_vel[6:] = np.where(oi_vals[:-6] > 0,
+                           (oi_vals[6:] - oi_vals[:-6]) / oi_vals[:-6] * 100,
+                           0.0)
+    oi['oi_velocity_6'] = np.clip(oi_vel, -25, 25)
+    
+    # 3. Session cumulative OI change (% from day's first OI reading)
+    oi['_date'] = oi['date'].dt.date
+    session_change = np.zeros(len(oi))
+    for d, grp in oi.groupby('_date'):
+        idx = grp.index
+        day_start_oi = grp['fut_oi'].iloc[0]
+        if day_start_oi > 0:
+            session_change[idx] = (grp['fut_oi'].values - day_start_oi) / day_start_oi * 100
+    oi['oi_session_change'] = np.clip(session_change, -20, 20)
+    
+    # 4. OI change / volume (conviction: higher = position change per unit vol)
+    oi_abs_change = np.abs(np.diff(oi_vals, prepend=oi_vals[0]))
+    oi['oi_vs_volume'] = np.where(oi_vol > 0,
+                                   oi_abs_change / oi_vol,
+                                   0.0)
+    oi['oi_vs_volume'] = np.clip(oi['oi_vs_volume'].values, 0, 10)
+    
+    # 5. OI acceleration (2nd derivative: d(oi_change)/dt)
+    oi_accel = np.zeros(len(oi_vals))
+    oi_accel[2:] = oi_pct[2:] - oi_pct[1:-1]
+    oi['oi_acceleration'] = np.clip(oi_accel, -5, 5)
+    
+    # 6. OI regime (current OI / 20-candle MA)
+    oi_ma20 = pd.Series(oi_vals).rolling(20, min_periods=5).mean().values
+    oi['oi_regime'] = np.where(oi_ma20 > 0, oi_vals / oi_ma20, 1.0)
+    oi['oi_regime'] = np.clip(oi['oi_regime'].values, 0.5, 2.0)
+    
+    # --- merge_asof: align OI features onto price candles ---
+    merge_cols = ['date'] + feat_names
+    oi_merge = oi[merge_cols].copy()
+    oi_merge = oi_merge.sort_values('date')
+    
+    result = result.sort_values('date').reset_index(drop=True)
+    
+    # Normalize timezones
+    _left = result[['date']].copy()
+    _right = oi_merge.copy()
+    if _left['date'].dt.tz is not None:
+        _left['date'] = _left['date'].dt.tz_localize(None)
+    if _right['date'].dt.tz is not None:
+        _right['date'] = _right['date'].dt.tz_localize(None)
+    
+    merged = pd.merge_asof(
+        _left,
+        _right,
+        on='date',
+        direction='backward',
+        tolerance=pd.Timedelta('10min'),
+    )
+    
+    for col in feat_names:
+        if col in merged.columns:
+            result[col] = merged[col].values
+        else:
+            result[col] = 0.0
+    
+    # Clean up
+    for col in feat_names:
+        result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    if '_date' in result.columns:
+        result.drop(columns=['_date'], inplace=True, errors='ignore')
+    
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+#  IV REGIME CONTEXT (from daily option chain data)
+# ══════════════════════════════════════════════════════════════
+
+def _add_iv_regime_context(intraday_df: pd.DataFrame, iv_df: pd.DataFrame) -> pd.DataFrame:
+    """Add daily IV regime features from NSE Bhav Copy option chain data.
+    
+    IV is a naturally slow-moving signal — it classifies the volatility
+    environment, not per-candle flow. This is exactly how it should be used:
+      - IV Rank: where is current IV vs recent range? (0-1)
+      - IV Percentile: % of recent days below current IV (0-1)
+      - IV Skew Z-score: how extreme is today's put-call IV gap?
+      - IV Regime: categorical (low=0, mid=1, high=2)
+      - PCR OI Regime: normalized PCR vs history
+    
+    Uses PREVIOUS day's values (no lookahead).
+    
+    Args:
+        intraday_df: 5-min price candles (with 'date' column)
+        iv_df: Daily options OI DataFrame with columns:
+            trade_date, atm_iv, iv_skew, pcr_oi
+    
+    Returns:
+        intraday_df with 5 new IV regime columns
+    """
+    feat_names = _get_iv_regime_feature_names()
+    result = intraday_df.copy()
+    
+    if iv_df is None or len(iv_df) < 5:
+        for col in feat_names:
+            result[col] = 0.0
+        return result
+    
+    iv = iv_df.copy()
+    
+    # Normalize date
+    if 'trade_date' in iv.columns:
+        iv['_date'] = pd.to_datetime(iv['trade_date']).dt.date
+    elif 'date' in iv.columns:
+        iv['_date'] = pd.to_datetime(iv['date']).dt.date
+    else:
+        for col in feat_names:
+            result[col] = 0.0
+        return result
+    
+    iv = iv.sort_values('_date').reset_index(drop=True)
+    
+    # Ensure required columns exist
+    for c in ['atm_iv', 'iv_skew', 'pcr_oi']:
+        if c not in iv.columns:
+            iv[c] = 0.0
+    
+    # --- Compute rolling IV features on the daily data ---
+    atm_iv = iv['atm_iv'].values.astype(float)
+    iv_skew_vals = iv['iv_skew'].values.astype(float)
+    pcr_vals = iv['pcr_oi'].values.astype(float)
+    
+    window = 30  # 30 trading days lookback
+    
+    # IV Rank: (current - min) / (max - min) over window
+    iv_min = pd.Series(atm_iv).rolling(window, min_periods=5).min().values
+    iv_max = pd.Series(atm_iv).rolling(window, min_periods=5).max().values
+    iv_range = np.maximum(iv_max - iv_min, 0.01)
+    iv['iv_rank_30d'] = np.clip((atm_iv - iv_min) / iv_range, 0, 1)
+    
+    # IV Percentile: fraction of past 30d with IV below current
+    iv_pctile = np.zeros(len(atm_iv))
+    for i in range(window, len(atm_iv)):
+        lookback = atm_iv[max(0, i - window):i]
+        iv_pctile[i] = np.mean(lookback < atm_iv[i])
+    # For early rows with less history, use what's available
+    for i in range(5, min(window, len(atm_iv))):
+        lookback = atm_iv[:i]
+        iv_pctile[i] = np.mean(lookback < atm_iv[i])
+    iv['iv_percentile_30d'] = np.clip(iv_pctile, 0, 1)
+    
+    # IV Skew Z-score: (current skew - 30d mean) / 30d std
+    skew_mean = pd.Series(iv_skew_vals).rolling(window, min_periods=5).mean().values
+    skew_std = pd.Series(iv_skew_vals).rolling(window, min_periods=5).std().values
+    skew_std = np.maximum(skew_std, 0.01)
+    iv['iv_skew_zscore'] = np.clip((iv_skew_vals - skew_mean) / skew_std, -3, 3)
+    
+    # IV Regime: categorical bucket
+    iv['iv_regime'] = np.where(iv['iv_percentile_30d'] < 0.25, 0,
+                      np.where(iv['iv_percentile_30d'] > 0.75, 2, 1)).astype(float)
+    
+    # PCR OI Regime: z-score of PCR vs 30d rolling
+    pcr_mean = pd.Series(pcr_vals).rolling(window, min_periods=5).mean().values
+    pcr_std = pd.Series(pcr_vals).rolling(window, min_periods=5).std().values
+    pcr_std = np.maximum(pcr_std, 0.01)
+    iv['pcr_oi_regime'] = np.clip((pcr_vals - pcr_mean) / pcr_std, -3, 3)
+    
+    # --- Build per-date lookup: use PREVIOUS day's values (no lookahead) ---
+    context_by_date = {}
+    for i in range(1, len(iv)):
+        curr_date = iv['_date'].iloc[i]
+        prev_row = iv.iloc[i - 1]
+        context_by_date[curr_date] = {
+            col: float(prev_row[col]) if col in iv.columns and pd.notna(prev_row.get(col)) else 0.0
+            for col in feat_names
+        }
+    
+    # Forward-fill for dates beyond IV coverage
+    _last_ctx = None
+    if len(iv) > 0:
+        _last = iv.iloc[-1]
+        _last_ctx = {
+            col: float(_last[col]) if col in iv.columns and pd.notna(_last.get(col)) else 0.0
+            for col in feat_names
+        }
+    
+    sorted_iv_dates = sorted(iv['_date'].unique())
+    
+    # Map onto each 5-min candle
+    result['_date'] = result['date'].dt.date
+    
+    def _lookup(d, c):
+        val = context_by_date.get(d, {}).get(c)
+        if val is not None:
+            return val
+        if _last_ctx is not None and len(sorted_iv_dates) > 0 and d > sorted_iv_dates[-1]:
+            return _last_ctx.get(c, 0.0)
+        return 0.0
+    
+    for col in feat_names:
+        result[col] = result['_date'].map(lambda d, c=col: _lookup(d, c))
+    
+    result.drop(columns=['_date'], inplace=True, errors='ignore')
+    
+    # Clean up
+    for col in feat_names:
         result[col] = result[col].replace([np.inf, -np.inf], 0).fillna(0)
     
     return result

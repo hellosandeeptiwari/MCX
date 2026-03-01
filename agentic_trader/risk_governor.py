@@ -18,7 +18,7 @@ from enum import Enum
 import json
 import os
 import logging
-from safe_io import atomic_json_save
+from state_db import get_state_db
 
 logger = logging.getLogger('risk_governor')
 
@@ -34,8 +34,8 @@ class SystemState(Enum):
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_daily_loss_pct: float = 15.0     # Max 15% daily loss
-    max_consecutive_losses: int = 5       # Max 5 losses in a row
+    max_daily_loss_pct: float = 20.0     # Max 20% daily loss
+    max_consecutive_losses: int = 8       # Max 8 losses in a row
     max_trades_per_day: int = 80          # Max 80 trades per day
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
     cooldown_minutes: int = 0             # No cooldown after loss (disabled per user request)
@@ -92,6 +92,7 @@ class RiskGovernor:
         self.state = RiskState()
         self.state_file = "risk_state.json"
         self.trade_date = datetime.now().date()
+        self._cached_unrealized_pnl = 0.0  # Updated by is_trading_allowed() with live ticker data
         
         # Sector/correlation mapping - MUST cover ALL APPROVED_UNIVERSE symbols
         self.sector_map = {
@@ -144,87 +145,123 @@ class RiskGovernor:
         self._load_state()
         self._check_new_day()
         self._reconcile_pnl_from_history()
+        self._reeval_halt()
+    
+    def _reeval_halt(self, active_positions: List[Dict] = None, unrealized_pnl: float = 0.0):
+        """Re-evaluate HALT_TRADING after state load + reconciliation.
+        If NET P&L (realized + unrealized) is within limits, clear the halt.
+        This prevents the asymmetry where SL cuts realize losses fast while
+        open winners (target extension / trailing) stay unrealized.
+        
+        Args:
+            active_positions: Open positions (legacy, used for fallback calc)
+            unrealized_pnl: Pre-computed unrealized P&L from ticker quotes (preferred)
+        """
+        if self.state.system_state != SystemState.HALT_TRADING.value:
+            return
+        # Only re-evaluate daily-loss halts (not consecutive-loss or circuit-break halts)
+        _is_loss_halt = 'daily loss' in (self.state.halt_reason or '').lower() or 'Max daily loss' in (self.state.halt_reason or '')
+        if not _is_loss_halt:
+            return
+        # Use pre-computed unrealized if provided, otherwise try from positions
+        unrealized = unrealized_pnl if unrealized_pnl != 0.0 else (
+            self._calc_unrealized_pnl(active_positions) if active_positions else 0.0
+        )
+        net_pnl = self.state.daily_pnl + unrealized
+        net_pnl_pct = (net_pnl / self.starting_capital) * 100 if self.starting_capital else 0.0
+        if abs(net_pnl_pct) < self.limits.max_daily_loss_pct:
+            # print(f"✅ Risk Governor: Net P&L ({net_pnl_pct:+.2f}%) is within {self.limits.max_daily_loss_pct}% limit "
+            #       f"(realized {self.state.daily_pnl_pct:+.2f}% + unrealized ₹{unrealized:+,.0f}) — HALT CLEARED")
+            self.state.system_state = SystemState.ACTIVE.value
+            self.state.halt_reason = ""
+            self._save_state()
+        else:
+            # Also check realized-only in case unrealized is 0 (positions not loaded yet)
+            if abs(self.state.daily_pnl_pct) < self.limits.max_daily_loss_pct:
+                # print(f"✅ Risk Governor: Realized P&L ({self.state.daily_pnl_pct:+.2f}%) is within {self.limits.max_daily_loss_pct}% limit — HALT CLEARED")
+                self.state.system_state = SystemState.ACTIVE.value
+                self.state.halt_reason = ""
+                self._save_state()
     
     def _load_state(self):
-        """Load state from file"""
+        """Load state from SQLite (falls back to JSON for migration)"""
+        try:
+            data = get_state_db().load_risk_state()
+            if data:
+                self.state = RiskState(**{k: v for k, v in data.items() if k != 'date'})
+                return
+        except Exception as e:
+            print(f"⚠️ Error loading risk state from SQLite: {e}")
+        # Fallback: legacy JSON (pre-migration)
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, 'r') as f:
                     data = json.load(f)
-                    # Only load if same day
                     if data.get('date') == str(datetime.now().date()):
                         self.state = RiskState(**{k: v for k, v in data.items() if k != 'date'})
             except Exception as e:
-                print(f"⚠️ Error loading risk state: {e}")
+                print(f"⚠️ Error loading risk state from JSON: {e}")
     
     def _reconcile_pnl_from_history(self):
-        """Reconcile daily_pnl using active_trades.json realized_pnl as single source of truth.
+        """Reconcile daily_pnl using active_trades realized_pnl as single source of truth.
         
-        active_trades.json's realized_pnl is updated by zerodha_tools.paper_pnl on EVERY
-        trade close (before archival), so it always reflects the true cumulative P&L —
-        even if some trades weren't archived to trade_history.json.
+        SQLite daily_state realized_pnl is updated by zerodha_tools.paper_pnl on EVERY
+        trade close (before archival), so it always reflects the true cumulative P&L.
         
-        Falls back to trade_history.json sum if active_trades.json is unavailable.
+        Falls back to Trade Ledger exits if SQLite is unavailable.
         """
-        base_dir = os.path.dirname(__file__)
-        
-        # --- PRIMARY SOURCE: active_trades.json realized_pnl ---
-        active_file = os.path.join(base_dir, 'active_trades.json')
         today_str = str(datetime.now().date())
-        if os.path.exists(active_file):
-            try:
-                with open(active_file, 'r') as f:
-                    active_data = json.load(f)
-                # Only reconcile if file is from today — skip stale data
-                if active_data.get('date') != today_str:
-                    print(f"📊 Risk Governor: Skipping stale active_trades.json (date={active_data.get('date')}, today={today_str})")
-                    return
-                active_pnl = active_data.get('realized_pnl', None)
-                if active_pnl is not None:
-                    old_pnl = self.state.daily_pnl
-                    if abs(old_pnl - active_pnl) > 1.0:
-                        self.state.daily_pnl = active_pnl
-                        self.state.daily_pnl_pct = (active_pnl / self.starting_capital) * 100
-                        self.current_capital = self.starting_capital + active_pnl
-                        self._save_state()
-                        print(f"📊 Risk Governor: Reconciled daily P&L from active_trades: ₹{old_pnl:+,.0f} → ₹{active_pnl:+,.0f}")
-                    return
-            except Exception as e:
-                print(f"⚠️ Risk Governor: active_trades reconciliation failed: {e}")
         
-        # --- FALLBACK: trade_history.json sum ---
-        history_file = os.path.join(base_dir, 'trade_history.json')
-        if not os.path.exists(history_file):
-            return
+        # --- PRIMARY SOURCE: SQLite daily_state realized_pnl ---
         try:
-            with open(history_file, 'r') as f:
-                history = json.load(f)
-            today_str = str(datetime.now().date())
-            today_pnl = sum(
-                t.get('pnl', 0) for t in history
-                if today_str in t.get('closed_at', '')
-            )
-            today_trades = [
-                t for t in history
-                if today_str in t.get('closed_at', '')
-            ]
-            if today_trades:
+            db = get_state_db()
+            _positions, active_pnl, _cap = db.load_active_trades(today_str)
+            if active_pnl is not None:
+                old_pnl = self.state.daily_pnl
+                if abs(old_pnl - active_pnl) > 1.0:
+                    self.state.daily_pnl = active_pnl
+                    self.state.daily_pnl_pct = (active_pnl / self.starting_capital) * 100
+                    self.current_capital = self.starting_capital + active_pnl
+                    # Re-evaluate halt: if reconciled P&L is within limits, clear the halt
+                    if self.state.system_state == SystemState.HALT_TRADING.value:
+                        reconciled_pct = abs(self.state.daily_pnl_pct)
+                        if reconciled_pct < self.limits.max_daily_loss_pct:
+                            self.state.system_state = SystemState.ACTIVE.value
+                            self.state.halt_reason = ""
+                    self._save_state()
+                return
+        except Exception as e:
+            print(f"⚠️ Risk Governor: active_trades reconciliation failed: {e}")
+        
+        # --- FALLBACK: Trade Ledger today's exits ---
+        try:
+            from trade_ledger import get_trade_ledger
+            exits = get_trade_ledger().get_exits()
+            if exits:
+                today_pnl = sum(e.get('pnl', 0) for e in exits)
                 old_pnl = self.state.daily_pnl
                 if abs(old_pnl - today_pnl) > 1.0:
                     self.state.daily_pnl = today_pnl
                     self.state.daily_pnl_pct = (today_pnl / self.starting_capital) * 100
                     self.current_capital = self.starting_capital + today_pnl
+                    # Re-evaluate halt: if reconciled P&L is within limits, clear the halt
+                    if self.state.system_state == SystemState.HALT_TRADING.value:
+                        reconciled_pct = abs(self.state.daily_pnl_pct)
+                        if reconciled_pct < self.limits.max_daily_loss_pct:
+                            self.state.system_state = SystemState.ACTIVE.value
+                            self.state.halt_reason = ""
+                            # print(f"✅ Risk Governor: Reconciled P&L ({self.state.daily_pnl_pct:+.2f}%) is within {self.limits.max_daily_loss_pct}% limit — HALT CLEARED")
                     self._save_state()
-                    print(f"📊 Risk Governor: Reconciled daily P&L from trade history (fallback): ₹{old_pnl:+,.0f} → ₹{today_pnl:+,.0f}")
+                    # print(f"📊 Risk Governor: Reconciled daily P&L from Trade Ledger (fallback): ₹{old_pnl:+,.0f} → ₹{today_pnl:+,.0f}")
         except Exception as e:
             print(f"⚠️ Risk Governor: P&L reconciliation failed: {e}")
     
     def _save_state(self):
-        """Save state to file (atomic write with error handling)"""
+        """Save state to SQLite (atomic, crash-safe)"""
         try:
             data = asdict(self.state)
             data['date'] = str(datetime.now().date())
-            atomic_json_save(self.state_file, data)
+            get_state_db().save_risk_state(data)
         except Exception as e:
             logger.error(f"Failed to save risk state: {e}")
     
@@ -241,7 +278,7 @@ class RiskGovernor:
         """Update current capital tracking (does NOT overwrite daily_pnl).
         
         daily_pnl is maintained by record_trade_result() and reconciled
-        from trade_history.json on startup. We only track current_capital here.
+        from Trade Ledger on startup. We only track current_capital here.
         """
         self.current_capital = new_capital
     
@@ -293,7 +330,9 @@ class RiskGovernor:
                     self._save_state()
         
         # Daily loss check using NET P&L (realized + unrealized)
-        unrealized_pnl = self._calc_unrealized_pnl(active_positions)
+        # Use cached unrealized from is_trading_allowed() (live ticker data),
+        # falling back to _calc_unrealized_pnl (which may return 0 if positions lack LTP).
+        unrealized_pnl = self._cached_unrealized_pnl if self._cached_unrealized_pnl != 0.0 else self._calc_unrealized_pnl(active_positions)
         net_pnl = self.state.daily_pnl + unrealized_pnl
         net_pnl_pct = (net_pnl / self.starting_capital) * 100
         
@@ -392,14 +431,27 @@ class RiskGovernor:
                     self.state.system_state = SystemState.ACTIVE.value
                     self._save_state()
         
-        # 3. Check max daily loss
-        if self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct:
-            self._halt_trading(f"Max daily loss hit: {self.state.daily_pnl_pct:.2f}%")
+        # 3. Check max daily loss using NET P&L (realized + unrealized)
+        # Profits run (target extension / trailing stops) while losses cut fast (SL),
+        # so realized P&L skews negative. Using net P&L prevents premature halts
+        # when open winners offset closed losers.
+        # Use cached unrealized from is_trading_allowed() (live ticker data),
+        # falling back to _calc_unrealized_pnl (which may return 0 if positions lack LTP).
+        _unrealized = self._cached_unrealized_pnl if self._cached_unrealized_pnl != 0.0 else self._calc_unrealized_pnl(active_positions)
+        _net_pnl = self.state.daily_pnl + _unrealized
+        _net_pnl_pct = (_net_pnl / self.starting_capital) * 100 if self.starting_capital else 0.0
+        
+        if _net_pnl_pct <= -self.limits.max_daily_loss_pct:
+            self._halt_trading(f"Max daily loss hit: net {_net_pnl_pct:.2f}% (realized {self.state.daily_pnl_pct:.2f}% + unrealized ₹{_unrealized:+,.0f})")
             return TradePermission(
                 allowed=False,
-                reason=f"Max daily loss exceeded: {self.state.daily_pnl_pct:.2f}%",
+                reason=f"Max daily loss exceeded: net {_net_pnl_pct:.2f}% (realized {self.state.daily_pnl_pct:.2f}%)",
                 warnings=["Daily loss limit reached"]
             )
+        
+        # Warn if realized alone would trigger halt but unrealized saves it
+        if self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct and _unrealized > 0:
+            warnings.append(f"⚠️ Realized P&L {self.state.daily_pnl_pct:.1f}% past limit, open winners keeping net OK ({_net_pnl_pct:.1f}%)")
         
         # 4. Check consecutive losses
         if self.state.consecutive_losses >= self.limits.max_consecutive_losses:
@@ -474,8 +526,8 @@ class RiskGovernor:
         if self.state.consecutive_losses == self.limits.max_consecutive_losses - 1:
             warnings.append("One more loss will halt trading")
         
-        if self.state.daily_pnl_pct < -(self.limits.max_daily_loss_pct * 0.7):
-            warnings.append(f"Approaching daily loss limit: {self.state.daily_pnl_pct:.2f}%")
+        if _net_pnl_pct < -(self.limits.max_daily_loss_pct * 0.7):
+            warnings.append(f"Approaching daily loss limit: net {_net_pnl_pct:.1f}% (realized {self.state.daily_pnl_pct:.1f}%)")
         
         return TradePermission(
             allowed=True,
@@ -502,6 +554,10 @@ class RiskGovernor:
         """
         self._check_new_day()
         
+        # Cache unrealized if provided (from caller's live ticker data)
+        if unrealized_pnl != 0.0:
+            self._cached_unrealized_pnl = unrealized_pnl
+        
         self.state.trades_today += 1
         self.state.daily_pnl += pnl
         self.state.daily_pnl_pct = (self.state.daily_pnl / self.starting_capital) * 100
@@ -525,12 +581,14 @@ class RiskGovernor:
         
         # Check if we should halt using NET P&L (realized + unrealized)
         # This prevents halting when open winners offset a closed loser
-        net_pnl = self.state.daily_pnl + unrealized_pnl
+        # Use cached unrealized if caller didn't provide it (live ticker data from is_trading_allowed)
+        _effective_unrealized = unrealized_pnl if unrealized_pnl != 0.0 else self._cached_unrealized_pnl
+        net_pnl = self.state.daily_pnl + _effective_unrealized
         net_pnl_pct = (net_pnl / self.starting_capital) * 100
         
         if net_pnl_pct <= -self.limits.max_daily_loss_pct:
-            self._halt_trading(f"Max daily loss: {net_pnl_pct:.2f}% (realized: {self.state.daily_pnl_pct:.2f}% + unrealized: ₹{unrealized_pnl:+,.0f})")
-        elif self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct and unrealized_pnl > 0:
+            self._halt_trading(f"Max daily loss: {net_pnl_pct:.2f}% (realized: {self.state.daily_pnl_pct:.2f}% + unrealized: ₹{_effective_unrealized:+,.0f})")
+        elif self.state.daily_pnl_pct <= -self.limits.max_daily_loss_pct and _effective_unrealized > 0:
             print(f"⚠️ Realized P&L {self.state.daily_pnl_pct:.2f}% exceeds limit, but open winners offset (net: {net_pnl_pct:.2f}%) — continuing")
         
         if self.state.consecutive_losses >= self.limits.max_consecutive_losses:
@@ -639,8 +697,13 @@ class RiskGovernor:
         """Manually halt trading"""
         self._halt_trading(reason)
     
-    def get_status(self) -> str:
-        """Get current risk governor status"""
+    def get_status(self, active_positions: List[Dict] = None, unrealized_pnl: float = 0.0) -> str:
+        """Get current risk governor status with live unrealized P&L
+        
+        Args:
+            active_positions: Open positions (legacy fallback)
+            unrealized_pnl: Pre-computed unrealized P&L from live ticker quotes (preferred)
+        """
         self._check_new_day()
         
         state_emoji = {
@@ -652,6 +715,13 @@ class RiskGovernor:
         
         emoji = state_emoji.get(self.state.system_state, "❓")
         
+        # Use pre-computed unrealized if provided, otherwise try from positions
+        unrealized = unrealized_pnl if unrealized_pnl != 0.0 else (
+            self._calc_unrealized_pnl(active_positions) if active_positions else 0.0
+        )
+        net_pnl = self.state.daily_pnl + unrealized
+        net_pnl_pct = (net_pnl / self.starting_capital) * 100 if self.starting_capital else 0.0
+        
         lines = [
             f"\n{emoji} RISK GOVERNOR STATUS:",
             f"   State: {self.state.system_state}",
@@ -660,6 +730,10 @@ class RiskGovernor:
             f"   Win/Loss: {self.state.wins_today}/{self.state.losses_today}",
             f"   Consecutive Losses: {self.state.consecutive_losses}/{self.limits.max_consecutive_losses}",
         ]
+        
+        # Show live realized + unrealized breakdown
+        if active_positions:
+            lines.append(f"   Unrealized: ₹{unrealized:+,.0f} | Net P&L: ₹{net_pnl:+,.0f} ({net_pnl_pct:+.2f}%)")
         
         if self.state.halt_reason:
             lines.append(f"   Reason: {self.state.halt_reason}")
@@ -672,8 +746,17 @@ class RiskGovernor:
         
         return "\n".join(lines)
     
-    def is_trading_allowed(self) -> bool:
-        """Quick check if trading is allowed"""
+    def is_trading_allowed(self, active_positions: List[Dict] = None, unrealized_pnl: float = 0.0) -> bool:
+        """Quick check if trading is allowed.
+        
+        If system is halted due to daily loss, re-evaluates using NET P&L
+        (realized + unrealized). This prevents premature halts when open
+        winners offset closed losers.
+        
+        Args:
+            active_positions: Open positions (legacy fallback)
+            unrealized_pnl: Pre-computed unrealized P&L from live ticker quotes
+        """
         self._check_new_day()
         # Also clear expired cooldowns
         if self.state.system_state == SystemState.COOLDOWN.value:
@@ -684,6 +767,13 @@ class RiskGovernor:
                     self.state.cooldown_until = ""
                     self._save_state()
                     print("✅ Cooldown expired - trading resumed")
+        # Re-evaluate halt with live unrealized P&L (net P&L may clear it)
+        if self.state.system_state == SystemState.HALT_TRADING.value:
+            if unrealized_pnl != 0.0 or active_positions:
+                self._reeval_halt(active_positions, unrealized_pnl=unrealized_pnl)
+        # Cache the unrealized P&L so can_trade() uses live data instead of broken fallback
+        if unrealized_pnl != 0.0:
+            self._cached_unrealized_pnl = unrealized_pnl
         return self.state.system_state == SystemState.ACTIVE.value
 
 

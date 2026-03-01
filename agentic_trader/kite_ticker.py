@@ -111,7 +111,7 @@ class TitanTicker:
                 pass
             
             self._instruments_loaded = True
-            print(f"🔌 Ticker: Loaded {len(self._instrument_map)} instrument tokens")
+            # print(f"🔌 Ticker: Loaded {len(self._instrument_map)} instrument tokens")
         except Exception as e:
             print(f"⚠️ Ticker: Failed to load instruments: {e}")
     
@@ -163,7 +163,7 @@ class TitanTicker:
             name="TitanTicker-WS"
         )
         self._ws_thread.start()
-        print("🔌 Ticker: WebSocket connecting...")
+        # print("🔌 Ticker: WebSocket connecting...")
     
     def stop(self):
         """Stop WebSocket connection"""
@@ -174,7 +174,7 @@ class TitanTicker:
             except:
                 pass
         self._connected = False
-        print("🔌 Ticker: Stopped")
+        # print("🔌 Ticker: Stopped")
     
     def subscribe_symbols(self, symbols: List[str], mode: str = 'quote'):
         """
@@ -201,7 +201,7 @@ class TitanTicker:
                 mode_map = {'ltp': 'ltp', 'quote': 'quote', 'full': 'full'}
                 ws_mode = mode_map.get(mode, 'quote')
                 self._ws.set_mode(ws_mode, tokens_to_sub)
-                print(f"🔌 Ticker: Subscribed {len(tokens_to_sub)} new instruments ({mode} mode)")
+                # print(f"🔌 Ticker: Subscribed {len(tokens_to_sub)} new instruments ({mode} mode)")
             except Exception as e:
                 print(f"⚠️ Ticker subscribe error: {e}")
         else:
@@ -422,7 +422,7 @@ class TitanTicker:
     def _on_connect(self, ws, response):
         """Called on WebSocket connect"""
         self._connected = True
-        print(f"🔌 Ticker: WebSocket CONNECTED")
+        # print(f"🔌 Ticker: WebSocket CONNECTED")
         
         # Subscribe to all previously requested tokens
         if self._subscribed_tokens:
@@ -430,7 +430,7 @@ class TitanTicker:
             try:
                 ws.subscribe(tokens_list)
                 ws.set_mode('quote', tokens_list)
-                print(f"🔌 Ticker: Re-subscribed {len(tokens_list)} instruments")
+                # print(f"🔌 Ticker: Re-subscribed {len(tokens_list)} instruments")
             except Exception as e:
                 print(f"⚠️ Ticker: Re-subscribe error: {e}")
     
@@ -438,7 +438,8 @@ class TitanTicker:
         """Called on WebSocket close"""
         self._connected = False
         if self._running:
-            print(f"🔌 Ticker: Connection closed ({code}: {reason}) — will reconnect")
+            # print(f"🔌 Ticker: Connection closed ({code}: {reason}) — will reconnect")
+            pass
     
     def _on_error(self, ws, code, reason):
         """Called on WebSocket error"""
@@ -463,7 +464,7 @@ class TitanTicker:
         order_id = data.get('order_id', 'unknown')
         status = data.get('status', 'unknown')
         symbol = data.get('tradingsymbol', 'unknown')
-        print(f"📋 Order update via WS: {symbol} #{order_id} → {status}")
+        # print(f"📋 Order update via WS: {symbol} #{order_id} → {status}")
         
         # Store for the main loop to process
         if not hasattr(self, '_order_updates'):
@@ -535,7 +536,7 @@ class TitanTicker:
 
             # Subscribe all futures in quote mode
             self.subscribe_symbols(fut_symbols, mode='quote')
-            print(f"🔌 Ticker: Subscribed {len(fut_symbols)} near-month futures for OI streaming")
+            # print(f"🔌 Ticker: Subscribed {len(fut_symbols)} near-month futures for OI streaming")
 
         except Exception as e:
             print(f"⚠️ Ticker: Futures subscription error: {e}")

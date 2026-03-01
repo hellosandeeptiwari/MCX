@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
+from state_db import get_state_db
 
 
 class DataHealthStatus(Enum):
@@ -77,10 +78,26 @@ class DataHealthGate:
         # Load saved state
         self._load_state()
         
-        print("🛡️ Data Health Gate: INITIALIZED")
+        # print("🛡️ Data Health Gate: INITIALIZED")
     
     def _load_state(self):
-        """Load health state from file"""
+        """Load health state from SQLite (falls back to JSON)"""
+        try:
+            data = get_state_db().load_data_health()
+            if data:
+                self.stale_counters = data.get('stale_counters', {})
+                self.halted_symbols = data.get('halted_symbols', [])
+                self.health_history = data.get('health_history', [])
+                try:
+                    from config import APPROVED_UNIVERSE
+                    self.halted_symbols = [s for s in self.halted_symbols if s in APPROVED_UNIVERSE]
+                    self.stale_counters = {k: v for k, v in self.stale_counters.items() if k in APPROVED_UNIVERSE}
+                except ImportError:
+                    pass
+                return
+        except Exception as e:
+            print(f"⚠️ Error loading health state from SQLite: {e}")
+        # Fallback: legacy JSON
         try:
             if os.path.exists(self.HEALTH_STATE_FILE):
                 with open(self.HEALTH_STATE_FILE, 'r') as f:
@@ -88,7 +105,6 @@ class DataHealthGate:
                     if data.get('date') == str(datetime.now().date()):
                         self.stale_counters = data.get('stale_counters', {})
                         self.halted_symbols = data.get('halted_symbols', [])
-                        # Clean symbols no longer in universe
                         try:
                             from config import APPROVED_UNIVERSE
                             self.halted_symbols = [s for s in self.halted_symbols if s in APPROVED_UNIVERSE]
@@ -96,20 +112,16 @@ class DataHealthGate:
                         except ImportError:
                             pass
         except Exception as e:
-            print(f"⚠️ Error loading health state: {e}")
+            print(f"⚠️ Error loading health state from JSON: {e}")
     
     def _save_state(self):
-        """Save health state to file"""
+        """Save health state to SQLite (atomic, crash-safe)"""
         try:
-            data = {
-                'date': str(datetime.now().date()),
-                'last_updated': datetime.now().isoformat(),
-                'stale_counters': self.stale_counters,
-                'halted_symbols': self.halted_symbols,
-                'health_history': self.health_history[-100:]  # Keep last 100
-            }
-            with open(self.HEALTH_STATE_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
+            get_state_db().save_data_health(
+                self.stale_counters,
+                self.halted_symbols,
+                self.health_history,
+            )
         except Exception as e:
             print(f"⚠️ Error saving health state: {e}")
     
@@ -434,7 +446,7 @@ class DataHealthGate:
         if symbol in self.halted_symbols:
             self.halted_symbols.remove(symbol)
         self._save_state()
-        print(f"✅ {symbol} health state reset")
+        # print(f"✅ {symbol} health state reset")
     
     def get_halted_symbols(self) -> List[str]:
         """Get list of halted symbols"""

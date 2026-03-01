@@ -53,6 +53,8 @@ class TradeLedger:
                   final_score: float = 0, # score after DR adjustments  
                   dr_score: float = 0,
                   dr_flag: bool = False,
+                  up_flag: bool = False,    # UP regime anomaly (hidden crash risk)
+                  down_flag: bool = False,  # DOWN regime anomaly (hidden bounce risk)
                   gate_prob: float = 0,
                   gmm_action: str = '',   # BOOST / BLOCK / ALLOW
                   ml_direction: str = '',
@@ -96,6 +98,8 @@ class TradeLedger:
             # DR / GMM
             'dr_score': round(dr_score, 4),
             'dr_flag': dr_flag,
+            'up_flag': up_flag,
+            'down_flag': down_flag,
             'gate_prob': round(gate_prob, 3),
             'gmm_action': gmm_action,
             # ML
