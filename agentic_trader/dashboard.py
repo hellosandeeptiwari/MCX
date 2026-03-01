@@ -324,6 +324,34 @@ def config_route():
     })
 
 
+# ── Pre-market health check ─────────────────────────────────
+@app.route('/api/health-check', methods=['POST'])
+def health_check():
+    """Run pre-market health check and return results."""
+    try:
+        r = subprocess.run(
+            [sys.executable, 'pre_market_check.py'],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(Path(__file__).parent),
+        )
+        lines = (r.stdout + r.stderr).strip().split('\n')
+        passed = sum(1 for l in lines if '✅' in l)
+        warned = sum(1 for l in lines if '⚠' in l)
+        failed = sum(1 for l in lines if '❌' in l)
+        return jsonify({
+            'ok': failed == 0,
+            'passed': passed,
+            'warned': warned,
+            'failed': failed,
+            'output': lines,
+            'exit_code': r.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'msg': 'Health check timed out'}), 504
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+
 # ══════════════════════════════════════════════════════════════
 #  Entry point
 # ══════════════════════════════════════════════════════════════

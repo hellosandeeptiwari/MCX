@@ -168,6 +168,7 @@ a{color:var(--blue);text-decoration:none}
       <button onclick="botAction('start')" class="btn-ctrl btn-start" title="Start Bot">&#9654; Start</button>
       <button onclick="botAction('stop')" class="btn-ctrl btn-stop" title="Stop Bot">&#9632; Stop</button>
       <button onclick="botAction('restart')" class="btn-ctrl btn-restart" title="Restart Bot">&#8635; Restart</button>
+      <button onclick="runHealthCheck()" id="btn-health" class="btn-ctrl" style="background:#2563eb;color:#fff" title="Pre-Market Health Check">&#128169; Health Check</button>
     </div>
   </div>
 </div>
@@ -403,6 +404,40 @@ async function botAction(action) {
   } finally {
     clearTimeout(safetyTimer);
     btns.forEach(b => { b.disabled = false; b.classList.remove('loading'); });
+  }
+}
+
+async function runHealthCheck() {
+  const btn = document.getElementById('btn-health');
+  btn.disabled = true; btn.textContent = '⏳ Checking...';
+  const safetyTimer = setTimeout(() => { btn.disabled = false; btn.textContent = '🩺 Health Check'; }, 35000);
+  try {
+    const r = await fetch('/api/health-check', {method:'POST'});
+    const d = await r.json();
+    btn.disabled = false; btn.textContent = '🩺 Health Check';
+    clearTimeout(safetyTimer);
+    // Show results in a modal overlay
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;align-items:center;justify-content:center;';
+    overlay.onclick = (e) => { if(e.target === overlay) overlay.remove(); };
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#1a1a2e;border:1px solid #333;border-radius:12px;padding:24px;max-width:700px;width:95%;max-height:80vh;overflow-y:auto;font-family:monospace;font-size:.8rem;line-height:1.6;';
+    const lines = (d.output || [d.msg || 'No output']).map(l =>
+      l.replace(/✅/g, '<span style="color:#10b981">✅</span>')
+       .replace(/⚠️/g, '<span style="color:#f59e0b">⚠️</span>')
+       .replace(/❌/g, '<span style="color:#ef4444">❌</span>')
+    ).join('<br>');
+    const badge = d.failed > 0 ? '<span style="color:#ef4444;font-weight:700">CRITICAL ISSUES</span>' :
+                  d.warned > 0 ? '<span style="color:#f59e0b;font-weight:700">WARNINGS</span>' :
+                  '<span style="color:#10b981;font-weight:700">ALL CLEAR</span>';
+    box.innerHTML = `<div style="text-align:right"><button onclick="this.closest('div[style]').parentElement.remove()" style="background:none;border:none;color:#888;cursor:pointer;font-size:1.2rem">&times;</button></div>${lines}<br><br><div style="text-align:center;font-size:.9rem">${badge}</div>`;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    showToast(`Health: ${d.passed}✅ ${d.warned}⚠ ${d.failed}❌`, d.failed === 0);
+  } catch(e) {
+    btn.disabled = false; btn.textContent = '🩺 Health Check';
+    clearTimeout(safetyTimer);
+    showToast('Health check failed: ' + e.message, false);
   }
 }
 
