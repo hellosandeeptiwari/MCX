@@ -862,6 +862,24 @@ async function loadScans() {
 }
 
 // ══════════════════════════════════════════════════════
+//  AUTO-RELOAD ON DEPLOY
+// ══════════════════════════════════════════════════════
+let _serverVersion = null;
+async function checkVersion() {
+  try {
+    const r = await fetch('/api/version');
+    const d = await r.json();
+    if(_serverVersion && d.v !== _serverVersion) {
+      console.log('Server restarted (deploy detected) — reloading...');
+      location.reload();
+    }
+    _serverVersion = d.v;
+  } catch {}
+}
+checkVersion();
+setInterval(checkVersion, 10000);  // Check every 10s
+
+// ══════════════════════════════════════════════════════
 //  INIT & AUTO-REFRESH
 // ══════════════════════════════════════════════════════
 loadOverview();

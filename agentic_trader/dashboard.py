@@ -99,9 +99,21 @@ def _sse_log_stream(filepath: str):
 #  ROUTES
 # ══════════════════════════════════════════════════════════════
 
+# Server boot timestamp — changes on every restart (i.e. every deploy)
+import time as _time
+_SERVER_BOOT = str(int(_time.time()))
+
 @app.route('/')
 def index():
-    return render_template('titan_dashboard.html')
+    resp = app.make_response(render_template('titan_dashboard.html'))
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
+@app.route('/api/version')
+def version():
+    return jsonify({'v': _SERVER_BOOT})
 
 
 # ── Live log SSE streams ─────────────────────────────────────
