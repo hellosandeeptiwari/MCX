@@ -1,6 +1,6 @@
 # ============================================================
 #  Titan Dashboard — systemd service
-#  Runs Flask dashboard on :5000, proxied by Nginx
+#  Runs Flask dashboard on :5000, accessible at http://IP:5000
 # ============================================================
 [Unit]
 Description=Titan Trading Dashboard (Flask)
@@ -8,29 +8,29 @@ After=network.target titan-bot.service
 
 [Service]
 Type=simple
-User=titan
-Group=titan
-WorkingDirectory=/home/titan/app/agentic_trader
-Environment=PATH=/home/titan/app/.venv/bin:/usr/bin:/bin
-Environment=FLASK_ENV=production
-EnvironmentFile=/home/titan/app/agentic_trader/.env
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+Environment=PATH=/home/ubuntu/titan/venv/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ubuntu/titan/agentic_trader/.env
 
-# Gunicorn for production (pip install gunicorn)
-ExecStart=/home/titan/app/.venv/bin/gunicorn \
-    --bind 127.0.0.1:5000 \
+# Gunicorn with gthread worker for SSE streaming support
+ExecStart=/home/ubuntu/titan/venv/bin/gunicorn \
+    --bind 0.0.0.0:5000 \
     --workers 2 \
-    --timeout 60 \
+    --threads 4 \
+    --worker-class gthread \
+    --timeout 120 \
     dashboard:app
 
 Restart=on-failure
 RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
-StandardOutput=append:/home/titan/app/agentic_trader/logs/dashboard.log
-StandardError=append:/home/titan/app/agentic_trader/logs/dashboard-error.log
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/home/titan/app
+StandardOutput=append:/home/ubuntu/titan/logs/dashboard.log
+StandardError=append:/home/ubuntu/titan/logs/dashboard-error.log
 
 [Install]
 WantedBy=multi-user.target

@@ -144,10 +144,17 @@ jobs:
           # 6) Restart bot service
           RESTART="${{ github.event.inputs.restart_bot || 'true' }}"
           if [ "$RESTART" = "true" ]; then
-            echo "[6/6] Restarting titan-bot service..."
+            echo "[6/6] Restarting services..."
             sudo systemctl restart titan-bot
-            sleep 3
+            sleep 2
+            # Restart dashboard if installed
+            if systemctl list-unit-files | grep -q titan-dashboard; then
+              sudo systemctl restart titan-dashboard
+            fi
+            sleep 2
             sudo systemctl status titan-bot --no-pager | head -10
+            systemctl is-active titan-dashboard 2>/dev/null && \
+              echo "  Dashboard: $(sudo systemctl is-active titan-dashboard)" || true
           else
             echo "[6/6] Skipping restart (manual trigger with restart=false)"
           fi

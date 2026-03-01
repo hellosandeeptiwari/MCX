@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Titan v5 — Trading Dashboard</title>
+<style>
+/* ── Reset & Base ─────────────────────────────────────── */
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0e17;--bg2:#111827;--bg3:#1f2937;--bg4:#374151;
+  --txt:#e5e7eb;--txt2:#9ca3af;--txt3:#6b7280;
+  --green:#10b981;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
+  --cyan:#06b6d4;--purple:#8b5cf6;
+  --border:#1f2937;--radius:10px;
+}
+html{font-size:14px}
+body{background:var(--bg);color:var(--txt);font-family:'Inter',system-ui,-apple-system,sans-serif;min-height:100vh}
+a{color:var(--blue);text-decoration:none}
+
+/* ── Layout ───────────────────────────────────────────── */
+.top-bar{
+  background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:12px 24px;display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);
+}
+.top-bar h1{font-size:1.15rem;font-weight:700;letter-spacing:.5px}
+.top-bar h1 span{color:var(--cyan);font-weight:400}
+.top-bar .mode{
+  padding:4px 12px;border-radius:20px;font-size:.75rem;font-weight:600;text-transform:uppercase;
+}
+.mode-paper{background:rgba(59,130,246,.15);color:var(--blue)}
+.mode-live{background:rgba(239,68,68,.15);color:var(--red)}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
+
+.container{max-width:1600px;margin:0 auto;padding:16px 20px}
+
+/* ── Tabs ─────────────────────────────────────────────── */
+.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--bg2);padding:4px;border-radius:8px;width:fit-content}
+.tab{
+  padding:8px 18px;border-radius:6px;cursor:pointer;font-size:.82rem;font-weight:500;
+  color:var(--txt2);transition:all .15s;border:none;background:none;
+}
+.tab:hover{color:var(--txt)}
+.tab.active{background:var(--bg4);color:#fff}
+.tab-content{display:none}
+.tab-content.active{display:block}
+
+/* ── Cards ────────────────────────────────────────────── */
+.card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
+.card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
+  padding:16px;position:relative;overflow:hidden;
+}
+.card .label{font-size:.72rem;color:var(--txt3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}
+.card .value{font-size:1.6rem;font-weight:700}
+.card .sub{font-size:.75rem;color:var(--txt2);margin-top:2px}
+.val-green{color:var(--green)}.val-red{color:var(--red)}.val-amber{color:var(--amber)}.val-blue{color:var(--blue)}
+
+/* ── Panel ────────────────────────────────────────────── */
+.panel{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
+  margin-bottom:16px;overflow:hidden;
+}
+.panel-header{
+  padding:12px 16px;border-bottom:1px solid var(--border);display:flex;
+  align-items:center;justify-content:space-between;
+}
+.panel-header h2{font-size:.9rem;font-weight:600}
+.panel-body{padding:16px}
+
+/* ── Table ────────────────────────────────────────────── */
+.tbl{width:100%;border-collapse:collapse;font-size:.8rem}
+.tbl th{
+  text-align:left;padding:8px 10px;font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.7px;color:var(--txt3);border-bottom:1px solid var(--border);
+  position:sticky;top:0;background:var(--bg2);
+}
+.tbl td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.03)}
+.tbl tr:hover td{background:rgba(255,255,255,.02)}
+.pnl-pos{color:var(--green);font-weight:600}
+.pnl-neg{color:var(--red);font-weight:600}
+.badge{
+  display:inline-block;padding:2px 8px;border-radius:12px;font-size:.68rem;font-weight:600;
+}
+.badge-win{background:rgba(16,185,129,.12);color:var(--green)}
+.badge-loss{background:rgba(239,68,68,.12);color:var(--red)}
+.badge-open{background:rgba(245,158,11,.12);color:var(--amber)}
+.badge-source{background:rgba(139,92,246,.12);color:var(--purple)}
+
+/* ── Log viewer ───────────────────────────────────────── */
+.log-box{
+  background:#050810;border:1px solid var(--border);border-radius:8px;
+  font-family:'JetBrains Mono','Fira Code','Consolas',monospace;
+  font-size:.75rem;line-height:1.55;padding:12px;
+  height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;
+  color:#a5f3a0;
+}
+.log-box .log-error{color:var(--red)}
+.log-box .log-warn{color:var(--amber)}
+.log-box .log-info{color:var(--cyan)}
+.log-box .log-pnl{color:var(--green);font-weight:600}
+
+/* ── P&L Bar Chart (CSS-only) ─────────────────────────── */
+.pnl-bars{display:flex;align-items:flex-end;gap:4px;height:140px;padding:8px 0}
+.pnl-bar-wrap{flex:1;display:flex;flex-direction:column;align-items:center;min-width:28px}
+.pnl-bar{
+  width:100%;min-height:2px;border-radius:3px 3px 0 0;transition:height .3s;position:relative;
+}
+.pnl-bar.pos{background:var(--green)}
+.pnl-bar.neg{background:var(--red);border-radius:0 0 3px 3px}
+.pnl-bar-label{font-size:.6rem;color:var(--txt3);margin-top:4px;writing-mode:vertical-rl;transform:rotate(180deg);max-height:60px;overflow:hidden}
+.pnl-bar-val{font-size:.6rem;color:var(--txt2);margin-bottom:2px}
+
+/* ── Responsive ───────────────────────────────────────── */
+@media(max-width:768px){
+  .card-grid{grid-template-columns:repeat(2,1fr)}
+  .container{padding:10px}
+  .log-box{height:350px}
+}
+
+/* ── Spinner ──────────────────────────────────────────── */
+.spinner{
+  width:20px;height:20px;border:2px solid var(--bg4);border-top-color:var(--cyan);
+  border-radius:50%;animation:spin .6s linear infinite;display:inline-block;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* scrollbar */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:4px}
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<!-- ═══════════════════ TOP BAR ═══════════════════ -->
+<div class="top-bar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <h1>TITAN <span>v5</span></h1>
+    <span id="mode-badge" class="mode mode-paper">PAPER</span>
+    <span style="display:flex;align-items:center;font-size:.8rem;color:var(--txt2)">
+      <span id="svc-dot" class="status-dot dot-red"></span>
+      <span id="svc-label">Checking...</span>
+    </span>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px;font-size:.8rem;color:var(--txt2)">
+    <span id="clock"></span>
+    <span id="uptime-label"></span>
+  </div>
+</div>
+
+<!-- ═══════════════════ CONTENT ═══════════════════ -->
+<div class="container">
+
+<!-- Tabs -->
+<div class="tabs">
+  <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="logs">Live Logs</button>
+  <button class="tab" data-tab="positions">Positions</button>
+  <button class="tab" data-tab="trades">Trade History</button>
+  <button class="tab" data-tab="scans">Scan Log</button>
+</div>
+
+<!-- ═══════════════ TAB: OVERVIEW ═══════════════ -->
+<div id="tab-overview" class="tab-content active">
+
+  <!-- KPI Cards -->
+  <div class="card-grid" id="kpi-cards">
+    <div class="card">
+      <div class="label">Capital</div>
+      <div class="value" id="kpi-capital">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Realized P&L (Today)</div>
+      <div class="value" id="kpi-pnl">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Open Positions</div>
+      <div class="value val-blue" id="kpi-positions">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Today Trades</div>
+      <div class="value" id="kpi-trades">—</div>
+      <div class="sub" id="kpi-winrate"></div>
+    </div>
+    <div class="card">
+      <div class="label">Risk / Trade</div>
+      <div class="value" id="kpi-risk">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Max Daily Loss</div>
+      <div class="value" id="kpi-maxloss">—</div>
+    </div>
+  </div>
+
+  <!-- P&L History Bar Chart -->
+  <div class="panel">
+    <div class="panel-header">
+      <h2>P&L History (last 30 days)</h2>
+      <span id="pnl-total" style="font-size:.85rem;font-weight:600"></span>
+    </div>
+    <div class="panel-body">
+      <div class="pnl-bars" id="pnl-chart"></div>
+    </div>
+  </div>
+
+  <!-- Today's trades summary table -->
+  <div class="panel">
+    <div class="panel-header"><h2>Today's Trades</h2></div>
+    <div class="panel-body" style="overflow-x:auto;max-height:400px;overflow-y:auto">
+      <table class="tbl" id="today-trades-tbl">
+        <thead>
+          <tr>
+            <th>#</th><th>Time</th><th>Symbol</th><th>Dir</th><th>Source</th>
+            <th>Score</th><th>Entry</th><th>P&L</th><th>Result</th><th>Hold</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ TAB: LIVE LOGS ═══════════════ -->
+<div id="tab-logs" class="tab-content">
+  <div style="display:flex;gap:8px;margin-bottom:12px">
+    <button class="tab active" id="btn-main-log" onclick="switchLog('main')">Main Log</button>
+    <button class="tab" id="btn-error-log" onclick="switchLog('error')">Error Log</button>
+    <label style="display:flex;align-items:center;gap:6px;margin-left:auto;font-size:.8rem;color:var(--txt2)">
+      <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+    </label>
+  </div>
+  <div class="log-box" id="log-viewer"></div>
+</div>
+
+<!-- ═══════════════ TAB: POSITIONS ═══════════════ -->
+<div id="tab-positions" class="tab-content">
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Open Positions</h2>
+      <span id="pos-count" style="font-size:.8rem;color:var(--txt2)"></span>
+    </div>
+    <div class="panel-body" style="overflow-x:auto">
+      <table class="tbl" id="positions-tbl">
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Dir</th><th>Qty</th><th>Avg Price</th>
+            <th>Strategy</th><th>Source</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h2>Exit States (SL/Target Tracking)</h2></div>
+    <div class="panel-body" style="overflow-x:auto;max-height:400px;overflow-y:auto">
+      <table class="tbl" id="exits-tbl">
+        <thead>
+          <tr><th>Symbol</th><th>SL</th><th>Target</th><th>Breakeven</th><th>Trailing</th><th>Candles</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ TAB: TRADE HISTORY ═══════════════ -->
+<div id="tab-trades" class="tab-content">
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Trade History</h2>
+      <select id="history-date" style="background:var(--bg3);color:var(--txt);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:.8rem"></select>
+    </div>
+    <div class="panel-body">
+      <!-- Day summary cards -->
+      <div class="card-grid" id="history-kpis" style="margin-bottom:16px"></div>
+      <!-- Trades table -->
+      <div style="overflow-x:auto;max-height:500px;overflow-y:auto">
+        <table class="tbl" id="history-tbl">
+          <thead>
+            <tr>
+              <th>#</th><th>Time</th><th>Symbol</th><th>Dir</th><th>Source</th>
+              <th>Score</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Result</th><th>R</th><th>Hold</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Multi-day summary -->
+  <div class="panel">
+    <div class="panel-header"><h2>Daily Performance (last 30 days)</h2></div>
+    <div class="panel-body" style="overflow-x:auto">
+      <table class="tbl" id="daily-summary-tbl">
+        <thead>
+          <tr><th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>P&L</th><th>Avg Win</th><th>Avg Loss</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ TAB: SCAN LOG ═══════════════ -->
+<div id="tab-scans" class="tab-content">
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Scan Decisions (Today)</h2>
+      <span id="scan-count" style="font-size:.8rem;color:var(--txt2)"></span>
+    </div>
+    <div class="panel-body" style="overflow-x:auto;max-height:600px;overflow-y:auto">
+      <table class="tbl" id="scans-tbl">
+        <thead>
+          <tr><th>#</th><th>Time</th><th>Symbol</th><th>Score</th><th>Dir</th><th>Outcome</th><th>Reason</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+</div><!-- /container -->
+
+<!-- ══════════════════ JAVASCRIPT ══════════════════ -->
+<script>
+// ── Helpers ──────────────────────────────────────────
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+const fmt = n => n == null ? '—' : '₹' + Number(n).toLocaleString('en-IN', {maximumFractionDigits:0});
+const fmtPnl = n => {
+  if(n == null) return '—';
+  const s = '₹' + Math.abs(n).toLocaleString('en-IN', {maximumFractionDigits:0});
+  return n >= 0 ? '+' + s : '-' + s;
+};
+const pnlClass = n => n >= 0 ? 'pnl-pos' : 'pnl-neg';
+const pnlBadge = n => n > 0 ? 'badge-win' : 'badge-loss';
+
+// Clock
+setInterval(() => {
+  $('#clock').textContent = new Date().toLocaleTimeString('en-IN', {hour12:false});
+}, 1000);
+
+// ── Tab switching ────────────────────────────────────
+$$('.tabs .tab[data-tab]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $$('.tabs .tab[data-tab]').forEach(b => b.classList.remove('active'));
+    $$('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    $(`#tab-${btn.dataset.tab}`).classList.add('active');
+
+    // Load data for specific tabs on-demand
+    if(btn.dataset.tab === 'logs' && !logSSE) startLogSSE('main');
+    if(btn.dataset.tab === 'positions') loadPositions();
+    if(btn.dataset.tab === 'trades') loadTradeHistory();
+    if(btn.dataset.tab === 'scans') loadScans();
+  });
+});
+
+// ══════════════════════════════════════════════════════
+//  API CALLS
+// ══════════════════════════════════════════════════════
+
+async function api(url) {
+  try {
+    const r = await fetch(url);
+    return await r.json();
+  } catch(e) {
+    console.error('API error:', url, e);
+    return null;
+  }
+}
+
+// ── Overview ─────────────────────────────────────────
+async function loadOverview() {
+  const [status, trades, history] = await Promise.all([
+    api('/api/status'),
+    api('/api/trades/today'),
+    api('/api/trades/history?days=30'),
+  ]);
+
+  if(status) {
+    // Mode badge
+    const badge = $('#mode-badge');
+    badge.textContent = status.mode;
+    badge.className = 'mode ' + (status.mode === 'PAPER' ? 'mode-paper' : 'mode-live');
+
+    // Service status
+    const dot = $('#svc-dot');
+    const lbl = $('#svc-label');
+    dot.className = 'status-dot ' + (status.service_active ? 'dot-green' : 'dot-red');
+    lbl.textContent = status.service_active ? 'Bot Running' : 'Bot Stopped';
+
+    if(status.service_uptime) {
+      $('#uptime-label').textContent = 'Up since: ' + status.service_uptime;
+    }
+
+    // KPI cards
+    $('#kpi-capital').textContent = fmt(status.capital);
+    const pnlEl = $('#kpi-pnl');
+    pnlEl.textContent = fmtPnl(status.realized_pnl);
+    pnlEl.className = 'value ' + (status.realized_pnl >= 0 ? 'val-green' : 'val-red');
+    $('#kpi-positions').textContent = status.open_positions;
+    $('#kpi-risk').textContent = ((status.config?.risk_per_trade || 0) * 100).toFixed(0) + '%';
+    $('#kpi-maxloss').textContent = ((status.config?.max_daily_loss || 0) * 100).toFixed(0) + '%';
+  }
+
+  if(trades) {
+    const n = trades.total_trades || 0;
+    $('#kpi-trades').textContent = n;
+    if(n > 0) {
+      $('#kpi-winrate').textContent = `W:${trades.wins} L:${trades.losses} (${trades.win_rate}%)`;
+    }
+    renderTodayTrades(trades);
+  }
+
+  if(history) {
+    renderPnlChart(history);
+    renderDailySummary(history);
+  }
+}
+
+function renderTodayTrades(summary) {
+  const tbody = $('#today-trades-tbl tbody');
+  const trades = summary.trades || [];
+  if(!trades.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--txt3);padding:24px">No trades today</td></tr>';
+    return;
+  }
+  tbody.innerHTML = trades.map((t, i) => {
+    const ts = (t.ts || '').split('T')[1]?.slice(0,8) || '';
+    const sym = (t.underlying || t.symbol || '').replace('NSE:','');
+    const pnl = t.total_pnl || 0;
+    const result = t.final_result || 'OPEN';
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${ts}</td>
+      <td><strong>${sym}</strong></td>
+      <td>${t.direction || ''}</td>
+      <td><span class="badge badge-source">${t.source || ''}</span></td>
+      <td>${(t.final_score || 0).toFixed(1)}</td>
+      <td>${fmt(t.entry_price)}</td>
+      <td class="${pnlClass(pnl)}">${fmtPnl(pnl)}</td>
+      <td><span class="badge ${result === 'OPEN' ? 'badge-open' : pnl >= 0 ? 'badge-win' : 'badge-loss'}">${result}</span></td>
+      <td>${t.hold_minutes || 0}m</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderPnlChart(history) {
+  const chart = $('#pnl-chart');
+  if(!history || !history.length) {
+    chart.innerHTML = '<span style="color:var(--txt3)">No P&L data yet</span>';
+    return;
+  }
+  const data = history.filter(d => d.total_trades > 0).reverse().slice(-30);
+  if(!data.length) {
+    chart.innerHTML = '<span style="color:var(--txt3)">No trading days yet</span>';
+    return;
+  }
+  const maxAbs = Math.max(...data.map(d => Math.abs(d.total_pnl || 0)), 1);
+  let cumPnl = 0;
+  data.forEach(d => cumPnl += (d.total_pnl || 0));
+  const totalEl = $('#pnl-total');
+  totalEl.textContent = 'Cumulative: ' + fmtPnl(cumPnl);
+  totalEl.className = cumPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+
+  chart.innerHTML = data.map(d => {
+    const pnl = d.total_pnl || 0;
+    const h = Math.max(Math.abs(pnl) / maxAbs * 100, 3);
+    const dt = (d.date || '').slice(5);  // MM-DD
+    return `<div class="pnl-bar-wrap" title="${d.date}: ${fmtPnl(pnl)} (${d.total_trades} trades)">
+      <div class="pnl-bar-val">${pnl>=0?'+':''}${(pnl/1000).toFixed(1)}k</div>
+      <div class="pnl-bar ${pnl >= 0 ? 'pos' : 'neg'}" style="height:${h}%"></div>
+      <div class="pnl-bar-label">${dt}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderDailySummary(history) {
+  const tbody = $('#daily-summary-tbl tbody');
+  if(!history.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--txt3);padding:24px">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = history.map(d => {
+    const pnl = d.total_pnl || 0;
+    return `<tr>
+      <td>${d.date}</td>
+      <td>${d.total_trades || d.trade_count || 0}</td>
+      <td>${d.wins || 0}</td>
+      <td>${d.losses || 0}</td>
+      <td>${d.win_rate || 0}%</td>
+      <td class="${pnlClass(pnl)}">${fmtPnl(pnl)}</td>
+      <td class="pnl-pos">${fmtPnl(d.avg_winner || 0)}</td>
+      <td class="pnl-neg">${fmtPnl(d.avg_loser || 0)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── LIVE LOGS ────────────────────────────────────────
+let logSSE = null;
+let currentLogType = null;
+
+function switchLog(type) {
+  if(logSSE) { logSSE.close(); logSSE = null; }
+  $('#btn-main-log').classList.toggle('active', type === 'main');
+  $('#btn-error-log').classList.toggle('active', type === 'error');
+  startLogSSE(type);
+}
+
+async function startLogSSE(type) {
+  currentLogType = type;
+  const viewer = $('#log-viewer');
+  viewer.innerHTML = '';
+
+  // First load recent history
+  const endpoint = type === 'error' ? '/api/logs/errors' : '/api/logs/recent';
+  const data = await api(endpoint + '?lines=300');
+  if(data && data.lines) {
+    data.lines.forEach(line => appendLogLine(line));
+    scrollLog();
+  }
+
+  // Then stream new lines
+  const sseUrl = type === 'error' ? '/api/logs/stream/error' : '/api/logs/stream';
+  logSSE = new EventSource(sseUrl);
+  logSSE.onmessage = e => {
+    const line = JSON.parse(e.data);
+    appendLogLine(line);
+    if($('#log-autoscroll').checked) scrollLog();
+  };
+  logSSE.onerror = () => {
+    appendLogLine('[SSE connection lost — retrying...]');
+  };
+}
+
+function appendLogLine(text) {
+  const viewer = $('#log-viewer');
+  const div = document.createElement('div');
+  // Colorize based on content
+  if(/ERROR|FATAL|Traceback|Exception/i.test(text)) div.className = 'log-error';
+  else if(/⚠️|WARN|warning/i.test(text)) div.className = 'log-warn';
+  else if(/P&L|pnl|₹.*[+-]/i.test(text)) div.className = 'log-pnl';
+  else if(/✅|initialized|loaded|OK|ENTRY|EXIT/i.test(text)) div.className = 'log-info';
+  div.textContent = text;
+  viewer.appendChild(div);
+  // Keep max 2000 lines
+  while(viewer.children.length > 2000) viewer.removeChild(viewer.firstChild);
+}
+
+function scrollLog() {
+  const v = $('#log-viewer');
+  v.scrollTop = v.scrollHeight;
+}
+
+// ── POSITIONS ────────────────────────────────────────
+async function loadPositions() {
+  const [status, exits] = await Promise.all([
+    api('/api/status'),
+    api('/api/exits'),
+  ]);
+
+  if(status && status.positions) {
+    const tbody = $('#positions-tbl tbody');
+    const positions = status.positions;
+    $('#pos-count').textContent = `${positions.length} open`;
+
+    if(!positions.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+    } else {
+      tbody.innerHTML = positions.map(p => {
+        const sym = (p.tradingsymbol || p.symbol || p.option_symbol || '').replace('NSE:','');
+        return `<tr>
+          <td><strong>${sym}</strong></td>
+          <td>${p.direction || (p.quantity > 0 ? 'LONG' : 'SHORT')}</td>
+          <td>${Math.abs(p.quantity || 0)}</td>
+          <td>${fmt(p.average_price || p.avg_price || p.entry_price || 0)}</td>
+          <td>${p.strategy_type || p.product || '—'}</td>
+          <td><span class="badge badge-source">${p.source || '—'}</span></td>
+          <td>${p.status || 'ACTIVE'}</td>
+        </tr>`;
+      }).join('');
+    }
+  }
+
+  if(exits) {
+    const tbody = $('#exits-tbl tbody');
+    const keys = Object.keys(exits);
+    if(!keys.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--txt3);padding:24px">No exit states</td></tr>';
+    } else {
+      tbody.innerHTML = keys.map(sym => {
+        const e = typeof exits[sym] === 'string' ? JSON.parse(exits[sym]) : exits[sym];
+        return `<tr>
+          <td><strong>${sym}</strong></td>
+          <td>${e.stop_loss ? fmt(e.stop_loss) : '—'}</td>
+          <td>${e.target ? fmt(e.target) : '—'}</td>
+          <td>${e.breakeven_applied ? '✅' : '—'}</td>
+          <td>${e.trailing_active ? '✅' : '—'}</td>
+          <td>${e.candle_count || 0}</td>
+        </tr>`;
+      }).join('');
+    }
+  }
+}
+
+// ── TRADE HISTORY ────────────────────────────────────
+async function loadTradeHistory() {
+  // Load available dates
+  const dates = await api('/api/ledger-dates');
+  const select = $('#history-date');
+
+  if(dates && dates.length) {
+    select.innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+    select.onchange = () => loadDayTrades(select.value);
+    loadDayTrades(dates[0]);
+  } else {
+    select.innerHTML = '<option>No data</option>';
+  }
+}
+
+async function loadDayTrades(dateStr) {
+  const data = await api(`/api/trades/day/${dateStr}`);
+  if(!data) return;
+
+  // KPI cards for this day
+  const kpis = $('#history-kpis');
+  kpis.innerHTML = `
+    <div class="card"><div class="label">Trades</div><div class="value">${data.total_trades||0}</div></div>
+    <div class="card"><div class="label">Wins / Losses</div><div class="value">${data.wins||0} / ${data.losses||0}</div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value">${data.win_rate||0}%</div></div>
+    <div class="card"><div class="label">P&L</div><div class="value ${pnlClass(data.total_pnl||0)}">${fmtPnl(data.total_pnl||0)}</div></div>
+    <div class="card"><div class="label">Avg Winner</div><div class="value pnl-pos">${fmtPnl(data.avg_winner||0)}</div></div>
+    <div class="card"><div class="label">Avg Loser</div><div class="value pnl-neg">${fmtPnl(data.avg_loser||0)}</div></div>
+  `;
+
+  // Trades table
+  const tbody = $('#history-tbl tbody');
+  const trades = data.trades || [];
+  if(!trades.length) {
+    tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--txt3);padding:24px">No trades</td></tr>';
+    return;
+  }
+  tbody.innerHTML = trades.map((t, i) => {
+    const ts = (t.ts || '').split('T')[1]?.slice(0,8) || '';
+    const sym = (t.underlying || t.symbol || '').replace('NSE:','');
+    const pnl = t.total_pnl || 0;
+    const result = t.final_result || 'OPEN';
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${ts}</td>
+      <td><strong>${sym}</strong></td>
+      <td>${t.direction||''}</td>
+      <td><span class="badge badge-source">${t.source||''}</span></td>
+      <td>${(t.final_score||0).toFixed(1)}</td>
+      <td>${fmt(t.entry_price)}</td>
+      <td>${t.exit_types?.length ? fmt(t.total_pnl!==0 ? t.entry_price+(pnl/(t.quantity||1)) : 0) : '—'}</td>
+      <td class="${pnlClass(pnl)}">${fmtPnl(pnl)}</td>
+      <td><span class="badge ${result==='OPEN'?'badge-open':pnl>=0?'badge-win':'badge-loss'}">${result}</span></td>
+      <td>${(t.best_r_multiple||0).toFixed(2)}R</td>
+      <td>${t.hold_minutes||0}m</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── SCAN LOG ─────────────────────────────────────────
+async function loadScans() {
+  const data = await api('/api/scans?limit=300');
+  if(!data) return;
+
+  const scans = Array.isArray(data) ? data : [];
+  $('#scan-count').textContent = `${scans.length} decisions`;
+  const tbody = $('#scans-tbl tbody');
+
+  if(!scans.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--txt3);padding:24px">No scan decisions today</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = scans.map((s, i) => {
+    let d;
+    try { d = typeof s === 'string' ? JSON.parse(s) : s; } catch { d = s; }
+    // Handle both {decision_json: '...'} and flat dict
+    if(d.decision_json) {
+      try { d = {...d, ...JSON.parse(d.decision_json)}; } catch {}
+    }
+    const ts = (d.ts || d.created_at || '').split('T')[1]?.slice(0,8) || '';
+    const outcome = d.outcome || d.action || '';
+    const isPlaced = /PLACED|ENTRY|BUY|SELL/i.test(outcome);
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${ts}</td>
+      <td><strong>${d.symbol || ''}</strong></td>
+      <td>${(d.score || 0).toFixed?.(1) || d.score || ''}</td>
+      <td>${d.direction || ''}</td>
+      <td><span class="badge ${isPlaced ? 'badge-win' : 'badge-loss'}">${outcome}</span></td>
+      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${d.reason||''}">${d.reason || ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ══════════════════════════════════════════════════════
+//  INIT & AUTO-REFRESH
+// ══════════════════════════════════════════════════════
+loadOverview();
+setInterval(loadOverview, 30000);  // Refresh overview every 30s
+
+</script>
+</body>
+</html>
