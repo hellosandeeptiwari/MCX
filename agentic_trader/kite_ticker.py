@@ -86,6 +86,9 @@ class TitanTicker:
             'fallback_calls': 0,
             'cache_hits': 0,
         }
+        
+        # === BREAKOUT WATCHER (initialized later via attach_breakout_watcher) ===
+        self._breakout_watcher: Optional['BreakoutWatcher'] = None
     
     def _load_instruments(self):
         """Load instrument token mapping from Kite (once per day)"""
@@ -357,6 +360,29 @@ class TitanTicker:
             last = self._last_update.get(token, 0)
         return (time.time() - last) < max_age_seconds
     
+    def attach_breakout_watcher(self, config: dict) -> 'BreakoutWatcher':
+        """
+        Create and attach a BreakoutWatcher that runs inside the tick thread.
+        
+        Args:
+            config: BREAKOUT_WATCHER config dict from config.py
+            
+        Returns:
+            The BreakoutWatcher instance (also stored on self._breakout_watcher)
+        """
+        watcher = BreakoutWatcher(config)
+        self._breakout_watcher = watcher
+        if watcher._enabled:
+            print(f"   ⚡ Breakout Watcher: ACTIVE (spike≥{config.get('price_spike_pct', 0.8)}%, "
+                  f"sustain={config.get('sustain_seconds', 15)}s, "
+                  f"cooldown={config.get('cooldown_seconds', 180)}s)")
+        return watcher
+    
+    @property
+    def breakout_watcher(self) -> Optional['BreakoutWatcher']:
+        """Access the attached breakout watcher"""
+        return self._breakout_watcher
+    
     @property
     def connected(self) -> bool:
         return self._connected
@@ -418,6 +444,12 @@ class TitanTicker:
                 
                 self._last_update[token] = time.time()
                 self._stats['ticks_received'] += 1
+                
+                # === BREAKOUT WATCHER: feed every equity tick ===
+                if self._breakout_watcher:
+                    sym = self._token_to_symbol.get(token)
+                    if sym and sym.startswith('NSE:') and ':NIFTY' not in sym:
+                        self._breakout_watcher.process_tick(sym, tick, self._token_to_symbol)
     
     def _on_connect(self, ws, response):
         """Called on WebSocket connect"""
@@ -600,6 +632,294 @@ class TitanTicker:
                         }
                         self._stats['cache_hits'] += 1
         return result
+
+
+# ===========================================================
+# BREAKOUT WATCHER — WebSocket-Driven Fast Entry Detection
+# ===========================================================
+# Runs inside the existing TitanTicker tick thread.
+# Monitors ALL subscribed equities for breakout signals.
+# Pushes triggered symbols to a thread-safe queue.
+# Main loop drains the queue within 1 second and runs full pipeline.
+# ===========================================================
+
+import queue
+
+class BreakoutWatcher:
+    """
+    Watches WebSocket ticks for breakout conditions and queues them
+    for the main trading loop to process through the full pipeline.
+    
+    Thread-safety: All methods called from TitanTicker's _on_ticks (WS thread).
+    Only drain_queue() is called from the main thread.
+    """
+    
+    def __init__(self, config: dict):
+        self._enabled = config.get('enabled', False)
+        
+        # Trigger thresholds
+        self._spike_pct = config.get('price_spike_pct', 0.8)
+        self._day_extreme = config.get('day_extreme_trigger', True)
+        self._vol_surge_x = config.get('volume_surge_multiplier', 2.5)
+        
+        # Sustain filter
+        self._sustain_secs = config.get('sustain_seconds', 15)
+        self._sustain_recheck_pct = config.get('sustain_recheck_pct', 0.5)
+        
+        # Cooldown
+        self._cooldown_secs = config.get('cooldown_seconds', 180)
+        self._max_per_min = config.get('max_triggers_per_minute', 3)
+        
+        # Active window
+        self._active_after = config.get('active_after', '09:20')
+        self._active_until = config.get('active_until', '15:10')
+        
+        # --- Internal state (accessed from WS thread only) ---
+        self._lock = threading.Lock()
+        self._queue: queue.Queue = queue.Queue(maxsize=50)
+        
+        # Baseline prices: symbol → {price, timestamp} — snapshot at subscribe or periodic reset
+        self._baselines: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}
+        
+        # Sustain pending: symbol → {trigger_price, trigger_ts, trigger_type, baseline_price}
+        self._pending: Dict[str, Dict] = {}
+        
+        # Cooldown tracker: symbol → last_trigger_timestamp
+        self._cooldowns: Dict[str, float] = {}
+        
+        # Volume rolling average: symbol → deque of recent volume DELTAS (for surge detection)
+        from collections import deque
+        self._vol_delta_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
+        self._prev_cumulative_vol: Dict[str, int] = {}  # sym → last cumulative volume
+        
+        # Day extremes: track the REPORTED ohlc.high/low from the exchange
+        # Separate dict so the update step doesn't clobber the comparison values
+        self._prev_reported_high: Dict[str, float] = {}  # sym → last seen ohlc.high
+        self._prev_reported_low: Dict[str, float] = {}   # sym → last seen ohlc.low
+        
+        # Global trigger rate limiter
+        self._recent_triggers: list = []  # list of timestamps
+        
+        # Stats
+        self._stats = {
+            'ticks_processed': 0,
+            'spikes_detected': 0,
+            'extremes_detected': 0,
+            'vol_surges_detected': 0,
+            'sustain_passed': 0,
+            'sustain_failed': 0,
+            'cooldown_blocked': 0,
+            'rate_limited': 0,
+            'queued': 0,
+        }
+    
+    def _is_active_window(self) -> bool:
+        """Check if current time is within the active trigger window"""
+        now = datetime.now()
+        h_after, m_after = map(int, self._active_after.split(':'))
+        h_until, m_until = map(int, self._active_until.split(':'))
+        start = now.replace(hour=h_after, minute=m_after, second=0)
+        end = now.replace(hour=h_until, minute=m_until, second=0)
+        return start <= now <= end
+    
+    def _check_rate_limit(self) -> bool:
+        """Return True if we're under the per-minute trigger limit"""
+        now = time.time()
+        # Prune old timestamps (older than 60s)
+        self._recent_triggers = [t for t in self._recent_triggers if now - t < 60]
+        return len(self._recent_triggers) < self._max_per_min
+    
+    def _is_cooled_down(self, symbol: str) -> bool:
+        """Return True if symbol is past its cooldown period"""
+        last = self._cooldowns.get(symbol, 0)
+        return (time.time() - last) >= self._cooldown_secs
+    
+    def process_tick(self, symbol: str, tick: dict, token_to_symbol: Dict[int, str]):
+        """
+        Called from TitanTicker._on_ticks for each tick.
+        Detects breakout conditions and manages the sustain → queue pipeline.
+        
+        Args:
+            symbol: "NSE:SYMBOL" format
+            tick: Raw tick dict from KiteTicker
+            token_to_symbol: Token→symbol mapping for reverse lookups
+        """
+        if not self._enabled:
+            return
+        
+        self._stats['ticks_processed'] += 1
+        
+        ltp = tick.get('last_price')
+        if not ltp or ltp <= 0:
+            return
+        
+        now = time.time()
+        
+        # === UPDATE DAY EXTREMES (extract OHLC high/low from exchange) ===
+        ohlc = tick.get('ohlc', {})
+        _tick_day_high = ohlc.get('high', 0) if ohlc else 0
+        _tick_day_low = ohlc.get('low', 0) if ohlc else 0
+        
+        # === COMPUTE VOLUME DELTA (convert cumulative → per-tick delta) ===
+        _cum_vol = tick.get('volume_traded', tick.get('volume', 0))
+        _vol_delta = 0
+        if _cum_vol > 0:
+            _prev_cv = self._prev_cumulative_vol.get(symbol, 0)
+            _vol_delta = max(0, _cum_vol - _prev_cv) if _prev_cv > 0 else 0
+            self._prev_cumulative_vol[symbol] = _cum_vol
+            if _vol_delta > 0:
+                self._vol_delta_history[symbol].append(_vol_delta)
+        
+        # === UPDATE BASELINE (first tick or every 60s reset) ===
+        bl = self._baselines.get(symbol)
+        if bl is None or (now - bl['ts']) > 60:
+            self._baselines[symbol] = {'price': ltp, 'ts': now}
+            return  # First tick for this baseline window — no comparison yet
+        
+        # === CHECK SUSTAIN PENDING ===
+        pending = self._pending.get(symbol)
+        if pending:
+            elapsed = now - pending['trigger_ts']
+            if elapsed >= self._sustain_secs:
+                # Time's up — check if price still holds
+                baseline_price = pending['baseline_price']
+                move_pct = abs(ltp - baseline_price) / baseline_price * 100
+                if move_pct >= self._sustain_recheck_pct:
+                    # SUSTAINED — push to queue
+                    self._stats['sustain_passed'] += 1
+                    print(f"   ✅ Watcher: {symbol} SUSTAINED {pending['trigger_type']} ({move_pct:.1f}% held) — queuing")
+                    self._fire_trigger(symbol, ltp, pending['trigger_type'], pending)
+                else:
+                    # Failed sustain — retrace
+                    self._stats['sustain_failed'] += 1
+                    print(f"   ❌ Watcher: {symbol} sustain FAILED ({move_pct:.1f}% < {self._sustain_recheck_pct}%) — dropped")
+                del self._pending[symbol]
+            return  # While pending, don't check new triggers for this symbol
+        
+        # === DETECT TRIGGERS ===
+        baseline_price = bl['price']
+        if baseline_price <= 0:
+            return
+        
+        move_pct = (ltp - baseline_price) / baseline_price * 100
+        trigger_type = None
+        
+        # 1) PRICE SPIKE: moved ≥ spike_pct from baseline
+        if abs(move_pct) >= self._spike_pct:
+            trigger_type = 'PRICE_SPIKE_UP' if move_pct > 0 else 'PRICE_SPIKE_DOWN'
+            self._stats['spikes_detected'] += 1
+        
+        # 2) DAY EXTREME: exchange-reported ohlc.high/low INCREASED since last tick
+        #    Compare ohlc.high between consecutive ticks (not ltp vs ohlc.high)
+        if self._day_extreme and not trigger_type and _tick_day_high > 0 and _tick_day_low > 0:
+            _prev_h = self._prev_reported_high.get(symbol, 0)
+            _prev_l = self._prev_reported_low.get(symbol, 0)
+            if _prev_h > 0 and _tick_day_high > _prev_h:
+                trigger_type = 'NEW_DAY_HIGH'
+                self._stats['extremes_detected'] += 1
+            elif _prev_l > 0 and _tick_day_low < _prev_l:
+                trigger_type = 'NEW_DAY_LOW'
+                self._stats['extremes_detected'] += 1
+            # Always update the tracked values
+            self._prev_reported_high[symbol] = _tick_day_high
+            self._prev_reported_low[symbol] = _tick_day_low
+        
+        # 3) VOLUME SURGE: current tick's volume DELTA ≥ N× rolling average delta
+        if not trigger_type and _vol_delta > 0 and len(self._vol_delta_history[symbol]) >= 5:
+            _hist = self._vol_delta_history[symbol]
+            _avg_delta = sum(_hist) / len(_hist)
+            if _avg_delta > 0 and _vol_delta >= _avg_delta * self._vol_surge_x:
+                trigger_type = 'VOLUME_SURGE'
+                self._stats['vol_surges_detected'] += 1
+        
+        # === ENTER SUSTAIN PHASE ===
+        if trigger_type:
+            print(f"   ⚡ Watcher: {symbol} {trigger_type} detected ({move_pct:+.1f}%) — sustaining {self._sustain_secs}s...")
+            self._pending[symbol] = {
+                'trigger_price': ltp,
+                'trigger_ts': now,
+                'trigger_type': trigger_type,
+                'baseline_price': baseline_price,
+                'move_pct': move_pct,
+            }
+    
+    def _fire_trigger(self, symbol: str, ltp: float, trigger_type: str, pending: dict):
+        """Push a confirmed trigger to the queue after passing all gates."""
+        # Gate: active window
+        if not self._is_active_window():
+            return
+        
+        # Gate: cooldown
+        if not self._is_cooled_down(symbol):
+            self._stats['cooldown_blocked'] += 1
+            print(f"   ⏳ Watcher: {symbol} blocked by cooldown — skipping")
+            return
+        
+        # Gate: rate limit
+        if not self._check_rate_limit():
+            self._stats['rate_limited'] += 1
+            print(f"   ⏳ Watcher: {symbol} rate-limited ({self._max_per_min}/min cap) — skipping")
+            return
+        
+        # All gates passed — queue it
+        now = time.time()
+        self._cooldowns[symbol] = now
+        self._recent_triggers.append(now)
+        
+        trigger_data = {
+            'symbol': symbol,
+            'ltp': ltp,
+            'trigger_type': trigger_type,
+            'move_pct': pending.get('move_pct', 0),
+            'baseline_price': pending.get('baseline_price', 0),
+            'trigger_price': pending.get('trigger_price', 0),
+            'detected_at': now,
+            'detected_time': datetime.now().strftime('%H:%M:%S'),
+        }
+        
+        try:
+            self._queue.put_nowait(trigger_data)
+            self._stats['queued'] += 1
+            print(f"   📤 Watcher: {symbol} QUEUED for main thread ({trigger_type}, {pending.get('move_pct', 0):+.1f}%)")
+        except queue.Full:
+            print(f"   ⚠️ Watcher: {symbol} DROPPED — queue full (50 max)")
+    
+    def drain_queue(self) -> List[Dict]:
+        """
+        Drain all pending triggers from the queue.
+        Called from the MAIN THREAD only (between scan cycles).
+        
+        Returns:
+            List of trigger dicts, each with: symbol, ltp, trigger_type, move_pct, etc.
+        """
+        triggers = []
+        while not self._queue.empty():
+            try:
+                triggers.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return triggers
+    
+    def set_enabled(self, enabled: bool):
+        """Enable/disable the watcher at runtime"""
+        self._enabled = enabled
+    
+    @property 
+    def stats(self) -> dict:
+        return dict(self._stats)
+    
+    def reset_day(self):
+        """Reset daily state (call at market open)"""
+        self._baselines.clear()
+        self._pending.clear()
+        self._cooldowns.clear()
+        self._vol_delta_history.clear()
+        self._prev_cumulative_vol.clear()
+        self._prev_reported_high.clear()
+        self._prev_reported_low.clear()
+        self._recent_triggers.clear()
+        for k in self._stats:
+            self._stats[k] = 0
 
 
 # === SINGLETON ===

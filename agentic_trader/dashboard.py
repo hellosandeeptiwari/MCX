@@ -58,16 +58,39 @@ def _tail_file(filepath: str, n=200):
 
 
 def _sse_log_stream(filepath: str):
-    """Generator: yield new lines as SSE data events."""
+    """Generator: yield new lines as SSE data events.
+    
+    Optimisations vs original:
+    - 100ms poll instead of 500ms → 5x faster log delivery
+    - SSE heartbeat comment every 15s → keeps connection alive through
+      proxies / gunicorn timeout, prevents [Errno 110] TimeoutError
+    - Handles log file rotation (re-open when truncated)
+    """
+    last_heartbeat = time.time()
     try:
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             f.seek(0, 2)
             while True:
+                where = f.tell()
                 line = f.readline()
                 if line:
                     yield f"data: {json.dumps(line.rstrip())}\n\n"
+                    last_heartbeat = time.time()
                 else:
-                    time.sleep(0.5)
+                    # Check for log rotation (file truncated / replaced)
+                    try:
+                        cur_size = os.path.getsize(filepath)
+                        if cur_size < where:
+                            # File was rotated — reopen from start
+                            f.seek(0)
+                            continue
+                    except OSError:
+                        pass
+                    # SSE keepalive comment every 15s (invisible to EventSource)
+                    if time.time() - last_heartbeat > 15:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = time.time()
+                    time.sleep(0.1)
     except FileNotFoundError:
         yield f"data: {json.dumps('[log file not found]')}\n\n"
 

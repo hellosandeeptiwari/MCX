@@ -115,10 +115,36 @@ HARD_RULES = {
 # First cold cycle: ~45-60s, subsequent cached cycles: ~15-25s.
 FULL_FNO_SCAN = {
     "enabled": True,               # True = scan ALL F&O stocks, False = curated + wildcards only
-    "max_indicator_stocks": 50,     # Top 50 F&O stocks by composite rank (no fixed list bias)
+    "max_indicator_stocks": 40,     # Top 50 F&O stocks by composite rank (no fixed list bias)
     "min_change_pct_filter": 0.5,   # Minimum change% to even consider (dead stocks filtered)
     "indicator_threads": 12,        # Thread pool size for parallel historical_data fetches
     "prefer_ws_quotes": True,       # Use WebSocket quote cache for initial screen (skip REST batch)
+}
+
+# === BREAKOUT WATCHER (WebSocket-Driven Fast Entry) ===
+# Monitors ALL ~200 F&O stocks via WebSocket ticks in real-time.
+# Detects breakout signals (price spike, day high/low break, volume surge)
+# and pushes them to a queue that the main loop drains within 1 second.
+# The triggered stock then goes through the FULL pipeline (score → ML → GMM → trade).
+# This replaces the 5-min poll delay for fast setups while the scan loop continues
+# unchanged for slower setups (sniper, model-tracker, mean-reversion).
+BREAKOUT_WATCHER = {
+    "enabled": True,
+    # --- Trigger Thresholds ---
+    "price_spike_pct": 0.8,          # Trigger if price moves ≥0.8% within sustain_window
+    "day_extreme_trigger": True,      # Trigger on new day high / day low break
+    "volume_surge_multiplier": 2.5,   # Trigger if tick volume ≥ 2.5x rolling average
+    # --- Sustain Filter (anti-false-trigger) ---
+    "sustain_seconds": 10,            # Price must HOLD the move for 10s before triggering
+    "sustain_recheck_pct": 0.5,       # After sustain, price must still be ≥0.5% from baseline
+    # --- Cooldown (anti-spam) ---
+    "cooldown_seconds": 180,          # Don't re-trigger same stock within 3 minutes
+    "max_triggers_per_minute": 3,     # Max triggers across ALL stocks per minute (burst limit)
+    # --- Timing ---
+    "active_after": "09:20",          # Don't trigger before 09:20 (let ORB range form)
+    "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
+    # --- Score Gate ---
+    "min_score": 66,                  # Minimum intraday score to trigger trade (same as ORB threshold)
 }
 
 # === GTT SAFETY NET (Server-Side SL + Target) ===
@@ -516,8 +542,8 @@ CREDIT_SPREAD_CONFIG = {
     "sl_multiplier": 2.0,            # Exit if loss reaches 2× credit received
     "target_pct": 65,                # Exit when 65% of max credit is captured (time decay)
     "time_decay_exit_minutes": 90,   # If < 90 min to close, exit at whatever P&L
-    "max_days_to_expiry": 15,        # Block credit spreads beyond 15 DTE — theta decays too slowly, ties up margin
-    "min_days_to_expiry": 2,         # Don't sell with <2 DTE (gamma risk)
+    "max_days_to_expiry": 3,        # Only enter credit spreads within 3 DTE — near-expiry theta is strongest
+    "min_days_to_expiry": 0,         # Allow 0DTE credit spreads (expiry day theta crush)
     "max_sold_delta": 0.40,          # Sold leg delta must be ≤ 0.40 (was 0.35 — slight relaxation for more entries)
     # --- Expiry Management ---
     "prefer_expiry": "CURRENT_WEEK", # Weekly options for faster theta decay
