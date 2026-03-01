@@ -84,10 +84,14 @@ class AutonomousTrader:
         
         if not paper_mode:
             print("\n  ⚠️  LIVE MODE - Real orders will be placed!")
-            confirm = input("  Type 'CONFIRM' to proceed: ")
-            if confirm != "CONFIRM":
-                print("  Aborted.")
-                sys.exit(0)
+            # Headless: auto-confirm (mode is controlled by .env TRADING_MODE)
+            if sys.stdin.isatty():
+                confirm = input("  Type 'CONFIRM' to proceed: ")
+                if confirm != "CONFIRM":
+                    print("  Aborted.")
+                    sys.exit(0)
+            else:
+                print("  Headless mode — auto-confirmed via .env TRADING_MODE")
         
         # Reset tools singleton to use new configuration
         reset_tools()

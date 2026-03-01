@@ -1112,13 +1112,26 @@ class ZerodhaTools:
                 print(f"⚠️ .env ZERODHA_ACCESS_TOKEN is invalid/expired")
                 self.access_token = None
         
-        # No valid token — prompt for authentication
+        # No valid token — check if we can prompt interactively
+        import sys
+        if not sys.stdin.isatty():
+            # Headless mode (systemd, Docker, CI) — cannot prompt for input
+            print(f"\n⚠️ No valid Kite access token. Running HEADLESS — skipping interactive auth.")
+            print(f"   Set ZERODHA_ACCESS_TOKEN in .env or run auth manually.")
+            return False
+        
         print(f"\n⚠️ No valid Kite access token found.")
         print(f"   Update ZERODHA_ACCESS_TOKEN in .env, or start interactive auth...\n")
         return self.authenticate()
     
     def authenticate(self):
         """Authenticate with Zerodha - run once daily"""
+        import sys
+        if not sys.stdin.isatty():
+            print("\n⚠️ Cannot authenticate interactively in headless mode.")
+            print("   Set ZERODHA_ACCESS_TOKEN in .env and restart.")
+            return False
+        
         print("\n🔐 Zerodha Authentication")
         print("="*50)
         

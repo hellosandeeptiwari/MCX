@@ -13,6 +13,7 @@ User=titan
 Group=titan
 WorkingDirectory=/home/titan/app/agentic_trader
 Environment=PATH=/home/titan/app/.venv/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/titan/app/agentic_trader/.env
 
 # Main command
