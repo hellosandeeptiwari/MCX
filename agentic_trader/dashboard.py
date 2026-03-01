@@ -29,7 +29,7 @@ from trade_ledger import get_trade_ledger
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
-LOG_DIR = Path(__file__).parent / 'logs'
+LOG_DIR = Path(__file__).resolve().parent.parent / 'logs'
 TRADE_LEDGER_DIR = Path(__file__).parent / 'trade_ledger'
 
 # ── Utility ──────────────────────────────────────────────────
