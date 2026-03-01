@@ -386,15 +386,22 @@ function showToast(msg, ok) {
 async function botAction(action) {
   const btns = $$('.btn-ctrl');
   btns.forEach(b => { b.disabled = true; b.classList.add('loading'); });
+  // Safety: always re-enable after 12s max
+  const safetyTimer = setTimeout(() => {
+    btns.forEach(b => { b.disabled = false; b.classList.remove('loading'); });
+  }, 12000);
   try {
-    const r = await fetch(`/api/bot/${action}`, {method:'POST'});
+    const ctrl = new AbortController();
+    const fetchTimer = setTimeout(() => ctrl.abort(), 10000);
+    const r = await fetch(`/api/bot/${action}`, {method:'POST', signal:ctrl.signal});
+    clearTimeout(fetchTimer);
     const d = await r.json();
     showToast(d.msg || (d.ok ? 'Done' : 'Failed'), d.ok);
-    // Refresh status after a short delay
     setTimeout(loadOverview, 2000);
   } catch(e) {
     showToast('Network error: ' + e.message, false);
   } finally {
+    clearTimeout(safetyTimer);
     btns.forEach(b => { b.disabled = false; b.classList.remove('loading'); });
   }
 }

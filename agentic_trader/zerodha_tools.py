@@ -1143,7 +1143,11 @@ class ZerodhaTools:
         print(f"\n3. After login, copy the 'request_token' from the redirect URL")
         print(f"   (It's in the URL like: ?request_token=XXXXXX)")
         
-        request_token = input("\n4. Paste request_token here: ").strip()
+        try:
+            request_token = input("\n4. Paste request_token here: ").strip()
+        except (EOFError, OSError):
+            print("\n⚠️ Cannot read input (headless/pipe mode). Set ZERODHA_ACCESS_TOKEN in .env.")
+            return False
         
         try:
             data = self.kite.generate_session(request_token, api_secret=ZERODHA_API_SECRET)
