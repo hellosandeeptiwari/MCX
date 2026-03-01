@@ -114,6 +114,41 @@ def recent_errors():
     return jsonify({'lines': [l.rstrip() for l in lines]})
 
 
+# ── Bot control (start / stop / restart) ─────────────────────
+
+@app.route('/api/bot/stop', methods=['POST'])
+def bot_stop():
+    try:
+        r = subprocess.run(['sudo', 'systemctl', 'stop', 'titan-bot'],
+                           capture_output=True, text=True, timeout=10)
+        ok = r.returncode == 0
+        return jsonify({'ok': ok, 'action': 'stop', 'msg': r.stderr.strip() if not ok else 'Bot stopped'})
+    except Exception as e:
+        return jsonify({'ok': False, 'action': 'stop', 'msg': str(e)}), 500
+
+
+@app.route('/api/bot/start', methods=['POST'])
+def bot_start():
+    try:
+        r = subprocess.run(['sudo', 'systemctl', 'start', 'titan-bot'],
+                           capture_output=True, text=True, timeout=10)
+        ok = r.returncode == 0
+        return jsonify({'ok': ok, 'action': 'start', 'msg': r.stderr.strip() if not ok else 'Bot started'})
+    except Exception as e:
+        return jsonify({'ok': False, 'action': 'start', 'msg': str(e)}), 500
+
+
+@app.route('/api/bot/restart', methods=['POST'])
+def bot_restart():
+    try:
+        r = subprocess.run(['sudo', 'systemctl', 'restart', 'titan-bot'],
+                           capture_output=True, text=True, timeout=15)
+        ok = r.returncode == 0
+        return jsonify({'ok': ok, 'action': 'restart', 'msg': r.stderr.strip() if not ok else 'Bot restarted'})
+    except Exception as e:
+        return jsonify({'ok': False, 'action': 'restart', 'msg': str(e)}), 500
+
+
 # ── System status ────────────────────────────────────────────
 @app.route('/api/status')
 def get_status():

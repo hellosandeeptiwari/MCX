@@ -132,6 +132,19 @@ a{color:var(--blue);text-decoration:none}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:4px}
+
+/* ── Bot control buttons ──────────────────────────── */
+.btn-ctrl{
+  padding:4px 12px;border-radius:6px;font-size:.72rem;font-weight:600;
+  border:1px solid var(--border);cursor:pointer;transition:all .15s;
+  background:var(--bg3);color:var(--txt2);
+}
+.btn-ctrl:hover{color:#fff;border-color:var(--txt3)}
+.btn-ctrl:disabled{opacity:.4;cursor:not-allowed}
+.btn-start:hover{background:rgba(16,185,129,.15);color:var(--green);border-color:var(--green)}
+.btn-stop:hover{background:rgba(239,68,68,.15);color:var(--red);border-color:var(--red)}
+.btn-restart:hover{background:rgba(245,158,11,.15);color:var(--amber);border-color:var(--amber)}
+.btn-ctrl.loading{pointer-events:none;opacity:.6}
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -148,11 +161,21 @@ a{color:var(--blue);text-decoration:none}
       <span id="svc-label">Checking...</span>
     </span>
   </div>
-  <div style="display:flex;align-items:center;gap:16px;font-size:.8rem;color:var(--txt2)">
+  <div style="display:flex;align-items:center;gap:12px;font-size:.8rem;color:var(--txt2)">
     <span id="clock"></span>
     <span id="uptime-label"></span>
+    <div id="bot-controls" style="display:flex;gap:6px;margin-left:8px">
+      <button onclick="botAction('start')" class="btn-ctrl btn-start" title="Start Bot">&#9654; Start</button>
+      <button onclick="botAction('stop')" class="btn-ctrl btn-stop" title="Stop Bot">&#9632; Stop</button>
+      <button onclick="botAction('restart')" class="btn-ctrl btn-restart" title="Restart Bot">&#8635; Restart</button>
+    </div>
   </div>
 </div>
+
+<!-- Toast notification -->
+<div id="toast" style="position:fixed;top:60px;right:20px;z-index:9999;display:none;
+  padding:10px 20px;border-radius:8px;font-size:.82rem;font-weight:600;
+  box-shadow:0 4px 20px rgba(0,0,0,.5);transition:opacity .3s;"></div>
 
 <!-- ═══════════════════ CONTENT ═══════════════════ -->
 <div class="container">
@@ -348,6 +371,33 @@ const pnlBadge = n => n > 0 ? 'badge-win' : 'badge-loss';
 setInterval(() => {
   $('#clock').textContent = new Date().toLocaleTimeString('en-IN', {hour12:false});
 }, 1000);
+
+// ── Bot control ──────────────────────────────────────
+function showToast(msg, ok) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.style.background = ok ? 'rgba(16,185,129,.9)' : 'rgba(239,68,68,.9)';
+  t.style.color = '#fff';
+  t.style.display = 'block';
+  t.style.opacity = '1';
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.style.display = 'none', 300); }, 3000);
+}
+
+async function botAction(action) {
+  const btns = $$('.btn-ctrl');
+  btns.forEach(b => { b.disabled = true; b.classList.add('loading'); });
+  try {
+    const r = await fetch(`/api/bot/${action}`, {method:'POST'});
+    const d = await r.json();
+    showToast(d.msg || (d.ok ? 'Done' : 'Failed'), d.ok);
+    // Refresh status after a short delay
+    setTimeout(loadOverview, 2000);
+  } catch(e) {
+    showToast('Network error: ' + e.message, false);
+  } finally {
+    btns.forEach(b => { b.disabled = false; b.classList.remove('loading'); });
+  }
+}
 
 // ── Tab switching ────────────────────────────────────
 $$('.tabs .tab[data-tab]').forEach(btn => {
