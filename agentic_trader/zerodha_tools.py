@@ -329,8 +329,20 @@ class ZerodhaTools:
             self.ticker.subscribe_symbols(list(option_syms), mode='quote')
             # print(f"🔌 Ticker: Subscribed {len(option_syms)} option contracts for live PnL")
 
+    # Path to signal file for dashboard manual exits
+    MANUAL_EXIT_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_exit_requests.json')
+
     def _save_active_trades(self):
-        """Save active trades to SQLite (caller must hold _positions_lock)"""
+        """Save active trades to SQLite (caller must hold _positions_lock).
+        
+        CRITICAL: Before saving, consume any pending manual exit signals
+        from the dashboard. This prevents a race condition where the bot
+        overwrites the dashboard's state_db changes with stale in-memory
+        state that still includes the manually exited position.
+        """
+        # ── Consume manual exit signals BEFORE saving ──
+        self._consume_manual_exit_signals()
+        
         try:
             get_state_db().save_active_trades(
                 self.paper_positions,
@@ -339,6 +351,80 @@ class ZerodhaTools:
             )
         except Exception as e:
             print(f"⚠️ Error saving trades: {e}")
+
+    def _consume_manual_exit_signals(self):
+        """Consume any pending manual exit signals from the dashboard.
+        
+        Removes matching positions from in-memory state so they won't be
+        written back to state_db. This is the anti-race-condition mechanism.
+        Called by _save_active_trades() on every save cycle.
+        """
+        if not os.path.exists(self.MANUAL_EXIT_SIGNAL):
+            return
+        
+        try:
+            with open(self.MANUAL_EXIT_SIGNAL, 'r') as f:
+                raw = f.read().strip()
+            if not raw:
+                os.remove(self.MANUAL_EXIT_SIGNAL)
+                return
+            
+            requests = json.loads(raw)
+            if not requests:
+                os.remove(self.MANUAL_EXIT_SIGNAL)
+                return
+            
+            # Process each exit request
+            consumed = []
+            for req in requests:
+                symbol = req.get('symbol', '')
+                pnl = req.get('pnl', 0)
+                exit_price = req.get('exit_price', 0)
+                
+                # Remove from in-memory positions
+                removed = False
+                for i, trade in enumerate(self.paper_positions):
+                    if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                        # LIVE MODE: Place exit order if dashboard didn't already
+                        if not self.paper_mode and not req.get('live_exit_placed', False):
+                            try:
+                                self._execute_live_exit(trade)
+                                print(f"   🖐️ LIVE exit order placed for {symbol}")
+                            except Exception as e:
+                                print(f"   🚨 LIVE exit order FAILED for {symbol}: {e}")
+                        
+                        # Cancel GTT
+                        gtt_id = trade.get('gtt_trigger_id')
+                        if gtt_id:
+                            try:
+                                self._cancel_gtt(gtt_id, symbol)
+                            except Exception:
+                                pass
+                        
+                        self.paper_positions.pop(i)
+                        self.paper_pnl += pnl
+                        removed = True
+                        print(f"   🖐️ Manual exit synced: {symbol} | P&L: ₹{pnl:+,.2f} | exit@{exit_price}")
+                        break
+                
+                consumed.append(symbol)
+            
+            # Clear signal file after processing
+            try:
+                os.remove(self.MANUAL_EXIT_SIGNAL)
+            except Exception:
+                pass
+            
+            if consumed:
+                print(f"   🖐️ _save_active_trades: consumed {len(consumed)} manual exit(s): {consumed}")
+        
+        except json.JSONDecodeError:
+            try:
+                os.remove(self.MANUAL_EXIT_SIGNAL)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"   ⚠️ Manual exit signal consumption error: {e}")
     
     # =================================================================
     # AUTOSLICE — Freeze Quantity Protection

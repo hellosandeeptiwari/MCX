@@ -225,7 +225,7 @@ def exit_position():
     6. Log EXIT in trade_ledger
     """
     try:
-        data = request.json or {}
+        data = request.get_json(force=True, silent=True) or {}
         symbol = data.get('symbol', '').strip()
         if not symbol:
             return jsonify({'ok': False, 'msg': 'Missing symbol'}), 400
@@ -250,14 +250,28 @@ def exit_position():
         # Get current LTP from live_pnl bridge
         live = db.load_live_pnl() or {}
         lp = live.get(symbol) or live.get(symbol.replace('NFO:', ''))
-        ltp = lp['ltp'] if lp else 0
+        ltp = 0
+        if isinstance(lp, dict):
+            ltp = lp.get('ltp', 0)
+        elif isinstance(lp, (int, float)):
+            ltp = float(lp)
 
         # Calculate P&L
         entry_price = target.get('avg_price') or target.get('entry_price') or 0
         qty = abs(target.get('quantity', 0))
         direction = target.get('direction') or target.get('side', 'BUY')
 
-        if ltp > 0 and entry_price > 0:
+        # For debit spreads, use net premium as entry
+        if target.get('is_debit_spread') or target.get('is_credit_spread'):
+            entry_price = target.get('net_premium', entry_price)
+            # For spreads, unrealized_pnl from live_pnl is the most accurate
+            pnl = 0
+            lp_spread = live.get(symbol)
+            if isinstance(lp_spread, dict) and lp_spread.get('unrealized_pnl') is not None:
+                pnl = lp_spread['unrealized_pnl']
+            elif target.get('unrealized_pnl'):
+                pnl = target['unrealized_pnl']
+        elif ltp > 0 and entry_price > 0:
             if direction in ('BUY', 'LONG'):
                 pnl = (ltp - entry_price) * qty
             else:
@@ -433,10 +447,12 @@ def _enrich_positions(positions: list, db) -> list:
 
         # Merge live LTP & unrealized P&L from bot's scan cycle
         lp = live.get(sym) or live.get(sym.replace('NFO:', ''))
-        if lp:
-            pos['ltp'] = lp['ltp']
-            pos['unrealized_pnl'] = lp['unrealized_pnl']
+        if isinstance(lp, dict):
+            pos['ltp'] = lp.get('ltp', 0)
+            pos['unrealized_pnl'] = lp.get('unrealized_pnl', 0)
             pos['ltp_updated'] = lp.get('last_updated', '')
+        elif isinstance(lp, (int, float)):
+            pos['ltp'] = float(lp)
     return positions
 
 
