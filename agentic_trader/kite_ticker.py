@@ -790,9 +790,8 @@ class BreakoutWatcher:
                     print(f"   ✅ Watcher: {symbol} SUSTAINED {pending['trigger_type']} ({move_pct:.1f}% held) — queuing")
                     self._fire_trigger(symbol, ltp, pending['trigger_type'], pending)
                 else:
-                    # Failed sustain — retrace
+                    # Failed sustain — retrace (silent)
                     self._stats['sustain_failed'] += 1
-                    print(f"   ❌ Watcher: {symbol} sustain FAILED ({move_pct:.1f}% < {self._sustain_recheck_pct}%) — dropped")
                 del self._pending[symbol]
             return  # While pending, don't check new triggers for this symbol
         
@@ -834,7 +833,7 @@ class BreakoutWatcher:
         
         # === ENTER SUSTAIN PHASE ===
         if trigger_type:
-            print(f"   ⚡ Watcher: {symbol} {trigger_type} detected ({move_pct:+.1f}%) — sustaining {self._sustain_secs}s...")
+            # Only log at debug level — queued messages will be printed if sustained
             self._pending[symbol] = {
                 'trigger_price': ltp,
                 'trigger_ts': now,
