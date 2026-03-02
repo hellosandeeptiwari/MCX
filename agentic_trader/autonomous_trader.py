@@ -455,34 +455,49 @@ class AutonomousTrader:
             print(f"  ⚠ 5-min freshness check: {_5m_chk_e}")
         
         # === AUTO-REFRESH STALE OI DATA ===
-        # If futures OI parquets are >1 day old, refresh them on every startup.
+        # If futures OI parquets are older than last trading day, refresh once.
         try:
             import pandas as _pd_oi_chk
             _oi_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'futures_oi')
             _sample_files = [f for f in os.listdir(_oi_dir) if f.endswith('_futures_oi.parquet')][:3]
             _oi_stale = False
+
+            # Compute last trading day (skip weekends; holidays are rare enough to ignore)
+            from datetime import timedelta as _td_oi
+            _today_oi = _pd_oi_chk.Timestamp.now().normalize()
+            _last_trading_day = _today_oi
+            if _last_trading_day.weekday() == 0:    # Monday → Friday
+                _last_trading_day -= _td_oi(days=3)
+            elif _last_trading_day.weekday() == 6:  # Sunday → Friday
+                _last_trading_day -= _td_oi(days=2)
+            elif _last_trading_day.weekday() == 5:  # Saturday → Friday
+                _last_trading_day -= _td_oi(days=1)
+            # If before 9:30 AM on a weekday, use previous trading day
+            if _pd_oi_chk.Timestamp.now().hour < 10 and _today_oi.weekday() < 5:
+                _last_trading_day -= _td_oi(days=1)
+                if _last_trading_day.weekday() >= 5:  # landed on weekend
+                    _last_trading_day -= _td_oi(days=(_last_trading_day.weekday() - 4))
+
             if not _sample_files:
                 _oi_stale = True
             else:
                 for _sf in _sample_files:
                     _sdf = _pd_oi_chk.read_parquet(os.path.join(_oi_dir, _sf))
-                    _last = _pd_oi_chk.Timestamp(_sdf['date'].max())
-                    if (_pd_oi_chk.Timestamp.now() - _last).days > 1:
+                    _last = _pd_oi_chk.Timestamp(_sdf['date'].max()).normalize()
+                    if _last < _last_trading_day:
                         _oi_stale = True
                         break
             if _oi_stale:
                 _gap = (_pd_oi_chk.Timestamp.now() - _last).days if '_last' in dir() else '?'
-                print(f"  ⚠️ Futures OI data stale ({_gap}d old) — auto-refreshing...")
+                print(f"  ⚠️ Futures OI data stale (last={_last.date() if '_last' in dir() else '?'}, need≥{_last_trading_day.date()}) — refreshing...")
                 from dhan_futures_oi import FuturesOIFetcher
                 _oi_fetcher = FuturesOIFetcher()
                 if _oi_fetcher.ready:
                     _oi_fetcher.backfill_all(months_back=1)
-                    # print("  ✅ OI data refreshed")
                 else:
                     print("  ⚠️ DhanHQ not ready — OI refresh skipped (check DHAN_ACCESS_TOKEN in .env)")
             else:
-                # print("  ✅ Futures OI data: fresh")
-                pass
+                print(f"  ✅ Futures OI data: fresh (last={_last.date() if '_last' in dir() else '?'}, need≥{_last_trading_day.date()})")
         except Exception as _oi_chk_e:
             print(f"  ⚠ OI freshness check: {_oi_chk_e}")
         
