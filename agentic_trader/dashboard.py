@@ -510,6 +510,140 @@ def get_status():
 
 
 # ── Trade ledger ─────────────────────────────────────────────
+
+@app.route('/api/trade_summary')
+def trade_summary():
+    """One-call comprehensive trade summary for today.
+    Includes: positions, P&L, ledger events, risk state — everything."""
+    import re as _re
+    db = get_state_db()
+    today = _today()
+    positions, realized_pnl, capital = db.load_active_trades(today)
+    live = db.load_live_pnl() or {}
+
+    # ── Enrich open positions ──
+    open_positions = []
+    total_unreal = 0
+    for p in positions:
+        sym = p.get('symbol', '')
+        entry = p.get('avg_price') or p.get('entry_price') or p.get('net_premium', 0)
+        qty = abs(p.get('quantity', 0))
+        d = p.get('direction', '')
+        spread = p.get('is_debit_spread') or p.get('is_credit_spread') or p.get('is_iron_condor')
+
+        lp = live.get(sym) or live.get(sym.replace('NFO:', ''))
+        ltp = 0
+        unreal = 0
+        if isinstance(lp, dict):
+            ltp = lp.get('ltp', 0)
+            unreal = lp.get('unrealized_pnl', 0)
+        elif isinstance(lp, (int, float)):
+            ltp = float(lp)
+
+        if unreal == 0 and ltp > 0 and entry > 0 and not spread:
+            if d in ('BUY', 'LONG'):
+                unreal = (ltp - entry) * qty
+            else:
+                unreal = (entry - ltp) * qty
+
+        total_unreal += unreal
+        pnl_pct = (unreal / (entry * qty) * 100) if entry > 0 and qty > 0 else 0
+
+        # Hold time
+        hold_mins = 0
+        try:
+            ts = p.get('timestamp', '')
+            if ts:
+                hold_mins = int((datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 60)
+        except Exception:
+            pass
+
+        open_positions.append({
+            'symbol': sym,
+            'direction': d,
+            'quantity': qty,
+            'entry_price': round(entry, 2),
+            'ltp': round(ltp, 2),
+            'unrealized_pnl': round(unreal, 2),
+            'pnl_pct': round(pnl_pct, 1),
+            'stop_loss': p.get('stop_loss', 0),
+            'target': p.get('target', 0),
+            'setup': p.get('setup_type', p.get('strategy_type', '')),
+            'score': p.get('smart_score', p.get('entry_score', 0)),
+            'hold_minutes': hold_mins,
+            'is_spread': bool(spread),
+            'status': 'winning' if unreal >= 0 else 'losing',
+        })
+
+    # ── Ledger events ──
+    ledger = get_trade_ledger()
+    ledger_entries = []
+    ledger_exits = []
+    try:
+        ledger_dir = Path(__file__).parent / 'trade_ledger'
+        ledger_file = ledger_dir / f'trade_ledger_{today}.jsonl'
+        if ledger_file.exists():
+            import json as _json
+            for line in ledger_file.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    ev = _json.loads(line)
+                    if ev.get('event') == 'ENTRY':
+                        ledger_entries.append({
+                            'symbol': ev.get('symbol', ''),
+                            'direction': ev.get('direction', ''),
+                            'entry_price': ev.get('entry_price', 0),
+                            'quantity': ev.get('quantity', 0),
+                            'source': ev.get('source', ''),
+                            'smart_score': ev.get('smart_score', 0),
+                            'time': str(ev.get('timestamp', ''))[:19],
+                        })
+                    elif ev.get('event') == 'EXIT':
+                        ledger_exits.append({
+                            'symbol': ev.get('symbol', ''),
+                            'exit_type': ev.get('exit_type', ''),
+                            'entry_price': ev.get('entry_price', 0),
+                            'exit_price': ev.get('exit_price', 0),
+                            'pnl': ev.get('pnl', 0),
+                            'quantity': ev.get('quantity', 0),
+                            'time': str(ev.get('timestamp', ''))[:19],
+                        })
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # ── Risk state ──
+    risk = db.load_risk_state(today) or {}
+
+    # ── Build summary ──
+    net_pnl = realized_pnl + total_unreal
+    winners = sum(1 for p in open_positions if p['status'] == 'winning')
+    losers = sum(1 for p in open_positions if p['status'] == 'losing')
+
+    return jsonify({
+        'date': today,
+        'capital': capital,
+        'realized_pnl': round(realized_pnl, 2),
+        'unrealized_pnl': round(total_unreal, 2),
+        'net_pnl': round(net_pnl, 2),
+        'return_pct': round(net_pnl / capital * 100, 2) if capital > 0 else 0,
+        'open_positions': open_positions,
+        'open_count': len(open_positions),
+        'open_winners': winners,
+        'open_losers': losers,
+        'ledger_entries': ledger_entries,
+        'ledger_exits': ledger_exits,
+        'total_entries_today': len(ledger_entries),
+        'total_exits_today': len(ledger_exits),
+        'risk': {
+            'daily_loss_pct': risk.get('daily_loss_pct', 0),
+            'circuit_breaker': risk.get('circuit_breaker', False),
+        },
+    })
+
+
 @app.route('/api/trades/today')
 def trades_today():
     ledger = get_trade_ledger()
