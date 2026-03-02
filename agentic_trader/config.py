@@ -259,9 +259,9 @@ ML_DIRECTION_CONFLICT = {
 #   gmm_confirms_direction = True means NO anomaly = clean pattern = safe
 #   → ML_OVERRIDE fires when XGB opposes AND gmm_confirms_direction=True
 ML_OVERRIDE_GATES = {
-    "min_move_prob": 0.56,            # XGB gate P(MOVE) floor — 0.52 was coin-flip noise, 0.56 ensures real conviction
+    "min_move_prob": 0.55,            # XGB gate P(MOVE) floor — 0.56 blocked edge cases due to float rounding
     "min_dr_score": 0.15,             # GMM must show clean signal (low dr = confirmed direction, high dr = anomaly)
-    "min_directional_prob": 0.40,     # XGB prob_up/prob_down must show real conviction
+    "min_directional_prob": 0.30,     # XGB prob_up/prob_down — relaxed from 0.40 (Mar 2 fix: LT blocked at 0.29)
     "max_concurrent_open": 3,         # Max simultaneously open ML_OVERRIDE_WGMM positions
     "min_smart_score": 55,            # Smart score floor (was 58)
 }
@@ -359,8 +359,8 @@ GMM_SNIPER = {
     "max_sniper_trades_per_day": 8,    # Max GMM sniper trades per day
     "lot_multiplier": 5.0,             # 5x normal lot size (was 3.0x, +2 lots Feb 26)
     "min_smart_score": 58,             # Smart score floor for 5x lots — needs real conviction (was 52)
-    "max_updr_score": 0.12,            # Must be very clean — UP regime (threshold 0.25)
-    "max_downdr_score": 0.10,           # Relaxed 0.09→0.10 — was too strict, 0 trades fired (threshold 0.25)
+    "max_updr_score": 0.15,            # Relaxed 0.12→0.15 — broad selloff days inflate all DR scores
+    "max_downdr_score": 0.15,           # Relaxed 0.10→0.15 — 0/40 passed at 0.10 on risk-off days
     "min_gate_prob": 0.55,             # XGB gate floor — 5x lots needs strong P(MOVE) (was 0.50)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 300000,        # ₹3 Lakh reserved exclusively for sniper trades

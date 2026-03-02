@@ -278,9 +278,9 @@ class AutonomousTrader:
             from config import ML_OVERRIDE_GATES
             self._ml_ovr_cfg = ML_OVERRIDE_GATES
         except ImportError:
-            self._ml_ovr_cfg = {'min_move_prob': 0.58, 'max_updr_score': 0.12,
+            self._ml_ovr_cfg = {'min_move_prob': 0.55, 'max_updr_score': 0.12,
                                 'max_downdr_score': 0.09,
-                                'min_directional_prob': 0.40, 'max_concurrent_open': 3}
+                                'min_directional_prob': 0.30, 'max_concurrent_open': 3}
         # _gmm_flip_count_today removed — GMM now used as veto/boost, not flip
         # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
         try:
@@ -605,11 +605,11 @@ class AutonomousTrader:
         except Exception:
             pass
         
-        # Gate 2: ml_move_prob minimum
+        # Gate 2: ml_move_prob minimum (round to 4dp to avoid float display confusion)
         _min_move = cfg.get('min_move_prob', 0.58)
-        _move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-        if _move_prob < _min_move:
-            return False, f"move_prob {_move_prob:.2f} < {_min_move}"
+        _move_prob = round(ml.get('ml_move_prob', ml.get('ml_p_move', 0.0)), 4)
+        if _move_prob < _min_move - 0.001:  # >= with tiny epsilon for float safety
+            return False, f"move_prob {_move_prob:.4f} < {_min_move}"
         
         # Gate 3: Directional dr_score MINIMUM — only for non-SNIPER paths
         # Uses the CONFIRMING regime score, not max(both).
@@ -620,14 +620,14 @@ class AutonomousTrader:
                 return False, f"{_confirm_tag} {_confirm_dr:.3f} < {_min_dr} (need confirming regime signal)"
         
         # Gate 4: XGB directional probability
-        _min_dir_prob = cfg.get('min_directional_prob', 0.40)
+        _min_dir_prob = cfg.get('min_directional_prob', 0.30)
         if _xgb_signal == 'UP':
             _dir_prob = ml.get('ml_prob_up', 0.0)
         elif _xgb_signal == 'DOWN':
             _dir_prob = ml.get('ml_prob_down', 0.0)
         else:
             _dir_prob = 0.0
-        if _dir_prob < _min_dir_prob:
+        if _dir_prob < _min_dir_prob - 0.001:  # >= with epsilon for float safety
             return False, f"dir_prob({_xgb_signal}) {_dir_prob:.2f} < {_min_dir_prob}"
         
         # Gate 5: Smart score floor — estimate smart_score from available data
@@ -2572,7 +2572,7 @@ class AutonomousTrader:
             ml = ml_results[sym]
             
             # Gate: P(MOVE) must be strong
-            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+            ml_move_prob = round(ml.get('ml_move_prob', ml.get('ml_p_move', 0.0)), 4)
             if ml_move_prob < min_move:
                 continue
             
