@@ -1253,8 +1253,12 @@ class AutonomousTrader:
                     else:
                         direction = 'BUY' if _move_pct > 0 else 'SELL'
                 
+                # Score audit from scorer (shows component breakdown)
+                _score_audit = getattr(_scorer, '_last_score_audit', '')
                 print(f"      📊 {_sym.replace('NSE:', '')}: Score {_final_score:.0f} | Dir: {direction} | "
                       f"Trigger: {_trigger_type} ({_move_pct:+.1f}%)")
+                if _score_audit:
+                    print(f"         🔍 Audit: {_score_audit}")
                 
                 # --- GATE A: Score threshold ---
                 if _final_score < _min_score:
@@ -2277,17 +2281,16 @@ class AutonomousTrader:
 
     # ========== TEST_GMM: PURE DR MODEL PLAY ==========
     def _place_test_gmm_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
-        """Place trades based on GMM Regime Divergence.
+        """Place trades based on GMM Flag-Confirmed Regime Divergence.
         
-        When UP and DOWN GMM models DIVERGE — one sees anomaly, the other doesn't —
-        the cross-regime disagreement IS the directional signal:
+        Direction follows the FLAGGING model (not contrarian):
         
-          HIGH down_score + LOW up_score → hidden bounce/UP risk → BUY CALL
-          HIGH up_score + LOW down_score → hidden crash risk     → BUY PUT
+          down_flag + HIGH down_score + LOW up_score → confirmed downside → BUY PUT
+          up_flag   + HIGH up_score + LOW down_score → confirmed upside   → BUY CALL
         
-        Pure GMM play — no XGB involvement. Direction comes solely from regime divergence.
-        DOWN model (AUROC=0.62) is more reliable → CALL side gets easier thresholds.
-        UP model (AUROC=0.56) is weaker → PUT side needs higher anomaly bar.
+        The flag IS the directional confirmation. No contrarian flip.
+        DOWN model (AUROC=0.62) is more reliable → PUT side gets easier thresholds.
+        UP model (AUROC=0.56) is weaker → CALL side needs higher anomaly bar.
         
         Tagged as 'TEST_GMM' for P&L tracking.
         """
@@ -2307,12 +2310,12 @@ class AutonomousTrader:
         if budget <= 0:
             return []
         
-        # Regime divergence thresholds
-        call_min_dn = cfg.get('call_min_down_score', 0.20)
-        call_max_up = cfg.get('call_max_up_score', 0.14)
-        put_min_up = cfg.get('put_min_up_score', 0.18)
-        put_max_dn = cfg.get('put_max_down_score', 0.14)
-        min_gap = cfg.get('min_divergence_gap', 0.06)
+        # Flag-confirmed divergence thresholds
+        dn_min = cfg.get('down_min_score', 0.25)        # DOWN model must be this high to signal PUT
+        dn_max_opp = cfg.get('down_max_opposite', 0.10)  # UP model must be this low (clean)
+        up_min = cfg.get('up_min_score', 0.22)            # UP model must be this high to signal CALL
+        up_max_opp = cfg.get('up_max_opposite', 0.10)    # DOWN model must be this low (clean)
+        min_gap = cfg.get('min_divergence_gap', 0.20)     # Strict: signaling vs clean gap ≥ 0.20
         
         # Flag-based conviction gates
         require_signaling_flag = cfg.get('require_signaling_flag', True)
@@ -2342,46 +2345,46 @@ class AutonomousTrader:
             up_flag = ml.get('ml_up_flag', False)
             down_flag = ml.get('ml_down_flag', False)
             
-            # REGIME DIVERGENCE CHECK (score + flag conviction):
-            # BUY CALL: DOWN model HIGH (bullish anomaly) + UP model LOW (no crash)
-            call_ok = (down_score >= call_min_dn) and (up_score <= call_max_up) and ((down_score - up_score) >= min_gap)
-            # BUY PUT: UP model HIGH (bearish anomaly) + DOWN model LOW (no bounce)
-            put_ok = (up_score >= put_min_up) and (down_score <= put_max_dn) and ((up_score - down_score) >= min_gap)
+            # FLAG-CONFIRMED DIVERGENCE CHECK:
+            # BUY PUT:  DOWN model HIGH + down_flag confirms + UP clean → go WITH the down signal
+            put_ok = (down_score >= dn_min) and (up_score <= dn_max_opp) and ((down_score - up_score) >= min_gap)
+            # BUY CALL: UP model HIGH + up_flag confirms + DOWN clean → go WITH the up signal
+            call_ok = (up_score >= up_min) and (down_score <= up_max_opp) and ((up_score - down_score) >= min_gap)
             
             if not call_ok and not put_ok:
                 continue
             
-            # FLAG CONVICTION: signaling regime must fire its own model-calibrated flag
+            # FLAG CONVICTION: signaling model must fire its own calibrated flag
             if require_signaling_flag:
-                if call_ok and not down_flag:
-                    call_ok = False  # DOWN model score high but didn't breach its own threshold
-                if put_ok and not up_flag:
-                    put_ok = False   # UP model score high but didn't breach its own threshold
+                if put_ok and not down_flag:
+                    put_ok = False   # DOWN model score high but didn't breach its own threshold
+                if call_ok and not up_flag:
+                    call_ok = False  # UP model score high but didn't breach its own threshold
                 if not call_ok and not put_ok:
                     continue
             
-            # CLEAN SIDE: opposite regime must NOT flag (no conflicting anomaly)
+            # CLEAN SIDE: opposite model must NOT flag (no conflicting signal)
             if require_clean_no_flag:
-                if call_ok and up_flag:
-                    call_ok = False  # UP model also firing = confused signal, skip
-                if put_ok and down_flag:
-                    put_ok = False   # DOWN model also firing = confused signal, skip
+                if put_ok and up_flag:
+                    put_ok = False   # UP model also firing = confused signal, skip
+                if call_ok and down_flag:
+                    call_ok = False  # DOWN model also firing = confused signal, skip
                 if not call_ok and not put_ok:
                     continue
             
-            # Determine direction from regime divergence
+            # Determine direction — flag-confirmed (not contrarian)
             if call_ok and not put_ok:
                 direction = 'BUY'
                 side_tag = 'CALL'
-                divergence_score = down_score - up_score
+                divergence_score = up_score - down_score
             elif put_ok and not call_ok:
                 direction = 'SELL'
                 side_tag = 'PUT'
-                divergence_score = up_score - down_score
+                divergence_score = down_score - up_score
             else:
                 # Both pass (rare) — pick stronger divergence
-                call_div = down_score - up_score
-                put_div = up_score - down_score
+                call_div = up_score - down_score
+                put_div = down_score - up_score
                 if call_div >= put_div:
                     direction, side_tag, divergence_score = 'BUY', 'CALL', call_div
                 else:
@@ -2501,7 +2504,7 @@ class AutonomousTrader:
                     lot_multiplier=lot_mult,
                     rationale=(f"TEST_GMM_DIVERGE_{cand['side_tag']}: UP={cand['up_score']:.3f} "
                               f"DN={cand['down_score']:.3f} gap={cand['divergence_score']:.3f} "
-                              f"gate={cand['ml_move_prob']:.2f} — regime divergence play"),
+                              f"gate={cand['ml_move_prob']:.2f} — flag-confirmed direction"),
                     setup_type='TEST_GMM',
                     ml_data=cand.get('ml_data', {}),
                     sector='',
@@ -3558,9 +3561,100 @@ class AutonomousTrader:
         except Exception as _unreal_err:
             # print(f"   [RG-UNREAL] exception: {_unreal_err}")
             return 0.0
+
+    # ── Manual exit processing (dashboard → bot in-memory sync) ──────
+    MANUAL_EXIT_FILE = os.path.join(os.path.dirname(__file__), 'manual_exit_requests.json')
+
+    def _process_manual_exit_requests(self):
+        """Process manual exit requests written by the dashboard.
+        
+        The dashboard writes a signal file with exits to process.
+        This method:
+        1. Reads the signal file
+        2. Removes matching positions from in-memory paper_positions
+        3. Places real exit orders (LIVE mode)
+        4. Clears the processed signal file
+        
+        Called at the start of every _check_positions_realtime() cycle.
+        """
+        if not os.path.exists(self.MANUAL_EXIT_FILE):
+            return
+        
+        try:
+            with open(self.MANUAL_EXIT_FILE, 'r') as f:
+                requests = json.load(f)
+            
+            if not requests:
+                os.remove(self.MANUAL_EXIT_FILE)
+                return
+            
+            print(f"\n   🖐️ MANUAL EXIT: Processing {len(requests)} dashboard exit request(s)...")
+            
+            processed = []
+            for req in requests:
+                symbol = req.get('symbol', '')
+                exit_price = req.get('exit_price', 0)
+                pnl = req.get('pnl', 0)
+                
+                with self.tools._positions_lock:
+                    found = False
+                    for i, trade in enumerate(self.tools.paper_positions):
+                        if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                            found = True
+                            
+                            # === LIVE MODE: Place real exit order ===
+                            if not self.tools.paper_mode:
+                                try:
+                                    self.tools._execute_live_exit(trade)
+                                    print(f"   🖐️ LIVE exit order placed for {symbol}")
+                                except Exception as e:
+                                    print(f"   🚨 LIVE exit order FAILED for {symbol}: {e}")
+                            
+                            # Cancel GTT if exists
+                            gtt_id = trade.get('gtt_trigger_id')
+                            if gtt_id:
+                                try:
+                                    self.tools._cancel_gtt(gtt_id, symbol)
+                                except Exception:
+                                    pass
+                            
+                            # Remove from in-memory positions
+                            self.tools.paper_positions.pop(i)
+                            self.tools.paper_pnl += pnl
+                            print(f"   🖐️ {symbol} removed from memory | P&L: ₹{pnl:+,.2f} | exit@{exit_price}")
+                            processed.append(symbol)
+                            break
+                    
+                    if not found:
+                        # Already removed by state_db update (dashboard did this)
+                        print(f"   🖐️ {symbol} already removed from memory (OK)")
+                        processed.append(symbol)
+                
+                # Save updated state
+                self.tools._save_active_trades()
+            
+            # Clear signal file
+            try:
+                os.remove(self.MANUAL_EXIT_FILE)
+            except Exception:
+                pass
+            
+            print(f"   🖐️ Manual exit complete: {len(processed)} processed ✅")
+            
+        except json.JSONDecodeError:
+            # Corrupt file — remove it
+            try:
+                os.remove(self.MANUAL_EXIT_FILE)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"   ⚠️ Manual exit processing error: {e}")
     
     def _check_positions_realtime(self):
         """Check all positions for target/stoploss hits using Exit Manager"""
+        # === PROCESS MANUAL EXITS FROM DASHBOARD ===
+        self._process_manual_exit_requests()
+        
         # Snapshot under lock to prevent race with trading thread
         with self.tools._positions_lock:
             active_trades = [t.copy() for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
@@ -6712,9 +6806,12 @@ class AutonomousTrader:
                 if IRON_CONDOR_CONFIG.get('enabled', False) and IRON_CONDOR_CONFIG.get('proactive_scan', False):
                     
                     # === DTE PRE-CHECK (once per day): Skip IC scan if no expiry within DTE limits ===
+                    # Track index vs stock eligibility SEPARATELY so stock IC scan
+                    # only runs on stock expiry days (DTE=0), not on index-only expiry days.
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     if not hasattr(self, '_ic_eligible_date') or self._ic_eligible_date != today_str:
-                        self._ic_eligible_today = False
+                        self._ic_idx_eligible = False
+                        self._ic_stk_eligible = False
                         self._ic_eligible_date = today_str
                         try:
                             from options_trader import get_options_trader as _get_ot, ExpirySelection
@@ -6725,10 +6822,11 @@ class AutonomousTrader:
                             )
                             idx_mode = IRON_CONDOR_CONFIG.get('index_mode', {})
                             stk_mode = IRON_CONDOR_CONFIG.get('stock_mode', {})
-                            idx_max_dte = idx_mode.get('max_dte', 2)
-                            stk_max_dte = stk_mode.get('max_dte', 15)
+                            idx_max_dte = idx_mode.get('max_dte', 0)
+                            stk_max_dte = stk_mode.get('max_dte', 0)
                             today_date = datetime.now().date()
                             
+                            # Check INDEX expiry
                             for idx_sym in IC_INDEX_SYMBOLS:
                                 try:
                                     idx_expiry_sel = ExpirySelection[idx_mode.get('prefer_expiry', 'CURRENT_WEEK')]
@@ -6738,38 +6836,42 @@ class AutonomousTrader:
                                         exp_d = idx_expiry if isinstance(idx_expiry, _date) and not isinstance(idx_expiry, datetime) else idx_expiry.date() if hasattr(idx_expiry, 'date') else idx_expiry
                                         idx_dte = (exp_d - today_date).days
                                         if idx_dte <= idx_max_dte:
-                                            self._ic_eligible_today = True
-                                            # print(f"   🦅 IC eligible today: {idx_sym} expiry {idx_expiry} (DTE={idx_dte}, max={idx_max_dte})")
+                                            self._ic_idx_eligible = True
+                                            print(f"   🦅 IC: Index {idx_sym} expiry {idx_expiry} DTE={idx_dte} ✅")
                                             break
                                 except Exception:
                                     pass
                             
-                            if not self._ic_eligible_today:
-                                try:
-                                    stk_expiry_sel = ExpirySelection[stk_mode.get('prefer_expiry', 'CURRENT_MONTH')]
-                                    stk_expiry = _ot_check.chain_fetcher.get_nearest_expiry("NSE:RELIANCE", stk_expiry_sel)
-                                    if stk_expiry:
-                                        from datetime import date as _date
-                                        exp_d = stk_expiry if isinstance(stk_expiry, _date) and not isinstance(stk_expiry, datetime) else stk_expiry.date() if hasattr(stk_expiry, 'date') else stk_expiry
-                                        stk_dte = (exp_d - today_date).days
-                                        if stk_dte <= stk_max_dte:
-                                            self._ic_eligible_today = True
-                                            # print(f"   🦅 IC eligible today: Stocks expiry {stk_expiry} (DTE={stk_dte}, max={stk_max_dte})")
-                                except Exception:
-                                    pass
+                            # Check STOCK expiry (separately — don't let index eligibility bypass this)
+                            try:
+                                stk_expiry_sel = ExpirySelection[stk_mode.get('prefer_expiry', 'CURRENT_MONTH')]
+                                stk_expiry = _ot_check.chain_fetcher.get_nearest_expiry("NSE:RELIANCE", stk_expiry_sel)
+                                if stk_expiry:
+                                    from datetime import date as _date
+                                    exp_d = stk_expiry if isinstance(stk_expiry, _date) and not isinstance(stk_expiry, datetime) else stk_expiry.date() if hasattr(stk_expiry, 'date') else stk_expiry
+                                    stk_dte = (exp_d - today_date).days
+                                    if stk_dte <= stk_max_dte:
+                                        self._ic_stk_eligible = True
+                                        print(f"   🦅 IC: Stock expiry {stk_expiry} DTE={stk_dte} ✅")
+                            except Exception:
+                                pass
                             
-                            if not self._ic_eligible_today:
+                            if not self._ic_idx_eligible and not self._ic_stk_eligible:
                                 print(f"   🦅 IC SKIPPED: Not expiry day (index max_dte={idx_max_dte}, stock max_dte={stk_max_dte})")
+                            elif self._ic_idx_eligible and not self._ic_stk_eligible:
+                                print(f"   🦅 IC: Index expiry only — stock IC scan will be SKIPPED (saving bandwidth)")
                         except Exception as dte_err:
                             print(f"   ⚠️ IC DTE pre-check failed: {dte_err} — will skip IC scan")
-                            self._ic_eligible_today = False
+                            self._ic_idx_eligible = False
+                            self._ic_stk_eligible = False
                     
                     # Only run IC scan if today has eligible expiry AND within time window
                     now_time = datetime.now().time()
                     ic_earliest = datetime.strptime(IRON_CONDOR_CONFIG.get('earliest_entry', '10:30'), '%H:%M').time()
                     ic_cutoff = datetime.strptime(IRON_CONDOR_CONFIG.get('no_entry_after', '12:30'), '%H:%M').time()
+                    _any_ic_eligible = self._ic_idx_eligible or self._ic_stk_eligible
                     
-                    if self._ic_eligible_today and ic_earliest <= now_time <= ic_cutoff:
+                    if _any_ic_eligible and ic_earliest <= now_time <= ic_cutoff:
                         from options_trader import get_options_trader
                         _ot = get_options_trader(
                             kite=self.tools.kite,
@@ -6829,7 +6931,8 @@ class AutonomousTrader:
                         
                         # --- STOCK IC SCAN (SOPHISTICATED MULTI-FACTOR SCORING) ---
                         # Score each F&O stock on 7 IC-quality factors, rank, and pick best
-                        if IRON_CONDOR_CONFIG.get('scan_rejected_stocks', True):
+                        # ONLY run if stocks have DTE=0 (expiry day), not on index-only expiry days.
+                        if IRON_CONDOR_CONFIG.get('scan_rejected_stocks', True) and self._ic_stk_eligible:
                             stock_ic_candidates = []
                             for symbol, data in sorted_data:
                                 if not isinstance(data, dict) or 'ltp' not in data:

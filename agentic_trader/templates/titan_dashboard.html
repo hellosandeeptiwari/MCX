@@ -145,6 +145,59 @@ a{color:var(--blue);text-decoration:none}
 .btn-stop:hover{background:rgba(239,68,68,.15);color:var(--red);border-color:var(--red)}
 .btn-restart:hover{background:rgba(245,158,11,.15);color:var(--amber);border-color:var(--amber)}
 .btn-ctrl.loading{pointer-events:none;opacity:.6}
+
+/* Exit button */
+.btn-exit{
+  padding:3px 10px;border-radius:5px;font-size:.7rem;font-weight:600;
+  border:1px solid rgba(239,68,68,.4);cursor:pointer;transition:all .15s;
+  background:rgba(239,68,68,.08);color:#f87171;white-space:nowrap;
+}
+.btn-exit:hover{background:rgba(239,68,68,.25);border-color:#ef4444;color:#fca5a5}
+.btn-exit:disabled{opacity:.4;cursor:not-allowed}
+.btn-exit.loading{pointer-events:none;opacity:.5}
+
+/* Exit confirmation modal */
+.exit-modal-overlay{
+  display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,.65);z-index:9999;
+  align-items:center;justify-content:center;
+}
+.exit-modal-overlay.active{display:flex}
+.exit-modal{
+  background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:24px 28px;min-width:340px;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,.5);
+}
+.exit-modal h3{margin:0 0 12px;color:#f87171;font-size:1rem}
+.exit-modal p{margin:6px 0;color:var(--txt2);font-size:.85rem;line-height:1.5}
+.exit-modal .exit-details{
+  background:var(--bg3);border-radius:8px;padding:12px 16px;margin:12px 0;
+  font-family:'JetBrains Mono',monospace;font-size:.78rem;
+}
+.exit-modal .exit-details span{color:var(--txt3)}
+.exit-modal .btn-row{display:flex;gap:10px;margin-top:16px;justify-content:flex-end}
+.exit-modal .btn-cancel{
+  padding:8px 18px;border-radius:6px;font-size:.8rem;font-weight:600;
+  border:1px solid var(--border);cursor:pointer;
+  background:var(--bg3);color:var(--txt2);
+}
+.exit-modal .btn-cancel:hover{border-color:var(--txt3);color:var(--txt1)}
+.exit-modal .btn-confirm-exit{
+  padding:8px 18px;border-radius:6px;font-size:.8rem;font-weight:600;
+  border:1px solid #ef4444;cursor:pointer;
+  background:rgba(239,68,68,.15);color:#f87171;
+}
+.exit-modal .btn-confirm-exit:hover{background:rgba(239,68,68,.3);color:#fca5a5}
+
+/* Exit toast notification */
+.exit-toast{
+  position:fixed;top:20px;right:20px;z-index:10000;
+  padding:12px 20px;border-radius:8px;font-size:.82rem;font-weight:600;
+  box-shadow:0 8px 30px rgba(0,0,0,.4);transition:all .3s;
+  opacity:0;transform:translateY(-10px);
+}
+.exit-toast.show{opacity:1;transform:translateY(0)}
+.exit-toast.success{background:rgba(16,185,129,.9);color:#fff;border:1px solid #10b981}
+.exit-toast.error{background:rgba(239,68,68,.9);color:#fff;border:1px solid #ef4444}
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -297,7 +350,7 @@ a{color:var(--blue);text-decoration:none}
           <tr>
             <th>Symbol</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
             <th>Entry</th><th>SL</th><th>Target</th>
-            <th>Setup</th><th>Score</th><th>P&L</th>
+            <th>Setup</th><th>Score</th><th>P&L</th><th>Action</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -705,7 +758,7 @@ async function loadPositions() {
     $('#pos-count').textContent = `${positions.length} open`;
 
     if(!positions.length) {
-      tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
     } else {
       tbody.innerHTML = positions.map(p => {
         const sym = (p.symbol || p.option_symbol || '').replace('NFO:','').replace('NSE:','');
@@ -779,6 +832,7 @@ async function loadPositions() {
           <td>${setupLabel}</td>
           <td>${scoreHtml}</td>
           <td class="${pnlClass}">${pnlStr}</td>
+          <td><button class="btn-exit" onclick="confirmExit('${p.symbol || p.option_symbol}', '${sym}', ${ltp || entry})" title="Exit at market">✕ Exit</button></td>
         </tr>`;
       }).join('');
     }
@@ -969,5 +1023,99 @@ setInterval(loadOverview, 30000);  // Refresh overview every 30s
 setInterval(loadAlerts, 60000);    // Refresh alerts every 60s
 
 </script>
+
+<!-- ═══════════ EXIT CONFIRMATION MODAL ═══════════ -->
+<div class="exit-modal-overlay" id="exit-modal">
+  <div class="exit-modal">
+    <h3>⚠️ Confirm Manual Exit</h3>
+    <p>Are you sure you want to exit this position at market price?</p>
+    <div class="exit-details">
+      <div>Symbol: <strong id="exit-sym"></strong></div>
+      <div><span>Approx Price:</span> <strong id="exit-price"></strong></div>
+    </div>
+    <p style="font-size:.75rem;color:var(--txt3)">This will place a market exit and log as MANUAL_DASHBOARD in trade ledger.</p>
+    <div class="btn-row">
+      <button class="btn-cancel" onclick="closeExitModal()">Cancel</button>
+      <button class="btn-confirm-exit" id="btn-confirm-exit" onclick="executeExit()">🗑️ Confirm Exit</button>
+    </div>
+  </div>
+</div>
+
+<!-- Exit toast -->
+<div class="exit-toast" id="exit-toast"></div>
+
+<script>
+// ═══════════ EXIT POSITION LOGIC ═══════════
+let _exitSymbol = '';
+let _exitDisplay = '';
+
+function confirmExit(fullSymbol, displayName, approxPrice) {
+  _exitSymbol = fullSymbol;
+  _exitDisplay = displayName;
+  document.getElementById('exit-sym').textContent = displayName;
+  document.getElementById('exit-price').textContent = '₹' + (approxPrice || 0).toFixed(2);
+  document.getElementById('exit-modal').classList.add('active');
+}
+
+function closeExitModal() {
+  document.getElementById('exit-modal').classList.remove('active');
+  _exitSymbol = '';
+}
+
+async function executeExit() {
+  const btn = document.getElementById('btn-confirm-exit');
+  btn.disabled = true;
+  btn.textContent = '⏳ Exiting...';
+
+  try {
+    const resp = await fetch('/api/exit_position', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ symbol: _exitSymbol }),
+    });
+    const data = await resp.json();
+
+    if(data.ok) {
+      showExitToast('success', data.msg || `Exited ${_exitDisplay}`);
+      closeExitModal();
+      // Refresh positions immediately
+      loadPositions();
+      // Also refresh overview (P&L totals)
+      loadOverview();
+    } else {
+      showExitToast('error', data.msg || 'Exit failed');
+    }
+  } catch(e) {
+    showExitToast('error', 'Network error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🗑️ Confirm Exit';
+  }
+}
+
+function showExitToast(type, msg) {
+  const toast = document.getElementById('exit-toast');
+  toast.className = 'exit-toast ' + type;
+  toast.textContent = msg;
+  // Trigger show
+  requestAnimationFrame(() => toast.classList.add('show'));
+  // Auto-hide after 5s
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => {
+    toast.classList.remove('show');
+  }, 5000);
+}
+
+// Close modal on overlay click
+document.getElementById('exit-modal').addEventListener('click', function(e) {
+  if(e.target === this) closeExitModal();
+});
+
+// Close modal on Escape key
+document.addEventListener('keydown', function(e) {
+  if(e.key === 'Escape') closeExitModal();
+});
+</script>
+
 </body>
 </html>

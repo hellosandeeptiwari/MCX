@@ -129,6 +129,17 @@ CREATE TABLE IF NOT EXISTS scan_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_sd_date   ON scan_decisions(date);
 CREATE INDEX IF NOT EXISTS idx_sd_sym    ON scan_decisions(date, symbol);
+
+-- ── live_pnl (dashboard bridge: bot writes LTP + unrealized P&L each cycle) ──
+CREATE TABLE IF NOT EXISTS live_pnl (
+    symbol          TEXT    NOT NULL,
+    date            TEXT    NOT NULL,
+    ltp             REAL    DEFAULT 0.0,
+    unrealized_pnl  REAL    DEFAULT 0.0,
+    total_unrealized REAL   DEFAULT 0.0,
+    last_updated    TEXT,
+    PRIMARY KEY (symbol, date)
+);
 """
 
 
@@ -244,6 +255,57 @@ class TitanStateDB:
             pnl = ds['realized_pnl'] if ds else 0.0
             cap = ds['paper_capital'] if ds else 0.0
         return positions, pnl, cap
+
+    # ------------------------------------------------------------------
+    #  1b. LIVE P&L  (bot -> dashboard bridge, updated each scan cycle)
+    # ------------------------------------------------------------------
+
+    def save_live_pnl(self, snapshots: list, total_unrealized: float = 0.0):
+        """Save per-position LTP + unrealized P&L for dashboard consumption.
+
+        Args:
+            snapshots: list of {symbol, ltp, unrealized_pnl}
+            total_unrealized: portfolio-level sum
+        """
+        today = self._today()
+        now = self._now_iso()
+        with self._lock:
+            c = self._conn
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute("DELETE FROM live_pnl WHERE date = ?", (today,))
+                for s in snapshots:
+                    c.execute(
+                        """INSERT INTO live_pnl (symbol, date, ltp, unrealized_pnl,
+                           total_unrealized, last_updated)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (s['symbol'], today, s.get('ltp', 0),
+                         s.get('unrealized_pnl', 0), total_unrealized, now),
+                    )
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def load_live_pnl(self, date_str: str = None) -> dict:
+        """Load live P&L snapshots. Returns {symbol: {ltp, unrealized_pnl}, '_total': float}."""
+        d = date_str or self._today()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT symbol, ltp, unrealized_pnl, total_unrealized, last_updated "
+                "FROM live_pnl WHERE date = ?", (d,)
+            ).fetchall()
+        result = {}
+        for r in rows:
+            result[r['symbol']] = {
+                'ltp': r['ltp'],
+                'unrealized_pnl': r['unrealized_pnl'],
+                'last_updated': r['last_updated'],
+            }
+        if rows:
+            result['_total'] = rows[0]['total_unrealized']
+            result['_last_updated'] = rows[0]['last_updated']
+        return result
 
     # ==================================================================
     #  2. EXIT STATES  (replaces exit_manager_state.json)

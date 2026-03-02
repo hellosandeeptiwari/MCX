@@ -280,35 +280,32 @@ GMM_CONTRARIAN = {
     "score_tier": "standard",          # Standard risk tier, not premium
 }
 
-# === TEST_GMM: Regime Divergence Strategy ===
-# Fires when UP and DOWN GMM models DIVERGE: one sees anomaly, the other doesn't.
-# The cross-regime disagreement IS the directional signal.
+# === TEST_GMM: Flag-Confirmed Regime Divergence Strategy ===
+# Fires when one GMM model flags AND the other is clean.
+# Direction follows the FLAGGING model (not contrarian):
 #
-# SEMANTICS (anomaly-based, from model training):
-#   HIGH down_score = DOWN regime anomaly = hidden UP/bounce risk → BULLISH
-#   HIGH up_score   = UP regime anomaly   = hidden crash risk    → BEARISH
-#   LOW score = no anomaly = neutral (NO directional info)
+#   down_flag=True + down_score HIGH + up clean → confirmed downside → BUY PUT
+#   up_flag=True   + up_score HIGH + down clean → confirmed upside   → BUY CALL
 #
-# BUY CALL: DOWN model flags (bullish anomaly) + UP model clean (no crash risk)
-# BUY PUT:  UP model flags (bearish anomaly) + DOWN model clean (no bounce risk)
+# The flag IS the directional confirmation. No contrarian flip.
 #
 # Unique vs other strategies:
 #   GMM_CONTRARIAN = single high DR + XGB=FLAT → flip direction
 #   GMM_SNIPER     = both DRs clean + high conviction → amplified bet
-#   TEST_GMM       = cross-regime DIVERGENCE + XGB agrees → directional bet
+#   TEST_GMM       = flag-confirmed divergence → directional bet WITH the flag
 #
-# Model quality: DOWN AUROC=0.62 (decent, CALL side stronger)
-#                UP   AUROC=0.56 (weaker, PUT side needs higher bar)
+# Model quality: DOWN AUROC=0.62 (decent, PUT side stronger)
+#                UP   AUROC=0.56 (weaker, CALL side needs higher bar)
 TEST_GMM = {
     "enabled": True,
-    # CALL side (uses DOWN model, AUROC=0.62 — decent signal)
-    "call_min_down_score": 0.25,         # DOWN regime must show strong anomaly (raised from 0.20)
-    "call_max_up_score": 0.10,           # UP regime must be very clean (tightened from 0.14)
-    # PUT side (uses UP model, AUROC=0.56 — weaker, needs tighter bar)
-    "put_min_up_score": 0.22,            # UP regime must show strong anomaly (raised from 0.18)
-    "put_max_down_score": 0.10,          # DOWN regime must be very clean (tightened from 0.14)
+    # DOWN model signal: down_flag confirms → BUY PUT
+    "down_min_score": 0.25,              # DOWN model must show strong signal
+    "down_max_opposite": 0.10,           # UP model must be clean (no conflicting signal)
+    # UP model signal: up_flag confirms → BUY CALL
+    "up_min_score": 0.22,                # UP model must show strong signal
+    "up_max_opposite": 0.10,             # DOWN model must be clean
     # Divergence quality
-    "min_divergence_gap": 0.12,          # |high_score - low_score| minimum (raised from 0.10 — tighter quality filter)
+    "min_divergence_gap": 0.20,          # |signaling_score - clean_score| minimum — strict filter
     # FLAG-based conviction gates (model-calibrated thresholds)
     "require_signaling_flag": True,      # Signaling regime must FIRE its own anomaly flag
     "require_clean_no_flag": True,       # Clean regime must NOT fire its flag (no conflicting signal)

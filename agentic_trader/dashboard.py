@@ -184,6 +184,143 @@ def bot_restart():
         return jsonify({'ok': False, 'action': 'restart', 'msg': str(e)}), 500
 
 
+# ── Manual position exit (dashboard → signal file → bot) ─────
+
+MANUAL_EXIT_FILE = Path(__file__).parent / 'manual_exit_requests.json'
+
+@app.route('/api/exit_position', methods=['POST'])
+def exit_position():
+    """Exit a position at market price via dashboard.
+    
+    Flow:
+    1. Find position in state_db
+    2. Get current LTP from live_pnl bridge
+    3. Calculate realized P&L
+    4. Write signal file for bot to process (in-memory cleanup + LIVE order)
+    5. Remove from state_db immediately (so UI refreshes)
+    6. Log EXIT in trade_ledger
+    """
+    try:
+        data = request.json or {}
+        symbol = data.get('symbol', '').strip()
+        if not symbol:
+            return jsonify({'ok': False, 'msg': 'Missing symbol'}), 400
+
+        db = get_state_db()
+        today = _today()
+        positions, realized_pnl, paper_capital = db.load_active_trades(today)
+
+        # Find the matching position
+        target = None
+        remaining = []
+        for pos in positions:
+            pos_sym = pos.get('symbol') or pos.get('option_symbol') or ''
+            if pos_sym == symbol and pos.get('status', 'OPEN') == 'OPEN':
+                target = pos
+            else:
+                remaining.append(pos)
+
+        if not target:
+            return jsonify({'ok': False, 'msg': f'Position {symbol} not found or already closed'}), 404
+
+        # Get current LTP from live_pnl bridge
+        live = db.load_live_pnl() or {}
+        lp = live.get(symbol) or live.get(symbol.replace('NFO:', ''))
+        ltp = lp['ltp'] if lp else 0
+
+        # Calculate P&L
+        entry_price = target.get('avg_price') or target.get('entry_price') or 0
+        qty = abs(target.get('quantity', 0))
+        direction = target.get('direction') or target.get('side', 'BUY')
+
+        if ltp > 0 and entry_price > 0:
+            if direction in ('BUY', 'LONG'):
+                pnl = (ltp - entry_price) * qty
+            else:
+                pnl = (entry_price - ltp) * qty
+        else:
+            pnl = target.get('unrealized_pnl', 0)
+
+        exit_price = ltp if ltp > 0 else entry_price
+
+        # 1️⃣  Write signal file for bot (handles in-memory + LIVE order placement)
+        signal = {
+            'symbol': symbol,
+            'exit_price': round(exit_price, 2),
+            'pnl': round(pnl, 2),
+            'exit_time': datetime.now().isoformat(),
+            'exit_type': 'MANUAL_DASHBOARD',
+            'direction': direction,
+            'quantity': qty,
+            'entry_price': round(entry_price, 2),
+            'trade': target,  # full trade dict for bot-side processing
+        }
+        # Append to signal file (thread-safe via atomic write)
+        pending = []
+        if MANUAL_EXIT_FILE.exists():
+            try:
+                pending = json.loads(MANUAL_EXIT_FILE.read_text())
+            except Exception:
+                pending = []
+        pending.append(signal)
+        MANUAL_EXIT_FILE.write_text(json.dumps(pending, indent=2, default=str))
+
+        # 2️⃣  Remove from state_db immediately (UI refreshes)
+        new_realized = realized_pnl + pnl
+        db.save_active_trades(remaining, new_realized, paper_capital)
+
+        # 3️⃣  Log EXIT in trade_ledger
+        try:
+            ledger = get_trade_ledger()
+            import re
+            _underlying = target.get('underlying', '')
+            if not _underlying:
+                m = re.match(r'(?:NFO:)?([A-Z]+)\d', symbol.replace('NFO:', ''))
+                _underlying = f"NSE:{m.group(1)}" if m else symbol
+            _hold_mins = 0
+            try:
+                _et = target.get('timestamp', '')
+                if _et:
+                    _hold_mins = int((datetime.now() - datetime.fromisoformat(_et)).total_seconds() / 60)
+            except Exception:
+                pass
+            _pnl_pct = (pnl / (entry_price * qty) * 100) if entry_price > 0 and qty > 0 else 0
+            ledger.log_exit(
+                symbol=symbol,
+                underlying=_underlying,
+                direction=direction,
+                source=target.get('setup_type', target.get('strategy_type', '')),
+                sector=target.get('sector', ''),
+                exit_type='MANUAL_DASHBOARD',
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=qty,
+                pnl=pnl,
+                pnl_pct=_pnl_pct,
+                smart_score=target.get('smart_score', 0),
+                final_score=target.get('entry_score', 0),
+                dr_score=target.get('dr_score', 0),
+                exit_reason='Manual exit from dashboard UI',
+                hold_minutes=_hold_mins,
+                entry_time=target.get('timestamp', ''),
+            )
+        except Exception as e:
+            print(f"⚠️ Trade ledger log failed for manual exit: {e}")
+
+        return jsonify({
+            'ok': True,
+            'msg': f'Exited {symbol} @ ₹{exit_price:.2f} | P&L: ₹{pnl:+,.2f}',
+            'symbol': symbol,
+            'exit_price': round(exit_price, 2),
+            'pnl': round(pnl, 2),
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'ok': False, 'msg': f'Exit failed: {str(e)}'}), 500
+
+
 # ── Helpers: enrich positions with exit-state LTP & unrealized P&L ──
 
 def _enrich_positions(positions: list, db) -> list:
