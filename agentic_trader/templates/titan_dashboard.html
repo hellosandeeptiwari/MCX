@@ -297,7 +297,7 @@ a{color:var(--blue);text-decoration:none}
           <tr>
             <th>Symbol</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
             <th>Entry</th><th>SL</th><th>Target</th>
-            <th>Strategy</th><th>P&L (est)</th><th>Status</th>
+            <th>Setup</th><th>Score</th><th>P&L</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -719,7 +719,6 @@ async function loadPositions() {
         const maxLoss = p.max_loss || 0;
         const premium = p.total_premium || (entry * qty);
         const ltp = p.ltp || 0;
-        // Use server-computed unrealized P&L (from exit_state premium_history)
         const upnl = p.unrealized_pnl || 0;
         let pnlStr;
         if(ltp > 0) {
@@ -730,6 +729,45 @@ async function loadPositions() {
           pnlStr = 'Awaiting LTP';
         }
         const pnlClass = upnl > 0 ? 'val-green' : upnl < 0 ? 'val-red' : '';
+
+        // Setup type with human-readable labels
+        const setup = p.setup_type || '';
+        const setupMap = {
+          'GMM_SNIPER': '🎯 Sniper',
+          'ML_OVERRIDE_WGMM': '🔄 ML+GMM',
+          'ALL_AGREE': '🧬 All-Agree',
+          'MODEL_TRACKER': '🧠 Score',
+          'ORB_BREAKOUT': '📊 ORB',
+          'VWAP_TREND': '📈 VWAP',
+          'VWAP_GRIND': '📈 VWAP-G',
+          'WATCHER': '⚡ Watcher',
+          'CONTRARIAN': '🔄 Contra',
+          'TEST_GMM': '🧪 GMM',
+          'TEST_XGB': '🧪 XGB',
+          'GPT': '🤖 GPT',
+          'MANUAL': '🤖 GPT',
+          '': '🤖 GPT'
+        };
+        const setupLabel = setupMap[setup] || setup || '🤖 GPT';
+
+        // Score display
+        const score = p.smart_score || p.entry_score || p.p_score || null;
+        const mlDir = p.ml_scored_direction || p.ml_direction || '';
+        const dr = p.dr_score;
+        let scoreHtml = '';
+        if(score !== null && score !== undefined) {
+          scoreHtml = `<strong>${score.toFixed?.(0) || score}</strong>`;
+        }
+        if(mlDir) {
+          const mlColor = mlDir === 'UP' ? '#4ade80' : mlDir === 'DOWN' ? '#f87171' : '#888';
+          scoreHtml += ` <span style="font-size:.65rem;color:${mlColor}">${mlDir}</span>`;
+        }
+        if(dr !== null && dr !== undefined) {
+          const drColor = dr < 0.08 ? '#4ade80' : dr < 0.15 ? '#fbbf24' : '#f87171';
+          scoreHtml += `<br><span style="font-size:.6rem;color:${drColor}">DR:${(dr*100).toFixed(1)}%</span>`;
+        }
+        if(!scoreHtml) scoreHtml = '—';
+
         return `<tr>
           <td><strong>${sym}</strong>${p.option_type ? ` <span class="badge" style="font-size:.65rem">${p.strike} ${p.option_type}</span>` : ''}</td>
           <td>${underlying}</td>
@@ -738,9 +776,9 @@ async function loadPositions() {
           <td>${fmt(entry)}</td>
           <td>${sl ? fmt(sl) : '—'}</td>
           <td>${target ? fmt(target) : '—'}</td>
-          <td>${p.strategy_type || '—'}</td>
+          <td>${setupLabel}</td>
+          <td>${scoreHtml}</td>
           <td class="${pnlClass}">${pnlStr}</td>
-          <td>${p.status || 'ACTIVE'}</td>
         </tr>`;
       }).join('');
     }

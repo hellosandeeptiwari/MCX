@@ -4525,10 +4525,22 @@ class AutonomousTrader:
                 _type_tag = '🧬ALL3'
             elif _setup == 'MODEL_TRACKER':
                 _type_tag = '🧠SCORE'
+            elif _setup == 'ORB_BREAKOUT':
+                _type_tag = '📊ORB'
+            elif _setup.startswith('VWAP'):
+                _type_tag = '📈VWAP'
+            elif _setup == 'WATCHER':
+                _type_tag = '⚡WATCH'
+            elif _setup == 'CONTRARIAN':
+                _type_tag = '🔄CONTR'
+            elif _setup == 'TEST_GMM':
+                _type_tag = '🧪GMM'
+            elif _setup == 'TEST_XGB':
+                _type_tag = '🧪XGB'
             elif _setup in ('', 'MANUAL', 'GPT') or not _setup:
                 _type_tag = '🤖GPT'
             else:
-                _type_tag = _setup[:8]
+                _type_tag = _setup[:10]
             
             # Calculate current P&L
             if side == 'BUY':
