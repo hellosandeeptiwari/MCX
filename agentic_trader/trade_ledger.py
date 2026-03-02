@@ -83,6 +83,7 @@ class TradeLedger:
                   is_sniper: bool = False,
                   extra: Optional[Dict] = None):
         """Log a new trade entry."""
+        _r = lambda v, n=2: round(v, n) if v is not None else 0
         record = {
             'event': 'ENTRY',
             'ts': datetime.now().isoformat(),
@@ -91,20 +92,20 @@ class TradeLedger:
             'direction': direction,
             'source': source,
             # Scores
-            'smart_score': round(smart_score, 1),
-            'pre_score': round(pre_score, 1),
-            'final_score': round(final_score, 1),
+            'smart_score': _r(smart_score, 1),
+            'pre_score': _r(pre_score, 1),
+            'final_score': _r(final_score, 1),
             'score_tier': score_tier,
             # DR / GMM
-            'dr_score': round(dr_score, 4),
+            'dr_score': _r(dr_score, 4),
             'dr_flag': dr_flag,
             'up_flag': up_flag,
             'down_flag': down_flag,
-            'gate_prob': round(gate_prob, 3),
+            'gate_prob': _r(gate_prob, 3),
             'gmm_action': gmm_action,
             # ML
             'ml_direction': ml_direction,
-            'ml_move_prob': round(ml_move_prob, 3),
+            'ml_move_prob': _r(ml_move_prob, 3),
             'ml_confidence': ml_confidence,
             'xgb_disagrees': xgb_disagrees,
             # Context
@@ -118,14 +119,14 @@ class TradeLedger:
             'option_type': option_type,
             'expiry': expiry,
             # Sizing
-            'entry_price': round(entry_price, 2),
+            'entry_price': _r(entry_price, 2),
             'quantity': quantity,
             'lots': lots,
-            'stop_loss': round(stop_loss, 2),
-            'target': round(target, 2),
-            'total_premium': round(total_premium, 2),
-            'delta': round(delta, 4),
-            'iv': round(iv, 4),
+            'stop_loss': _r(stop_loss, 2),
+            'target': _r(target, 2),
+            'total_premium': _r(total_premium, 2),
+            'delta': _r(delta, 4),
+            'iv': _r(iv, 4),
             # IDs
             'rationale': rationale,
             'order_id': order_id,
