@@ -184,6 +184,32 @@ def bot_restart():
         return jsonify({'ok': False, 'action': 'restart', 'msg': str(e)}), 500
 
 
+# ── Helpers: enrich positions with exit-state LTP & unrealized P&L ──
+
+def _enrich_positions(positions: list, db) -> list:
+    """Merge live P&L data into each position dict so the dashboard
+    can display current LTP, unrealized P&L, underlying symbol, etc."""
+    import re
+
+    # Primary source: live_pnl table (updated every scan cycle by the bot)
+    live = db.load_live_pnl() or {}
+
+    for pos in positions:
+        sym = pos.get('symbol') or pos.get('option_symbol') or ''
+        # Derive underlying from NFO symbol  e.g. NFO:DLF26MAR590PE -> DLF
+        if not pos.get('underlying'):
+            m = re.match(r'(?:NFO:)?([A-Z]+)\d', sym.replace('NFO:', ''))
+            pos['underlying'] = f"NSE:{m.group(1)}" if m else ''
+
+        # Merge live LTP & unrealized P&L from bot's scan cycle
+        lp = live.get(sym) or live.get(sym.replace('NFO:', ''))
+        if lp:
+            pos['ltp'] = lp['ltp']
+            pos['unrealized_pnl'] = lp['unrealized_pnl']
+            pos['ltp_updated'] = lp.get('last_updated', '')
+    return positions
+
+
 # ── System status ────────────────────────────────────────────
 @app.route('/api/status')
 def get_status():
@@ -191,6 +217,10 @@ def get_status():
     today = _today()
 
     positions, realized_pnl, paper_capital = db.load_active_trades(today)
+    positions = _enrich_positions(positions, db)
+
+    total_unrealized = sum(p.get('unrealized_pnl', 0) for p in positions)
+
     risk_state = db.load_risk_state(today) or {}
     data_health = db.load_data_health(today) or {}
 
@@ -215,6 +245,7 @@ def get_status():
         'service_uptime': svc_uptime,
         'capital': paper_capital,
         'realized_pnl': realized_pnl,
+        'unrealized_pnl': total_unrealized,
         'open_positions': len(positions),
         'positions': positions[:50],
         'risk_state': risk_state,

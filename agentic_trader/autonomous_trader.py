@@ -454,50 +454,66 @@ class AutonomousTrader:
         except Exception as _5m_chk_e:
             print(f"  ⚠ 5-min freshness check: {_5m_chk_e}")
         
-        # === AUTO-REFRESH STALE OI DATA ===
-        # If futures OI parquets are older than last trading day, refresh once.
+        # === AUTO-REFRESH STALE OI DATA (runs ONCE per calendar day) ===
         try:
             import pandas as _pd_oi_chk
-            _oi_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'futures_oi')
-            _sample_files = [f for f in os.listdir(_oi_dir) if f.endswith('_futures_oi.parquet')][:3]
-            _oi_stale = False
-
-            # Compute last trading day (skip weekends; holidays are rare enough to ignore)
             from datetime import timedelta as _td_oi
-            _today_oi = _pd_oi_chk.Timestamp.now().normalize()
-            _last_trading_day = _today_oi
-            if _last_trading_day.weekday() == 0:    # Monday → Friday
-                _last_trading_day -= _td_oi(days=3)
-            elif _last_trading_day.weekday() == 6:  # Sunday → Friday
-                _last_trading_day -= _td_oi(days=2)
-            elif _last_trading_day.weekday() == 5:  # Saturday → Friday
-                _last_trading_day -= _td_oi(days=1)
-            # If before 9:30 AM on a weekday, use previous trading day
-            if _pd_oi_chk.Timestamp.now().hour < 10 and _today_oi.weekday() < 5:
-                _last_trading_day -= _td_oi(days=1)
-                if _last_trading_day.weekday() >= 5:  # landed on weekend
-                    _last_trading_day -= _td_oi(days=(_last_trading_day.weekday() - 4))
+            _oi_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_models', 'data', 'futures_oi')
+            _oi_marker = os.path.join(_oi_dir, f'.oi_backfill_done_{_pd_oi_chk.Timestamp.now().strftime("%Y-%m-%d")}')
 
-            if not _sample_files:
-                _oi_stale = True
+            if os.path.exists(_oi_marker):
+                # Already ran backfill today — skip entirely
+                print(f"  ✅ Futures OI data: backfill already done today (marker exists)")
             else:
-                for _sf in _sample_files:
-                    _sdf = _pd_oi_chk.read_parquet(os.path.join(_oi_dir, _sf))
-                    _last = _pd_oi_chk.Timestamp(_sdf['date'].max()).normalize()
-                    if _last < _last_trading_day:
-                        _oi_stale = True
-                        break
-            if _oi_stale:
-                _gap = (_pd_oi_chk.Timestamp.now() - _last).days if '_last' in dir() else '?'
-                print(f"  ⚠️ Futures OI data stale (last={_last.date() if '_last' in dir() else '?'}, need≥{_last_trading_day.date()}) — refreshing...")
-                from dhan_futures_oi import FuturesOIFetcher
-                _oi_fetcher = FuturesOIFetcher()
-                if _oi_fetcher.ready:
-                    _oi_fetcher.backfill_all(months_back=1)
+                _sample_files = [f for f in os.listdir(_oi_dir) if f.endswith('_futures_oi.parquet')][:3]
+                _oi_stale = False
+
+                # Compute last trading day (skip weekends)
+                _today_oi = _pd_oi_chk.Timestamp.now().normalize()
+                _last_trading_day = _today_oi
+                if _last_trading_day.weekday() == 0:    # Monday → Friday
+                    _last_trading_day -= _td_oi(days=3)
+                elif _last_trading_day.weekday() == 6:  # Sunday → Friday
+                    _last_trading_day -= _td_oi(days=2)
+                elif _last_trading_day.weekday() == 5:  # Saturday → Friday
+                    _last_trading_day -= _td_oi(days=1)
+                # If before 10 AM on a weekday, use previous trading day
+                if _pd_oi_chk.Timestamp.now().hour < 10 and _today_oi.weekday() < 5:
+                    _last_trading_day -= _td_oi(days=1)
+                    if _last_trading_day.weekday() >= 5:
+                        _last_trading_day -= _td_oi(days=(_last_trading_day.weekday() - 4))
+
+                if not _sample_files:
+                    _oi_stale = True
                 else:
-                    print("  ⚠️ DhanHQ not ready — OI refresh skipped (check DHAN_ACCESS_TOKEN in .env)")
-            else:
-                print(f"  ✅ Futures OI data: fresh (last={_last.date() if '_last' in dir() else '?'}, need≥{_last_trading_day.date()})")
+                    for _sf in _sample_files:
+                        _sdf = _pd_oi_chk.read_parquet(os.path.join(_oi_dir, _sf))
+                        _last = _pd_oi_chk.Timestamp(_sdf['date'].max()).normalize()
+                        if _last < _last_trading_day:
+                            _oi_stale = True
+                            break
+                if _oi_stale:
+                    print(f"  ⚠️ Futures OI data stale (last={_last.date() if '_last' in dir() else '?'}, need≥{_last_trading_day.date()}) — refreshing (once)...")
+                    from dhan_futures_oi import FuturesOIFetcher
+                    _oi_fetcher = FuturesOIFetcher()
+                    if _oi_fetcher.ready:
+                        _oi_fetcher.backfill_all(months_back=1)
+                    else:
+                        print("  ⚠️ DhanHQ not ready — OI refresh skipped")
+                    # Write marker regardless — don't retry on every restart
+                    with open(_oi_marker, 'w') as _mf:
+                        _mf.write(f"done at {_pd_oi_chk.Timestamp.now().isoformat()}\n")
+                    # Clean up old markers (keep only today's)
+                    for _old in os.listdir(_oi_dir):
+                        if _old.startswith('.oi_backfill_done_') and _old != os.path.basename(_oi_marker):
+                            try: os.remove(os.path.join(_oi_dir, _old))
+                            except: pass
+                    print(f"  ✅ OI backfill complete — marker written (won't repeat today)")
+                else:
+                    print(f"  ✅ Futures OI data: fresh (last={_last.date() if '_last' in dir() else '?'}, need≥{_last_trading_day.date()})")
+                    # Data is fresh, write marker so we skip check on restart
+                    with open(_oi_marker, 'w') as _mf:
+                        _mf.write(f"fresh at {_pd_oi_chk.Timestamp.now().isoformat()}\n")
         except Exception as _oi_chk_e:
             print(f"  ⚠ OI freshness check: {_oi_chk_e}")
         
@@ -4575,6 +4591,48 @@ class AutonomousTrader:
             print(f"📊 TOTAL UNREALIZED P&L: ₹{total_pnl:+,.0f} | Capital: ₹{self.capital:,.0f} | Daily P&L: ₹{self.daily_pnl:+,.0f}")
             # Print exit manager status
             print(self.exit_manager.get_status_summary())
+
+        # ── Always persist live P&L snapshot for dashboard (not gated by show_status) ──
+        if active_trades and quotes:
+            try:
+                live_snaps = []
+                _total_upnl = 0.0
+                for t in active_trades:
+                    if t.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    sym = t['symbol']
+                    ltp = 0.0
+                    upnl = 0.0
+                    if t.get('is_credit_spread'):
+                        sold_sym = t.get('sold_symbol', '')
+                        hedge_sym = t.get('hedge_symbol', '')
+                        s_ltp = quotes.get(sold_sym, {}).get('last_price', 0)
+                        h_ltp = quotes.get(hedge_sym, {}).get('last_price', 0)
+                        ltp = s_ltp - h_ltp
+                        upnl = (t.get('net_credit', 0) - ltp) * t['quantity']
+                    elif t.get('is_debit_spread'):
+                        b_ltp = quotes.get(t.get('buy_symbol', ''), {}).get('last_price', 0)
+                        sl_ltp = quotes.get(t.get('sell_symbol', ''), {}).get('last_price', 0)
+                        ltp = b_ltp - sl_ltp
+                        upnl = (ltp - t.get('net_debit', 0)) * t['quantity']
+                    elif t.get('is_iron_condor'):
+                        s_ce = quotes.get(t.get('sold_ce_symbol', ''), {}).get('last_price', 0)
+                        h_ce = quotes.get(t.get('hedge_ce_symbol', ''), {}).get('last_price', 0)
+                        s_pe = quotes.get(t.get('sold_pe_symbol', ''), {}).get('last_price', 0)
+                        h_pe = quotes.get(t.get('hedge_pe_symbol', ''), {}).get('last_price', 0)
+                        ltp = (s_ce - h_ce) + (s_pe - h_pe)
+                        upnl = (t.get('total_credit', 0) - ltp) * t['quantity']
+                    elif sym in quotes:
+                        ltp = quotes[sym]['last_price']
+                        if t['side'] == 'BUY':
+                            upnl = (ltp - t['avg_price']) * t['quantity']
+                        else:
+                            upnl = (t['avg_price'] - ltp) * t['quantity']
+                    _total_upnl += upnl
+                    live_snaps.append({'symbol': sym, 'ltp': round(ltp, 2), 'unrealized_pnl': round(upnl, 2)})
+                get_state_db().save_live_pnl(live_snaps, round(_total_upnl, 2))
+            except Exception as e:
+                pass  # Silent — don't spam logs with dashboard bridge errors
     
     def reset_agent(self):
         """Reset agent to clear conversation history - but KEEP positions"""

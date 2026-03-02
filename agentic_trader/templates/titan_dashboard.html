@@ -218,6 +218,10 @@ a{color:var(--blue);text-decoration:none}
       <div class="value" id="kpi-pnl">—</div>
     </div>
     <div class="card">
+      <div class="label">Unrealized P&L</div>
+      <div class="value" id="kpi-upnl">—</div>
+    </div>
+    <div class="card">
       <div class="label">Open Positions</div>
       <div class="value val-blue" id="kpi-positions">—</div>
     </div>
@@ -291,8 +295,9 @@ a{color:var(--blue);text-decoration:none}
       <table class="tbl" id="positions-tbl">
         <thead>
           <tr>
-            <th>Symbol</th><th>Dir</th><th>Qty</th><th>Avg Price</th>
-            <th>Strategy</th><th>Source</th><th>Status</th>
+            <th>Symbol</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
+            <th>Entry</th><th>SL</th><th>Target</th>
+            <th>Strategy</th><th>P&L (est)</th><th>Status</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -519,6 +524,20 @@ async function loadOverview() {
     const pnlEl = $('#kpi-pnl');
     pnlEl.textContent = fmtPnl(status.realized_pnl);
     pnlEl.className = 'value ' + (status.realized_pnl >= 0 ? 'val-green' : 'val-red');
+
+    // Unrealized P&L from open positions
+    let upnl = 0;
+    if(status.positions) {
+      upnl = status.positions.reduce((s, p) => s + (p.unrealized_pnl || 0), 0);
+    }
+    // Also use the server-side total if available
+    if(status.unrealized_pnl !== undefined && status.unrealized_pnl !== 0) {
+      upnl = status.unrealized_pnl;
+    }
+    const upnlEl = $('#kpi-upnl');
+    upnlEl.textContent = upnl !== 0 ? fmtPnl(upnl) : 'Awaiting LTP';
+    upnlEl.className = 'value ' + (upnl >= 0 ? 'val-green' : 'val-red');
+
     $('#kpi-positions').textContent = status.open_positions;
     $('#kpi-risk').textContent = ((status.config?.risk_per_trade || 0) * 100).toFixed(0) + '%';
     $('#kpi-maxloss').textContent = ((status.config?.max_daily_loss || 0) * 100).toFixed(0) + '%';
@@ -686,17 +705,41 @@ async function loadPositions() {
     $('#pos-count').textContent = `${positions.length} open`;
 
     if(!positions.length) {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
     } else {
       tbody.innerHTML = positions.map(p => {
-        const sym = (p.tradingsymbol || p.symbol || p.option_symbol || '').replace('NSE:','');
+        const sym = (p.symbol || p.option_symbol || '').replace('NFO:','').replace('NSE:','');
+        const underlying = (p.underlying || '').replace('NSE:','');
+        const entry = p.avg_price || p.entry_price || 0;
+        const sl = p.stop_loss || 0;
+        const target = p.target || 0;
+        const qty = Math.abs(p.quantity || 0);
+        const lots = p.lots || Math.ceil(qty / 100);
+        const dir = p.direction || (p.side === 'BUY' ? 'LONG' : 'SHORT');
+        const maxLoss = p.max_loss || 0;
+        const premium = p.total_premium || (entry * qty);
+        const ltp = p.ltp || 0;
+        // Use server-computed unrealized P&L (from exit_state premium_history)
+        const upnl = p.unrealized_pnl || 0;
+        let pnlStr;
+        if(ltp > 0) {
+          pnlStr = `${fmtPnl(upnl)} <span style="font-size:.7rem;color:var(--txt3)">LTP:${fmt(ltp)}</span>`;
+        } else if(maxLoss) {
+          pnlStr = `Max risk: ${fmt(maxLoss)}`;
+        } else {
+          pnlStr = 'Awaiting LTP';
+        }
+        const pnlClass = upnl > 0 ? 'val-green' : upnl < 0 ? 'val-red' : '';
         return `<tr>
-          <td><strong>${sym}</strong></td>
-          <td>${p.direction || (p.quantity > 0 ? 'LONG' : 'SHORT')}</td>
-          <td>${Math.abs(p.quantity || 0)}</td>
-          <td>${fmt(p.average_price || p.avg_price || p.entry_price || 0)}</td>
-          <td>${p.strategy_type || p.product || '—'}</td>
-          <td><span class="badge badge-source">${p.source || '—'}</span></td>
+          <td><strong>${sym}</strong>${p.option_type ? ` <span class="badge" style="font-size:.65rem">${p.strike} ${p.option_type}</span>` : ''}</td>
+          <td>${underlying}</td>
+          <td><span class="badge ${dir==='SELL'?'badge-loss':'badge-win'}">${dir}</span></td>
+          <td>${qty.toLocaleString()} (${lots}L)</td>
+          <td>${fmt(entry)}</td>
+          <td>${sl ? fmt(sl) : '—'}</td>
+          <td>${target ? fmt(target) : '—'}</td>
+          <td>${p.strategy_type || '—'}</td>
+          <td class="${pnlClass}">${pnlStr}</td>
           <td>${p.status || 'ACTIVE'}</td>
         </tr>`;
       }).join('');
