@@ -93,6 +93,10 @@ class PositionReconciliation:
         # Recovery actions log
         self.recovery_actions: List[str] = []
         
+        # Callback for manual/Kite-app exits detected via reconciliation
+        # Signature: callback(symbol, local_position_dict, reason_str)
+        self.on_manual_exit_callback = None
+        
         # Load any saved state
         self._load_state()
         
@@ -358,7 +362,21 @@ class PositionReconciliation:
             # Check 3: SL/Target orders - if local has SL set but broker doesn't have order
             # (This would be checked against self.broker_orders)
             
-            # === HANDLE MISMATCHES ===
+            # === AUTO-CLOSE LOCAL_ONLY POSITIONS (Kite/manual exit detection) ===
+            local_only = [m for m in mismatches if m['type'] == 'LOCAL_ONLY']
+            if local_only and self.on_manual_exit_callback:
+                for m in local_only:
+                    sym = m['symbol']
+                    # Find the full local position dict
+                    lp_full = next((lp for lp in self.local_positions if lp.get('symbol') == sym), None)
+                    try:
+                        self.on_manual_exit_callback(sym, lp_full, 'MANUAL_KITE_EXIT')
+                        print(f"   🔄 Reconciliation: Auto-closed {sym} (not at broker → manual/Kite exit)")
+                        mismatches = [m2 for m2 in mismatches if m2.get('symbol') != sym]  # remove from mismatch list
+                    except Exception as _cb_err:
+                        print(f"   ⚠️ Reconciliation callback error for {sym}: {_cb_err}")
+
+            # === HANDLE REMAINING MISMATCHES ===
             
             if mismatches:
                 self.consecutive_mismatches += 1

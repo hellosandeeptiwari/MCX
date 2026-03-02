@@ -194,6 +194,9 @@ class AutonomousTrader:
         except Exception as e:
             print(f"⚠️ Dynamic lot size fetch failed at startup (will retry on scan): {e}")
         
+        # Wire manual-exit reconciliation callback (Kite app exits)
+        self.position_recon.on_manual_exit_callback = self._on_recon_manual_exit
+        
         # Start reconciliation loop
         self.position_recon.start()
         
@@ -3602,13 +3605,15 @@ class AutonomousTrader:
                         if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
                             found = True
                             
-                            # === LIVE MODE: Place real exit order ===
-                            if not self.tools.paper_mode:
+                            # === LIVE MODE: Place real exit order (only if dashboard didn't already) ===
+                            if not self.tools.paper_mode and not req.get('live_exit_placed', False):
                                 try:
                                     self.tools._execute_live_exit(trade)
                                     print(f"   🖐️ LIVE exit order placed for {symbol}")
                                 except Exception as e:
                                     print(f"   🚨 LIVE exit order FAILED for {symbol}: {e}")
+                            elif req.get('live_exit_placed'):
+                                print(f"   🖐️ LIVE exit already placed by dashboard for {symbol}")
                             
                             # Cancel GTT if exists
                             gtt_id = trade.get('gtt_trigger_id')
@@ -3649,6 +3654,100 @@ class AutonomousTrader:
                 pass
         except Exception as e:
             print(f"   ⚠️ Manual exit processing error: {e}")
+
+    # ── Reconciliation callback: Kite app manual exit detected ───
+    def _on_recon_manual_exit(self, symbol: str, local_pos: dict, reason: str):
+        """Called by PositionReconciliation when a position exists locally
+        but is gone from broker (= exited on Kite app/web).
+        
+        Cleans up in-memory state, logs to trade_ledger, updates state_db.
+        No LIVE order needed — broker already has no position.
+        """
+        if not symbol or not local_pos:
+            return
+        
+        print(f"\n   🔄 KITE EXIT DETECTED: {symbol} (reason: {reason})")
+        
+        entry_price = local_pos.get('avg_price') or local_pos.get('entry_price') or 0
+        qty = abs(local_pos.get('quantity', 0))
+        direction = local_pos.get('direction') or local_pos.get('side', 'BUY')
+        
+        # Try to get last traded price for P&L calculation
+        ltp = 0
+        try:
+            if self.tools.ticker and self.tools.ticker.connected:
+                cached = self.tools.ticker.get_ltp_batch([symbol])
+                ltp = cached.get(symbol, 0)
+            if not ltp:
+                live = get_state_db().load_live_pnl() or {}
+                lp = live.get(symbol) or live.get(symbol.replace('NFO:', ''))
+                ltp = lp['ltp'] if lp else 0
+        except Exception:
+            pass
+        
+        if ltp > 0 and entry_price > 0:
+            pnl = (ltp - entry_price) * qty if direction in ('BUY', 'LONG') else (entry_price - ltp) * qty
+        else:
+            pnl = local_pos.get('unrealized_pnl', 0)
+        
+        exit_price = ltp if ltp > 0 else entry_price
+        
+        # Remove from in-memory positions
+        with self.tools._positions_lock:
+            for i, trade in enumerate(self.tools.paper_positions):
+                if trade.get('symbol') == symbol and trade.get('status', 'OPEN') == 'OPEN':
+                    # Cancel GTT if exists
+                    gtt_id = trade.get('gtt_trigger_id')
+                    if gtt_id:
+                        try:
+                            self.tools._cancel_gtt(gtt_id, symbol)
+                        except Exception:
+                            pass
+                    self.tools.paper_positions.pop(i)
+                    self.tools.paper_pnl += pnl
+                    break
+        
+        self.tools._save_active_trades()
+        
+        # Log to trade_ledger
+        try:
+            from trade_ledger import get_trade_ledger
+            import re
+            _underlying = local_pos.get('underlying', '')
+            if not _underlying:
+                m = re.match(r'(?:NFO:)?([A-Z]+)\d', symbol.replace('NFO:', ''))
+                _underlying = f"NSE:{m.group(1)}" if m else symbol
+            _hold_mins = 0
+            try:
+                _et = local_pos.get('timestamp', '')
+                if _et:
+                    _hold_mins = int((datetime.now() - datetime.fromisoformat(_et)).total_seconds() / 60)
+            except Exception:
+                pass
+            _pnl_pct = (pnl / (entry_price * qty) * 100) if entry_price > 0 and qty > 0 else 0
+            get_trade_ledger().log_exit(
+                symbol=symbol,
+                underlying=_underlying,
+                direction=direction,
+                source=local_pos.get('setup_type', local_pos.get('strategy_type', '')),
+                sector=local_pos.get('sector', ''),
+                exit_type=reason,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=qty,
+                pnl=pnl,
+                pnl_pct=_pnl_pct,
+                smart_score=local_pos.get('smart_score', 0),
+                final_score=local_pos.get('entry_score', 0),
+                dr_score=local_pos.get('dr_score', 0),
+                exit_reason=f'Position closed outside Titan ({reason})',
+                hold_minutes=_hold_mins,
+                entry_time=local_pos.get('timestamp', ''),
+            )
+        except Exception as e:
+            print(f"   ⚠️ Trade ledger log failed for recon exit {symbol}: {e}")
+        
+        print(f"   🔄 {symbol}: Cleaned up | P&L: ₹{pnl:+,.2f} | exit@{exit_price:.2f} ✅")
     
     def _check_positions_realtime(self):
         """Check all positions for target/stoploss hits using Exit Manager"""

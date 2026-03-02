@@ -21,9 +21,33 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     HARD_RULES, APPROVED_UNIVERSE, PAPER_MODE,
     TRADING_HOURS, TIER_1_OPTIONS, TIER_2_OPTIONS,
+    ZERODHA_API_KEY,
 )
 from state_db import get_state_db
 from trade_ledger import get_trade_ledger
+
+# ── Lightweight Kite instance for LIVE exit orders ────────────
+_dashboard_kite = None
+
+def _get_dashboard_kite():
+    """Lazy-init a KiteConnect instance for placing exit orders.
+    Reuses the same access token as the bot (from .env)."""
+    global _dashboard_kite
+    if _dashboard_kite is not None:
+        return _dashboard_kite
+    try:
+        from kiteconnect import KiteConnect
+        token = os.environ.get('ZERODHA_ACCESS_TOKEN', '')
+        if not token:
+            return None
+        kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
+        kite.set_access_token(token)
+        kite.profile()  # validate token
+        _dashboard_kite = kite
+        return kite
+    except Exception as e:
+        print(f"⚠️ Dashboard KiteConnect init failed: {e}")
+        return None
 
 # ── App setup ────────────────────────────────────────────────
 app = Flask(__name__, static_folder='static', template_folder='templates')
@@ -243,7 +267,68 @@ def exit_position():
 
         exit_price = ltp if ltp > 0 else entry_price
 
-        # 1️⃣  Write signal file for bot (handles in-memory + LIVE order placement)
+        # 1️⃣  LIVE MODE: Place real exit order immediately from dashboard
+        live_exit_placed = False
+        live_exit_msg = ''
+        if not PAPER_MODE:
+            kite = _get_dashboard_kite()
+            if kite:
+                try:
+                    # Cancel pending SL-M order first
+                    sl_order_id = target.get('sl_order_id')
+                    if sl_order_id and not str(sl_order_id).startswith('PAPER_'):
+                        try:
+                            kite.cancel_order(variety='regular', order_id=sl_order_id)
+                        except Exception:
+                            pass  # May have already triggered
+
+                    # Determine legs for spreads/condors
+                    legs = []
+                    is_spread = target.get('is_credit_spread') or target.get('is_debit_spread') or target.get('is_iron_condor')
+                    if target.get('is_iron_condor'):
+                        for pfx, act in [('sold_ce','BUY'),('sold_pe','BUY'),('hedge_ce','SELL'),('hedge_pe','SELL')]:
+                            s = target.get(f'{pfx}_symbol')
+                            if s: legs.append((s, act))
+                    elif target.get('is_credit_spread'):
+                        if target.get('sold_symbol'): legs.append((target['sold_symbol'], 'BUY'))
+                        if target.get('hedge_symbol'): legs.append((target['hedge_symbol'], 'SELL'))
+                    elif target.get('is_debit_spread'):
+                        syms = (target.get('symbol') or '').split('|')
+                        if len(syms) == 2:
+                            legs.append((syms[0], 'SELL'))
+                            legs.append((syms[1], 'BUY'))
+                    elif '|' in symbol:
+                        syms = symbol.split('|')
+                        if len(syms) == 2:
+                            legs.append((syms[0], 'SELL' if direction in ('BUY','LONG') else 'BUY'))
+                            legs.append((syms[1], 'BUY' if direction in ('BUY','LONG') else 'SELL'))
+                    else:
+                        exit_side = 'SELL' if direction in ('BUY', 'LONG') else 'BUY'
+                        legs.append((symbol, exit_side))
+
+                    # Place exit order for each leg
+                    for leg_sym, leg_action in legs:
+                        exch, tsym = leg_sym.split(':')
+                        tx = kite.TRANSACTION_TYPE_SELL if leg_action == 'SELL' else kite.TRANSACTION_TYPE_BUY
+                        order_id = kite.place_order(
+                            variety=kite.VARIETY_REGULAR,
+                            exchange=exch,
+                            tradingsymbol=tsym,
+                            transaction_type=tx,
+                            quantity=qty,
+                            product=kite.PRODUCT_MIS,
+                            order_type=kite.ORDER_TYPE_MARKET,
+                            validity=kite.VALIDITY_DAY,
+                            tag='TITAN_MANUAL'
+                        )
+                        live_exit_msg += f' order:{order_id}'
+
+                    live_exit_placed = True
+                except Exception as e:
+                    live_exit_msg = f'⚠️ LIVE exit order failed: {e}'
+                    print(f"   🚨 Dashboard LIVE exit failed for {symbol}: {e}")
+
+        # 2️⃣  Write signal file for bot (in-memory cleanup + sync)
         signal = {
             'symbol': symbol,
             'exit_price': round(exit_price, 2),
@@ -253,9 +338,9 @@ def exit_position():
             'direction': direction,
             'quantity': qty,
             'entry_price': round(entry_price, 2),
-            'trade': target,  # full trade dict for bot-side processing
+            'trade': target,
+            'live_exit_placed': live_exit_placed,  # bot skips placing order if True
         }
-        # Append to signal file (thread-safe via atomic write)
         pending = []
         if MANUAL_EXIT_FILE.exists():
             try:
@@ -307,12 +392,20 @@ def exit_position():
         except Exception as e:
             print(f"⚠️ Trade ledger log failed for manual exit: {e}")
 
+        _mode_label = 'LIVE' if not PAPER_MODE else 'PAPER'
+        _exit_msg = f'[{_mode_label}] Exited {symbol} @ ₹{exit_price:.2f} | P&L: ₹{pnl:+,.2f}'
+        if live_exit_placed:
+            _exit_msg += ' | Broker order placed ✅'
+        elif not PAPER_MODE:
+            _exit_msg += f' | {live_exit_msg}'
+
         return jsonify({
             'ok': True,
-            'msg': f'Exited {symbol} @ ₹{exit_price:.2f} | P&L: ₹{pnl:+,.2f}',
+            'msg': _exit_msg,
             'symbol': symbol,
             'exit_price': round(exit_price, 2),
             'pnl': round(pnl, 2),
+            'live_exit_placed': live_exit_placed,
         })
 
     except Exception as e:
