@@ -173,6 +173,202 @@ def recent_errors():
     return jsonify({'lines': [l.rstrip() for l in lines]})
 
 
+# ── Smart Log Reader with Bookmarks ──────────────────────────
+# Bookmark file stores {file_key: {"line": N, "ts": "ISO"}} so the AI agent
+# can call ?set_bookmark=true after reading, and next call with
+# ?since_bookmark=true returns ONLY new lines since that position.
+
+_LOG_BOOKMARK_FILE = LOG_DIR / 'log_bookmarks.json'
+
+# All log files the system knows about
+_LOG_FILES = {
+    'titan':           LOG_DIR / 'titan.log',
+    'titan_error':     LOG_DIR / 'titan-error.log',
+    'dashboard_error': LOG_DIR / 'dashboard-error.log',
+    'dashboard':       LOG_DIR / 'dashboard.log',
+    'watchdog':        LOG_DIR / 'watchdog.log',
+    'bot_debug':       Path(__file__).parent / 'bot_debug.log',
+}
+
+
+def _load_bookmarks() -> dict:
+    try:
+        if _LOG_BOOKMARK_FILE.exists():
+            with open(_LOG_BOOKMARK_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_bookmarks(bm: dict):
+    try:
+        _LOG_BOOKMARK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_BOOKMARK_FILE, 'w') as f:
+            json.dump(bm, f, indent=2)
+    except Exception:
+        pass
+
+
+def _count_lines(filepath) -> int:
+    """Fast line count without loading entire file into memory."""
+    try:
+        count = 0
+        with open(filepath, 'rb') as f:
+            for _ in f:
+                count += 1
+        return count
+    except FileNotFoundError:
+        return 0
+
+
+def _read_lines_from(filepath, start_line: int, max_lines: int = 2000) -> list:
+    """Read lines from start_line (1-based) up to max_lines."""
+    result = []
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            for i, line in enumerate(f, 1):
+                if i < start_line:
+                    continue
+                result.append(line.rstrip())
+                if len(result) >= max_lines:
+                    break
+    except FileNotFoundError:
+        pass
+    return result
+
+
+def _file_meta(filepath) -> dict:
+    """Return metadata for a log file."""
+    p = Path(filepath)
+    if not p.exists():
+        return {'exists': False, 'size': 0, 'total_lines': 0, 'modified': None}
+    stat = p.stat()
+    return {
+        'exists': True,
+        'size': stat.st_size,
+        'size_human': f"{stat.st_size / 1024:.1f}KB" if stat.st_size < 1048576 else f"{stat.st_size / 1048576:.1f}MB",
+        'total_lines': _count_lines(p),
+        'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def _find_last_scan_cycle_line(filepath) -> int:
+    """Find line number of last SCAN CYCLE marker."""
+    last_scan_line = 0
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            for i, line in enumerate(f, 1):
+                if 'SCAN CYCLE @' in line or 'SCAN: scan_and_trade() ENTER' in line:
+                    last_scan_line = i
+    except FileNotFoundError:
+        pass
+    return last_scan_line
+
+
+@app.route('/api/logs/smart')
+def smart_logs():
+    """Smart log reader with bookmark support.
+
+    Query params:
+      file          – log key: titan|titan_error|dashboard_error|watchdog|bot_debug
+                      (default: titan). Use "all" for metadata-only overview.
+      lines         – max lines to return (default: 300)
+      since_bookmark – if "true", return only new lines after saved bookmark
+      set_bookmark  – if "true", save current end-of-file as bookmark after read
+      from_scan     – if "true", return lines starting from last SCAN CYCLE
+      grep          – optional regex filter applied to returned lines
+      tail          – if "true" (default), read last N lines; if "false", read from bookmark/scan
+
+    Returns:
+      {meta: {file_key: {exists, size, total_lines, modified, bookmark_line}},
+       file: str, lines: [...], start_line: int, end_line: int,
+       bookmark_was: int|null, bookmark_now: int|null}
+    """
+    import re as _re
+
+    file_key = request.args.get('file', 'titan')
+    max_lines = int(request.args.get('lines', 300))
+    since_bm = request.args.get('since_bookmark', '').lower() == 'true'
+    set_bm = request.args.get('set_bookmark', '').lower() == 'true'
+    from_scan = request.args.get('from_scan', '').lower() == 'true'
+    grep_pat = request.args.get('grep', '')
+    tail_mode = request.args.get('tail', 'true').lower() != 'false'
+
+    bookmarks = _load_bookmarks()
+
+    # ── Always return metadata for ALL log files ──
+    meta = {}
+    for key, path in _LOG_FILES.items():
+        fm = _file_meta(path)
+        bm_line = bookmarks.get(key, {}).get('line', 0)
+        fm['bookmark_line'] = bm_line
+        fm['new_lines'] = max(0, fm['total_lines'] - bm_line) if fm['exists'] else 0
+        meta[key] = fm
+
+    # ── If "all", return just metadata overview ──
+    if file_key == 'all':
+        if set_bm:
+            for key in _LOG_FILES:
+                if meta[key]['exists']:
+                    bookmarks[key] = {
+                        'line': meta[key]['total_lines'],
+                        'ts': datetime.now().isoformat(),
+                    }
+            _save_bookmarks(bookmarks)
+        return jsonify({'meta': meta, 'file': 'all', 'lines': [],
+                        'note': 'Use ?file=<key> to read a specific log'})
+
+    if file_key not in _LOG_FILES:
+        return jsonify({'error': f'Unknown file key: {file_key}',
+                        'available': list(_LOG_FILES.keys())}), 400
+
+    log_path = _LOG_FILES[file_key]
+    total = meta[file_key]['total_lines']
+    bm_was = bookmarks.get(file_key, {}).get('line', 0)
+
+    # ── Decide start line ──
+    if from_scan and file_key == 'titan':
+        scan_line = _find_last_scan_cycle_line(log_path)
+        start = scan_line if scan_line > 0 else max(1, total - max_lines + 1)
+    elif since_bm and bm_was > 0:
+        start = bm_was + 1
+    elif tail_mode:
+        start = max(1, total - max_lines + 1)
+    else:
+        start = 1
+
+    lines = _read_lines_from(log_path, start, max_lines)
+    end_line = start + len(lines) - 1 if lines else start
+
+    # ── Optional grep filter ──
+    if grep_pat:
+        try:
+            pat = _re.compile(grep_pat, _re.IGNORECASE)
+            lines = [l for l in lines if pat.search(l)]
+        except _re.error:
+            pass  # bad regex — return unfiltered
+
+    # ── Set bookmark ──
+    bm_now = None
+    if set_bm:
+        bm_now = total
+        bookmarks[file_key] = {'line': total, 'ts': datetime.now().isoformat()}
+        _save_bookmarks(bookmarks)
+
+    return jsonify({
+        'meta': meta,
+        'file': file_key,
+        'start_line': start,
+        'end_line': end_line,
+        'total_lines': total,
+        'returned': len(lines),
+        'bookmark_was': bm_was or None,
+        'bookmark_now': bm_now,
+        'lines': lines,
+    })
+
+
 # ── Bot control (start / stop / restart) ─────────────────────
 
 @app.route('/api/bot/stop', methods=['POST'])
