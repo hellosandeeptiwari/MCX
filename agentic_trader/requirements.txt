@@ -24,4 +24,4 @@ flask-cors>=4.0.0
 
 # Auto-auth (optional, for cloud deployment)
 # selenium>=4.15.0
-# pyotp>=2.9.0
+pyotp>=2.9.0

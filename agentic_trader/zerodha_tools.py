@@ -1186,7 +1186,11 @@ class ZerodhaTools:
         return updates
     
     def _load_token(self):
-        """Load access token from .env (ZERODHA_ACCESS_TOKEN)"""
+        """Load access token from .env (ZERODHA_ACCESS_TOKEN).
+        
+        If token is invalid/expired AND headless, tries kite_token_manager
+        for automatic TOTP-based renewal before giving up.
+        """
         env_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "")
         if env_token:
             self.access_token = env_token
@@ -1198,12 +1202,34 @@ class ZerodhaTools:
                 print(f"⚠️ .env ZERODHA_ACCESS_TOKEN is invalid/expired")
                 self.access_token = None
         
-        # No valid token — check if we can prompt interactively
+        # Try headless auto-renewal via kite_token_manager
+        try:
+            from kite_token_manager import renew_kite_token
+            print("🔄 Attempting headless Kite token renewal via TOTP...")
+            if renew_kite_token(restart_service=False):
+                # Reload the new token from os.environ (set by renew_kite_token)
+                new_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "")
+                if new_token:
+                    self.access_token = new_token
+                    self.kite.set_access_token(self.access_token)
+                    try:
+                        self.kite.profile()
+                        print("✅ Kite token auto-renewed successfully")
+                        return True
+                    except Exception as e:
+                        print(f"⚠️ Auto-renewed token failed verification: {e}")
+                        self.access_token = None
+        except ImportError:
+            pass  # kite_token_manager not available
+        except Exception as e:
+            print(f"⚠️ Auto-renewal failed: {e}")
+        
+        # Fallback: check if we can prompt interactively
         import sys
         if not sys.stdin.isatty():
             # Headless mode (systemd, Docker, CI) — cannot prompt for input
-            print(f"\n⚠️ No valid Kite access token. Running HEADLESS — skipping interactive auth.")
-            print(f"   Set ZERODHA_ACCESS_TOKEN in .env or run auth manually.")
+            print(f"\n⚠️ No valid Kite access token. Running HEADLESS — auto-renewal failed.")
+            print(f"   Check kite_token_manager logs or run auth manually.")
             return False
         
         print(f"\n⚠️ No valid Kite access token found.")
@@ -4308,7 +4334,10 @@ class ZerodhaTools:
                     "new_premium": plan.total_premium
                 }
         else:
-            max_total_exposure = 500000  # ₹5 lakh total option exposure (full capital)
+            # Total exposure cap = remaining capital (not fixed 5L)
+            from config import HARD_RULES as _hr
+            _base_capital = _hr.get('CAPITAL', 500000)
+            max_total_exposure = max(_base_capital, 500000)  # At least ₹5L or configured capital
             current_exposure = sum(p.get('total_premium', 0) for p in self.paper_positions 
                                  if p.get('status', 'OPEN') == 'OPEN' and not p.get('is_sniper', False))
             if current_exposure + plan.total_premium > max_total_exposure:
@@ -5209,6 +5238,35 @@ class ZerodhaTools:
         
         print(f"   Sell leg: {option_type_str} {sell_strike} @ ₹{sell_premium:.2f} (OI: {sell_oi:,})")
         print(f"   Spread: width={spread_width} | net_debit=₹{net_debit:.2f}/share | total=₹{net_debit_total:,.0f}")
+        
+        # === COST-AWARE HEDGE GATE ===
+        # Reject hedge if the resulting spread has terrible economics.
+        # Better to EXIT outright than waste money on a corpse spread.
+        if THESIS_HEDGE_CONFIG.get('cost_gate_enabled', True):
+            # Gate 1: Debit-to-Width ratio — if net_debit eats most of the spread, R:R is terrible
+            max_dtw = THESIS_HEDGE_CONFIG.get('max_debit_to_width_pct', 55)
+            dtw_pct = (net_debit / spread_width * 100) if spread_width > 0 else 0
+            if spread_width > 0 and dtw_pct > max_dtw:
+                max_profit_pct = 100 - dtw_pct
+                return {"success": False, "error": f"COST GATE: net_debit/width={dtw_pct:.0f}% > {max_dtw}% — max profit only {max_profit_pct:.0f}% of risk, EXIT instead"}
+            
+            # Gate 2: Remaining value — if buy leg has already collapsed, don't hedge a corpse
+            min_remaining = THESIS_HEDGE_CONFIG.get('min_remaining_value_pct', 30)
+            # Use current LTP of buy leg (sell_contract's chain should have it)
+            buy_contract = chain.get_contract(buy_strike, opt_type, expiry)
+            if buy_contract and buy_contract.ltp > 0:
+                remaining_pct = (buy_contract.ltp / buy_entry_price) * 100
+                if remaining_pct < min_remaining:
+                    return {"success": False, "error": f"COST GATE: buy leg at {remaining_pct:.0f}% of entry (₹{buy_contract.ltp:.2f}/₹{buy_entry_price:.2f}) — option is a corpse, EXIT instead"}
+            
+            # Gate 3: Reward-to-Risk ratio on the resulting spread
+            min_rr = THESIS_HEDGE_CONFIG.get('min_spread_rr_ratio', 0.50)
+            max_profit_per_share = spread_width - net_debit
+            spread_rr = (max_profit_per_share / net_debit) if net_debit > 0 else 999
+            if net_debit > 0 and spread_rr < min_rr:
+                return {"success": False, "error": f"COST GATE: spread R:R={spread_rr:.2f} < {min_rr} — max profit ₹{max_profit_per_share:.2f} vs risk ₹{net_debit:.2f}, EXIT instead"}
+            
+            print(f"   ✅ COST GATE PASSED: debit/width={dtw_pct:.0f}%, R:R={spread_rr:.2f}")
         
         # === EXECUTE SELL LEG ===
         import random

@@ -192,10 +192,10 @@ class IntradayOptionScorer:
     PARTIAL_FILL_PENALTY_RATE = 0.3   # > 30% partials = penalty
     CANCEL_RATE_PENALTY = 0.4         # > 40% cancels = penalty
     
-    # === TRADE THRESHOLDS (Tightened Feb 25 — SCORE trades losing, +6% across board) ===
-    BLOCK_THRESHOLD = 62         # < 62 = BLOCK (naked option buy minimum) [was 58]
-    STANDARD_THRESHOLD = 68      # 68-71 = Standard (ATM/ITM, 1x size) [was 64]
-    PREMIUM_THRESHOLD = 72       # >= 72 = Premium (ATM/ITM, up to 2.5x) [was 68]
+    # === TRADE THRESHOLDS (Tightened Mar 2 — ORB/VWAP filtering, +4 across board) ===
+    BLOCK_THRESHOLD = 66         # < 66 = BLOCK (naked option buy minimum) [was 62]
+    STANDARD_THRESHOLD = 72      # 72-75 = Standard (ATM/ITM, 1x size) [was 68]
+    PREMIUM_THRESHOLD = 76       # >= 76 = Premium (ATM/ITM, up to 2.5x) [was 72]
     CHOP_PENALTY = 12            # Deduct if in CHOP zone [reduced from 30: was nuking all scores]
     
     # === AGGRESSIVE SIZING REQUIREMENTS (Risk of ruin protection) ===
@@ -237,9 +237,9 @@ class IntradayOptionScorer:
     # === ORB + VOLUME SMART CONSUMPTION (Feb 17 improvements) ===
     # 1. ORB-Volume Combo Gate: ORB breakout score scales by volume regime
     ORB_VOL_COMBO = {
-        'EXPLOSIVE': 1.0,    # Full ORB credit
-        'HIGH': 0.75,        # 75% ORB credit
-        'NORMAL': 0.25,      # 25% ORB credit — low conviction breakout
+        'EXPLOSIVE': 1.0,    # Full ORB credit — only EXPLOSIVE gets real weight
+        'HIGH': 0.35,        # 35% ORB credit — HIGH alone is weak signal [was 0.75]
+        'NORMAL': 0.0,       # Zero ORB credit — meaningless breakout [was 0.25]
         'LOW': 0.0,          # Zero ORB credit — fake breakout on no volume
     }
     # 2. ORB Re-entry Penalty: multiple re-entries = whipsaw
@@ -500,11 +500,11 @@ class IntradayOptionScorer:
         # ORB strength 2-5% = weak breakout, halve points
         # ORB strength >= 5% = real breakout, normal scoring
         orb_strength_filter = 1.0
-        if orb_strength < 2:
-            orb_strength_filter = 0.0  # Fake breakout — zero points
-            cap_reason += f" [NOISE: {orb_strength:.1f}% < 2% min]" 
+        if orb_strength < 3:
+            orb_strength_filter = 0.0  # Fake breakout — zero points [tightened from 2% to 3%]
+            cap_reason += f" [NOISE: {orb_strength:.1f}% < 3% min]" 
         elif orb_strength < 5:
-            orb_strength_filter = 0.5  # Weak breakout — half credit
+            orb_strength_filter = 0.4  # Weak breakout — 40% credit [tightened from 50%]
             cap_reason += f" [WEAK: {orb_strength:.1f}% < 5%]"
         
         # === FIX 1: ORB + VOLUME COMBO GATE ===
@@ -516,9 +516,9 @@ class IntradayOptionScorer:
             orb_points = int(orb_max_points * orb_decay * orb_strength_filter * _orb_vol_combo_mult * _orb_reentry_mult)
             # ORB hold check — need at least 2 candles holding above ORB to confirm
             orb_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
-            if orb_hold < 2:
-                orb_points = max(2, orb_points // 2) if orb_points > 0 else 0  # Halve points for unconfirmed breakout
-                cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 2]"
+            if orb_hold < 3:
+                orb_points = max(1, orb_points // 3) if orb_points > 0 else 0  # 33% credit for unconfirmed [tightened: was /2 at <2]
+                cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 3]"
             # Apply ORB range width adjustment
             orb_points = max(0, orb_points + _orb_width_adj)
             # Apply ORB re-entry chop penalty to score directly
@@ -533,11 +533,11 @@ class IntradayOptionScorer:
                 direction = "BUY"
         elif signal.orb_signal == "BREAKOUT_DOWN":
             orb_points = int(orb_max_points * orb_decay * orb_strength_filter * _orb_vol_combo_mult * _orb_reentry_mult)
-            # ORB hold check — need at least 2 candles holding below ORB to confirm
+            # ORB hold check — need at least 3 candles holding below ORB to confirm [tightened from 2]
             orb_hold = getattr(signal, 'orb_hold_candles', market_data.get('orb_hold_candles', 0) if market_data else 0)
-            if orb_hold < 2:
-                orb_points = max(2, orb_points // 2) if orb_points > 0 else 0
-                cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 2]"
+            if orb_hold < 3:
+                orb_points = max(1, orb_points // 3) if orb_points > 0 else 0  # 33% credit [tightened]
+                cap_reason += f" [UNCONFIRMED: hold {orb_hold} candles < 3]"
             # Apply ORB range width adjustment
             orb_points = max(0, orb_points + _orb_width_adj)
             # Apply ORB re-entry chop penalty to score directly

@@ -155,59 +155,47 @@ def check_thesis(
     # ── CHECK 3: IV CRUSH DETECTION ──────────────────────────────
     # Only for option trades where we have underlying data
     if state.is_option and underlying_ltp > 0 and state.entry_price > 0:
-        # How much did the underlying actually move against our thesis?
-        # For CE (BUY side): underlying going DOWN is adverse
-        # For PE (BUY side): underlying going UP is adverse
-        # But we need the underlying price at entry — approximate from initial_sl structure
-        # We can use initial_sl as the "adverse direction boundary"
-        # Instead, compute underlying % move from direction perspective
-        # Since we don't store underlying_entry, use a simpler heuristic:
-        #   "Premium dropped ≥8% but underlying barely moved against us"
-        #   This catches pure IV/theta decay
-        
-        # Use initial_sl to estimate entry-time underlying reference:
-        # For BUY (CE): adverse = underlying dropped below entry zone
-        # For SELL (PE-like, but we rarely SELL options): adverse = underlying rose
-        
-        # Simpler: compare underlying move vs option move
-        # If premium_loss_pct >= 8% and underlying barely moved against direction,
-        # then it's IV crush, not directional loss
-        
-        # We need underlying reference price — derive from structure
-        # initial_sl is the structure level, entry_price is option premium
-        # If underlying hasn't breached initial_sl, it's within structure
-        
         if premium_loss_pct >= IV_CRUSH_PREMIUM_DROP:
-            # Check if underlying stays within structure (hasn't moved against us much)
-            # For CE trades: adverse is underlying dropping toward initial_sl
-            # For PE trades: adverse is underlying rising toward initial_sl
-            if state.side == "BUY":
-                # CE: adverse = underlying below entry → dropping
-                # Check: underlying hasn't moved much below the SL structure
-                # If underlying is ABOVE initial_sl → direction is fine, it's pure IV crush
-                underlying_fine = underlying_ltp > state.initial_sl
-            else:
-                # PE/SELL: adverse = underlying above entry → rising
-                underlying_fine = underlying_ltp < state.initial_sl
-
-            if underlying_fine:
-                reason = (
-                    f"IV crush: premium -{premium_loss_pct:.1f}% but underlying "
-                    f"still on our side (LTP={underlying_ltp:.2f}, SL={state.initial_sl:.2f})"
-                )
-                logger.info(f"TIE TRIGGERED [{state.symbol}]: {reason}")
-                return ThesisResult(
-                    is_invalid=True,
-                    check_name="IV_CRUSH",
-                    reason=reason,
-                    details={
-                        'premium_loss_pct': round(premium_loss_pct, 2),
-                        'underlying_ltp': underlying_ltp,
-                        'initial_sl': state.initial_sl,
-                        'underlying_fine': underlying_fine,
-                        'candles': candles,
-                    },
-                )
+            # Get underlying price at entry for comparison
+            ul_entry = getattr(state, 'underlying_entry_ltp', 0)
+            if ul_entry <= 0 and hasattr(state, 'underlying_history') and state.underlying_history:
+                ul_entry = state.underlying_history[0]
+            
+            if ul_entry > 0:
+                # How much did underlying move since entry?
+                ul_move_pct = (underlying_ltp - ul_entry) / ul_entry * 100
+                opt_type = getattr(state, 'option_type_str', '')
+                
+                # Determine if underlying is "still on our side"
+                # PE option profits from underlying going DOWN
+                # CE option profits from underlying going UP
+                if opt_type == 'PE':
+                    # For PE: adverse = underlying went UP significantly
+                    underlying_fine = ul_move_pct <= IV_CRUSH_UNDERLYING_MAX
+                else:
+                    # For CE: adverse = underlying went DOWN significantly
+                    underlying_fine = ul_move_pct >= -IV_CRUSH_UNDERLYING_MAX
+                
+                if underlying_fine:
+                    reason = (
+                        f"IV crush: premium -{premium_loss_pct:.1f}% but underlying "
+                        f"moved only {ul_move_pct:+.2f}% from entry "
+                        f"(entry={ul_entry:.2f}, now={underlying_ltp:.2f})"
+                    )
+                    logger.info(f"TIE TRIGGERED [{state.symbol}]: {reason}")
+                    return ThesisResult(
+                        is_invalid=True,
+                        check_name="IV_CRUSH",
+                        reason=reason,
+                        details={
+                            'premium_loss_pct': round(premium_loss_pct, 2),
+                            'underlying_ltp': underlying_ltp,
+                            'underlying_entry': ul_entry,
+                            'underlying_move_pct': round(ul_move_pct, 3),
+                            'option_type': opt_type,
+                            'candles': candles,
+                        },
+                    )
 
     # ── CHECK 4: UNDERLYING BOS (Break of Structure) AGAINST ─────
     if underlying_ltp > 0:

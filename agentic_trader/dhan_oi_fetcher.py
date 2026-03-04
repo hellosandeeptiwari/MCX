@@ -331,10 +331,17 @@ class DhanOIFetcher:
         """Renew access token for another 24 hours.
         
         Must be called while current token is still valid.
+        Uses dhanClientId header (per DhanHQ docs).
         Returns True if renewal successful.
         """
         try:
-            r = requests.post(self.RENEW_URL, headers=self._headers(), timeout=10)
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'access-token': self.access_token,
+                'dhanClientId': self.client_id,
+            }
+            r = requests.post(self.RENEW_URL, headers=headers, timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 new_token = data.get('accessToken', '')

@@ -53,7 +53,7 @@ UNIVERSE_STOCKS = [
     'MCX', 'IRFC',
 ]
 
-# DhanHQ equity security IDs (from dhan_oi_fetcher.py DHAN_SCRIP_MAP)
+# DhanHQ equity security IDs — hardcoded fallback (auto-discovered from instrument master at runtime)
 EQUITY_SCRIP_MAP = {
     'SBIN': 3045, 'HDFCBANK': 1333, 'ICICIBANK': 4963, 'AXISBANK': 5900,
     'KOTAKBANK': 1922, 'INDUSINDBK': 5258, 'BANKBARODA': 4668, 'PNB': 10666,
@@ -70,6 +70,9 @@ EQUITY_SCRIP_MAP = {
     'NHPC': 15337, 'POWERGRID': 14977, 'NTPC': 11630, 'TATAPOWER': 3426,
     'MCX': 14932,
 }
+
+# Auto-discovered equity scrip IDs — populated at runtime from instrument master
+_EQUITY_SCRIP_AUTO: Dict[str, int] = {}
 
 
 def _load_config() -> dict:
@@ -121,6 +124,26 @@ class FuturesOIFetcher:
                 resp = requests.get(url, headers=self._headers, timeout=15)
             else:
                 resp = requests.post(url, headers=self._headers, json=json_body, timeout=15)
+            
+            # Auto-renew on 401 (token expired)
+            if resp.status_code == 401:
+                try:
+                    from dhan_token_manager import ensure_token_fresh
+                    if ensure_token_fresh():
+                        # Reload token into headers
+                        new_token = os.environ.get('DHAN_ACCESS_TOKEN', '')
+                        if new_token and new_token != self.access_token:
+                            self.access_token = new_token
+                            self._headers['access-token'] = new_token
+                            print("  🔑 Dhan token auto-renewed, retrying request...")
+                            self._rate_limit()
+                            if method == 'GET':
+                                resp = requests.get(url, headers=self._headers, timeout=15)
+                            else:
+                                resp = requests.post(url, headers=self._headers, json=json_body, timeout=15)
+                except Exception as _renew_e:
+                    print(f"  ⚠️ Token auto-renew failed: {_renew_e}")
+            
             try:
                 data = resp.json()
             except Exception:
@@ -161,6 +184,7 @@ class FuturesOIFetcher:
         # 5=TRADING_SYMBOL, 8=EXPIRY_DATE, 13=EXCH_INSTRUMENT_TYPE
         
         contracts = {}  # symbol -> list of contracts
+        equity_scrips = {}  # symbol -> equity security_id (auto-discovered)
         
         for row in reader:
             if len(row) < 14:
@@ -170,6 +194,20 @@ class FuturesOIFetcher:
             trading_sym = row[5]
             expiry = row[8]
             inst_type = row[13]
+            
+            # --- Auto-discover NSE equity scrip IDs for ALL stocks ---
+            # This fixes the 38-stock EQUITY_SCRIP_MAP gap that caused
+            # 167/205 stocks to get fut_basis_pct=0, fut_vol_ratio=0
+            # DhanHQ CSV: inst_type='ES', series='EQ', segment='E' for equity
+            series = row[14] if len(row) > 14 else ''
+            if exch == 'NSE' and inst_type == 'ES' and series == 'EQ':
+                # trading_sym for equity is just the symbol (e.g. 'SBIN')
+                base_eq = trading_sym.strip()
+                if base_eq and sec_id:
+                    try:
+                        equity_scrips[base_eq] = int(sec_id)
+                    except (ValueError, TypeError):
+                        pass
             
             # Only NSE futures (not BSE which has low OI)
             if exch != 'NSE':
@@ -199,9 +237,18 @@ class FuturesOIFetcher:
         for sym in contracts:
             contracts[sym].sort(key=lambda x: x['expiry'])
         
-        # Save cache
+        # Save futures contracts cache
         with open(cache_file, 'w') as f:
             json.dump(contracts, f, indent=2)
+        
+        # Save auto-discovered equity scrip IDs
+        global _EQUITY_SCRIP_AUTO
+        if equity_scrips:
+            _EQUITY_SCRIP_AUTO = equity_scrips
+            eq_cache = os.path.join(DATA_DIR, 'equity_scrip_map.json')
+            with open(eq_cache, 'w') as f:
+                json.dump(equity_scrips, f, indent=2)
+            print(f"✅ Auto-discovered {len(equity_scrips)} equity scrip IDs")
         
         self._contracts_cache = contracts
         print(f"✅ Found futures contracts for {len(contracts)} symbols")
@@ -286,6 +333,78 @@ class FuturesOIFetcher:
         
         df = df.sort_values('date').reset_index(drop=True)
         df['symbol'] = symbol
+        
+        # --- GAP-FILL: DhanHQ historical/daily endpoint can lag 1-3 days ---
+        # Use the intraday endpoint (which is real-time) to fill missing recent days
+        last_daily = df['date'].max().normalize()
+        today = pd.Timestamp.now().normalize()
+        # Calculate expected last trading day
+        expected_last = today
+        if expected_last.weekday() == 6:   # Sunday
+            expected_last -= timedelta(days=2)
+        elif expected_last.weekday() == 5: # Saturday
+            expected_last -= timedelta(days=1)
+        # If market hasn't closed yet today (before 15:30 IST), use previous trading day
+        if pd.Timestamp.now().hour < 16 and expected_last == today:
+            expected_last -= timedelta(days=1)
+            if expected_last.weekday() == 6:
+                expected_last -= timedelta(days=2)
+            elif expected_last.weekday() == 5:
+                expected_last -= timedelta(days=1)
+        
+        gap_days = (expected_last - last_daily).days
+        if gap_days >= 1 and contract:
+            # Fetch intraday for the missing days and aggregate to daily
+            gap_start = (last_daily + timedelta(days=1)).strftime('%Y-%m-%d 09:15:00')
+            gap_end = (expected_last + timedelta(days=1)).strftime('%Y-%m-%d 15:30:00')
+            
+            _st, _intra = self._request('POST', '/charts/intraday', json_body={
+                'securityId': contract['id'],
+                'exchangeSegment': 'NSE_FNO',
+                'instrument': 'FUTSTK',
+                'interval': '5',
+                'oi': True,
+                'fromDate': gap_start,
+                'toDate': gap_end,
+            })
+            
+            if _st == 200 and _intra.get('timestamp'):
+                intra_df = pd.DataFrame({
+                    'date': pd.to_datetime(_intra['timestamp'], unit='s'),
+                    'open': _intra['open'],
+                    'high': _intra['high'],
+                    'low': _intra['low'],
+                    'close': _intra['close'],
+                    'volume': _intra['volume'],
+                    'fut_oi': _intra.get('open_interest', [0] * len(_intra['timestamp'])),
+                })
+                # Filter to IST trading hours (09:15 - 15:30)
+                intra_df = intra_df[intra_df['date'].dt.hour >= 3]  # UTC 3:45 = IST 9:15
+                intra_df = intra_df[intra_df['date'].dt.hour <= 10] # UTC 10:00 = IST 15:30
+                
+                if len(intra_df) > 0:
+                    intra_df['trade_date'] = intra_df['date'].dt.normalize()
+                    # Aggregate to daily OHLCV + last OI
+                    daily_gap = intra_df.groupby('trade_date').agg(
+                        open=('open', 'first'),
+                        high=('high', 'max'),
+                        low=('low', 'min'),
+                        close=('close', 'last'),
+                        volume=('volume', 'sum'),
+                        fut_oi=('fut_oi', 'last'),  # Last OI of the day
+                    ).reset_index()
+                    daily_gap = daily_gap.rename(columns={'trade_date': 'date'})
+                    daily_gap['symbol'] = symbol
+                    
+                    # Only add days that are actually newer than what we have
+                    daily_gap = daily_gap[daily_gap['date'] > last_daily]
+                    
+                    if len(daily_gap) > 0:
+                        df = pd.concat([df, daily_gap], ignore_index=True)
+                        df = df.sort_values('date').reset_index(drop=True)
+                        logger.info(f"{symbol}: gap-filled {len(daily_gap)} days from intraday "
+                                    f"(historical ended {last_daily.date()}, now through {df['date'].max().date()})")
+        
         return df
     
     def fetch_intraday_futures_oi(self, symbol: str, days_back: int = 85,
@@ -357,9 +476,53 @@ class FuturesOIFetcher:
         df['symbol'] = symbol
         return df
     
+    def _get_equity_scrip_id(self, symbol: str) -> Optional[int]:
+        """Get equity security ID for a symbol.
+        
+        Checks in order:
+        1. Hardcoded EQUITY_SCRIP_MAP (38 stocks, always available)
+        2. Auto-discovered map from instrument master (213+ stocks)
+        3. Cached auto-discovered map from disk
+        """
+        # 1. Hardcoded map
+        eq_id = EQUITY_SCRIP_MAP.get(symbol)
+        if eq_id:
+            return eq_id
+        
+        # 2. In-memory auto-discovered map
+        global _EQUITY_SCRIP_AUTO
+        if _EQUITY_SCRIP_AUTO:
+            eq_id = _EQUITY_SCRIP_AUTO.get(symbol)
+            if eq_id:
+                return eq_id
+        
+        # 3. Load from disk cache
+        eq_cache = os.path.join(DATA_DIR, 'equity_scrip_map.json')
+        if os.path.exists(eq_cache) and not _EQUITY_SCRIP_AUTO:
+            try:
+                with open(eq_cache, 'r') as f:
+                    _EQUITY_SCRIP_AUTO = json.load(f)
+                    # Convert values to int
+                    _EQUITY_SCRIP_AUTO = {k: int(v) for k, v in _EQUITY_SCRIP_AUTO.items()}
+                eq_id = _EQUITY_SCRIP_AUTO.get(symbol)
+                if eq_id:
+                    return eq_id
+            except Exception:
+                pass
+        
+        # 4. If still not found, trigger instrument master refresh
+        if self._contracts_cache is not None and not _EQUITY_SCRIP_AUTO:
+            # Contracts loaded but equity map empty — force refresh
+            self.load_instrument_master(force_refresh=True)
+            eq_id = _EQUITY_SCRIP_AUTO.get(symbol)
+            if eq_id:
+                return eq_id
+        
+        return None
+
     def fetch_equity_spot(self, symbol: str, months_back: int = 36) -> Optional[pd.DataFrame]:
         """Fetch daily equity spot price for basis calculation."""
-        eq_id = EQUITY_SCRIP_MAP.get(symbol)
+        eq_id = self._get_equity_scrip_id(symbol)
         if not eq_id:
             return None
         
@@ -450,6 +613,13 @@ class FuturesOIFetcher:
                 on='merge_date', how='left'
             )
             
+            # Forward-fill spot data for dates where equity API returned no data
+            # but futures API did (e.g. DhanHQ gap on pre-holiday days).
+            # Without this, those dates get basis=0, vol_ratio=0 → uniform features
+            # → model bias (all-UP or all-DOWN).
+            merged['spot_close'] = merged['spot_close'].ffill()
+            merged['spot_volume'] = merged['spot_volume'].ffill()
+            
             features['fut_basis_pct'] = np.where(
                 merged['spot_close'] > 0,
                 (fut_df['close'] - merged['spot_close']) / merged['spot_close'] * 100,
@@ -468,10 +638,11 @@ class FuturesOIFetcher:
             features['fut_basis_pct'] = 0.0
             features['fut_vol_ratio'] = 0.0
         
-        # 4. 5-day OI trend
-        features['fut_oi_5d_trend'] = (
-            fut_df['fut_oi'].pct_change(5) * 100
-        )
+        # 4. 5-day OI trend — clipped to ±50% to prevent anomalous spikes
+        # (Short histories like 23 rows caused values of 2000%+ which broke
+        # the direction model since fut_oi_buildup is 46.5% of its importance)
+        raw_5d = fut_df['fut_oi'].pct_change(5) * 100
+        features['fut_oi_5d_trend'] = np.clip(raw_5d, -50.0, 50.0)
         
         # Clean up
         features = features.replace([np.inf, -np.inf], 0).fillna(0)

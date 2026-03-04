@@ -1538,10 +1538,17 @@ def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
         result['relative_strength'] = 0.0
     
     # ── NIFTY Daily context (previous day's values) ──
-    if nifty_daily_df is not None and len(nifty_daily_df) >= 60:
+    # Use adaptive EMA period: prefer EMA-50 (matches training), but fall back
+    # to shorter period if insufficient data. The minimum viable is ~20 days
+    # for RSI-14 warmup + 1 day for "previous day" lookup.
+    _nifty_daily_ok = nifty_daily_df is not None and len(nifty_daily_df) >= 20
+    if _nifty_daily_ok:
         nd = nifty_daily_df.copy().sort_values('date').reset_index(drop=True)
         ndc = nd['close'].values
-        nd_ema50 = _ema(ndc, 50)
+        
+        # Adaptive EMA period: use 50 if enough data, else use (N-5) capped at 20
+        _ema_period = 50 if len(nd) >= 60 else max(10, min(len(nd) - 5, 20))
+        nd_ema = _ema(ndc, _ema_period)
         nd_rsi = _rsi(ndc, 14)
         
         nd['_date'] = nd['date'].dt.date if hasattr(nd['date'].dt, 'date') else nd['date'].apply(
@@ -1550,10 +1557,11 @@ def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
         
         # Build lookup: date D → previous day's NIFTY daily features
         daily_ctx = {}
-        for i in range(51, len(nd)):
+        _loop_start = max(_ema_period + 1, 16)  # need at least 15 for RSI warmup
+        for i in range(_loop_start, len(nd)):
             d = nd['_date'].iloc[i]
             prev = i - 1
-            trend = (ndc[prev] - nd_ema50[prev]) / nd_ema50[prev] * 100 if nd_ema50[prev] > 0 else 0.0
+            trend = (ndc[prev] - nd_ema[prev]) / nd_ema[prev] * 100 if nd_ema[prev] > 0 else 0.0
             daily_ctx[d] = {
                 'nifty_daily_trend': float(trend),
                 'nifty_daily_rsi': float(nd_rsi[prev]),
@@ -1583,7 +1591,7 @@ def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
             lambda d: _get_daily_ctx(d, 'nifty_daily_rsi')
         )
         result.drop(columns=['_date'], inplace=True, errors='ignore')
-    else:
+    elif not _nifty_daily_ok:
         result['nifty_daily_trend'] = 0.0
         result['nifty_daily_rsi'] = 0.0
     

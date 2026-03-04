@@ -455,7 +455,9 @@ def exit_position():
         # Calculate P&L
         entry_price = target.get('avg_price') or target.get('entry_price') or 0
         qty = abs(target.get('quantity', 0))
-        direction = target.get('direction') or target.get('side', 'BUY')
+        # Use 'side' (actual transaction side: BUY/SELL) NOT 'direction' (market view: BUY=bullish, SELL=bearish)
+        # For PE options: direction=SELL but side=BUY → must use side for correct P&L
+        direction = target.get('side') or target.get('direction', 'BUY')
 
         # For debit spreads, use net premium as entry
         if target.get('is_debit_spread') or target.get('is_credit_spread'):

@@ -130,16 +130,20 @@ FULL_FNO_SCAN = {
 # unchanged for slower setups (sniper, model-tracker, mean-reversion).
 BREAKOUT_WATCHER = {
     "enabled": True,
-    # --- Trigger Thresholds ---
-    "price_spike_pct": 0.8,          # Trigger if price moves ≥0.8% within sustain_window
+    # --- Trigger Thresholds (tightened Mar-04: reduce noise from weak triggers) ---
+    "price_spike_pct": 1.2,           # Trigger if price moves ≥1.2% within 60s baseline (was 0.8)
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
-    "volume_surge_multiplier": 2.5,   # Trigger if tick volume ≥ 2.5x rolling average
-    # --- Sustain Filter (anti-false-trigger) ---
-    "sustain_seconds": 10,            # Price must HOLD the move for 10s before triggering
-    "sustain_recheck_pct": 0.5,       # After sustain, price must still be ≥0.5% from baseline
+    "day_extreme_min_move_pct": 0.4,  # NEW: day extreme must also show ≥0.4% move from baseline
+    "volume_surge_multiplier": 3.5,   # Trigger if tick volume ≥ 3.5x rolling average (was 2.5)
+    # --- Sustain Filter (anti-false-trigger, tightened) ---
+    "sustain_seconds": 20,            # Price must HOLD the move for 20s before triggering (was 10)
+    "sustain_recheck_pct": 0.8,       # After sustain, price must still be ≥0.8% from baseline (was 0.5)
     # --- Cooldown (anti-spam) ---
     "cooldown_seconds": 180,          # Don't re-trigger same stock within 3 minutes
-    "max_triggers_per_minute": 3,     # Max triggers across ALL stocks per minute (burst limit)
+    "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days (was 3)
+    # --- Priority Queue (Mar-04 fix: big movers were lost to noise on crash days) ---
+    "queue_size": 100,                # Max queued triggers (up from 50) — evicts weakest when full
+    "priority_bypass_pct": 2.0,       # Moves ≥2.0% BYPASS rate limit — always enter queue
     # --- Timing ---
     "active_after": "09:20",          # Don't trigger before 09:20 (let ORB range form)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
@@ -180,6 +184,12 @@ ELITE_AUTO_FIRE = {
     "max_auto_fires_per_cycle": 3,    # Max auto-fired trades per scan cycle
     "require_setup": True,            # Must have a valid setup (ORB/VWAP/MOMENTUM), not just high score
     "log_all": True,                  # Log every auto-fire decision to scan_decisions.json
+    # --- ML Confidence Floor (prevent coin-flip ML from auto-firing) ---
+    "min_ml_confidence": 0.55,        # Block if ml_confidence < 55% (VBL had 0.48 → coin flip)
+    "min_ml_move_prob": 0.52,         # Block if ml_move_prob < 52% (directional signal too weak)
+    # --- Move Exhaustion Gate (prevent late entries after big moves) ---
+    "max_existing_move_pct": 2.5,     # Block if stock already moved >2.5% from prev close at entry
+    "exhaustion_min_acceleration": 0.3,  # Override exhaustion if last-candle acceleration > 0.3%
 }
 
 # === DYNAMIC MAX PICKS (GPT picks scale with signal quality) ===
@@ -231,7 +241,7 @@ DOWN_RISK_GATING = {
     # Flag=True guarantees score > model threshold (UP≈0.19, DOWN≈0.23).
     # Floor must be BELOW these thresholds so flagged stocks aren't double-filtered.
     "min_confirm_score": 0.0,          # Flag gate is sufficient — smart_score safety weight handles quality ranking
-    "min_smart_score": 50,             # Lowered from 55 — alignment bonus (+15/+10) already boosts quality trades
+    "min_smart_score": 55,             # Raised from 50 — require real conviction (Mar 2: VEDL tech=35 slipped through at 54)
     # === ALL_AGREE AMPLIFIED BET ===
     # All 3 models agree (Titan + GMM + XGB) = strongest conviction → amplified lot sizing
     "all_agree_lot_multiplier": 1.5,   # 1.5x lots for ALL_AGREE (strongest conviction)
@@ -299,13 +309,13 @@ GMM_CONTRARIAN = {
 TEST_GMM = {
     "enabled": True,
     # DOWN model signal: down_flag confirms → BUY PUT
-    "down_min_score": 0.25,              # DOWN model must show strong signal
-    "down_max_opposite": 0.10,           # UP model must be clean (no conflicting signal)
+    "down_min_score": 0.35,              # DOWN model must show strong signal (was 0.25 — too loose)
+    "down_max_opposite": 0.08,           # UP model must be very clean (was 0.10)
     # UP model signal: up_flag confirms → BUY CALL
-    "up_min_score": 0.22,                # UP model must show strong signal
-    "up_max_opposite": 0.10,             # DOWN model must be clean
+    "up_min_score": 0.32,                # UP model must show strong signal (was 0.22 — AUROC=0.56 needs higher bar)
+    "up_max_opposite": 0.08,             # DOWN model must be very clean (was 0.10)
     # Divergence quality
-    "min_divergence_gap": 0.20,          # |signaling_score - clean_score| minimum — strict filter
+    "min_divergence_gap": 0.30,          # |signaling_score - clean_score| minimum (was 0.20 — tighter separation)
     # FLAG-based conviction gates (model-calibrated thresholds)
     "require_signaling_flag": True,      # Signaling regime must FIRE its own anomaly flag
     "require_clean_no_flag": True,       # Clean regime must NOT fire its flag (no conflicting signal)
@@ -315,7 +325,7 @@ TEST_GMM = {
     "max_gate_prob": 0.75,               # Cap P(MOVE) — too-high gate = confirmed momentum, contrarian fails
     "max_ml_confidence": 0.55,           # Cap XGB confidence — high confidence = fighting real trend
     "min_smart_score": 0,                # No smart score — divergence IS the signal
-    "max_trades_per_day": 3,             # Conservative — quality over quantity
+    "max_trades_per_day": 999,           # No daily cap — quality gates handle filtering
     "lot_multiplier": 1.5,               # Slight boost — divergence is unique differentiated signal
     "score_tier": "standard",
 }
@@ -332,10 +342,11 @@ TEST_GMM = {
 #   TEST_XGB      = pure XGB conviction, no GMM
 TEST_XGB = {
     "enabled": True,
-    "min_move_prob": 0.58,               # P(MOVE) floor — gate model must be confident
-    "min_directional_prob": 0.42,        # prob_up or prob_down must exceed this for direction
-    "min_directional_margin": 0.10,      # |prob_up - prob_down| minimum for clear lean
-    "max_trades_per_day": 3,             # Conservative cap
+    "min_move_prob": 0.65,               # P(MOVE) floor (was 0.58 — too easy on volatile days)
+    "min_directional_prob": 0.48,        # prob_up or prob_down must exceed this (was 0.42)
+    "min_directional_margin": 0.15,      # |prob_up - prob_down| minimum (was 0.10 — need clearer lean)
+    "min_ml_confidence": 0.60,           # XGB confidence floor — model must be sure, not just sensing movement
+    "max_trades_per_day": 999,           # No daily cap — quality gates handle filtering
     "lot_multiplier": 1.0,               # Standard lots — testing phase
     "score_tier": "standard",
     # --- IV Crush Overrides (tighter than global IV_CRUSH_GATE) ---
@@ -435,6 +446,129 @@ SNIPER_PCR_EXTREME = {
 # === DECISION LOG (Full Scan Audit Trail) ===
 # Logs every stock evaluated each cycle with score, outcome, and reason.
 # Enables post-hoc analysis of missed opportunities.
+
+# === ARBTR (Sector Arbitrage: Laggard Catch-Up) ===
+# Exploits intraday correlation gaps: when a sector index moves hard, most
+# correlated stocks follow — but 1-2 laggards haven't caught up yet.
+# ARBTR buys the laggard in the direction of the sector move, expecting
+# it to converge.  This is NOT contrarian — we trade WITH the sector.
+#
+# Edge: Sector indices are cap-weighted averages.  Individual laggards
+# converge with 65-70% probability within 30-90 min on normal days.
+#
+# Risk controls: ML confirmation, volume gate, max divergence cap,
+# chop filter, and tight stops (if stock lags because it's decoupling,
+# the stop fires fast).
+ARBTR_CONFIG = {
+    "enabled": True,
+    "max_trades_per_day": 6,              # Max ARBTR entries per day
+    "lot_multiplier": 1.0,                # Conservative sizing — 1x lots to start
+
+    # --- Sector Move Detection ---
+    "min_sector_move_pct": 1.5,           # Sector index must move ≥1.5% from prev close
+    "min_sector_stocks_aligned": 0.60,    # ≥60% of sector stocks must have moved WITH sector
+
+    # --- Laggard Detection ---
+    "max_laggard_move_pct": 0.50,         # Laggard stock moved <0.50% (barely budged)
+    "min_divergence_pct": 1.0,            # |sector_move - stock_move| must be ≥1.0%
+    "max_divergence_pct": 5.0,            # If gap >5% the stock is decoupled (skip)
+
+    # --- Confirmation Gates (reduce failure trades) ---
+    "require_volume_confirmation": True,  # Laggard must have ≥0.8x normal volume (not halted/illiquid)
+    "min_volume_ratio": 0.8,              # Volume vs 20-day avg must be ≥0.8
+    "require_ml_move_signal": True,       # XGB must show ≥40% P(move) — dead stocks stay dead
+    "min_ml_move_prob": 0.40,             # ML move probability floor
+    "min_ml_confidence": 0.45,            # ML confidence floor
+    "max_ml_flat_prob": 0.55,             # If ML says >55% flat → stock won't catch up, skip
+    "require_no_chop_zone": True,         # Laggard must NOT be in chop zone
+    "require_htf_not_opposed": True,      # HTF must not oppose sector direction
+    "min_smart_score": 35,                # Low floor — ARBTR signal is primary, score is secondary
+
+    # --- GMM Safety Net ---
+    "use_gmm_veto": True,                 # GMM anomaly model can veto if opposing
+    "max_dr_score": 0.25,                 # GMM down-risk score must be <0.25 (clean)
+
+    # --- Timing ---
+    "earliest_entry": "09:45",            # First 30 min: too noisy, let the divergence establish
+    "no_entry_after": "14:00",            # No entries after 2 PM — need time for convergence
+    "cooldown_per_sector_minutes": 15,    # After entering one ARBTR in a sector, wait 15 min
+
+    # --- Risk / Sizing ---
+    "score_tier": "standard",             # Standard sizing (3% risk)
+    "target_multiplier": 1.5,             # Target = 1.5x SL distance (quick convergence play)
+    "sl_multiplier": 1.0,                 # Tight SL — if thesis wrong, exit fast
+    "max_simultaneous_arbtr": 3,          # Max 3 ARBTR trades open at once
+    "separate_capital": 200000,           # ₹2L reserved for ARBTR
+}
+
+# Sector definitions for ARBTR — must match _sector_stock_map in scan_and_trade
+ARBTR_SECTOR_MAP = {
+    'METALS': {
+        'index': 'NSE:NIFTY METAL',
+        'stocks': ['TATASTEEL', 'JSWSTEEL', 'HINDALCO', 'VEDL', 'JINDALSTEL',
+                   'NMDC', 'NATIONALUM', 'HINDZINC', 'SAIL', 'HINDCOPPER', 'COALINDIA'],
+    },
+    'IT': {
+        'index': 'NSE:NIFTY IT',
+        'stocks': ['INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM',
+                   'KPITTECH', 'COFORGE', 'MPHASIS', 'PERSISTENT'],
+    },
+    'BANKS': {
+        'index': 'NSE:NIFTY BANK',
+        'stocks': ['SBIN', 'HDFCBANK', 'ICICIBANK', 'AXISBANK', 'KOTAKBANK',
+                   'BANKBARODA', 'PNB', 'IDFCFIRSTB', 'INDUSINDBK', 'FEDERALBNK'],
+    },
+    'AUTO': {
+        'index': 'NSE:NIFTY AUTO',
+        'stocks': ['MARUTI', 'TATAMOTORS', 'M&M', 'BAJAJ-AUTO', 'HEROMOTOCO',
+                   'EICHERMOT', 'ASHOKLEY', 'BHARATFORG', 'MOTHERSON'],
+    },
+    'PHARMA': {
+        'index': 'NSE:NIFTY PHARMA',
+        'stocks': ['SUNPHARMA', 'CIPLA', 'DRREDDY', 'DIVISLAB', 'AUROPHARMA',
+                   'BIOCON', 'LUPIN', 'APOLLOHOSP'],
+    },
+    'ENERGY': {
+        'index': 'NSE:NIFTY ENERGY',
+        'stocks': ['RELIANCE', 'ONGC', 'NTPC', 'POWERGRID', 'TATAPOWER',
+                   'ADANIENT', 'BPCL', 'IOC', 'GAIL'],
+    },
+    'FMCG': {
+        'index': 'NSE:NIFTY FMCG',
+        'stocks': ['ITC', 'HINDUNILVR', 'NESTLEIND', 'BRITANNIA', 'DABUR',
+                   'GODREJCP', 'MARICO', 'COLPAL', 'TATACONSUM', 'VBL'],
+    },
+    'REALTY': {
+        'index': 'NSE:NIFTY REALTY',
+        'stocks': ['DLF', 'GODREJPROP', 'OBEROIRLTY', 'PRESTIGE', 'PHOENIXLTD',
+                   'BRIGADE', 'LODHA', 'SOBHA'],
+    },
+    'INFRA': {
+        'index': 'NSE:NIFTY INFRA',
+        'stocks': ['LT', 'ADANIPORTS', 'ULTRACEMCO', 'GRASIM', 'SHREECEM',
+                   'AMBUJACEM', 'ACC', 'SIEMENS', 'ABB', 'BEL', 'HAL', 'BHEL'],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GCR — GMM CONVICTION RECHECK
+# Re-queries GMM DR scores on open LOSING positions every scan cycle.
+# If the model now OPPOSES the trade direction for N consecutive checks,
+# exit the position (the thesis has structurally changed).
+# ═══════════════════════════════════════════════════════════════════════════════
+GCR_CONFIG = {
+    'enabled': True,
+    'min_loss_pct': 7,                # Only recheck positions losing ≥ this %
+    'consecutive_checks_required': 3, # GMM must oppose N consecutive scans
+    'dr_oppose_threshold': 0.25,      # DR_DOWN > 25% → opposes CE; DR_UP > 25% → opposes PE
+    'time_window': ('09:30', '15:10'),# Only run during market hours
+    'skip_setup_types': [             # Don't GCR-exit hedges or spreads
+        'PROACTIVE_HEDGE', 'THP_HEDGE',
+    ],
+    'max_exits_per_day': 4,           # Safety cap
+    'cooldown_after_exit_min': 10,    # Don't re-enter same underlying for N minutes
+}
+
 DECISION_LOG = {
     "enabled": True,
     "file": "scan_decisions.json",
@@ -636,6 +770,13 @@ THESIS_HEDGE_CONFIG = {
     "max_hedge_loss_pct": 20,          # UNIFIED: only hedge if current loss ≤ 20% (TIE + TIME_STOP)
     # --- TIME_STOP Hedge (dead-trade rescue) ---
     "hedge_time_stop": True,          # Also hedge naked options hitting TIME_STOP (not just TIE)
+    # --- Cost-Aware Hedge Gate (REJECT hedge if R:R is terrible) ---
+    # Prevents wasting money converting a corpse option into a dead spread.
+    # If the resulting spread has bad economics, SKIP hedge → let caller EXIT outright.
+    "cost_gate_enabled": True,
+    "max_debit_to_width_pct": 55,     # REJECT if net_debit > 55% of spread_width (bad R:R, max profit < 45% of risk)
+    "min_remaining_value_pct": 30,    # REJECT if buy leg LTP < 30% of entry price (option is a corpse)
+    "min_spread_rr_ratio": 0.50,      # REJECT if (spread_width - net_debit) / net_debit < 0.50 (need at least 0.5:1 R:R)
     # --- Hedge Unwind (restore full upside on recovery) ---
     "unwind_enabled": True,           # Buy back sold leg when thesis re-validates
     "unwind_buy_leg_recovery_pct": 100, # Unwind when buy leg LTP >= 100% of entry (fully recovered)
@@ -765,14 +906,17 @@ ASYMMETRIC_EXIT = {
 IV_CRUSH_GATE = {
     "enabled": True,
     # --- IV/RV Ratio Thresholds ---
-    "iv_rv_ratio_hard_block": 2.0,     # Block entry if IV > 2× realized vol
-    "iv_rv_ratio_reduce_lots": 1.5,    # Halve lots if IV > 1.5× realized vol
+    # On crash days both IV and RV spike, so ratio stays "normal" even though
+    # IV is about to mean-revert and crush premiums. Tighten to catch this.
+    "iv_rv_ratio_hard_block": 1.8,     # Block entry if IV > 1.8× realized vol (was 2.0x)
+    "iv_rv_ratio_reduce_lots": 1.3,    # Halve lots if IV > 1.3× realized vol (was 1.5x)
     # --- Absolute IV Caps ---
-    "max_atm_iv_pct": 60,              # Hard block: ATM IV > 60% (extreme overpricing)
-    "reduce_atm_iv_pct": 45,           # Halve lots: ATM IV > 45% (elevated overpricing)
+    # 60% was never triggered. Real IV crush happens at 35-50% on liquid stocks.
+    "max_atm_iv_pct": 50,              # Hard block: ATM IV > 50% (was 60% — too high)
+    "reduce_atm_iv_pct": 38,           # Halve lots: ATM IV > 38% (was 45%)
     # --- Morning IV Adjustment ---
-    "morning_iv_premium_until": "11:00",  # Before 11:00 morning IV is structurally inflated
-    "morning_ratio_penalty": 0.2,         # Add 0.2 to ratio thresholds (more lenient in morning)
+    "morning_iv_premium_until": "10:30",  # Before 10:30 morning IV is structurally inflated (was 11:00)
+    "morning_ratio_penalty": 0.15,        # Add 0.15 to ratio thresholds (was 0.2 — tighter morning too)
 }
 
 # === GREEKS-BASED EXIT INTELLIGENCE ===

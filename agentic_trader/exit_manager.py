@@ -85,6 +85,7 @@ class TradeState:
     greeks_sl_applied: bool = False  # True once Greeks-adjusted SL has been set
     score_tier: str = 'standard'     # 'premium', 'standard', or 'base'
     target_extended: bool = False    # True when target zone reached → let winners run
+    underlying_entry_ltp: float = 0.0  # Underlying spot price at entry (for IV crush detection)
     premium_history: list = field(default_factory=list)      # Premium at each candle boundary (trajectory tracking)
     underlying_history: list = field(default_factory=list)   # Underlying LTP at each candle boundary
     _cached_greeks: object = None    # Last full GreeksSnapshot (not serialised)
@@ -142,13 +143,13 @@ class ExitManager:
         
         # === PHASED TRAILING: Build → Run → Harvest ===
         # Build zone (0 → 1.0R): No trailing, let trade establish
-        # Run zone (1.0R → 2.0R): Wide trail, let momentum continue
+        # Run zone (1.0R → 2.0R): Moderate trail, balance room vs profit lock
         # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
         self.trailing_start_r = 1.0    # Don't trail until 1.0R (was 0.5R — too early!)
-        self.trailing_run_pct = 0.40   # Run zone: retain 40% of peak (give back 60%)
+        self.trailing_run_pct = 0.50   # Run zone: retain 50% of peak (give back 50%) — was 0.40 (too loose, giving back 60%)
         self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
-        self.trailing_harvest_pct = 0.55  # Harvest zone: retain 55% of peak (give back 45%)
-        self.trailing_pct = 0.40  # Default (used as fallback) — was 0.60 (too tight!)
+        self.trailing_harvest_pct = 0.65  # Harvest zone: retain 65% of peak (give back 35%) — was 0.55 (too loose, giving back 45%)
+        self.trailing_pct = 0.50  # Default (used as fallback) — was 0.40
         
         # Scaled profit booking (options only)
         self.partial_profit_pct = 30.0       # Book 50% at +30% premium gain (was 15% — too early!)
@@ -254,7 +255,7 @@ class ExitManager:
         # print(f"📊 Exit Manager: Registered {symbol} {side} @ {entry_price}")
         return state
     
-    def update_trade(self, symbol: str, current_price: float, underlying_ltp: float = 0.0) -> Optional[ExitSignal]:
+    def update_trade(self, symbol: str, current_price: float, underlying_ltp: float = 0.0, skip_tie: bool = False) -> Optional[ExitSignal]:
         """
         Update trade state and check for exit signals
         Call this on every price update.
@@ -263,6 +264,7 @@ class ExitManager:
         Profit = net_credit - current_debit. If current_debit rises, we're losing.
         
         underlying_ltp: spot price of the underlying (for option thesis checks).
+        skip_tie: if True, skip the TIE check this cycle (throttled to every 60s).
         """
         if symbol not in self.trade_states:
             return None
@@ -299,6 +301,10 @@ class ExitManager:
             premium_pct = (current_price - state.entry_price) / state.entry_price * 100
             state.max_premium_gain_pct = max(state.max_premium_gain_pct, premium_pct)
         
+        # Capture underlying spot at entry (first valid reading)
+        if state.is_option and underlying_ltp > 0 and state.underlying_entry_ltp == 0:
+            state.underlying_entry_ltp = underlying_ltp
+
         # Record candle-level snapshots for trajectory analysis (one per candle)
         if state.is_option and state.candles_since_entry > 0:
             while len(state.premium_history) < state.candles_since_entry:
@@ -337,7 +343,8 @@ class ExitManager:
         
         # 2.5 THESIS INVALIDATION ENGINE (TIE) — structural thesis broken?
         # Skip TIE for positions already hedged by THP (they're debit spreads now)
-        if not state.is_debit_spread:
+        # TIE is throttled to run every ~60s (skip_tie=True on interim calls)
+        if not state.is_debit_spread and not skip_tie:
             tie_result = check_thesis(state, current_price, underlying_ltp)
             if tie_result is not None and tie_result.is_invalid:
                 print(f"\n🔴 THESIS INVALID [{state.symbol}]: {tie_result.check_name}")
@@ -1258,18 +1265,19 @@ class ExitManager:
         """Get all tracked trades"""
         return list(self.trade_states.values())
     
-    def check_all_exits(self, prices: Dict[str, float], underlying_prices: Optional[Dict[str, float]] = None) -> List[ExitSignal]:
+    def check_all_exits(self, prices: Dict[str, float], underlying_prices: Optional[Dict[str, float]] = None, skip_tie: bool = False) -> List[ExitSignal]:
         """
         Check all trades for exit signals
         prices: Dict of symbol -> current_price
         underlying_prices: Dict of option_symbol -> underlying_ltp (for TIE checks)
+        skip_tie: if True, skip TIE checks this cycle (throttled to every 60s)
         """
         if underlying_prices is None:
             underlying_prices = {}
         signals = []
         for symbol, price in prices.items():
             ul_ltp = underlying_prices.get(symbol, 0.0)
-            signal = self.update_trade(symbol, price, underlying_ltp=ul_ltp)
+            signal = self.update_trade(symbol, price, underlying_ltp=ul_ltp, skip_tie=skip_tie)
             if signal:
                 signals.append(signal)
         return signals

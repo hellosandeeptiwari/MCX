@@ -375,7 +375,9 @@ class TitanTicker:
         if watcher._enabled:
             print(f"   ⚡ Breakout Watcher: ACTIVE (spike≥{config.get('price_spike_pct', 0.8)}%, "
                   f"sustain={config.get('sustain_seconds', 15)}s, "
-                  f"cooldown={config.get('cooldown_seconds', 180)}s)")
+                  f"cooldown={config.get('cooldown_seconds', 180)}s, "
+                  f"queue={config.get('queue_size', 100)}, "
+                  f"bypass≥{config.get('priority_bypass_pct', 2.0)}%)")
         return watcher
     
     @property
@@ -645,6 +647,73 @@ class TitanTicker:
 
 import queue
 
+
+class PriorityTriggerQueue:
+    """
+    Thread-safe priority queue for breakout triggers.
+    
+    Uses abs(move_pct) as priority — bigger moves get processed first.
+    When full, evicts the LOWEST-priority item instead of dropping the new one,
+    ensuring large movers (like VBL's 3% spike) are never lost to noise.
+    
+    Thread-safety: guarded by a threading.Lock since both the WebSocket thread
+    (_fire_trigger) and the main thread (drain) access the internal list.
+    """
+
+    def __init__(self, maxsize: int = 100):
+        self._items: list = []          # [(priority, seq, trigger_data), ...] sorted desc
+        self._maxsize = maxsize
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def put(self, trigger_data: dict, priority: float):
+        """
+        Add a trigger by priority.  If full, evict lowest-priority item
+        only if the new item has higher priority.
+        
+        Returns:
+            (was_added: bool, evicted_symbol: str | None)
+        """
+        with self._lock:
+            self._seq += 1
+
+            if len(self._items) < self._maxsize:
+                self._items.append((priority, self._seq, trigger_data))
+                self._items.sort(key=lambda x: -x[0])      # highest priority first
+                return True, None
+
+            # Queue full — compare with the weakest (last) item
+            min_priority = self._items[-1][0]
+            if priority > min_priority:
+                evicted = self._items.pop()                 # remove weakest
+                evicted_sym = evicted[2].get('symbol', '?')
+                self._items.append((priority, self._seq, trigger_data))
+                self._items.sort(key=lambda x: -x[0])
+                return True, evicted_sym
+
+            return False, None                              # new item too weak
+
+    def drain(self) -> list:
+        """Drain ALL items, returned highest-priority first. Thread-safe."""
+        with self._lock:
+            result = [item[2] for item in self._items]
+            self._items.clear()
+            return result
+
+    def empty(self) -> bool:
+        with self._lock:
+            return len(self._items) == 0
+
+    @property
+    def qsize(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+
 class BreakoutWatcher:
     """
     Watches WebSocket ticks for breakout conditions and queues them
@@ -662,13 +731,19 @@ class BreakoutWatcher:
         self._day_extreme = config.get('day_extreme_trigger', True)
         self._vol_surge_x = config.get('volume_surge_multiplier', 2.5)
         
+        self._day_ext_min_move = config.get('day_extreme_min_move_pct', 0.4)
+        
         # Sustain filter
         self._sustain_secs = config.get('sustain_seconds', 15)
         self._sustain_recheck_pct = config.get('sustain_recheck_pct', 0.5)
         
         # Cooldown
         self._cooldown_secs = config.get('cooldown_seconds', 180)
-        self._max_per_min = config.get('max_triggers_per_minute', 3)
+        self._max_per_min = config.get('max_triggers_per_minute', 10)
+        
+        # Priority queue settings
+        self._queue_size = config.get('queue_size', 100)
+        self._priority_bypass_pct = config.get('priority_bypass_pct', 2.0)
         
         # Active window
         self._active_after = config.get('active_after', '09:20')
@@ -676,7 +751,7 @@ class BreakoutWatcher:
         
         # --- Internal state (accessed from WS thread only) ---
         self._lock = threading.Lock()
-        self._queue: queue.Queue = queue.Queue(maxsize=50)
+        self._queue = PriorityTriggerQueue(maxsize=self._queue_size)
         
         # Baseline prices: symbol → {price, timestamp} — snapshot at subscribe or periodic reset
         self._baselines: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}
@@ -810,13 +885,15 @@ class BreakoutWatcher:
         
         # 2) DAY EXTREME: exchange-reported ohlc.high/low INCREASED since last tick
         #    Compare ohlc.high between consecutive ticks (not ltp vs ohlc.high)
+        #    ALSO requires the move from 60s baseline to be >= day_extreme_min_move_pct
+        #    to filter out tiny incremental ₹0.01 new highs in trending stocks.
         if self._day_extreme and not trigger_type and _tick_day_high > 0 and _tick_day_low > 0:
             _prev_h = self._prev_reported_high.get(symbol, 0)
             _prev_l = self._prev_reported_low.get(symbol, 0)
-            if _prev_h > 0 and _tick_day_high > _prev_h:
+            if _prev_h > 0 and _tick_day_high > _prev_h and abs(move_pct) >= self._day_ext_min_move:
                 trigger_type = 'NEW_DAY_HIGH'
                 self._stats['extremes_detected'] += 1
-            elif _prev_l > 0 and _tick_day_low < _prev_l:
+            elif _prev_l > 0 and _tick_day_low < _prev_l and abs(move_pct) >= self._day_ext_min_move:
                 trigger_type = 'NEW_DAY_LOW'
                 self._stats['extremes_detected'] += 1
             # Always update the tracked values
@@ -843,24 +920,38 @@ class BreakoutWatcher:
             }
     
     def _fire_trigger(self, symbol: str, ltp: float, trigger_type: str, pending: dict):
-        """Push a confirmed trigger to the queue after passing all gates."""
+        """Push a confirmed trigger to the priority queue after passing gates.
+        
+        Priority = abs(move_pct).  When queue is full, the WEAKEST trigger
+        is evicted — ensuring large movers are never dropped by noise.
+        
+        Big moves (≥ priority_bypass_pct) bypass the rate limit so they
+        ALWAYS enter the queue even during flood conditions (crash days).
+        """
         # Gate: active window
         if not self._is_active_window():
             return
         
-        # Gate: cooldown
+        # Gate: cooldown (per-symbol)
         if not self._is_cooled_down(symbol):
             self._stats['cooldown_blocked'] += 1
             print(f"   ⏳ Watcher: {symbol} blocked by cooldown — skipping")
             return
         
-        # Gate: rate limit
-        if not self._check_rate_limit():
-            self._stats['rate_limited'] += 1
-            print(f"   ⏳ Watcher: {symbol} rate-limited ({self._max_per_min}/min cap) — skipping")
-            return
+        move_pct_abs = abs(pending.get('move_pct', 0))
         
-        # All gates passed — queue it
+        # Gate: rate limit — BIG moves bypass this entirely
+        if not self._check_rate_limit():
+            if move_pct_abs < self._priority_bypass_pct:
+                self._stats['rate_limited'] += 1
+                print(f"   ⏳ Watcher: {symbol} rate-limited ({self._max_per_min}/min cap, "
+                      f"move={move_pct_abs:.1f}% < {self._priority_bypass_pct}% bypass) — skipping")
+                return
+            # Big move → bypass rate limit
+            print(f"   🔥 Watcher: {symbol} BYPASSING rate limit "
+                  f"(move={move_pct_abs:.1f}% ≥ {self._priority_bypass_pct}% threshold)")
+        
+        # All gates passed — queue with priority
         now = time.time()
         self._cooldowns[symbol] = now
         self._recent_triggers.append(now)
@@ -876,28 +967,31 @@ class BreakoutWatcher:
             'detected_time': datetime.now().strftime('%H:%M:%S'),
         }
         
-        try:
-            self._queue.put_nowait(trigger_data)
+        priority = move_pct_abs
+        added, evicted = self._queue.put(trigger_data, priority)
+        
+        if added:
             self._stats['queued'] += 1
-            print(f"   📤 Watcher: {symbol} QUEUED for main thread ({trigger_type}, {pending.get('move_pct', 0):+.1f}%)")
-        except queue.Full:
-            print(f"   ⚠️ Watcher: {symbol} DROPPED — queue full (50 max)")
+            if evicted:
+                print(f"   📤 Watcher: {symbol} QUEUED (evicted weaker {evicted}) — "
+                      f"{trigger_type}, {pending.get('move_pct', 0):+.1f}%")
+            else:
+                print(f"   📤 Watcher: {symbol} QUEUED for main thread "
+                      f"({trigger_type}, {pending.get('move_pct', 0):+.1f}%)")
+        else:
+            self._stats['priority_dropped'] = self._stats.get('priority_dropped', 0) + 1
+            print(f"   ⚠️ Watcher: {symbol} NOT QUEUED — weaker than all "
+                  f"{self._queue.qsize} queued items (move={move_pct_abs:.1f}%)")
     
     def drain_queue(self) -> List[Dict]:
         """
-        Drain all pending triggers from the queue.
+        Drain all pending triggers from the priority queue.
         Called from the MAIN THREAD only (between scan cycles).
         
         Returns:
-            List of trigger dicts, each with: symbol, ltp, trigger_type, move_pct, etc.
+            List of trigger dicts sorted by priority (biggest move first).
         """
-        triggers = []
-        while not self._queue.empty():
-            try:
-                triggers.append(self._queue.get_nowait())
-            except queue.Empty:
-                break
-        return triggers
+        return self._queue.drain()
     
     def set_enabled(self, enabled: bool):
         """Enable/disable the watcher at runtime"""
@@ -917,6 +1011,7 @@ class BreakoutWatcher:
         self._prev_reported_high.clear()
         self._prev_reported_low.clear()
         self._recent_triggers.clear()
+        self._queue.clear()
         for k in self._stats:
             self._stats[k] = 0
 
