@@ -239,6 +239,13 @@ class AutonomousTrader:
         self._auto_fired_this_session = set()   # Symbols auto-fired today (no re-fire)
         self._watcher_fired_this_session = set()    # All symbols traded via breakout watcher today
         self._last_watcher_scan_time = 0             # Cooldown between watcher focused scans (epoch)
+        self._watcher_drain_count = 0                # Total drain calls today
+        self._watcher_total_drained = 0              # Total triggers drained today
+        self._watcher_total_actionable = 0           # Total triggers that passed filter
+        self._watcher_total_pipeline_sent = 0        # Total triggers sent to focused scan
+        self._watcher_total_gate_blocked = 0         # Total blocked by pipeline gates
+        self._watcher_total_placed = 0               # Total trades successfully placed
+        self._watcher_total_pos_exhausted = 0        # Times blocked by position limit
         self._last_market_breadth = 'MIXED'          # Cached market breadth from last scan_and_trade
         self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
         
@@ -293,6 +300,15 @@ class AutonomousTrader:
         self._gcr_exits_today = 0
         self._gcr_date = datetime.now().date()
         self._gcr_exit_times = {}      # underlying → last exit time (for cooldown)
+        # VIX REGIME: India VIX-based entry/SL/trailing adjustment
+        try:
+            from config import VIX_REGIME_CONFIG
+            self._vix_cfg = VIX_REGIME_CONFIG
+        except ImportError:
+            self._vix_cfg = {'enabled': False}
+        self._current_vix = self._vix_cfg.get('fallback_vix', 14.0)
+        self._vix_regime = 'NORMAL'       # LOW / NORMAL / HIGH / EXTREME
+        self._vix_last_fetch = 0.0        # timestamp of last VIX fetch
         # GMM Contrarian (DR_FLIP) state
         self._dr_flip_symbols = set()
         self._dr_flip_trades_today = 0
@@ -1006,6 +1022,20 @@ class AutonomousTrader:
         
         return auto_fired
     
+    # ========== WATCHER LOG — writes to bot_debug.log + watcher_debug.log ==========
+    def _wlog(self, msg: str):
+        """Write timestamped debug message to bot_debug.log AND watcher_debug.log."""
+        _ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        _line = f"[{_ts}] WATCHER: {msg}"
+        print(_line)
+        for _fname in ('bot_debug.log', 'watcher_debug.log'):
+            try:
+                _path = os.path.join(os.path.dirname(__file__), _fname)
+                with open(_path, 'a', encoding='utf-8') as _f:
+                    _f.write(_line + '\n')
+            except Exception:
+                pass
+
     # ========== BREAKOUT WATCHER QUEUE DRAIN ==========
     def _process_breakout_triggers(self):
         """
@@ -1026,7 +1056,8 @@ class AutonomousTrader:
         
         # Cooldown check BEFORE draining — keeps triggers in queue until we can process
         import time as _wt
-        if _wt.time() - self._last_watcher_scan_time < 20:
+        _cooldown_elapsed = _wt.time() - self._last_watcher_scan_time
+        if _cooldown_elapsed < 5:   # 5-sec cooldown (was 20s) — fast reaction to breakouts
             return
         
         watcher = ticker.breakout_watcher
@@ -1034,38 +1065,78 @@ class AutonomousTrader:
         if not triggers:
             return
         
-        # Filter: skip already-held, already-fired, already-processed
+        # === WATCHER ACTIVITY BANNER ===
+        _sym_list = ', '.join(t['symbol'].replace('NSE:', '') for t in triggers[:5])
+        self._wlog(f"🔔 TRIGGER — {len(triggers)} breakout(s) detected: {_sym_list}")
+        self._wlog(f"   ⚡ Processing immediately (cooldown={_cooldown_elapsed:.0f}s)...")
+        
+        self._watcher_drain_count += 1
+        self._watcher_total_drained += len(triggers)
+        
+        # --- Position exhaustion pre-check ---
+        _breadth = getattr(self, '_last_market_breadth', 'MIXED')
+        active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        if _breadth == 'MIXED':
+            _max_pos = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
+        elif _breadth in ('BULLISH', 'BEARISH'):
+            _max_pos = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
+        else:
+            _max_pos = HARD_RULES['MAX_POSITIONS']
+        _pos_slots_free = max(0, _max_pos - len(active_positions))
+        
+        if _pos_slots_free == 0:
+            self._watcher_total_pos_exhausted += 1
+            _syms_brief = ', '.join(t['symbol'].replace('NSE:', '') for t in triggers[:5])
+            self._wlog(f"❌ BLOCKED: Position slots full ({len(active_positions)}/{_max_pos} {_breadth}) — {_syms_brief}")
+            return
+        
+        # Filter: skip already-held, already-watcher-fired
+        # NOTE: We do NOT filter on _auto_fired_this_session — the watcher is an
+        # INDEPENDENT entry path.  A stock the main scan auto-fired should still be
+        # eligible for a watcher breakout trade if it's a new trigger event.
         actionable = []
         _skip_reasons = []
         for t in triggers:
             sym = t['symbol']
             if self.tools.is_symbol_in_active_trades(sym):
-                _skip_reasons.append(f"{sym.replace('NSE:', '')}=already-held")
-                continue
-            if sym in self._auto_fired_this_session:
-                _skip_reasons.append(f"{sym.replace('NSE:', '')}=already-fired")
+                _skip_reasons.append(f"{sym.replace('NSE:', '')}=held")
                 continue
             if sym in self._watcher_fired_this_session:
-                _skip_reasons.append(f"{sym.replace('NSE:', '')}=watcher-fired")
+                _skip_reasons.append(f"{sym.replace('NSE:', '')}=watcher-done")
                 continue
             if not self.risk_governor.is_trading_allowed():
-                _skip_reasons.append("risk-governor-blocked")
+                _skip_reasons.append(f"{sym.replace('NSE:', '')}=risk-gov")
                 break
             actionable.append(t)
         
+        # Log EVERY drain — critical for debugging
+        _trigger_summary = ', '.join(
+            f"{t['symbol'].replace('NSE:', '')}({t.get('trigger_type', '?')[:8]} {t.get('move_pct', 0):+.1f}%)"
+            for t in triggers
+        )
+        
         if not actionable:
-            if _skip_reasons:
-                print(f"   ⚡ Watcher drained {len(triggers)} trigger(s) but all filtered: {', '.join(_skip_reasons)}")
+            self._wlog(f"⚠️ ALL {len(triggers)} triggers filtered: {', '.join(_skip_reasons)} | triggers=[{_trigger_summary}]")
             return
+        
+        self._watcher_total_actionable += len(actionable)
         
         # Process up to 3 triggers per drain
         _batch = actionable[:3]
-        for t in _batch:
-            print(f"\n   ⚡ BREAKOUT WATCHER: {t['symbol']} — {t['trigger_type']} "
-                  f"({t.get('move_pct', 0):+.1f}%) at {t.get('detected_time', '?')}")
+        self._watcher_total_pipeline_sent += len(_batch)
+        
+        _actionable_summary = ', '.join(
+            f"{t['symbol'].replace('NSE:', '')}({t.get('trigger_type', '?')[:8]} {t.get('move_pct', 0):+.1f}%)"
+            for t in _batch
+        )
+        _filter_note = f" | filtered=[{', '.join(_skip_reasons)}]" if _skip_reasons else ''
+        self._wlog(f"🚀 PIPELINE: Sending {len(_batch)} stocks → [{_actionable_summary}] (slots={_pos_slots_free}){_filter_note}")
         
         # Run the FULL pipeline for these symbols (identical gates as scan_and_trade)
+        _pipe_start = _wt.time()
         self._watcher_focused_scan(_batch)
+        _pipe_dur = _wt.time() - _pipe_start
+        self._wlog(f"✅ PIPELINE DONE in {_pipe_dur:.1f}s | placed={self._watcher_total_placed} total today")
         self._last_watcher_scan_time = _wt.time()
     
     # ========== WATCHER FOCUSED SCAN (FULL PIPELINE) ==========
@@ -1087,6 +1158,9 @@ class AutonomousTrader:
           ✅ ADX trend strength gate (≥25)
           ✅ OI conflict veto (institutions vs direction)
           ✅ ML flat veto (high P(flat) blocks auto-fire)
+          ✅ XGB direction conflict veto (strong opposing signal blocks)
+          ✅ XGB move probability floor (P(move) >= 0.40)
+          ✅ GMM down-risk veto (extreme anomaly opposes direction → block)
           ✅ Position limit (regime-aware)
         
         The ONLY difference from a 5-min scan:
@@ -1102,6 +1176,33 @@ class AutonomousTrader:
         
         try:
             # ================================================================
+            # 0) F&O ELIGIBILITY — skip non-F&O stocks BEFORE the expensive pipeline
+            # ================================================================
+            _fo_set = getattr(self, '_fno_universe', None)
+            if not _fo_set:
+                try:
+                    _nfo_inst = self.tools.get_nfo_instruments()
+                    _fo_set = {f"NSE:{i['name']}" for i in _nfo_inst if i.get('segment') == 'NFO-OPT' and i.get('instrument_type') == 'CE'} if _nfo_inst else set()
+                    if not _fo_set:
+                        _fo_set = {f"NSE:{s}" for s in self.market_scanner.fo_stocks} if hasattr(self.market_scanner, 'fo_stocks') else set()
+                    self._fno_universe = _fo_set
+                except Exception:
+                    _fo_set = set()
+            
+            if _fo_set:
+                _before = len(_symbols)
+                _fno_triggers = [t for t in triggers if t['symbol'] in _fo_set]
+                _non_fno = [t['symbol'] for t in triggers if t['symbol'] not in _fo_set]
+                if _non_fno:
+                    self._wlog(f"PIPELINE: skipping non-F&O: {_non_fno}")
+                if not _fno_triggers:
+                    self._wlog(f"PIPELINE: all {_before} triggers are non-F&O — skipping pipeline")
+                    return
+                triggers = _fno_triggers
+                _trigger_map = {t['symbol']: t for t in triggers}
+                _symbols = [t['symbol'] for t in triggers]
+
+            # ================================================================
             # 1) MARKET DATA — fresh candles + indicators for triggered stocks
             #    force_fresh=True bypasses 10-min indicator cache so RSI/VWAP/ADX
             #    are computed from live candles (watcher only processes 1-3 stocks)
@@ -1110,7 +1211,7 @@ class AutonomousTrader:
             _sorted_data = [(s, d) for s, d in market_data.items()
                             if isinstance(d, dict) and 'ltp' in d]
             if not _sorted_data:
-                print(f"      ⚠️ Watcher scan: no market data — skipping")
+                self._wlog(f"PIPELINE: no market data for {[s for s in _symbols]} — skipping")
                 return
             
             # ================================================================
@@ -1156,7 +1257,7 @@ class AutonomousTrader:
                     pass
             
             if not _pre_scores:
-                print(f"      ⚠️ Watcher scan: scoring failed for all symbols")
+                self._wlog(f"PIPELINE: scoring failed for all symbols — skipping")
                 return
             
             # ================================================================
@@ -1289,7 +1390,7 @@ class AutonomousTrader:
                         _pre_scores[_oi_sym] += _oi_penalty
                         if _oi_sym in _cycle_decisions:
                             _cycle_decisions[_oi_sym]['score'] = _pre_scores[_oi_sym]
-                        print(f"      📊 OI cross-val: {_oi_sym.replace('NSE:', '')} "
+                        self._wlog(f"OI cross-val: {_oi_sym.replace('NSE:', '')} "
                               f"penalised {_oi_penalty} (OI {_oi_bias} vs scored {_scored_dir})")
                 except Exception:
                     pass
@@ -1326,7 +1427,7 @@ class AutonomousTrader:
                         _pre_scores[_sym] += _sec_penalty
                         if _sym in _cycle_decisions:
                             _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
-                        print(f"      🏭 Sector cross-val: {_stock_name} penalised {_sec_penalty} "
+                        self._wlog(f"Sector cross-val: {_stock_name} penalised {_sec_penalty} "
                               f"(sector {_sec_chg:+.1f}% vs BUY)")
                     elif _sec_chg >= 1.0 and _scored_dir == 'SELL':
                         if _stk_chg < 0 and abs(_stk_chg) >= abs(_sec_chg) * 2:
@@ -1335,7 +1436,7 @@ class AutonomousTrader:
                         _pre_scores[_sym] += _sec_penalty
                         if _sym in _cycle_decisions:
                             _cycle_decisions[_sym]['score'] = _pre_scores[_sym]
-                        print(f"      🏭 Sector cross-val: {_stock_name} penalised {_sec_penalty} "
+                        self._wlog(f"Sector cross-val: {_stock_name} penalised {_sec_penalty} "
                               f"(sector {_sec_chg:+.1f}% vs SELL)")
                 except Exception:
                     pass
@@ -1391,14 +1492,30 @@ class AutonomousTrader:
                 
                 # Score audit from scorer (shows component breakdown)
                 _score_audit = getattr(_scorer, '_last_score_audit', '')
-                print(f"      📊 {_sym.replace('NSE:', '')}: Score {_final_score:.0f} | Dir: {direction} | "
-                      f"Trigger: {_trigger_type} ({_move_pct:+.1f}%)")
+                _stock_name = _sym.replace('NSE:', '')
+                _ml_pred = _ml_results.get(_sym, {})
+                _ml_signal = _ml_pred.get('ml_signal', 'N/A')
+                _ml_conf = _ml_pred.get('ml_confidence', 0)
+                _ml_move_prob = _ml_pred.get('ml_move_prob', 0)
+                _dr_score = _ml_pred.get('ml_down_risk_score', 0)
+                _up_score = _ml_pred.get('ml_up_score', 0)
+                _down_score = _ml_pred.get('ml_down_score', 0)
+                _prob_up = _ml_pred.get('ml_prob_up', 0)
+                _prob_down = _ml_pred.get('ml_prob_down', 0)
+                self._wlog(f"GATE CHECK: {_stock_name} | score={_final_score:.0f} dir={direction} "
+                           f"trigger={_trigger_type}({_move_pct:+.1f}%) | "
+                           f"XGB={_ml_signal} conf={_ml_conf:.2f} P(move)={_ml_move_prob:.2f} P(up)={_prob_up:.2f} P(dn)={_prob_down:.2f} | "
+                           f"GMM DR={_dr_score:.3f} up={_up_score:.3f} dn={_down_score:.3f} | "
+                           f"ORB={_data.get('orb_signal', '?')} VWAP={_data.get('price_vs_vwap', '?')} "
+                           f"VOL={_data.get('volume_regime', '?')} ADX={_data.get('adx', 0):.0f} "
+                           f"FT={_data.get('follow_through_candles', 0)} RSI={_data.get('rsi_14', 50):.0f}")
                 if _score_audit:
-                    print(f"         🔍 Audit: {_score_audit}")
+                    self._wlog(f"  AUDIT: {_score_audit}")
                 
                 # --- GATE A: Score threshold ---
                 if _final_score < _min_score:
-                    print(f"      ⛔ Score {_final_score:.0f} < {_min_score} — blocked")
+                    self._wlog(f"  BLOCKED(A-SCORE): {_stock_name} score={_final_score:.0f} < {_min_score}")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_SCORE',
                                       reason=f'Breakout {_trigger_type} but score {_final_score:.0f} < {_min_score}',
                                       direction=direction)
@@ -1406,7 +1523,8 @@ class AutonomousTrader:
                 
                 # --- GATE B: Chop zone filter ---
                 if _data.get('chop_zone', False):
-                    print(f"      ⛔ Chop zone — blocked")
+                    self._wlog(f"  BLOCKED(B-CHOP): {_stock_name} in chop zone: {_data.get('chop_reason', '')}")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_CHOP_ZONE',
                                       reason=f'Breakout {_trigger_type} in chop zone: {_data.get("chop_reason", "")}',
                                       direction=direction)
@@ -1424,7 +1542,8 @@ class AutonomousTrader:
                     _data.get('rsi_14', 50) < 30 or _data.get('rsi_14', 50) > 70
                 )
                 if not has_setup:
-                    print(f"      ⛔ No valid setup — blocked")
+                    self._wlog(f"  BLOCKED(C-SETUP): {_stock_name} no setup | ORB={orb} VWAP={vwap} VOL={vol} EMA={ema} RSI={_data.get('rsi_14', 50):.0f}")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_SETUP',
                                       reason=f'Breakout {_trigger_type} but no ORB/VWAP/EMA/RSI setup',
                                       direction=direction)
@@ -1434,7 +1553,8 @@ class AutonomousTrader:
                 ft_candles = _data.get('follow_through_candles', 0)
                 orb_hold = _data.get('orb_hold_candles', 0)
                 if ft_candles == 0 and orb_hold > 2:
-                    print(f"      ⛔ FT=0, ORB hold={orb_hold} — stale breakout, blocked")
+                    self._wlog(f"  BLOCKED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} — stale breakout")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_FOLLOWTHROUGH',
                                       reason=f'FT=0, ORB hold={orb_hold} candles — stale breakout',
                                       direction=direction)
@@ -1443,7 +1563,8 @@ class AutonomousTrader:
                 # --- GATE E: ADX trend strength gate (same as ELITE: ≥25) ---
                 adx_val = _data.get('adx', 20)
                 if adx_val < 25:
-                    print(f"      ⛔ ADX={adx_val:.0f} < 25 — weak trend, blocked")
+                    self._wlog(f"  BLOCKED(E-ADX): {_stock_name} ADX={adx_val:.0f} < 25")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_WEAK_ADX',
                                       reason=f'ADX={adx_val:.0f} < 25',
                                       direction=direction)
@@ -1452,13 +1573,15 @@ class AutonomousTrader:
                 # --- GATE F: OI conflict veto (same as ELITE) ---
                 oi_signal = _data.get('oi_signal', 'NEUTRAL')
                 if direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
-                    print(f"      ⛔ OI conflict: BUY vs SHORT_BUILDUP — blocked")
+                    self._wlog(f"  BLOCKED(F-OI): {_stock_name} BUY vs SHORT_BUILDUP")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_CONFLICT',
                                       reason=f'BUY direction but OI={oi_signal}',
                                       direction=direction)
                     continue
                 if direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
-                    print(f"      ⛔ OI conflict: SELL vs LONG_BUILDUP — blocked")
+                    self._wlog(f"  BLOCKED(F-OI): {_stock_name} SELL vs LONG_BUILDUP")
+                    self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_CONFLICT',
                                       reason=f'SELL direction but OI={oi_signal}',
                                       direction=direction)
@@ -1469,9 +1592,92 @@ class AutonomousTrader:
                     _cached_ml = _cycle_decisions.get(_sym, {}).get('ml_prediction', {})
                     if _cached_ml.get('ml_elite_ok') is False:
                         _ml_flat_p = _cached_ml.get('ml_prob_flat', 0)
-                        print(f"      ⛔ ML flat veto: P(flat)={_ml_flat_p:.0%} — blocked")
+                        self._wlog(f"  BLOCKED(G-ML): {_stock_name} P(flat)={_ml_flat_p:.0%}")
+                        self._watcher_total_gate_blocked += 1
                         self._log_decision(_ts, _sym, _final_score, 'WATCHER_ML_FLAT',
                                           reason=f'ML FLAT ({_ml_flat_p:.0%} flat prob)',
+                                          direction=direction)
+                        continue
+                except Exception:
+                    pass
+                
+                # --- GATE G2: XGB Direction Conflict (watcher-specific) ---
+                # If XGB strongly predicts the OPPOSITE direction, block.
+                # Relaxed vs main scan (0.55→0.50 move_prob, needs strong opposing prob).
+                try:
+                    _xgb_ml = _ml_results.get(_sym, {})
+                    _xgb_signal = _xgb_ml.get('ml_signal', 'UNKNOWN')
+                    _xgb_move_prob = _xgb_ml.get('ml_move_prob', 0)
+                    _xgb_prob_up = _xgb_ml.get('ml_prob_up', 0)
+                    _xgb_prob_down = _xgb_ml.get('ml_prob_down', 0)
+                    _xgb_conf = _xgb_ml.get('ml_confidence', 0)
+                    
+                    # Hard block: XGB says opposite with strong conviction
+                    _xgb_opposes = False
+                    if direction == 'BUY' and _xgb_signal == 'DOWN' and _xgb_prob_down >= 0.40 and _xgb_conf >= 0.50:
+                        _xgb_opposes = True
+                    elif direction == 'SELL' and _xgb_signal == 'UP' and _xgb_prob_up >= 0.40 and _xgb_conf >= 0.50:
+                        _xgb_opposes = True
+                    
+                    if _xgb_opposes:
+                        self._wlog(f"  BLOCKED(G2-XGB): {_stock_name} XGB={_xgb_signal} opposes {direction} "
+                                   f"(P_up={_xgb_prob_up:.2f} P_down={_xgb_prob_down:.2f} conf={_xgb_conf:.2f})")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_XGB_CONFLICT',
+                                          reason=f'XGB {_xgb_signal} opposes {direction} '
+                                                 f'(P_up={_xgb_prob_up:.2f} P_down={_xgb_prob_down:.2f} conf={_xgb_conf:.2f})',
+                                          direction=direction)
+                        continue
+                except Exception:
+                    pass
+                
+                # --- GATE G3: XGB Move Probability Floor (watcher-specific) ---
+                # XGB must show minimum conviction that a move (up OR down) will happen.
+                # Watcher threshold: 0.40 (relaxed vs elite 0.55 — catching early signals).
+                try:
+                    _xgb_ml = _ml_results.get(_sym, {})
+                    _xgb_move_prob = _xgb_ml.get('ml_move_prob', 0)
+                    # Only gate if ML data is available (don't block when ML fails)
+                    if _xgb_ml and _xgb_move_prob > 0 and _xgb_move_prob < 0.40:
+                        self._wlog(f"  BLOCKED(G3-XGB_PROB): {_stock_name} P(move)={_xgb_move_prob:.2f} < 0.40")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_XGB_LOW_PROB',
+                                          reason=f'XGB P(move)={_xgb_move_prob:.2f} < 0.40',
+                                          direction=direction)
+                        continue
+                except Exception:
+                    pass
+                
+                # --- GATE G4: GMM Down-Risk Veto (watcher-specific) ---
+                # If GMM DR score opposes trade direction AND is very high → block.
+                # UP_Flag=True (UP regime, high dr) = hidden crash risk → opposes BUY
+                # Down_Flag=True (DOWN regime, high dr) = hidden bounce risk → opposes SELL
+                # Threshold: 0.30 (generous — only blocks extreme anomaly, main sniper uses 0.08-0.13)
+                try:
+                    _gmm_ml = _ml_results.get(_sym, {})
+                    _dr_score = _gmm_ml.get('ml_down_risk_score', 0)
+                    _up_flag = _gmm_ml.get('ml_up_flag', False)
+                    _down_flag = _gmm_ml.get('ml_down_flag', False)
+                    _up_score = _gmm_ml.get('ml_up_score', 0)
+                    _down_score = _gmm_ml.get('ml_down_score', 0)
+                    
+                    _gmm_blocks = False
+                    _gmm_reason = ''
+                    
+                    if direction == 'BUY' and _up_flag and _up_score >= 0.30:
+                        # UP regime flagged = hidden crash risk → opposes BUY
+                        _gmm_blocks = True
+                        _gmm_reason = f'UP_flag=True up_score={_up_score:.3f}>=0.30 (crash risk opposes BUY)'
+                    elif direction == 'SELL' and _down_flag and _down_score >= 0.30:
+                        # DOWN regime flagged = hidden bounce risk → opposes SELL
+                        _gmm_blocks = True
+                        _gmm_reason = f'DOWN_flag=True down_score={_down_score:.3f}>=0.30 (bounce risk opposes SELL)'
+                    
+                    if _gmm_blocks:
+                        self._wlog(f"  BLOCKED(G4-GMM): {_stock_name} {_gmm_reason}")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_GMM_DR_VETO',
+                                          reason=f'GMM DR veto: {_gmm_reason}',
                                           direction=direction)
                         continue
                 except Exception:
@@ -1486,11 +1692,13 @@ class AutonomousTrader:
                 else:
                     _max_pos = HARD_RULES['MAX_POSITIONS']
                 if len(active_positions) >= _max_pos:
-                    print(f"      ⛔ Position limit: {len(active_positions)} >= {_max_pos} ({_breadth}) — blocked")
+                    self._wlog(f"  BLOCKED(H-POS): {_stock_name} positions={len(active_positions)}/{_max_pos} ({_breadth}) — EXHAUSTED")
+                    self._watcher_total_pos_exhausted += 1
                     break
                 
                 # === ALL GATES PASSED — Execute trade ===
-                print(f"      ✅ ALL GATES PASSED — executing watcher trade")
+                self._wlog(f"  ✅ ALL GATES PASSED: {_stock_name} score={_final_score:.0f} dir={direction} "
+                           f"trigger={_trigger_type} pos={len(active_positions)}/{_max_pos} — EXECUTING")
                 
                 # Build ML data payload (same format as ELITE auto-fire)
                 _elite_ml = _ml_results.get(_sym, {})
@@ -1540,24 +1748,26 @@ class AutonomousTrader:
                 )
                 
                 if result and result.get('success'):
-                    print(f"      ✅ WATCHER TRADE: {_sym.replace('NSE:', '')} ({direction}) "
-                          f"score={_final_score:.0f} trigger={_trigger_type}")
+                    self._wlog(f"  🎯 TRADE PLACED: {_sym.replace('NSE:', '')} ({direction}) "
+                               f"score={_final_score:.0f} trigger={_trigger_type}({_move_pct:+.1f}%) "
+                               f"order={result.get('order_id', '?')} setup={_setup_type}")
                     self._watcher_fired_this_session.add(_sym)
                     self._auto_fired_this_session.add(_sym)  # Prevent ELITE re-fire
                     _fired_count += 1
+                    self._watcher_total_placed += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_FIRED',
                                       reason=(f'Breakout {_trigger_type} ({_move_pct:+.1f}%) — '
                                              f'FULL PIPELINE: score+ML+OI+sector+DR+setup+FT+ADX all passed'),
                                       direction=direction, setup=_setup_type)
                 else:
                     _err = result.get('error', 'unknown') if result else 'no result'
-                    print(f"      ⚠️ Watcher trade failed for {_sym.replace('NSE:', '')}: {_err}")
+                    self._wlog(f"  ⚠️ TRADE FAILED: {_sym.replace('NSE:', '')} — {_err}")
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_TRADE_FAILED',
                                       reason=f'{_trigger_type}: {str(_err)[:80]}',
                                       direction=direction)
         
         except Exception as _e:
-            print(f"      ❌ Watcher focused scan error: {_e}")
+            self._wlog(f"PIPELINE ERROR: {_e}")
             import traceback
             traceback.print_exc()
     
@@ -2712,13 +2922,33 @@ class AutonomousTrader:
         min_conf = cfg.get('min_ml_confidence', 0.60)
         lot_mult = cfg.get('lot_multiplier', 1.0)
         
+        # ── SAFETY: Respect herd detection + market/sector breadth ──
+        # TEST_XGB is "pure XGB" but must NOT fight the market OR sector.
+        # Priority: sector trend > market breadth (sector is more specific).
+        # If stock's sector is bullish but market is bearish, follow sector.
+        # If stock has no sector mapping, fall back to market breadth.
+        _breadth = getattr(self, '_last_market_breadth', 'MIXED')
+        _sector_changes = getattr(self, '_sector_index_changes_cache', {})
+        _stock_to_sector = getattr(self, '_stock_to_sector', {})
+        
         # Build candidate pool — pure XGB plays
         candidates = []
         active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', [])
                       if p.get('status', 'OPEN') == 'OPEN'}
+        _xgb_skipped_herd = 0
+        _xgb_skipped_breadth = 0
+        _xgb_sector_override = 0
         
         for sym in ml_results:
             ml = ml_results[sym]
+            
+            # Gate: HERD — skip stocks explicitly flattened (Tier 3 low-conf during conflict)
+            # ml_herd_survived=True → sector-aligned or high-confidence → LET THROUGH
+            # ml_herd_caution=True → low-conf, boost reduced → LET THROUGH (sector gate below filters)
+            # ml_herd_flattened=True → legacy hard-kill (no longer set, kept for safety)
+            if ml.get('ml_herd_flattened', False):
+                _xgb_skipped_herd += 1
+                continue
             
             # Gate: P(MOVE) must be strong
             ml_move_prob = round(ml.get('ml_move_prob', ml.get('ml_p_move', 0.0)), 4)
@@ -2750,7 +2980,54 @@ class AutonomousTrader:
             else:
                 continue
             
+            # ── Gate: SECTOR-AWARE BREADTH CONFLICT ──
+            # Step 1: Check if stock belongs to a known sector
+            # Step 2: If sector has a clear trend (>= +1% or <= -1%), use sector trend
+            # Step 3: If no sector data, fall back to overall market breadth
+            # Logic: Don't buy PEs in a bullish environment, don't buy CEs in bearish
+            #        "environment" = sector if available, else market breadth
             sym_clean = sym.replace('NSE:', '')
+            _sec_match = _stock_to_sector.get(sym_clean)  # (sector_name, index_symbol)
+            _effective_trend = None  # 'BULLISH', 'BEARISH', or None (no opinion)
+            _trend_source = 'MARKET'
+            _sec_chg_val = None
+            
+            if _sec_match and _sector_changes:
+                _sec_name, _sec_index = _sec_match
+                _sec_chg_val = _sector_changes.get(_sec_index)
+                if _sec_chg_val is not None:
+                    if _sec_chg_val >= 1.0:
+                        _effective_trend = 'BULLISH'
+                        _trend_source = f'SECTOR({_sec_name}:{_sec_chg_val:+.1f}%)'
+                    elif _sec_chg_val <= -1.0:
+                        _effective_trend = 'BEARISH'
+                        _trend_source = f'SECTOR({_sec_name}:{_sec_chg_val:+.1f}%)'
+                    # else: sector is flat (-1% to +1%), fall through to market breadth
+            
+            # Fall back to market breadth if sector gave no clear signal
+            if _effective_trend is None and _breadth in ('BULLISH', 'BEARISH'):
+                _effective_trend = _breadth
+                _trend_source = f'MARKET({_breadth})'
+            
+            # Block if direction contradicts the effective trend
+            # SELL (PE) in BULLISH trend = fighting the trend → skip
+            # BUY (CE) in BEARISH trend = fighting the trend → skip
+            if _effective_trend:
+                _conflicts = (
+                    (direction == 'SELL' and _effective_trend == 'BULLISH') or
+                    (direction == 'BUY' and _effective_trend == 'BEARISH')
+                )
+                if _conflicts:
+                    _xgb_skipped_breadth += 1
+                    continue
+                # Track when sector OVERRODE market breadth (allowed a trade market would block)
+                if _sec_match and _trend_source.startswith('SECTOR') and _breadth in ('BULLISH', 'BEARISH'):
+                    _market_would_block = (
+                        (direction == 'SELL' and _breadth == 'BULLISH') or
+                        (direction == 'BUY' and _breadth == 'BEARISH')
+                    )
+                    if _market_would_block:
+                        _xgb_sector_override += 1
             
             # Skip if already traded today (any path)
             if sym in self._test_xgb_symbols:
@@ -2765,6 +3042,11 @@ class AutonomousTrader:
             dr_score = ml.get('ml_down_risk_score', 0)
             p_score = pre_scores.get(sym, 0)
             
+            # Sector info for this candidate (for rationale + logging)
+            _cand_sector = _sec_match[0] if _sec_match else ''
+            _cand_sec_chg = _sec_chg_val if _sec_chg_val is not None else 0
+            _cand_trend_src = _trend_source
+            
             candidates.append({
                 'sym': sym,
                 'sym_clean': sym_clean,
@@ -2777,6 +3059,9 @@ class AutonomousTrader:
                 'margin': margin,
                 'dr_score': dr_score,
                 'p_score': p_score,
+                'sector': _cand_sector,
+                'sector_chg': _cand_sec_chg,
+                'trend_source': _cand_trend_src,
                 'ml_data': {
                     'smart_score': 0,  # Not used — pure XGB play
                     'p_score': p_score,
@@ -2813,6 +3098,17 @@ class AutonomousTrader:
                 },
             })
         
+        # ── Log gate summary ──
+        if _xgb_skipped_herd or _xgb_skipped_breadth or _xgb_sector_override:
+            _gate_parts = []
+            if _xgb_skipped_herd:
+                _gate_parts.append(f'herd_blocked={_xgb_skipped_herd}')
+            if _xgb_skipped_breadth:
+                _gate_parts.append(f'breadth_blocked={_xgb_skipped_breadth}(mkt={_breadth})')
+            if _xgb_sector_override:
+                _gate_parts.append(f'sector_overrides={_xgb_sector_override}')
+            print(f"   \U0001f6e1 TEST_XGB GATES: {' | '.join(_gate_parts)} → {len(candidates)} candidates remaining")
+        
         if not candidates:
             return []
         
@@ -2827,6 +3123,16 @@ class AutonomousTrader:
         for cand in selected:
             _dir_label = 'BUY(CALL)' if cand['direction'] == 'BUY' else 'SELL(PUT)'
             try:
+                # Build rationale string with sector info
+                _sec_part = ''
+                if cand.get('sector'):
+                    _sc = cand['sector_chg']
+                    _sec_part = f" | {cand['sector']}:{_sc:+.1f}%"
+                _xgb_rationale = (
+                    f"TEST_XGB_{cand['side_tag']}: P(MOVE)={cand['ml_move_prob']:.2f} "
+                    f"P(UP)={cand['prob_up']:.2f} P(DN)={cand['prob_down']:.2f} "
+                    f"margin={cand['margin']:.2f}{_sec_part} [{cand.get('trend_source', 'MARKET')}]"
+                )
                 # Pass pre-fetched market_data so IV crush gate can compute RV (ATR-based)
                 _sym_md = market_data.get(cand['sym'], {})
                 if not _sym_md:
@@ -2837,12 +3143,10 @@ class AutonomousTrader:
                     strike_selection="ATM",
                     use_intraday_scoring=False,
                     lot_multiplier=lot_mult,
-                    rationale=(f"TEST_XGB_{cand['side_tag']}: P(MOVE)={cand['ml_move_prob']:.2f} "
-                              f"P(UP)={cand['prob_up']:.2f} P(DN)={cand['prob_down']:.2f} "
-                              f"margin={cand['margin']:.2f} — pure XGB play"),
+                    rationale=_xgb_rationale,
                     setup_type='TEST_XGB',
                     ml_data=cand.get('ml_data', {}),
-                    sector='',
+                    sector=cand.get('sector', ''),
                     pre_fetched_market_data=_sym_md if _sym_md else None,
                 )
                 if result and result.get('success'):
@@ -3196,6 +3500,63 @@ class AutonomousTrader:
             print(f"   📊 ARBTR placed {len(placed)}: {', '.join(placed)} | {remaining}/{max_per_day} remaining today")
 
         return placed
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # VIX REGIME — Fetch India VIX & determine current regime
+    # Cached for `cache_seconds` to avoid API spam. Falls back to default on error.
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _fetch_india_vix(self):
+        """Fetch India VIX and update self._current_vix / self._vix_regime.
+        Uses Kite LTP with a cache to avoid hitting API every 3 seconds.
+        """
+        if not self._vix_cfg.get('enabled', False):
+            return self._current_vix
+
+        import time as _t
+        cache_s = self._vix_cfg.get('cache_seconds', 120)
+        now_ts = _t.time()
+        if now_ts - self._vix_last_fetch < cache_s:
+            return self._current_vix  # Use cached value
+
+        try:
+            vix_key = self._vix_cfg.get('vix_instrument', 'NSE:INDIA VIX')
+            raw = self.tools.kite.ltp([vix_key])
+            if raw and vix_key in raw:
+                vix_val = raw[vix_key].get('last_price', 0)
+                if vix_val and vix_val > 0:
+                    self._current_vix = round(vix_val, 2)
+                    self._vix_last_fetch = now_ts
+        except Exception as e:
+            # Silently use fallback — don't let VIX fetch failure block trading
+            pass
+
+        # Determine regime
+        low = self._vix_cfg.get('low_vix_upper', 13.0)
+        normal = self._vix_cfg.get('normal_vix_upper', 18.0)
+        high = self._vix_cfg.get('high_vix_upper', 25.0)
+        if self._current_vix < low:
+            self._vix_regime = 'LOW'
+        elif self._current_vix < normal:
+            self._vix_regime = 'NORMAL'
+        elif self._current_vix < high:
+            self._vix_regime = 'HIGH'
+        else:
+            self._vix_regime = 'EXTREME'
+
+        return self._current_vix
+
+    def _get_vix_multipliers(self):
+        """Return (score_mult, lot_mult, sl_widen, trail_reduce) for current VIX regime."""
+        regime = self._vix_regime.lower()
+        cfg = self._vix_cfg
+        return {
+            'score_multiplier': cfg.get(f'score_multiplier_{regime}', 1.0),
+            'lot_multiplier': cfg.get(f'lot_multiplier_{regime}', 1.0),
+            'sl_widen': cfg.get(f'sl_widen_{regime}', 1.0),
+            'trail_retain_reduce': cfg.get(f'trail_retain_reduce_{regime}', 0.0),
+            'regime': self._vix_regime,
+            'vix': self._current_vix,
+        }
 
     # ═══════════════════════════════════════════════════════════════════════════
     # GCR — GMM CONVICTION RECHECK
@@ -5908,6 +6269,26 @@ class AutonomousTrader:
         
         _scan_dbg("SCAN: all pre-checks passed, proceeding to scan...")
         
+        # === INDIA VIX REGIME CHECK ===
+        # Fetch India VIX (cached for 2 min) and determine regime.
+        # Printed once per scan cycle for visibility.
+        try:
+            _vix_val = self._fetch_india_vix()
+            _vix_m = self._get_vix_multipliers()
+            _vix_emoji = {'LOW': '🟢', 'NORMAL': '🔵', 'HIGH': '🟠', 'EXTREME': '🔴'}.get(self._vix_regime, '⚪')
+            _scan_dbg(f"SCAN: India VIX = {_vix_val:.1f} | Regime: {_vix_emoji} {self._vix_regime} "
+                       f"| Score×{_vix_m['score_multiplier']:.2f} Lots×{_vix_m['lot_multiplier']:.2f} "
+                       f"SL widen×{_vix_m['sl_widen']:.2f} Trail-{_vix_m['trail_retain_reduce']:.0%}")
+            # Push VIX multipliers to tools so place_option_order can access them
+            self.tools._vix_multipliers = _vix_m
+            # Push VIX trailing adjustment to exit_manager
+            self.exit_manager.vix_trail_retain_reduce = _vix_m.get('trail_retain_reduce', 0.0)
+        except Exception as _vix_err:
+            _scan_dbg(f"SCAN: VIX fetch error (non-fatal): {_vix_err}")
+            self.tools._vix_multipliers = {'score_multiplier': 1.0, 'lot_multiplier': 1.0,
+                                            'sl_widen': 1.0, 'trail_retain_reduce': 0.0,
+                                            'regime': 'NORMAL', 'vix': 14.0}
+        
         self._scanning = True  # Suppress real-time dashboard during scan
         _cycle_start = time.time()
         print(f"\n{'='*80}")
@@ -6438,14 +6819,15 @@ class AutonomousTrader:
                                     _ml_predictions[_sym] = _pred
                         
                         # ── HERD DETECTION: Detect when ML gives same signal to all stocks ──
-                        # When >80% of DIRECTIONAL stocks get the same signal, it means the
+                        # When >80% of DIRECTIONAL stocks get the same signal, it MIGHT mean the
                         # model is responding to a market-wide factor (nifty crash, OI stale,
                         # extreme day returns) rather than stock-specific signals.
-                        # In that case, score_boost is noise — zero it out.
+                        # FIX Mar-05: TIERED response instead of nuclear flatten-all.
+                        #   - Sector-aligned stocks KEEP their signal (genuine sector play)
+                        #   - High-confidence stocks KEEP signal (stock-specific alpha)
+                        #   - Low-confidence stocks get boost reduced (not zeroed)
+                        #   - Signals are NEVER blanket-forced to FLAT (kills all trading)
                         # FIX Mar-04: Only count directional signals (UP/DOWN) for herd ratio.
-                        # FLAT is non-directional — including it diluted the ratio and let
-                        # 26 UP / 0 DOWN / 14 FLAT slip past as 26/40=65% < 80%.
-                        # With fix: 26/26 = 100% → herd correctly detected.
                         _herd_mode = False
                         _herd_signal = None
                         _directional_signals = [p.get('ml_signal') for p in _ml_predictions.values() if p.get('ml_signal') in ('UP', 'DOWN')]
@@ -6459,29 +6841,74 @@ class AutonomousTrader:
                                 _herd_mode = True
                                 _herd_signal = _dominant_signal
                                 
-                                # Check if market breadth contradicts the herd direction
-                                # e.g., herd says UP but breadth is BEARISH → model is stale/wrong
                                 _cur_breadth = getattr(self, '_last_market_breadth', 'MIXED')
                                 _herd_vs_breadth_conflict = (
                                     (_dominant_signal == 'UP' and _cur_breadth == 'BEARISH') or
                                     (_dominant_signal == 'DOWN' and _cur_breadth == 'BULLISH')
                                 )
                                 
-                                for _hp in _ml_predictions.values():
-                                    _hp['ml_score_boost'] = 0
+                                # Sector + confidence caches for tiered response
+                                _h_stock_to_sector = getattr(self, '_stock_to_sector', {})
+                                _h_sector_changes = getattr(self, '_sector_index_changes_cache', {})
+                                _h_survived = 0
+                                _h_reduced = 0
+                                _h_sector_kept = 0
+                                _h_conf_kept = 0
+                                
+                                for _hp_sym, _hp in _ml_predictions.items():
                                     _hp['ml_herd_signal'] = True
-                                    # If herd direction contradicts market breadth, force FLAT
-                                    # This prevents entering longs on crash days / shorts on rally days
-                                    # when the model is blindly following stale OI features
-                                    if _herd_vs_breadth_conflict and _hp.get('ml_signal') == _dominant_signal:
-                                        _hp['ml_signal'] = 'FLAT'
-                                        _hp['ml_direction_hint'] = 'NEUTRAL'
-                                        _hp['ml_herd_flattened'] = True
+                                    _hp_conf = _hp.get('ml_confidence', 0)
+                                    _hp_sig = _hp.get('ml_signal')
+                                    _hp_sym_clean = _hp_sym.replace('NSE:', '')
+                                    
+                                    # --- Tier 1: Sector-aligned → KEEP signal ---
+                                    # If stock's sector is moving in the SAME direction as herd,
+                                    # this is a genuine sector play, not noise.
+                                    _hp_sector_aligned = False
+                                    _hp_sec_match = _h_stock_to_sector.get(_hp_sym_clean)
+                                    if _hp_sec_match and _h_sector_changes:
+                                        _hp_sec_name, _hp_sec_idx = _hp_sec_match
+                                        _hp_sec_chg = _h_sector_changes.get(_hp_sec_idx)
+                                        if _hp_sec_chg is not None:
+                                            if _dominant_signal == 'DOWN' and _hp_sec_chg <= -0.8:
+                                                _hp_sector_aligned = True
+                                            elif _dominant_signal == 'UP' and _hp_sec_chg >= 0.8:
+                                                _hp_sector_aligned = True
+                                    
+                                    if _hp_sector_aligned and _hp_sig == _dominant_signal:
+                                        # Sector confirms direction → keep signal, halve boost
+                                        _hp['ml_score_boost'] = round(_hp.get('ml_score_boost', 0) * 0.5, 2)
+                                        _hp['ml_herd_survived'] = True
+                                        _hp['ml_herd_reason'] = 'sector_aligned'
+                                        _h_sector_kept += 1
+                                        _h_survived += 1
+                                        continue
+                                    
+                                    # --- Tier 2: High confidence → KEEP signal ---
+                                    # Stock with ml_confidence >= 0.72 may have genuine
+                                    # stock-specific features, not just market-wide noise.
+                                    if _hp_conf >= 0.72 and _hp_sig == _dominant_signal:
+                                        _hp['ml_score_boost'] = round(_hp.get('ml_score_boost', 0) * 0.5, 2)
+                                        _hp['ml_herd_survived'] = True
+                                        _hp['ml_herd_reason'] = 'high_confidence'
+                                        _h_conf_kept += 1
+                                        _h_survived += 1
+                                        continue
+                                    
+                                    # --- Tier 3: Everyone else → reduce boost, keep signal direction ---
+                                    # Don't flatten to FLAT — that kills all trading.
+                                    # Instead: reduce boost by 70%, mark herd_caution.
+                                    # Downstream strategies (TEST_XGB, etc.) have their own
+                                    # sector/breadth gates to filter bad trades.
+                                    _hp['ml_score_boost'] = round(_hp.get('ml_score_boost', 0) * 0.3, 2)
+                                    _hp['ml_herd_caution'] = True
+                                    _h_reduced += 1
                                 
                                 if _herd_vs_breadth_conflict:
-                                    print(f"   ⚠️ ML HERD DETECTED + BREADTH CONFLICT: {_dominant_count}/{len(_directional_signals)} predict {_dominant_signal} but breadth={_cur_breadth} → signals FORCED to FLAT + boosts zeroed")
+                                    _surv_detail = f"sector_kept={_h_sector_kept}, conf_kept={_h_conf_kept}"
+                                    print(f"   ⚠️ ML HERD + BREADTH CONFLICT: {_dominant_count}/{len(_directional_signals)} predict {_dominant_signal} but breadth={_cur_breadth} → {_h_survived} survived ({_surv_detail}), {_h_reduced} boost-reduced")
                                 else:
-                                    print(f"   ⚠️ ML HERD DETECTED: {_dominant_count}/{len(_directional_signals)} directional ({_herd_ratio:.0%}) predict {_dominant_signal} → score_boost zeroed (no stock discrimination)")
+                                    print(f"   ⚠️ ML HERD DETECTED: {_dominant_count}/{len(_directional_signals)} directional ({_herd_ratio:.0%}) predict {_dominant_signal} → boosts halved/reduced ({_h_survived} survived, {_h_reduced} reduced)")
                         
                         # Merge predictions into scores (single-threaded — modifies shared state)
                         for _sym, _ml_pred in _ml_predictions.items():
@@ -6500,8 +6927,11 @@ class AutonomousTrader:
                             _ml_flat = sum(1 for r in _ml_results.values() if r.get('ml_signal') == 'FLAT')
                             _ml_caution = sum(1 for r in _ml_results.values() if r.get('ml_entry_caution'))
                             _skip_note = f" | {_ml_skipped} skipped(score<{_ML_SCORE_THRESHOLD})" if _ml_skipped > 0 else ""
-                            _herd_flattened = sum(1 for r in _ml_results.values() if r.get('ml_herd_flattened'))
-                            _herd_note = f" | ⚠️HERD({_herd_signal}→{_herd_flattened} flattened)" if _herd_mode else ""
+                            _herd_survived = sum(1 for r in _ml_results.values() if r.get('ml_herd_survived'))
+                            _herd_cautioned = sum(1 for r in _ml_results.values() if r.get('ml_herd_caution'))
+                            _herd_note = ""
+                            if _herd_mode:
+                                _herd_note = f" | HERD({_herd_signal}: {_herd_survived} survived, {_herd_cautioned} cautioned)"
                             print(f"   🧠 ML: {len(_ml_results)} analyzed | {_ml_boosted} score-adjusted | {_ml_up} UP | {_ml_down} DOWN | {_ml_flat} FLAT | {_ml_caution} CAUTION{_skip_note}{_herd_note}")
                         else:
                             _eligible = sum(1 for s in _pre_scores if (_candle_cache.get(s) is not None and len(_candle_cache.get(s, [])) >= 50) or (_daily_cache.get(s) is not None and len(_daily_cache.get(s, [])) >= 50))
@@ -8750,6 +9180,10 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             _d_flat = _flat_count if '_flat_count' in dir() else '?'
             print(f"🌐 Market: {_d_breadth} | Up:{_d_up} Down:{_d_down} Flat:{_d_flat}")
             
+            # VIX Regime (safe access)
+            _d_vix_emoji = {'LOW': '🟢', 'NORMAL': '🔵', 'HIGH': '🟠', 'EXTREME': '🔴'}.get(self._vix_regime, '⚪')
+            print(f"📊 India VIX: {self._current_vix:.1f} | Regime: {_d_vix_emoji} {self._vix_regime}")
+            
             # Scorer summary (safe access)
             _d_scores = _pre_scores if '_pre_scores' in dir() else {}
             _d_fno = fno_opportunities if 'fno_opportunities' in dir() else []
@@ -9209,14 +9643,33 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         _dbg(f"DHAN_TOKEN: check error: {_tok_loop_e}")
                 if _loop_count % 60 == 0:  # Log heartbeat every 60s
                     _watcher_stats = ''
+                    _watcher_alive = ''
                     try:
                         _tw = getattr(self.tools, 'ticker', None)
                         if _tw and hasattr(_tw, 'breakout_watcher') and _tw.breakout_watcher:
                             _ws = _tw.breakout_watcher.stats
-                            _watcher_stats = f" | watcher: queued={_ws.get('queued', 0)} fired={len(self._watcher_fired_this_session)}"
+                            _wq = _ws.get('queued', 0)
+                            _watcher_stats = (f" | watcher: q={_wq} "
+                                             f"drains={self._watcher_drain_count} "
+                                             f"drained={self._watcher_total_drained} "
+                                             f"actionable={self._watcher_total_actionable} "
+                                             f"piped={self._watcher_total_pipeline_sent} "
+                                             f"gated={self._watcher_total_gate_blocked} "
+                                             f"placed={self._watcher_total_placed} "
+                                             f"pos_full={self._watcher_total_pos_exhausted} "
+                                             f"fired={len(self._watcher_fired_this_session)}")
+                            # Periodic watcher-alive banner every 5 min
+                            if _loop_count % 300 == 0 and self.is_trading_hours():
+                                _n_subs = _tw.stats.get('subscribed', 0) if hasattr(_tw, 'stats') else 0
+                                _watcher_alive = (f"\n👁️  WATCHER ALIVE — monitoring {_n_subs} stocks | "
+                                                 f"q={_wq} triggered={self._watcher_total_drained} "
+                                                 f"placed={self._watcher_total_placed} | "
+                                                 f"cooldown=5s, score≥35")
                     except Exception:
                         pass
                     _dbg(f"HEARTBEAT: loop iteration {_loop_count}, system_state={getattr(self.risk_governor.state, 'system_state', '?')}{_watcher_stats}")
+                    if _watcher_alive:
+                        _dbg(_watcher_alive)
                 
                 time.sleep(1)
         except KeyboardInterrupt:

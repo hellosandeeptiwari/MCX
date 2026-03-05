@@ -277,11 +277,10 @@ class MovePredictor:
         # Gate model: P(MOVE) — uses full feature set
         with self._xgb_lock:
             gate_raw = float(self.gate_model.predict_proba(X)[0, 1])  # P(MOVE)
-        # Apply isotonic calibration if available
-        if self.gate_cal is not None:
-            p_move = float(self.gate_cal.predict([gate_raw])[0])
-        else:
-            p_move = gate_raw
+        # RAW probabilities — no calibration overlay
+        # Calibrators removed Mar-05: they were biasing predictions
+        # (e.g. compressing all signals toward FLAT in volatile markets)
+        p_move = gate_raw
         
         # Direction model: P(UP|MOVE) — may use pruned feature subset
         if self.dir_feature_names != self.feature_names:
@@ -293,24 +292,15 @@ class MovePredictor:
         
         with self._xgb_lock:
             dir_raw = float(self.dir_model.predict_proba(X_dir)[0, 1])  # P(UP|MOVE)
-        if self.dir_cal is not None:
-            p_up_given_move = float(self.dir_cal.predict([dir_raw])[0])
-        else:
-            p_up_given_move = dir_raw
+        # RAW probabilities — no calibration overlay
+        p_up_given_move = dir_raw
         
-        # ── Market regime Bayesian adjustment ──
-        # ROOT CAUSE FIX: The direction model gives NIFTY features only ~10%
-        # importance vs 57% for OI features. In bear markets, OI signals
-        # (buildup=-1 / short buildup) were learned as mean-reversion → UP
-        # during bull-market training. The model STRUCTURALLY underweights
-        # market context and cannot adapt to regime changes.
-        #
-        # This applies a principled Bayesian prior using the NIFTY features
-        # already in the feature vector, effectively amplifying their weight
-        # from ~10% to ~25-30%. This is NOT a post-hoc patch — it corrects
-        # a known training-data bias where 90% of UP labels came from a
-        # bull market period (Sept 2025–Feb 2026).
-        p_up_given_move, _regime_adj = self._market_regime_adjust(X, p_up_given_move)
+        # Market regime Bayesian adjustment REMOVED (Mar-05):
+        # The regime adjustment was biasing 40/40 stocks to DOWN in bullish
+        # markets by over-weighting NIFTY daily features. The model should
+        # predict what it predicts — downstream sector/breadth gates handle
+        # market context filtering without distorting raw probabilities.
+        _regime_adj = 0.0
         
         p_down_given_move = 1 - p_up_given_move
         
@@ -540,19 +530,9 @@ class MovePredictor:
         # Predict probabilities — 3-class: [prob_down, prob_flat, prob_up]
         probas = self.model.predict_proba(X)[0]
         
-        # Apply isotonic calibration if available
-        if self.calibrators and len(probas) == 3:
-            calibrated = np.zeros(3)
-            for cls in range(3):
-                if cls in self.calibrators:
-                    calibrated[cls] = self.calibrators[cls].predict([probas[cls]])[0]
-                else:
-                    calibrated[cls] = probas[cls]
-            # Re-normalize
-            total = calibrated.sum()
-            if total > 1e-8:
-                calibrated /= total
-            probas = calibrated
+        # Isotonic calibration REMOVED (Mar-05): using raw model probabilities
+        # Calibrators were distorting raw predictions and contributing to
+        # uniform signal bias (40/40 stocks getting same direction).
         
         # Handle both 3-class and legacy 2-class models gracefully
         if len(probas) == 3:

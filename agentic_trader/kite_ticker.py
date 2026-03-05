@@ -166,7 +166,7 @@ class TitanTicker:
             name="TitanTicker-WS"
         )
         self._ws_thread.start()
-        # print("🔌 Ticker: WebSocket connecting...")
+        print("🔌 Ticker: WebSocket connecting...")
     
     def stop(self):
         """Stop WebSocket connection"""
@@ -204,7 +204,7 @@ class TitanTicker:
                 mode_map = {'ltp': 'ltp', 'quote': 'quote', 'full': 'full'}
                 ws_mode = mode_map.get(mode, 'quote')
                 self._ws.set_mode(ws_mode, tokens_to_sub)
-                # print(f"🔌 Ticker: Subscribed {len(tokens_to_sub)} new instruments ({mode} mode)")
+                print(f"🔌 Ticker: Subscribed {len(tokens_to_sub)} new instruments ({mode} mode)")
             except Exception as e:
                 print(f"⚠️ Ticker subscribe error: {e}")
         else:
@@ -447,6 +447,17 @@ class TitanTicker:
                 self._last_update[token] = time.time()
                 self._stats['ticks_received'] += 1
                 
+                # Periodic tick count log (every 10,000 ticks)
+                if self._stats['ticks_received'] % 10000 == 0:
+                    _bw_stats = self._breakout_watcher.stats if self._breakout_watcher else {}
+                    print(f"📊 Ticker: {self._stats['ticks_received']:,} ticks | "
+                          f"spikes={_bw_stats.get('spikes_detected', 0)} "
+                          f"extremes={_bw_stats.get('extremes_detected', 0)} "
+                          f"vol_surges={_bw_stats.get('vol_surges_detected', 0)} "
+                          f"sustain_pass={_bw_stats.get('sustain_passed', 0)} "
+                          f"sustain_fail={_bw_stats.get('sustain_failed', 0)} "
+                          f"queued={_bw_stats.get('queued', 0)}")
+                
                 # === BREAKOUT WATCHER: feed every equity tick ===
                 if self._breakout_watcher:
                     sym = self._token_to_symbol.get(token)
@@ -456,7 +467,7 @@ class TitanTicker:
     def _on_connect(self, ws, response):
         """Called on WebSocket connect"""
         self._connected = True
-        # print(f"🔌 Ticker: WebSocket CONNECTED")
+        print(f"🔌 Ticker: WebSocket CONNECTED — subscribing {len(self._subscribed_tokens)} instruments")
         
         # Subscribe to all previously requested tokens
         if self._subscribed_tokens:
@@ -464,7 +475,7 @@ class TitanTicker:
             try:
                 ws.subscribe(tokens_list)
                 ws.set_mode('quote', tokens_list)
-                # print(f"🔌 Ticker: Re-subscribed {len(tokens_list)} instruments")
+                print(f"🔌 Ticker: Subscribed {len(tokens_list)} instruments OK")
             except Exception as e:
                 print(f"⚠️ Ticker: Re-subscribe error: {e}")
     
@@ -472,8 +483,7 @@ class TitanTicker:
         """Called on WebSocket close"""
         self._connected = False
         if self._running:
-            # print(f"🔌 Ticker: Connection closed ({code}: {reason}) — will reconnect")
-            pass
+            print(f"🔌 Ticker: Connection closed ({code}: {reason}) — will reconnect")
     
     def _on_error(self, ws, code, reason):
         """Called on WebSocket error"""
@@ -736,6 +746,7 @@ class BreakoutWatcher:
         # Sustain filter
         self._sustain_secs = config.get('sustain_seconds', 15)
         self._sustain_recheck_pct = config.get('sustain_recheck_pct', 0.5)
+        self._sustain_recheck_pct_volume = config.get('sustain_recheck_pct_volume', 0.15)
         
         # Cooldown
         self._cooldown_secs = config.get('cooldown_seconds', 180)
@@ -859,14 +870,26 @@ class BreakoutWatcher:
                 # Time's up — check if price still holds
                 baseline_price = pending['baseline_price']
                 move_pct = abs(ltp - baseline_price) / baseline_price * 100
-                if move_pct >= self._sustain_recheck_pct:
+                # Volume surges use a lower sustain bar (they just need price not to crash)
+                _ttype = pending.get('trigger_type', '')
+                _recheck = self._sustain_recheck_pct_volume if 'VOLUME' in _ttype else self._sustain_recheck_pct
+                if move_pct >= _recheck:
                     # SUSTAINED — push to queue
                     self._stats['sustain_passed'] += 1
-                    print(f"   ✅ Watcher: {symbol} SUSTAINED {pending['trigger_type']} ({move_pct:.1f}% held) — queuing")
+                    print(f"   ✅ Watcher: {symbol} SUSTAINED {_ttype} ({move_pct:.1f}% held vs {_recheck}%) — queuing")
                     self._fire_trigger(symbol, ltp, pending['trigger_type'], pending)
                 else:
-                    # Failed sustain — retrace (silent)
+                    # Failed sustain — retrace (tracked, only non-volume printed)
                     self._stats['sustain_failed'] += 1
+                    if 'VOLUME' not in _ttype:
+                        # Price spikes / day extremes failing sustain = noteworthy
+                        print(f"   ❌ Watcher: {symbol} sustain FAILED {_ttype} ({move_pct:.1f}% < {_recheck}%)")
+                    else:
+                        # Volume surge fails are very common — batch-log every 50
+                        _vf = self._stats.get('_vol_sustain_fails', 0) + 1
+                        self._stats['_vol_sustain_fails'] = _vf
+                        if _vf % 50 == 0:
+                            print(f"   📉 Watcher: {_vf} volume-surge sustain fails so far (latest: {symbol} {move_pct:.1f}%)")
                 del self._pending[symbol]
             return  # While pending, don't check new triggers for this symbol
         

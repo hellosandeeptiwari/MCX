@@ -155,6 +155,9 @@ class ExitManager:
         self.partial_profit_pct = 30.0       # Book 50% at +30% premium gain (was 15% — too early!)
         self.partial_exit_fraction = 0.5     # Exit 50% of position
         
+        # VIX regime trailing adjustment (set by autonomous_trader each cycle)
+        self.vix_trail_retain_reduce = 0.0   # Reduce retention by this amount in high VIX
+        
         # Early speed gate (options only) — RELAXED: was killing 91% of trades
         self.option_speed_gate_candles = 12  # Check after 12 candles (60 min) — was 6
         self.option_speed_gate_pct = 3.0     # Need +3% premium gain — was 5%
@@ -1207,6 +1210,12 @@ class ExitManager:
         else:
             retain_pct = self.trailing_run_pct  # 40% — wide
             zone = "RUN"
+        
+        # VIX regime: reduce retention in high-VIX (wider trailing to avoid whipsaws)
+        # e.g. retain_pct=0.50, vix_reduce=0.05 → effective 0.45 (more giveback room)
+        _vix_reduce = getattr(self, 'vix_trail_retain_reduce', 0.0)
+        if _vix_reduce > 0 and retain_pct > 0.20:  # Floor: never go below 20% retention
+            retain_pct = max(0.20, retain_pct - _vix_reduce)
         
         risk = abs(state.entry_price - state.initial_sl)
         

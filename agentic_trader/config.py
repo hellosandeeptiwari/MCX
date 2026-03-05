@@ -130,14 +130,15 @@ FULL_FNO_SCAN = {
 # unchanged for slower setups (sniper, model-tracker, mean-reversion).
 BREAKOUT_WATCHER = {
     "enabled": True,
-    # --- Trigger Thresholds (tightened Mar-04: reduce noise from weak triggers) ---
-    "price_spike_pct": 1.2,           # Trigger if price moves ≥1.2% within 60s baseline (was 0.8)
+    # --- Trigger Thresholds (loosened Mar-05: afternoon moves are smaller) ---
+    "price_spike_pct": 0.7,           # Trigger if price moves ≥0.7% within 60s baseline (was 1.0)
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
-    "day_extreme_min_move_pct": 0.4,  # NEW: day extreme must also show ≥0.4% move from baseline
-    "volume_surge_multiplier": 3.5,   # Trigger if tick volume ≥ 3.5x rolling average (was 2.5)
-    # --- Sustain Filter (anti-false-trigger, tightened) ---
-    "sustain_seconds": 20,            # Price must HOLD the move for 20s before triggering (was 10)
-    "sustain_recheck_pct": 0.8,       # After sustain, price must still be ≥0.8% from baseline (was 0.5)
+    "day_extreme_min_move_pct": 0.25, # Day extreme must also show ≥0.25% move from baseline (was 0.4)
+    "volume_surge_multiplier": 3.0,   # Trigger if tick volume ≥ 3.0x rolling average (was 3.5)
+    # --- Sustain Filter (differentiated Mar-05: vol surges need lower bar) ---
+    "sustain_seconds": 15,            # Price must HOLD the move for 15s before triggering (was 20)
+    "sustain_recheck_pct": 0.5,       # Spike/extreme: price must still be ≥0.5% from baseline (was 0.8)
+    "sustain_recheck_pct_volume": 0.15,  # Volume surge: price must still be ≥0.15% from baseline (NEW)
     # --- Cooldown (anti-spam) ---
     "cooldown_seconds": 180,          # Don't re-trigger same stock within 3 minutes
     "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days (was 3)
@@ -148,7 +149,7 @@ BREAKOUT_WATCHER = {
     "active_after": "09:20",          # Don't trigger before 09:20 (let ORB range form)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
     # --- Score Gate ---
-    "min_score": 66,                  # Minimum intraday score to trigger trade (same as ORB threshold)
+    "min_score": 35,                  # Watcher catches EARLY moves → lower bar than main scan (was 66)
 }
 
 # === GTT SAFETY NET (Server-Side SL + Target) ===
@@ -325,7 +326,7 @@ TEST_GMM = {
     "max_gate_prob": 0.75,               # Cap P(MOVE) — too-high gate = confirmed momentum, contrarian fails
     "max_ml_confidence": 0.55,           # Cap XGB confidence — high confidence = fighting real trend
     "min_smart_score": 0,                # No smart score — divergence IS the signal
-    "max_trades_per_day": 999,           # No daily cap — quality gates handle filtering
+    "max_trades_per_day": 6,            # Hard cap — was 999, quality gates alone weren't sufficient
     "lot_multiplier": 1.5,               # Slight boost — divergence is unique differentiated signal
     "score_tier": "standard",
 }
@@ -346,7 +347,7 @@ TEST_XGB = {
     "min_directional_prob": 0.48,        # prob_up or prob_down must exceed this (was 0.42)
     "min_directional_margin": 0.15,      # |prob_up - prob_down| minimum (was 0.10 — need clearer lean)
     "min_ml_confidence": 0.60,           # XGB confidence floor — model must be sure, not just sensing movement
-    "max_trades_per_day": 999,           # No daily cap — quality gates handle filtering
+    "max_trades_per_day": 6,            # Hard cap — was 999, allowed 11 PEs against BULLISH market
     "lot_multiplier": 1.0,               # Standard lots — testing phase
     "score_tier": "standard",
     # --- IV Crush Overrides (tighter than global IV_CRUSH_GATE) ---
@@ -370,8 +371,8 @@ GMM_SNIPER = {
     "max_sniper_trades_per_day": 8,    # Max GMM sniper trades per day
     "lot_multiplier": 5.0,             # 5x normal lot size (was 3.0x, +2 lots Feb 26)
     "min_smart_score": 58,             # Smart score floor for 5x lots — needs real conviction (was 52)
-    "max_updr_score": 0.15,            # Relaxed 0.12→0.15 — broad selloff days inflate all DR scores
-    "max_downdr_score": 0.15,           # Relaxed 0.10→0.15 — 0/40 passed at 0.10 on risk-off days
+    "max_updr_score": 0.08,             # Tight upside cap — clean low-risk setups (was 0.07)
+    "max_downdr_score": 0.13,           # Tight downside cap — ONGC 0.141 still blocked (was 0.12)
     "min_gate_prob": 0.55,             # XGB gate floor — 5x lots needs strong P(MOVE) (was 0.50)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 300000,        # ₹3 Lakh reserved exclusively for sniper trades
@@ -917,6 +918,56 @@ IV_CRUSH_GATE = {
     # --- Morning IV Adjustment ---
     "morning_iv_premium_until": "10:30",  # Before 10:30 morning IV is structurally inflated (was 11:00)
     "morning_ratio_penalty": 0.15,        # Add 0.15 to ratio thresholds (was 0.2 — tighter morning too)
+}
+
+# === INDIA VIX REGIME GATE ===
+# Fetches India VIX each scan cycle and uses it to:
+#   1. Gate entries: high VIX = require stronger conviction (options are expensive)
+#   2. Adjust SL width: high VIX = wider SL (bigger swings = more noise hits)
+#   3. Adjust trailing: high VIX = wider trailing (let winners breathe in volatile market)
+# Thresholds are GENEROUS — we don't want to block trades in normal markets.
+# India VIX mean ~13-15; spikes to 20+ during fear events, 25+ during crashes.
+VIX_REGIME_CONFIG = {
+    "enabled": True,
+    # --- Regime Boundaries ---
+    "low_vix_upper": 13.0,       # VIX < 13 = LOW (calm market, cheap options)
+    "normal_vix_upper": 18.0,    # 13-18 = NORMAL (standard regime, no adjustments)
+    "high_vix_upper": 25.0,      # 18-25 = HIGH (elevated fear, cautious sizing)
+    # VIX > 25 = EXTREME (crash/event, very selective)
+    # --- Entry Gate: Score multiplier per regime ---
+    # Multiplier applied to minimum conviction threshold.
+    # 1.0 = no change, 1.1 = need 10% higher score, etc.
+    # LOW & NORMAL have NO penalty (we want trades to flow).
+    "score_multiplier_low": 1.0,       # Low VIX: options are cheap, standard gates fine
+    "score_multiplier_normal": 1.0,    # Normal VIX: standard gates fine
+    "score_multiplier_high": 1.10,     # High VIX: need 10% higher conviction (e.g., 52 → 57)
+    "score_multiplier_extreme": 1.25,  # Extreme VIX: need 25% higher conviction (e.g., 52 → 65)
+    # --- Lot Size Multiplier (position sizing) ---
+    # Scales down lots in high-VIX to limit damage from wider swings.
+    "lot_multiplier_low": 1.0,         # Full size in calm markets
+    "lot_multiplier_normal": 1.0,      # Full size in normal markets
+    "lot_multiplier_high": 0.75,       # 75% size when VIX elevated
+    "lot_multiplier_extreme": 0.50,    # 50% size during crashes
+    # --- SL Width Multiplier ---
+    # Widens the SL in high-VIX so noise doesn't stop us out prematurely.
+    # Applied to the 0.72 (28% loss) premium SL factor in position sizer.
+    # e.g., 1.15 means SL becomes 0.72 * (1 - 0.15) = 0.618 → ~38% loss SL instead of 28%
+    # Wider SL = more room, but max_loss is naturally capped by lot reduction above.
+    "sl_widen_low": 1.0,               # Standard SL (28% loss)
+    "sl_widen_normal": 1.0,            # Standard SL (28% loss)
+    "sl_widen_high": 1.15,             # 15% wider SL (~32% loss) — avoids noise stops
+    "sl_widen_extreme": 1.30,          # 30% wider SL (~36% loss) — crash swings are huge
+    # --- Trailing Retention Adjustment ---
+    # In high-VIX, wider swings mean tighter trailing kills winners prematurely.
+    # Reduce retain_pct slightly to give more room (lower retain = more giveback allowed).
+    "trail_retain_reduce_low": 0.0,    # No change
+    "trail_retain_reduce_normal": 0.0, # No change
+    "trail_retain_reduce_high": 0.05,  # Give back 5% more (e.g., 50% → 45% retention)
+    "trail_retain_reduce_extreme": 0.10, # Give back 10% more (e.g., 50% → 40%)
+    # --- VIX Fetch Settings ---
+    "vix_instrument": "NSE:INDIA VIX",   # Kite LTP key for India VIX
+    "fallback_vix": 14.0,                # If fetch fails, assume normal VIX
+    "cache_seconds": 120,                # Re-fetch VIX every 2 minutes (not every tick)
 }
 
 # === GREEKS-BASED EXIT INTELLIGENCE ===

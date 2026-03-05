@@ -3822,6 +3822,22 @@ class ZerodhaTools:
                 "action": "Too many correlated positions"
             }
         
+        # === VIX REGIME ENTRY GATE ===
+        # In HIGH/EXTREME VIX, apply lot reduction. EXTREME also blocks low-conviction.
+        # Multipliers are pushed by autonomous_trader each scan cycle.
+        _vix_m = getattr(self, '_vix_multipliers', None)
+        if _vix_m and _vix_m.get('regime') in ('HIGH', 'EXTREME'):
+            _vix_lot_mult = _vix_m.get('lot_multiplier', 1.0)
+            _vix_regime = _vix_m.get('regime', 'NORMAL')
+            _vix_val = _vix_m.get('vix', 14.0)
+            if lot_multiplier:
+                lot_multiplier = lot_multiplier * _vix_lot_mult
+            else:
+                lot_multiplier = _vix_lot_mult
+            if _vix_regime in ('HIGH', 'EXTREME'):
+                _vix_emoji = '🟠' if _vix_regime == 'HIGH' else '🔴'
+                print(f"   {_vix_emoji} VIX REGIME [{_vix_regime}] VIX={_vix_val:.1f}: lots ×{_vix_lot_mult:.2f}")
+        
         # === CHECK FOR DUPLICATE OPTION ON SAME UNDERLYING ===
         for pos in self.paper_positions:
             if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_option') and pos.get('underlying') == underlying:
@@ -4366,6 +4382,24 @@ class ZerodhaTools:
             else:
                 # print(f"   ⚠️ Lot multiplier {lot_multiplier}x would exceed limits, keeping {original_lots} lots")
                 pass
+
+        # === VIX REGIME: WIDEN SL (high VIX = more noise, wider SL avoids premature stops) ===
+        _vix_m = getattr(self, '_vix_multipliers', None)
+        if _vix_m and _vix_m.get('sl_widen', 1.0) > 1.0:
+            _sl_widen = _vix_m['sl_widen']
+            _old_sl = plan.stoploss_premium
+            # Widen SL: lower the stoploss_premium further from entry (for BUY positions)
+            # Factor: SL distance from entry increases by sl_widen factor
+            # e.g. entry=100, SL=72 (28% loss). sl_widen=1.15 → new SL = 100 - (100-72)*1.15 = 67.8 (~32% loss)
+            _entry_p = plan.contract.ltp
+            _sl_distance = _entry_p - _old_sl
+            _new_sl_distance = _sl_distance * _sl_widen
+            plan.stoploss_premium = round(_entry_p - _new_sl_distance, 2)
+            if plan.stoploss_premium < 0.05:
+                plan.stoploss_premium = 0.05  # Floor: never let SL go to 0
+            _vix_regime = _vix_m.get('regime', 'NORMAL')
+            _vix_val = _vix_m.get('vix', 14.0)
+            print(f"   📐 VIX SL WIDEN [{_vix_regime}] VIX={_vix_val:.1f}: SL ₹{_old_sl:.2f} → ₹{plan.stoploss_premium:.2f} (×{_sl_widen:.2f})")
 
         # Execute the order
         result = options_trader.execute_option_order(plan)

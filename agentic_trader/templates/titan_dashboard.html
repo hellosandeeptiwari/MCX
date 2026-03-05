@@ -8,11 +8,13 @@
 /* ── Reset & Base ─────────────────────────────────────── */
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --bg:#0a0e17;--bg2:#111827;--bg3:#1f2937;--bg4:#374151;
-  --txt:#e5e7eb;--txt2:#9ca3af;--txt3:#6b7280;
-  --green:#10b981;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
-  --cyan:#06b6d4;--purple:#8b5cf6;
-  --border:#1f2937;--radius:10px;
+  /* Light theme */
+  --bg:#f8f9fb;--bg2:#ffffff;--bg3:#f1f3f5;--bg4:#e2e5ea;
+  --txt:#1a1d23;--txt2:#5c6370;--txt3:#8b929e;
+  --green:#059669;--red:#dc2626;--amber:#d97706;--blue:#2563eb;
+  --cyan:#0891b2;--purple:#7c3aed;
+  --border:#e2e5ea;--radius:10px;
+  --shadow:0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
 }
 html{font-size:14px}
 body{background:var(--bg);color:var(--txt);font-family:'Inter',system-ui,-apple-system,sans-serif;min-height:100vh}
@@ -23,14 +25,15 @@ a{color:var(--blue);text-decoration:none}
   background:var(--bg2);border-bottom:1px solid var(--border);
   padding:12px 24px;display:flex;align-items:center;justify-content:space-between;
   position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);
+  box-shadow:var(--shadow);
 }
-.top-bar h1{font-size:1.15rem;font-weight:700;letter-spacing:.5px}
+.top-bar h1{font-size:1.15rem;font-weight:700;letter-spacing:.5px;color:#1a1d23}
 .top-bar h1 span{color:var(--cyan);font-weight:400}
 .top-bar .mode{
   padding:4px 12px;border-radius:20px;font-size:.75rem;font-weight:600;text-transform:uppercase;
 }
-.mode-paper{background:rgba(59,130,246,.15);color:var(--blue)}
-.mode-live{background:rgba(239,68,68,.15);color:var(--red)}
+.mode-paper{background:rgba(37,99,235,.1);color:var(--blue)}
+.mode-live{background:rgba(220,38,38,.1);color:var(--red)}
 .status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
 .dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
 .dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
@@ -38,13 +41,13 @@ a{color:var(--blue);text-decoration:none}
 .container{max-width:1600px;margin:0 auto;padding:16px 20px}
 
 /* ── Tabs ─────────────────────────────────────────────── */
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--bg2);padding:4px;border-radius:8px;width:fit-content}
+.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--bg3);padding:4px;border-radius:8px;width:fit-content}
 .tab{
   padding:8px 18px;border-radius:6px;cursor:pointer;font-size:.82rem;font-weight:500;
   color:var(--txt2);transition:all .15s;border:none;background:none;
 }
 .tab:hover{color:var(--txt)}
-.tab.active{background:var(--bg4);color:#fff}
+.tab.active{background:var(--bg2);color:var(--txt);box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .tab-content{display:none}
 .tab-content.active{display:block}
 
@@ -52,7 +55,7 @@ a{color:var(--blue);text-decoration:none}
 .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
 .card{
   background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
-  padding:16px;position:relative;overflow:hidden;
+  padding:16px;position:relative;overflow:hidden;box-shadow:var(--shadow);
 }
 .card .label{font-size:.72rem;color:var(--txt3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}
 .card .value{font-size:1.6rem;font-weight:700}
@@ -62,7 +65,7 @@ a{color:var(--blue);text-decoration:none}
 /* ── Panel ────────────────────────────────────────────── */
 .panel{
   background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
-  margin-bottom:16px;overflow:hidden;
+  margin-bottom:16px;overflow:hidden;box-shadow:var(--shadow);
 }
 .panel-header{
   padding:12px 16px;border-bottom:1px solid var(--border);display:flex;
@@ -78,30 +81,39 @@ a{color:var(--blue);text-decoration:none}
   letter-spacing:.7px;color:var(--txt3);border-bottom:1px solid var(--border);
   position:sticky;top:0;background:var(--bg2);
 }
-.tbl td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.03)}
-.tbl tr:hover td{background:rgba(255,255,255,.02)}
+.tbl td{padding:8px 10px;border-bottom:1px solid var(--border)}
+.tbl tr:hover td{background:rgba(0,0,0,.02)}
 .pnl-pos{color:var(--green);font-weight:600}
 .pnl-neg{color:var(--red);font-weight:600}
 .badge{
   display:inline-block;padding:2px 8px;border-radius:12px;font-size:.68rem;font-weight:600;
 }
-.badge-win{background:rgba(16,185,129,.12);color:var(--green)}
-.badge-loss{background:rgba(239,68,68,.12);color:var(--red)}
-.badge-open{background:rgba(245,158,11,.12);color:var(--amber)}
-.badge-source{background:rgba(139,92,246,.12);color:var(--purple)}
+.badge-win{background:rgba(5,150,105,.1);color:var(--green)}
+.badge-loss{background:rgba(220,38,38,.1);color:var(--red)}
+.badge-open{background:rgba(217,119,6,.1);color:var(--amber)}
+.badge-source{background:rgba(124,58,237,.1);color:var(--purple)}
 
-/* ── Log viewer ───────────────────────────────────────── */
+/* ── Log viewer (DARK — kept dark for readability) ──── */
 .log-box{
-  background:#050810;border:1px solid var(--border);border-radius:8px;
+  background:#0a0e17;border:1px solid #1f2937;border-radius:8px;
   font-family:'JetBrains Mono','Fira Code','Consolas',monospace;
   font-size:.75rem;line-height:1.55;padding:12px;
   height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;
   color:#a5f3a0;
 }
-.log-box .log-error{color:var(--red)}
-.log-box .log-warn{color:var(--amber)}
-.log-box .log-info{color:var(--cyan)}
-.log-box .log-pnl{color:var(--green);font-weight:600}
+.log-box .log-error{color:#ef4444}
+.log-box .log-warn{color:#f59e0b}
+.log-box .log-info{color:#06b6d4}
+.log-box .log-pnl{color:#10b981;font-weight:600}
+
+/* ── Live Logs tab — dark island ──────────────────────── */
+#tab-logs{
+  background:#0f1219;border-radius:12px;padding:16px;margin:-4px;
+}
+#tab-logs .tab{color:#9ca3af}
+#tab-logs .tab:hover{color:#e5e7eb}
+#tab-logs .tab.active{background:#374151;color:#fff;box-shadow:none}
+#tab-logs label{color:#9ca3af !important}
 
 /* ── P&L Bar Chart (CSS-only) ─────────────────────────── */
 .pnl-bars{display:flex;align-items:flex-end;gap:4px;height:140px;padding:8px 0}
@@ -139,35 +151,35 @@ a{color:var(--blue);text-decoration:none}
   border:1px solid var(--border);cursor:pointer;transition:all .15s;
   background:var(--bg3);color:var(--txt2);
 }
-.btn-ctrl:hover{color:#fff;border-color:var(--txt3)}
+.btn-ctrl:hover{color:var(--txt);border-color:var(--txt3)}
 .btn-ctrl:disabled{opacity:.4;cursor:not-allowed}
-.btn-start:hover{background:rgba(16,185,129,.15);color:var(--green);border-color:var(--green)}
-.btn-stop:hover{background:rgba(239,68,68,.15);color:var(--red);border-color:var(--red)}
-.btn-restart:hover{background:rgba(245,158,11,.15);color:var(--amber);border-color:var(--amber)}
+.btn-start:hover{background:rgba(5,150,105,.1);color:var(--green);border-color:var(--green)}
+.btn-stop:hover{background:rgba(220,38,38,.1);color:var(--red);border-color:var(--red)}
+.btn-restart:hover{background:rgba(217,119,6,.1);color:var(--amber);border-color:var(--amber)}
 .btn-ctrl.loading{pointer-events:none;opacity:.6}
 
 /* Exit button */
 .btn-exit{
   padding:3px 10px;border-radius:5px;font-size:.7rem;font-weight:600;
-  border:1px solid rgba(239,68,68,.4);cursor:pointer;transition:all .15s;
-  background:rgba(239,68,68,.08);color:#f87171;white-space:nowrap;
+  border:1px solid rgba(220,38,38,.3);cursor:pointer;transition:all .15s;
+  background:rgba(220,38,38,.06);color:#dc2626;white-space:nowrap;
 }
-.btn-exit:hover{background:rgba(239,68,68,.25);border-color:#ef4444;color:#fca5a5}
+.btn-exit:hover{background:rgba(220,38,38,.15);border-color:#dc2626;color:#b91c1c}
 .btn-exit:disabled{opacity:.4;cursor:not-allowed}
 .btn-exit.loading{pointer-events:none;opacity:.5}
 
 /* Exit confirmation modal */
 .exit-modal-overlay{
   display:none;position:fixed;top:0;left:0;right:0;bottom:0;
-  background:rgba(0,0,0,.65);z-index:9999;
+  background:rgba(0,0,0,.4);z-index:9999;
   align-items:center;justify-content:center;
 }
 .exit-modal-overlay.active{display:flex}
 .exit-modal{
   background:var(--bg2);border:1px solid var(--border);border-radius:12px;
-  padding:24px 28px;min-width:340px;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,.5);
+  padding:24px 28px;min-width:340px;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,.15);
 }
-.exit-modal h3{margin:0 0 12px;color:#f87171;font-size:1rem}
+.exit-modal h3{margin:0 0 12px;color:#dc2626;font-size:1rem}
 .exit-modal p{margin:6px 0;color:var(--txt2);font-size:.85rem;line-height:1.5}
 .exit-modal .exit-details{
   background:var(--bg3);border-radius:8px;padding:12px 16px;margin:12px 0;
@@ -184,7 +196,7 @@ a{color:var(--blue);text-decoration:none}
 .exit-modal .btn-confirm-exit{
   padding:8px 18px;border-radius:6px;font-size:.8rem;font-weight:600;
   border:1px solid #ef4444;cursor:pointer;
-  background:rgba(239,68,68,.15);color:#f87171;
+  background:rgba(220,38,38,.08);color:#dc2626;
 }
 .exit-modal .btn-confirm-exit:hover{background:rgba(239,68,68,.3);color:#fca5a5}
 
@@ -229,7 +241,7 @@ a{color:var(--blue);text-decoration:none}
 <!-- Toast notification -->
 <div id="toast" style="position:fixed;top:60px;right:20px;z-index:9999;display:none;
   padding:10px 20px;border-radius:8px;font-size:.82rem;font-weight:600;
-  box-shadow:0 4px 20px rgba(0,0,0,.5);transition:opacity .3s;"></div>
+  box-shadow:0 4px 20px rgba(0,0,0,.15);transition:opacity .3s;"></div>
 
 <!-- ═══════════════════ CONTENT ═══════════════════ -->
 <div class="container">
@@ -248,12 +260,12 @@ a{color:var(--blue);text-decoration:none}
 <div id="tab-alerts" class="tab-content">
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
     <h3 style="margin:0">Watchdog Alerts</h3>
-    <span id="alerts-badge" style="background:#333;padding:2px 10px;border-radius:12px;font-size:.75rem">—</span>
+    <span id="alerts-badge" style="background:var(--bg3);padding:2px 10px;border-radius:12px;font-size:.75rem">—</span>
     <button onclick="loadAlerts()" style="background:#2563eb;color:#fff;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:.75rem">Refresh</button>
-    <span id="alerts-updated" style="color:#888;font-size:.72rem;margin-left:auto"></span>
+    <span id="alerts-updated" style="color:var(--txt3);font-size:.72rem;margin-left:auto"></span>
   </div>
   <div id="alerts-list" style="font-family:'JetBrains Mono',monospace;font-size:.78rem;line-height:1.7;max-height:65vh;overflow-y:auto">
-    <div style="color:#888;padding:20px;text-align:center">Watchdog monitors logs during market hours (9:10 AM – 3:35 PM).<br>Alerts will appear here when issues are detected.</div>
+    <div style="color:var(--txt3);padding:20px;text-align:center">Watchdog monitors logs during market hours (9:10 AM – 3:35 PM).<br>Alerts will appear here when issues are detected.</div>
   </div>
 </div>
 
@@ -344,6 +356,10 @@ a{color:var(--blue);text-decoration:none}
       <h2>Open Positions</h2>
       <span id="pos-count" style="font-size:.8rem;color:var(--txt2)"></span>
     </div>
+    <!-- Totals summary bar -->
+    <div id="pos-totals" style="display:none;padding:10px 16px;background:var(--bg3);border-bottom:1px solid var(--border);
+        font-size:.82rem;display:flex;flex-wrap:wrap;gap:18px;align-items:center">
+    </div>
     <div class="panel-body" style="overflow-x:auto">
       <table class="tbl" id="positions-tbl">
         <thead>
@@ -354,6 +370,7 @@ a{color:var(--blue);text-decoration:none}
           </tr>
         </thead>
         <tbody></tbody>
+        <tfoot id="positions-tfoot" style="display:none"></tfoot>
       </table>
     </div>
   </div>
@@ -494,10 +511,10 @@ async function runHealthCheck() {
     clearTimeout(safetyTimer);
     // Show results in a modal overlay
     const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;align-items:center;justify-content:center;';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.35);z-index:10000;display:flex;align-items:center;justify-content:center;';
     overlay.onclick = (e) => { if(e.target === overlay) overlay.remove(); };
     const box = document.createElement('div');
-    box.style.cssText = 'background:#1a1a2e;border:1px solid #333;border-radius:12px;padding:24px;max-width:700px;width:95%;max-height:80vh;overflow-y:auto;font-family:monospace;font-size:.8rem;line-height:1.6;';
+    box.style.cssText = 'background:#fff;border:1px solid #e2e5ea;border-radius:12px;padding:24px;max-width:700px;width:95%;max-height:80vh;overflow-y:auto;font-family:monospace;font-size:.8rem;line-height:1.6;color:#1a1d23;box-shadow:0 20px 60px rgba(0,0,0,.12);';
     const lines = (d.output || [d.msg || 'No output']).map(l =>
       l.replace(/✅/g, '<span style="color:#10b981">✅</span>')
        .replace(/⚠️/g, '<span style="color:#f59e0b">⚠️</span>')
@@ -506,7 +523,7 @@ async function runHealthCheck() {
     const badge = d.failed > 0 ? '<span style="color:#ef4444;font-weight:700">CRITICAL ISSUES</span>' :
                   d.warned > 0 ? '<span style="color:#f59e0b;font-weight:700">WARNINGS</span>' :
                   '<span style="color:#10b981;font-weight:700">ALL CLEAR</span>';
-    box.innerHTML = `<div style="text-align:right"><button onclick="this.closest('div[style]').parentElement.remove()" style="background:none;border:none;color:#888;cursor:pointer;font-size:1.2rem">&times;</button></div>${lines}<br><br><div style="text-align:center;font-size:.9rem">${badge}</div>`;
+    box.innerHTML = `<div style="text-align:right"><button onclick="this.closest('div[style]').parentElement.remove()" style="background:none;border:none;color:#8b929e;cursor:pointer;font-size:1.2rem">&times;</button></div>${lines}<br><br><div style="text-align:center;font-size:.9rem">${badge}</div>`;
     overlay.appendChild(box);
     document.body.appendChild(overlay);
     showToast(`Health: ${d.passed}✅ ${d.warned}⚠ ${d.failed}❌`, d.failed === 0);
@@ -754,12 +771,72 @@ async function loadPositions() {
 
   if(status && status.positions) {
     const tbody = $('#positions-tbl tbody');
+    const tfoot = $('#positions-tfoot');
+    const totalsBar = $('#pos-totals');
     const positions = status.positions;
     $('#pos-count').textContent = `${positions.length} open`;
 
     if(!positions.length) {
       tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+      tfoot.style.display = 'none';
+      totalsBar.style.display = 'none';
     } else {
+      // ── Compute totals ──
+      let totalUpnl = 0, totalPremium = 0, totalQty = 0, totalLots = 0;
+      let buys = 0, sells = 0, winners = 0, losers = 0;
+      const setupCounts = {};
+
+      positions.forEach(p => {
+        const upnl = p.unrealized_pnl || 0;
+        const entry = p.avg_price || p.entry_price || 0;
+        const qty = Math.abs(p.quantity || 0);
+        const lots = p.lots || Math.ceil(qty / 100);
+        const dir = p.direction || (p.side === 'BUY' ? 'LONG' : 'SHORT');
+        const setup = p.setup_type || 'GPT';
+
+        totalUpnl += upnl;
+        totalPremium += p.total_premium || (entry * qty);
+        totalQty += qty;
+        totalLots += lots;
+        if(dir === 'BUY' || dir === 'LONG') buys++; else sells++;
+        if(upnl > 0) winners++; else if(upnl < 0) losers++;
+        setupCounts[setup] = (setupCounts[setup] || 0) + 1;
+      });
+
+      const pnlColor = totalUpnl > 0 ? '#059669' : totalUpnl < 0 ? '#dc2626' : 'var(--txt)';
+      const realPnl = status.realized_pnl || 0;
+      const netPnl = realPnl + totalUpnl;
+      const netColor = netPnl > 0 ? '#059669' : netPnl < 0 ? '#dc2626' : 'var(--txt)';
+
+      // Setup breakdown string
+      const setupStr = Object.entries(setupCounts)
+        .sort((a,b) => b[1] - a[1])
+        .map(([k,v]) => `${k}:${v}`)
+        .join(' · ');
+
+      totalsBar.style.display = 'flex';
+      totalsBar.innerHTML = `
+        <span><strong>${positions.length}</strong> positions</span>
+        <span>📊 <strong style="color:${pnlColor}">${fmtPnl(totalUpnl)}</strong> unrealized</span>
+        <span>💰 <strong style="color:${netColor}">${fmtPnl(realPnl)}</strong> realized</span>
+        <span>📈 <strong style="color:${netColor}">${fmtPnl(netPnl)}</strong> net P&L</span>
+        <span>🟢 ${buys} long · 🔴 ${sells} short</span>
+        <span>✅ ${winners} win · ❌ ${losers} loss</span>
+        <span>💵 ${fmt(totalPremium)} deployed</span>
+        <span style="font-size:.72rem;color:var(--txt3)">${setupStr}</span>
+      `;
+
+      // ── Totals footer row ──
+      tfoot.style.display = '';
+      tfoot.innerHTML = `<tr style="background:var(--bg3);font-weight:600;border-top:2px solid var(--border)">
+        <td colspan="3">TOTALS</td>
+        <td>${totalQty.toLocaleString()} (${totalLots}L)</td>
+        <td colspan="4">${fmt(totalPremium)} deployed</td>
+        <td></td>
+        <td class="${totalUpnl>0?'val-green':totalUpnl<0?'val-red':''}">${fmtPnl(totalUpnl)}</td>
+        <td></td>
+      </tr>`;
+
       tbody.innerHTML = positions.map(p => {
         const sym = (p.symbol || p.option_symbol || '').replace('NFO:','').replace('NSE:','');
         const underlying = (p.underlying || '').replace('NSE:','');
@@ -812,11 +889,11 @@ async function loadPositions() {
           scoreHtml = `<strong>${score.toFixed?.(0) || score}</strong>`;
         }
         if(mlDir) {
-          const mlColor = mlDir === 'UP' ? '#4ade80' : mlDir === 'DOWN' ? '#f87171' : '#888';
+          const mlColor = mlDir === 'UP' ? '#059669' : mlDir === 'DOWN' ? '#dc2626' : '#8b929e';
           scoreHtml += ` <span style="font-size:.65rem;color:${mlColor}">${mlDir}</span>`;
         }
         if(dr !== null && dr !== undefined) {
-          const drColor = dr < 0.08 ? '#4ade80' : dr < 0.15 ? '#fbbf24' : '#f87171';
+          const drColor = dr < 0.08 ? '#059669' : dr < 0.15 ? '#d97706' : '#dc2626';
           scoreHtml += `<br><span style="font-size:.6rem;color:${drColor}">DR:${(dr*100).toFixed(1)}%</span>`;
         }
         if(!scoreHtml) scoreHtml = '—';
@@ -934,19 +1011,19 @@ async function loadAlerts() {
 
   if(!alerts.length) {
     badge.textContent = '0';
-    badge.style.background = '#166534';
-    list.innerHTML = '<div style="color:#888;padding:20px;text-align:center">✅ No alerts — all clear during today\'s session.</div>';
+    badge.style.background = '#dcfce7'; badge.style.color = '#166534';
+    list.innerHTML = '<div style="color:var(--txt3);padding:20px;text-align:center">✅ No alerts — all clear during today\'s session.</div>';
   } else {
     badge.textContent = `${crit} critical · ${warn} warning`;
-    badge.style.background = crit > 0 ? '#991b1b' : '#92400e';
+    badge.style.background = crit > 0 ? '#fee2e2' : '#fef3c7'; badge.style.color = crit > 0 ? '#991b1b' : '#92400e';
     list.innerHTML = alerts.slice().reverse().map(a => {
-      const color = a.level === 'CRITICAL' ? '#ef4444' : '#f59e0b';
+      const color = a.level === 'CRITICAL' ? '#dc2626' : '#d97706';
       const icon  = a.level === 'CRITICAL' ? '🔴' : '🟡';
       const time  = (a.timestamp || '').split(' ').pop() || '';
-      return `<div style="border-left:3px solid ${color};padding:4px 10px;margin-bottom:6px;background:rgba(255,255,255,.03);border-radius:0 6px 6px 0">
+      return `<div style="border-left:3px solid ${color};padding:4px 10px;margin-bottom:6px;background:rgba(0,0,0,.02);border-radius:0 6px 6px 0">
         <span style="color:${color};font-weight:600">${icon} ${a.level}</span>
-        <span style="color:#888;margin-left:8px">${time}</span>
-        <div style="color:#ccc;margin-top:2px">${a.message || ''}</div>
+        <span style="color:var(--txt3);margin-left:8px">${time}</span>
+        <div style="color:var(--txt);margin-top:2px">${a.message || ''}</div>
       </div>`;
     }).join('');
   }
@@ -956,7 +1033,8 @@ async function loadAlerts() {
   const ovBadge = document.getElementById('overview-alerts-badge');
   if(ovBadge) {
     ovBadge.textContent = alerts.length ? `${crit}🔴 ${warn}🟡` : '✅';
-    ovBadge.style.background = crit > 0 ? '#991b1b' : alerts.length ? '#92400e' : '#166534';
+    ovBadge.style.background = crit > 0 ? '#fee2e2' : alerts.length ? '#fef3c7' : '#dcfce7';
+    ovBadge.style.color = crit > 0 ? '#991b1b' : alerts.length ? '#92400e' : '#166534';
   }
 }
 

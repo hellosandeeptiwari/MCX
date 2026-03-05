@@ -720,6 +720,13 @@ class SniperStrategies:
             else:
                 continue  # PCR in neutral zone — no signal
 
+            # --- MIN PCR EDGE GATE ---
+            min_edge = cfg.get('min_pcr_edge', 0.05)
+            if pcr_edge < min_edge:
+                sym_clean = sym.replace('NSE:', '')
+                print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: pcr_edge={pcr_edge:.3f} < min={min_edge:.3f}")
+                continue
+
             # --- Index PCR agreement check (optional) ---
             if require_index and index_pcr is not None:
                 if direction == 'BUY' and index_pcr < base_oversold * 0.85:
