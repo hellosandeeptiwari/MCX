@@ -1775,6 +1775,39 @@ class AutonomousTrader:
                 } if _elite_ml else {}
                 
                 _setup_type = 'ORB_BREAKOUT' if 'DAY' in _trigger_type or 'SPIKE' in _trigger_type else 'WATCHER'
+                
+                # --- GATE I: ORB-specific tightening (higher bar for ORB_BREAKOUT) ---
+                if _setup_type == 'ORB_BREAKOUT':
+                    _orb_min_score = BREAKOUT_WATCHER.get('orb_min_score', 45)
+                    _orb_min_move = BREAKOUT_WATCHER.get('orb_min_move_prob', 0.65)
+                    _xgb_mp = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
+                    if _final_score < _orb_min_score:
+                        self._wlog(f"  BLOCKED(I-ORB_SCORE): {_stock_name} ORB score={_final_score:.0f} < {_orb_min_score}")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_ORB_LOW_SCORE',
+                                          reason=f'ORB_BREAKOUT score {_final_score:.0f} < {_orb_min_score}',
+                                          direction=direction)
+                        continue
+                    if _xgb_mp > 0 and _xgb_mp < _orb_min_move:
+                        self._wlog(f"  BLOCKED(I-ORB_MOVE): {_stock_name} ORB P(move)={_xgb_mp:.2f} < {_orb_min_move}")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_ORB_LOW_MOVE',
+                                          reason=f'ORB_BREAKOUT P(move)={_xgb_mp:.2f} < {_orb_min_move}',
+                                          direction=direction)
+                        continue
+
+                # --- GATE I-W: WATCHER P(move) floor ---
+                if _setup_type == 'WATCHER':
+                    _w_min_move = BREAKOUT_WATCHER.get('watcher_min_move_prob', 0.57)
+                    _w_mp = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
+                    if _w_mp > 0 and _w_mp < _w_min_move:
+                        self._wlog(f"  BLOCKED(I-W_MOVE): {_stock_name} WATCHER P(move)={_w_mp:.2f} < {_w_min_move}")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_MOVE',
+                                          reason=f'WATCHER P(move)={_w_mp:.2f} < {_w_min_move}',
+                                          direction=direction)
+                        continue
+                
                 result = self.tools.place_option_order(
                     underlying=_sym,
                     direction=direction,

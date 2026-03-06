@@ -398,7 +398,7 @@ a{color:var(--blue);text-decoration:none}
           <tr>
             <th>Time</th><th>Symbol</th><th>Type</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
             <th>Entry</th><th>SL</th><th>Target</th>
-            <th>Setup</th><th>Score</th><th>P&amp;L</th><th>Action</th>
+            <th>Setup</th><th>Score</th><th>ML Metrics</th><th>P&amp;L</th><th>Action</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -436,7 +436,7 @@ a{color:var(--blue);text-decoration:none}
           <thead>
             <tr>
               <th>#</th><th>Time</th><th>Symbol</th><th>Dir</th><th>Source</th>
-              <th>Score</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Result</th><th>R</th><th>Hold</th>
+              <th>Score</th><th>ML Metrics</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Result</th><th>R</th><th>Hold</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -798,7 +798,7 @@ async function loadPositions() {
     $('#pos-count').textContent = positions.length + ' open';
 
     if(!positions.length) {
-      tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="14" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
       tfoot.style.display = 'none';
       totalsBar.style.display = 'none';
     } else {
@@ -851,7 +851,7 @@ async function loadPositions() {
       tfoot.innerHTML = '<tr style="background:var(--bg3);font-weight:600;border-top:2px solid var(--border)">' +
         '<td colspan="4">TOTALS</td>' +
         '<td>' + totalQty.toLocaleString() + ' (' + totalLots + 'L)</td>' +
-        '<td colspan="5">' + fmt(totalPremium) + ' deployed</td>' +
+        '<td colspan="6">' + fmt(totalPremium) + ' deployed</td>' +
         '<td></td>' +
         '<td class="' + (totalUpnl>0?'val-green':totalUpnl<0?'val-red':'') + '">' + fmtPnl(totalUpnl) + totalPnlPctStr + '</td>' +
         '<td></td></tr>';
@@ -958,6 +958,53 @@ async function loadPositions() {
         }
         if(!scoreHtml) scoreHtml = DASH;
 
+        // ── ML Metrics cell ──
+        const xgb = p.xgb_model || {};
+        const gmm = p.gmm_model || {};
+        const movProb = p.ml_move_prob || xgb.move_prob || 0;
+        const mlConf = p.ml_confidence || xgb.confidence || '';
+        const gmmAction = gmm.gmm_action || gmm.action || '';
+        const gmmRegime = gmm.gmm_regime_used || '';
+        const xgbDisagree = p.ml_xgb_disagrees || false;
+        const probUp = xgb.prob_up || 0;
+        const probDown = xgb.prob_down || 0;
+        const gmmDR = gmm.down_risk_score || p.dr_score || 0;
+        const gmmBucket = gmm.down_risk_bucket || '';
+        const gmmConfirms = gmm.gmm_confirms_direction || false;
+
+        let mlHtml = '';
+        // P(move) with color coding
+        if(movProb > 0) {
+          const mpColor = movProb >= 0.70 ? '#059669' : movProb >= 0.57 ? '#d97706' : '#dc2626';
+          mlHtml += '<span style="font-size:.72rem;font-weight:600;color:' + mpColor + '">P(m):' + (movProb*100).toFixed(0) + '%</span>';
+        }
+        // XGB prob_up / prob_down
+        if(probUp > 0 || probDown > 0) {
+          mlHtml += '<br><span style="font-size:.6rem;color:var(--txt3)">\u2191' + (probUp*100).toFixed(0) + '% \u2193' + (probDown*100).toFixed(0) + '%</span>';
+        }
+        // Confidence
+        if(mlConf) {
+          const confColor = mlConf === 'HIGH' ? '#059669' : mlConf === 'MEDIUM' ? '#d97706' : '#8b929e';
+          mlHtml += '<br><span style="font-size:.6rem;color:' + confColor + '">' + mlConf + '</span>';
+        }
+        // GMM regime + action
+        if(gmmAction || gmmRegime) {
+          const actColor = gmmAction === 'BOOST' ? '#059669' : gmmAction === 'BLOCK' ? '#dc2626' : '#8b929e';
+          mlHtml += '<br><span style="font-size:.6rem;color:' + actColor + '">GMM:' + (gmmAction||'?') + '</span>';
+          if(gmmRegime) mlHtml += '<span style="font-size:.55rem;color:var(--txt3)"> (' + gmmRegime + ')</span>';
+        }
+        // GMM DR bucket + confirms
+        if(gmmBucket) {
+          const bucketColor = gmmBucket === 'LOW' ? '#059669' : gmmBucket === 'MED' ? '#d97706' : '#dc2626';
+          mlHtml += '<br><span style="font-size:.6rem;color:' + bucketColor + '">Risk:' + gmmBucket + '</span>';
+          if(gmmConfirms) mlHtml += '<span style="font-size:.6rem;color:#059669"> \u2713</span>';
+        }
+        // XGB disagrees flag
+        if(xgbDisagree) {
+          mlHtml += '<br><span style="font-size:.6rem;color:#dc2626;font-weight:600">\u26A0 XGB Disagree</span>';
+        }
+        if(!mlHtml) mlHtml = '<span style="font-size:.65rem;color:var(--txt3)">N/A</span>';
+
         // Entry time + hold duration from raw timestamp
         const rawTs = p.timestamp || '';
         let entryTime = '', holdStr = '';
@@ -992,6 +1039,7 @@ async function loadPositions() {
           '<td>' + (target ? fmt(target) : DASH) + '</td>' +
           '<td>' + setupLabel + '</td>' +
           '<td>' + scoreHtml + '</td>' +
+          '<td style="white-space:nowrap;line-height:1.3">' + mlHtml + '</td>' +
           '<td class="' + upnlClass + '">' + pnlStr + '</td>' +
           '<td><button class="btn-exit" onclick="confirmExit(\'' + (p.symbol || p.option_symbol) + '\', \'' + sym + '\', ' + (ltp || entry) + ')" title="Exit at market">&#10005; Exit</button></td>' +
           '</tr>';
@@ -1050,7 +1098,7 @@ async function loadDayTrades(dateStr) {
   const tbody = $('#history-tbl tbody');
   const trades = data.trades || [];
   if(!trades.length) {
-    tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--txt3);padding:24px">No trades</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--txt3);padding:24px">No trades</td></tr>';
     return;
   }
   tbody.innerHTML = trades.map((t, i) => {
@@ -1058,6 +1106,56 @@ async function loadDayTrades(dateStr) {
     const sym = (t.underlying || t.symbol || '').replace('NSE:','');
     const pnl = t.total_pnl || 0;
     const result = t.final_result || 'OPEN';
+
+    // ── ML Metrics for trade history ──
+    const tMovProb = t.ml_move_prob || t.gate_prob || 0;
+    const tMlDir = t.ml_direction || '';
+    const tConf = t.ml_confidence || '';
+    const tGmmAct = t.gmm_action || '';
+    const tXgbDis = t.xgb_disagrees || false;
+    const tDrScore = t.dr_score || 0;
+    const tUpFlag = t.up_flag || false;
+    const tDownFlag = t.down_flag || false;
+    const tScoreTier = t.score_tier || '';
+
+    let tMlHtml = '';
+    // P(move)
+    if(tMovProb > 0) {
+      const mpC = tMovProb >= 0.70 ? '#059669' : tMovProb >= 0.57 ? '#d97706' : '#dc2626';
+      tMlHtml += '<span style="font-size:.72rem;font-weight:600;color:' + mpC + '">P(m):' + (tMovProb*100).toFixed(0) + '%</span>';
+    }
+    // ML Direction
+    if(tMlDir) {
+      const dirC = tMlDir === 'UP' || tMlDir === 'BUY' ? '#059669' : tMlDir === 'DOWN' || tMlDir === 'SELL' ? '#dc2626' : '#8b929e';
+      tMlHtml += ' <span style="font-size:.62rem;color:' + dirC + '">' + tMlDir + '</span>';
+    }
+    // Confidence
+    if(tConf) {
+      const cC = (typeof tConf === 'string' && tConf === 'HIGH') || tConf > 0.65 ? '#059669' : '#d97706';
+      const cLabel = typeof tConf === 'number' ? (tConf*100).toFixed(0) + '%' : tConf;
+      tMlHtml += '<br><span style="font-size:.6rem;color:' + cC + '">Conf:' + cLabel + '</span>';
+    }
+    // GMM action
+    if(tGmmAct) {
+      const gC = tGmmAct === 'BOOST' ? '#059669' : tGmmAct === 'BLOCK' ? '#dc2626' : '#8b929e';
+      tMlHtml += ' <span style="font-size:.6rem;color:' + gC + '">GMM:' + tGmmAct + '</span>';
+    }
+    // DR Score + flags
+    if(tDrScore > 0) {
+      const drC = tDrScore < 0.08 ? '#059669' : tDrScore < 0.15 ? '#d97706' : '#dc2626';
+      tMlHtml += '<br><span style="font-size:.6rem;color:' + drC + '">DR:' + (tDrScore*100).toFixed(1) + '%</span>';
+    }
+    if(tUpFlag) tMlHtml += ' <span style="font-size:.55rem;color:#059669">[UP]</span>';
+    if(tDownFlag) tMlHtml += ' <span style="font-size:.55rem;color:#dc2626">[DN]</span>';
+    // XGB disagrees
+    if(tXgbDis) tMlHtml += '<br><span style="font-size:.6rem;color:#dc2626;font-weight:600">\u26A0 XGB Disagree</span>';
+    // Score tier
+    if(tScoreTier && tScoreTier !== 'unknown') {
+      const stC = tScoreTier === 'PREMIUM' ? '#059669' : tScoreTier === 'BLOCK' ? '#dc2626' : '#8b929e';
+      tMlHtml += '<br><span style="font-size:.55rem;color:' + stC + '">' + tScoreTier + '</span>';
+    }
+    if(!tMlHtml) tMlHtml = '<span style="font-size:.65rem;color:var(--txt3)">N/A</span>';
+
     return '<tr>' +
       '<td>' + (i+1) + '</td>' +
       '<td>' + ts + '</td>' +
@@ -1065,6 +1163,7 @@ async function loadDayTrades(dateStr) {
       '<td>' + (t.direction||'') + '</td>' +
       '<td><span class="badge badge-source">' + (t.source||'') + '</span></td>' +
       '<td>' + (t.final_score||0).toFixed(1) + '</td>' +
+      '<td style="white-space:nowrap;line-height:1.3">' + tMlHtml + '</td>' +
       '<td>' + fmt(t.entry_price) + '</td>' +
       '<td>' + (t.exit_types?.length ? fmt(t.total_pnl!==0 ? t.entry_price+(pnl/(t.quantity||1)) : 0) : DASH) + '</td>' +
       '<td class="' + pnlClass(pnl) + '">' + fmtPnl(pnl) + '</td>' +

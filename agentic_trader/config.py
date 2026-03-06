@@ -173,7 +173,10 @@ BREAKOUT_WATCHER = {
     "active_after": "09:20",          # Don't trigger before 09:20 (let ORB range form)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
     # --- Score Gate ---
-    "min_score": 35,                  # Watcher catches EARLY moves → lower bar than main scan (was 66)
+    "min_score": 40,                  # Tightened Mar 6: was 35, raised to filter marginal setups
+    "orb_min_score": 40,               # ORB_BREAKOUT floor — matches watcher min (BDL=40, RVNL=41 were winners)
+    "orb_min_move_prob": 0.65,         # ORB trades need P(move)≥65% — winners avg 0.85, loser was 0.64
+    "watcher_min_move_prob": 0.57,     # WATCHER P(move) floor — winners avg 0.62, losers avg 0.59
 }
 
 # === GTT SAFETY NET (Server-Side SL + Target) ===
