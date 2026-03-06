@@ -170,6 +170,7 @@ class TradeLedger:
                  entry_time: str = '',
                  extra: Optional[Dict] = None):
         """Log a trade exit (full or partial)."""
+        _r = lambda v, n=2: round(v, n) if v is not None else 0
         record = {
             'event': 'EXIT',
             'ts': datetime.now().isoformat(),
@@ -181,27 +182,27 @@ class TradeLedger:
             'sector': sector,
             'exit_type': exit_type,
             # Prices
-            'entry_price': round(entry_price, 2),
-            'exit_price': round(exit_price, 2),
+            'entry_price': _r(entry_price, 2),
+            'exit_price': _r(exit_price, 2),
             'quantity': quantity,
-            'pnl': round(pnl, 2),
-            'pnl_pct': round(pnl_pct, 2),
+            'pnl': _r(pnl, 2),
+            'pnl_pct': _r(pnl_pct, 2),
             # Entry scores (carried)
-            'smart_score': round(smart_score, 1),
-            'final_score': round(final_score, 1),
-            'dr_score': round(dr_score, 4),
+            'smart_score': _r(smart_score, 1),
+            'final_score': _r(final_score, 1),
+            'dr_score': _r(dr_score, 4),
             'score_tier': score_tier,
             'strategy_type': strategy_type,
             'is_sniper': is_sniper,
             # Exit quality
             'candles_held': candles_held,
-            'r_multiple': round(r_multiple, 3),
-            'max_favorable': round(max_favorable, 2),
+            'r_multiple': _r(r_multiple, 3),
+            'max_favorable': _r(max_favorable, 2),
             'exit_reason': exit_reason,
             'breakeven_applied': breakeven_applied,
             'trailing_active': trailing_active,
             'partial_booked': partial_booked,
-            'current_sl': round(current_sl, 2),
+            'current_sl': _r(current_sl, 2),
             'hold_minutes': hold_minutes,
             # IDs
             'order_id': order_id,

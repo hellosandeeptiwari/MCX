@@ -374,8 +374,9 @@ class TitanTicker:
         self._breakout_watcher = watcher
         if watcher._enabled:
             print(f"   ⚡ Breakout Watcher: ACTIVE (spike≥{config.get('price_spike_pct', 0.8)}%, "
+                  f"slow_grind≥{config.get('slow_grind_pct', 1.0)}%/5min, "
                   f"sustain={config.get('sustain_seconds', 15)}s, "
-                  f"cooldown={config.get('cooldown_seconds', 180)}s, "
+                  f"cooldown={config.get('cooldown_seconds', 180)}s+escalation, "
                   f"queue={config.get('queue_size', 100)}, "
                   f"bypass≥{config.get('priority_bypass_pct', 2.0)}%)")
         return watcher
@@ -734,12 +735,14 @@ class BreakoutWatcher:
     """
     
     def __init__(self, config: dict):
+        self._config = config  # Store full config for runtime lookups
         self._enabled = config.get('enabled', False)
         
         # Trigger thresholds
         self._spike_pct = config.get('price_spike_pct', 0.8)
         self._day_extreme = config.get('day_extreme_trigger', True)
         self._vol_surge_x = config.get('volume_surge_multiplier', 2.5)
+        self._vol_surge_min_move = config.get('volume_surge_min_move_pct', 0.3)
         
         self._day_ext_min_move = config.get('day_extreme_min_move_pct', 0.4)
         
@@ -747,6 +750,9 @@ class BreakoutWatcher:
         self._sustain_secs = config.get('sustain_seconds', 15)
         self._sustain_recheck_pct = config.get('sustain_recheck_pct', 0.5)
         self._sustain_recheck_pct_volume = config.get('sustain_recheck_pct_volume', 0.15)
+        
+        # Slow grind: 5-minute baseline to detect persistent moves
+        self._slow_grind_pct = config.get('slow_grind_pct', 1.0)  # 1% move over 5min = slow grind
         
         # Cooldown
         self._cooldown_secs = config.get('cooldown_seconds', 180)
@@ -765,13 +771,15 @@ class BreakoutWatcher:
         self._queue = PriorityTriggerQueue(maxsize=self._queue_size)
         
         # Baseline prices: symbol → {price, timestamp} — snapshot at subscribe or periodic reset
-        self._baselines: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}
+        self._baselines: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}  (60s window)
+        self._baselines_long: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}  (5min window)
         
         # Sustain pending: symbol → {trigger_price, trigger_ts, trigger_type, baseline_price}
         self._pending: Dict[str, Dict] = {}
         
-        # Cooldown tracker: symbol → last_trigger_timestamp
+        # Cooldown tracker: symbol → last_trigger_timestamp + trigger type for priority escalation
         self._cooldowns: Dict[str, float] = {}
+        self._cooldown_trigger_type: Dict[str, str] = {}  # sym → trigger_type that set cooldown
         
         # Volume rolling average: symbol → deque of recent volume DELTAS (for surge detection)
         from collections import deque
@@ -784,7 +792,8 @@ class BreakoutWatcher:
         self._prev_reported_low: Dict[str, float] = {}   # sym → last seen ohlc.low
         
         # Global trigger rate limiter
-        self._recent_triggers: list = []  # list of timestamps
+        self._recent_triggers: list = []  # list of timestamps (global)
+        self._per_symbol_triggers: Dict[str, list] = {}  # sym → list of timestamps
         
         # Stats
         self._stats = {
@@ -808,12 +817,30 @@ class BreakoutWatcher:
         end = now.replace(hour=h_until, minute=m_until, second=0)
         return start <= now <= end
     
-    def _check_rate_limit(self) -> bool:
-        """Return True if we're under the per-minute trigger limit"""
+    def _check_rate_limit(self, symbol: str = None) -> bool:
+        """Return True if we're under per-symbol AND global per-minute limits.
+        
+        Per-symbol: max 3 triggers/min per stock (prevents one noisy stock flooding)
+        Global: max 20 triggers/min total (safety net for crash days)
+        Individual stocks should NOT be dropped because other stocks ate the quota.
+        """
         now = time.time()
         # Prune old timestamps (older than 60s)
         self._recent_triggers = [t for t in self._recent_triggers if now - t < 60]
-        return len(self._recent_triggers) < self._max_per_min
+        
+        # Global safety cap (generous — 20/min, not the old 10)
+        if len(self._recent_triggers) >= 20:
+            return False
+        
+        # Per-symbol cap: 3/min per stock
+        if symbol:
+            _sym_triggers = self._per_symbol_triggers.get(symbol, [])
+            _sym_triggers = [t for t in _sym_triggers if now - t < 60]
+            self._per_symbol_triggers[symbol] = _sym_triggers
+            if len(_sym_triggers) >= 3:
+                return False
+        
+        return True
     
     def _is_cooled_down(self, symbol: str) -> bool:
         """Return True if symbol is past its cooldown period"""
@@ -856,11 +883,49 @@ class BreakoutWatcher:
             if _vol_delta > 0:
                 self._vol_delta_history[symbol].append(_vol_delta)
         
-        # === UPDATE BASELINE (first tick or every 60s reset) ===
+        # === UPDATE BASELINES ===
+        # Short baseline (60s) — existing, detects fast spikes
         bl = self._baselines.get(symbol)
         if bl is None or (now - bl['ts']) > 60:
             self._baselines[symbol] = {'price': ltp, 'ts': now}
-            return  # First tick for this baseline window — no comparison yet
+            # Don't return yet — check long baseline first
+        
+        # Long baseline (rolling) — detects slow grinds that the 60s window misses.
+        # ROLLING design: baseline only resets when (a) grind fires, (b) price REVERSES
+        # back to within 0.15% of the baseline, or (c) max age 10min (stale protection).
+        # This way a steady 0.2%/min grind accumulates to 1% over 5 min and fires.
+        bl_long = self._baselines_long.get(symbol)
+        if bl_long is None:
+            self._baselines_long[symbol] = {'price': ltp, 'ts': now}
+        else:
+            _long_move = (ltp - bl_long['price']) / bl_long['price'] * 100 if bl_long['price'] > 0 else 0
+            _age = now - bl_long['ts']
+            
+            # Check if slow grind threshold crossed
+            if abs(_long_move) >= self._slow_grind_pct and symbol not in self._pending:
+                _sg_type = 'SLOW_GRIND_UP' if _long_move > 0 else 'SLOW_GRIND_DOWN'
+                self._stats['slow_grinds_detected'] = self._stats.get('slow_grinds_detected', 0) + 1
+                self._pending[symbol] = {
+                    'trigger_price': ltp,
+                    'trigger_ts': now,
+                    'trigger_type': _sg_type,
+                    'baseline_price': bl_long['price'],
+                    'move_pct': _long_move,
+                }
+                _mins = _age / 60
+                print(f"   🐢 Watcher: {symbol} SLOW GRIND detected ({_long_move:+.1f}% over {_mins:.1f}min) → sustain check")
+                # Reset baseline after firing
+                self._baselines_long[symbol] = {'price': ltp, 'ts': now}
+            elif abs(_long_move) < 0.15:
+                # Price reverted back to baseline — reset (move died)
+                self._baselines_long[symbol] = {'price': ltp, 'ts': now}
+            elif _age > 600:
+                # Stale protection: max 10 min baseline age
+                self._baselines_long[symbol] = {'price': ltp, 'ts': now}
+        
+        # If short baseline was just reset, skip trigger detection this tick
+        if bl is None or (now - self._baselines[symbol]['ts']) < 0.01:
+            return
         
         # === CHECK SUSTAIN PENDING ===
         pending = self._pending.get(symbol)
@@ -869,7 +934,7 @@ class BreakoutWatcher:
             if elapsed >= self._sustain_secs:
                 # Time's up — check if price still holds
                 baseline_price = pending['baseline_price']
-                move_pct = abs(ltp - baseline_price) / baseline_price * 100
+                move_pct = round(abs(ltp - baseline_price) / baseline_price * 100, 1)
                 # Volume surges use a lower sustain bar (they just need price not to crash)
                 _ttype = pending.get('trigger_type', '')
                 _recheck = self._sustain_recheck_pct_volume if 'VOLUME' in _ttype else self._sustain_recheck_pct
@@ -879,11 +944,14 @@ class BreakoutWatcher:
                     print(f"   ✅ Watcher: {symbol} SUSTAINED {_ttype} ({move_pct:.1f}% held vs {_recheck}%) — queuing")
                     self._fire_trigger(symbol, ltp, pending['trigger_type'], pending)
                 else:
-                    # Failed sustain — retrace (tracked, only non-volume printed)
+                    # Failed sustain — retrace (batch-logged to reduce noise)
                     self._stats['sustain_failed'] += 1
                     if 'VOLUME' not in _ttype:
-                        # Price spikes / day extremes failing sustain = noteworthy
-                        print(f"   ❌ Watcher: {symbol} sustain FAILED {_ttype} ({move_pct:.1f}% < {_recheck}%)")
+                        # Price spikes / day extremes — batch-log every 25
+                        _pf = self._stats.get('_price_sustain_fails', 0) + 1
+                        self._stats['_price_sustain_fails'] = _pf
+                        if _pf <= 3 or _pf % 25 == 0:
+                            print(f"   ❌ Watcher: {symbol} sustain FAILED {_ttype} ({move_pct:.1f}% < {_recheck}%) [#{_pf}]")
                     else:
                         # Volume surge fails are very common — batch-log every 50
                         _vf = self._stats.get('_vol_sustain_fails', 0) + 1
@@ -924,12 +992,17 @@ class BreakoutWatcher:
             self._prev_reported_low[symbol] = _tick_day_low
         
         # 3) VOLUME SURGE: current tick's volume DELTA ≥ N× rolling average delta
+        #    [FIX Mar 6] Also require minimum price move — explosive volume with
+        #    only 0.1% move = absorption, not breakout. BDL had EXPLOSIVE vol but
+        #    tiny move, reversed in 4 min.
         if not trigger_type and _vol_delta > 0 and len(self._vol_delta_history[symbol]) >= 5:
             _hist = self._vol_delta_history[symbol]
             _avg_delta = sum(_hist) / len(_hist)
             if _avg_delta > 0 and _vol_delta >= _avg_delta * self._vol_surge_x:
-                trigger_type = 'VOLUME_SURGE'
-                self._stats['vol_surges_detected'] += 1
+                if abs(move_pct) >= self._vol_surge_min_move:
+                    trigger_type = 'VOLUME_SURGE'
+                    self._stats['vol_surges_detected'] += 1
+                # else: volume spike but price hasn't moved enough — absorption, skip
         
         # === ENTER SUSTAIN PHASE ===
         if trigger_type:
@@ -955,19 +1028,37 @@ class BreakoutWatcher:
         if not self._is_active_window():
             return
         
-        # Gate: cooldown (per-symbol)
+        # Gate: cooldown (per-symbol) — with priority escalation
+        # Higher-priority trigger types can bypass cooldown set by weaker triggers.
+        # Priority order: PRICE_SPIKE / SLOW_GRIND > NEW_DAY_LOW/HIGH > VOLUME_SURGE
+        _TRIGGER_PRIORITY = {
+            'VOLUME_SURGE': 1,
+            'NEW_DAY_HIGH': 2, 'NEW_DAY_LOW': 2,
+            'PRICE_SPIKE_UP': 3, 'PRICE_SPIKE_DOWN': 3,
+            'SLOW_GRIND_UP': 3, 'SLOW_GRIND_DOWN': 3,
+        }
         if not self._is_cooled_down(symbol):
-            self._stats['cooldown_blocked'] += 1
-            print(f"   ⏳ Watcher: {symbol} blocked by cooldown — skipping")
-            return
+            # Check if this trigger outranks the one that set the cooldown
+            _new_priority = _TRIGGER_PRIORITY.get(trigger_type, 1)
+            _prev_type = self._cooldown_trigger_type.get(symbol, 'VOLUME_SURGE')
+            _prev_priority = _TRIGGER_PRIORITY.get(_prev_type, 1)
+            if _new_priority > _prev_priority:
+                print(f"   🔄 Watcher: {symbol} ESCALATING through cooldown "
+                      f"({trigger_type}[p{_new_priority}] > {_prev_type}[p{_prev_priority}])")
+            else:
+                self._stats['cooldown_blocked'] += 1
+                _cb = self._stats['cooldown_blocked']
+                if _cb <= 3 or _cb % 25 == 0:
+                    print(f"   ⏳ Watcher: {symbol} blocked by cooldown — skipping [#{_cb}]")
+                return
         
         move_pct_abs = abs(pending.get('move_pct', 0))
         
         # Gate: rate limit — BIG moves bypass this entirely
-        if not self._check_rate_limit():
+        if not self._check_rate_limit(symbol):
             if move_pct_abs < self._priority_bypass_pct:
                 self._stats['rate_limited'] += 1
-                print(f"   ⏳ Watcher: {symbol} rate-limited ({self._max_per_min}/min cap, "
+                print(f"   ⏳ Watcher: {symbol} rate-limited (per-sym 3/min or global 20/min, "
                       f"move={move_pct_abs:.1f}% < {self._priority_bypass_pct}% bypass) — skipping")
                 return
             # Big move → bypass rate limit
@@ -977,7 +1068,12 @@ class BreakoutWatcher:
         # All gates passed — queue with priority
         now = time.time()
         self._cooldowns[symbol] = now
+        self._cooldown_trigger_type[symbol] = trigger_type  # Track what type set this cooldown
         self._recent_triggers.append(now)
+        # Track per-symbol triggers for per-symbol rate limit
+        if symbol not in self._per_symbol_triggers:
+            self._per_symbol_triggers[symbol] = []
+        self._per_symbol_triggers[symbol].append(now)
         
         trigger_data = {
             'symbol': symbol,
@@ -999,8 +1095,10 @@ class BreakoutWatcher:
                 print(f"   📤 Watcher: {symbol} QUEUED (evicted weaker {evicted}) — "
                       f"{trigger_type}, {pending.get('move_pct', 0):+.1f}%")
             else:
-                print(f"   📤 Watcher: {symbol} QUEUED for main thread "
-                      f"({trigger_type}, {pending.get('move_pct', 0):+.1f}%)")
+                _qc = self._stats['queued']
+                if _qc <= 5 or _qc % 25 == 0:
+                    print(f"   📤 Watcher: {symbol} QUEUED for main thread "
+                          f"({trigger_type}, {pending.get('move_pct', 0):+.1f}%) [#{_qc}]")
         else:
             self._stats['priority_dropped'] = self._stats.get('priority_dropped', 0) + 1
             print(f"   ⚠️ Watcher: {symbol} NOT QUEUED — weaker than all "
@@ -1027,8 +1125,11 @@ class BreakoutWatcher:
     def reset_day(self):
         """Reset daily state (call at market open)"""
         self._baselines.clear()
+        self._baselines_long.clear()
         self._pending.clear()
         self._cooldowns.clear()
+        self._cooldown_trigger_type.clear()
+        self._per_symbol_triggers.clear()
         self._vol_delta_history.clear()
         self._prev_cumulative_vol.clear()
         self._prev_reported_high.clear()

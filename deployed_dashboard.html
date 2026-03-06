@@ -140,29 +140,6 @@ a{color:var(--blue);text-decoration:none}
 }
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* spread / naked type tag */
-.type-tag{
-  display:inline-block;padding:2px 7px;border-radius:10px;font-size:.62rem;font-weight:600;
-  letter-spacing:.3px;text-transform:uppercase;margin-left:6px;vertical-align:middle;
-}
-.type-naked{background:rgba(220,38,38,.08);color:#dc2626;border:1px solid rgba(220,38,38,.2)}
-.type-spread{background:rgba(37,99,235,.08);color:#2563eb;border:1px solid rgba(37,99,235,.2)}
-.type-debit{background:rgba(124,58,237,.08);color:#7c3aed;border:1px solid rgba(124,58,237,.2)}
-.type-iron{background:rgba(217,119,6,.08);color:#d97706;border:1px solid rgba(217,119,6,.2)}
-
-/* refresh button */
-.btn-refresh{
-  padding:4px 12px;border-radius:6px;font-size:.72rem;font-weight:600;
-  border:1px solid var(--border);cursor:pointer;transition:all .15s;
-  background:var(--bg3);color:var(--txt2);display:inline-flex;align-items:center;gap:4px;
-}
-.btn-refresh:hover{color:var(--cyan);border-color:var(--cyan);background:rgba(8,145,178,.06)}
-.btn-refresh.spinning .refresh-icon{animation:spin .6s linear infinite}
-.last-updated{font-size:.68rem;color:var(--txt3);margin-left:8px}
-
-/* P&L percent sub-line */
-.pnl-pct{font-size:.68rem;font-weight:500;opacity:.85}
-
 /* scrollbar */
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:var(--bg)}
@@ -380,13 +357,7 @@ a{color:var(--blue);text-decoration:none}
   <div class="panel">
     <div class="panel-header">
       <h2>Open Positions</h2>
-      <div style="display:flex;align-items:center;gap:10px">
-        <span id="pos-last-updated" class="last-updated"></span>
-        <button class="btn-refresh" id="btn-refresh-pos" onclick="manualRefreshPositions()" title="Refresh positions">
-          <span class="refresh-icon" style="display:inline-block">&#8635;</span> Refresh
-        </button>
-        <span id="pos-count" style="font-size:.8rem;color:var(--txt2)"></span>
-      </div>
+      <span id="pos-count" style="font-size:.8rem;color:var(--txt2)"></span>
     </div>
     <!-- Totals summary bar -->
     <div id="pos-totals" style="display:none;padding:10px 16px;background:var(--bg3);border-bottom:1px solid var(--border);
@@ -396,7 +367,7 @@ a{color:var(--blue);text-decoration:none}
       <table class="tbl" id="positions-tbl">
         <thead>
           <tr>
-            <th>Time</th><th>Symbol</th><th>Type</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
+            <th>Symbol</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
             <th>Entry</th><th>SL</th><th>Target</th>
             <th>Setup</th><th>Score</th><th>P&amp;L</th><th>Action</th>
           </tr>
@@ -798,7 +769,7 @@ async function loadPositions() {
     $('#pos-count').textContent = positions.length + ' open';
 
     if(!positions.length) {
-      tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
       tfoot.style.display = 'none';
       totalsBar.style.display = 'none';
     } else {
@@ -845,15 +816,13 @@ async function loadPositions() {
         '<span style="font-size:.72rem;color:var(--txt3)">' + setupStr + '</span>';
 
       // Totals footer row
-      const totalPnlPct = totalPremium > 0 ? ((totalUpnl / totalPremium) * 100) : 0;
-      const totalPnlPctStr = totalPnlPct !== 0 ? (' <span class="pnl-pct">(' + (totalPnlPct >= 0 ? '+' : '') + totalPnlPct.toFixed(1) + '%)</span>') : '';
       tfoot.style.display = '';
       tfoot.innerHTML = '<tr style="background:var(--bg3);font-weight:600;border-top:2px solid var(--border)">' +
-        '<td colspan="4">TOTALS</td>' +
+        '<td colspan="3">TOTALS</td>' +
         '<td>' + totalQty.toLocaleString() + ' (' + totalLots + 'L)</td>' +
-        '<td colspan="5">' + fmt(totalPremium) + ' deployed</td>' +
+        '<td colspan="4">' + fmt(totalPremium) + ' deployed</td>' +
         '<td></td>' +
-        '<td class="' + (totalUpnl>0?'val-green':totalUpnl<0?'val-red':'') + '">' + fmtPnl(totalUpnl) + totalPnlPctStr + '</td>' +
+        '<td class="' + (totalUpnl>0?'val-green':totalUpnl<0?'val-red':'') + '">' + fmtPnl(totalUpnl) + '</td>' +
         '<td></td></tr>';
 
       tbody.innerHTML = positions.map(p => {
@@ -889,12 +858,9 @@ async function loadPositions() {
         const premium = p.total_premium || (entry * qty);
         const ltp = p.ltp || 0;
         const upnl = p.unrealized_pnl || 0;
-        // P&L with percentage
-        const pnlPct = (premium > 0 && ltp > 0) ? ((upnl / premium) * 100) : 0;
-        const pnlPctStr = pnlPct !== 0 ? ('<br><span class="pnl-pct">' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%</span>') : '';
         let pnlStr;
         if(ltp > 0) {
-          pnlStr = fmtPnl(upnl) + pnlPctStr + ' <span style="font-size:.7rem;color:var(--txt3)">LTP:' + fmt(ltp) + '</span>';
+          pnlStr = fmtPnl(upnl) + ' <span style="font-size:.7rem;color:var(--txt3)">LTP:' + fmt(ltp) + '</span>';
         } else if(maxLoss) {
           pnlStr = 'Max risk: ' + fmt(maxLoss);
         } else {
@@ -915,31 +881,11 @@ async function loadPositions() {
           'CONTRARIAN': '&#128260; Contra',
           'TEST_GMM': '&#129514; GMM',
           'TEST_XGB': '&#129514; XGB',
-          'ARBTR': '&#128257; ARBTR',
-          'WILDCARD_MOMENTUM': '&#128293; Wildcard',
-          'ELITE': '&#11088; Elite',
-          'MOMENTUM': '&#128640; Momentum',
-          'EMA_SQUEEZE': '&#128167; EMA-Sq',
-          'RSI_REVERSAL': '&#128260; RSI-Rev',
-          'SNIPER_OI_UNWINDING': '&#127919; OI-Sniper',
-          'SNIPER_PCR_EXTREME': '&#127919; PCR-Sniper',
-          'DR_FLIP': '&#128260; DR-Flip',
-          'GMM_CONTRARIAN': '&#128260; GMM-Contra',
           'GPT': '&#129302; GPT',
           'MANUAL': '&#129302; GPT',
           '': '&#129302; GPT'
         };
-        const setupLabel = setupMap[setup] || ('&#128312; ' + setup) || '&#129302; GPT';
-
-        // Spread vs Naked type detection
-        const isDebitSpread = p.is_debit_spread || false;
-        const isCreditSpread = p.is_credit_spread || false;
-        const isIronCondor = p.is_iron_condor || false;
-        let typeTag;
-        if(isIronCondor) typeTag = '<span class="type-tag type-iron">Iron Condor</span>';
-        else if(isCreditSpread) typeTag = '<span class="type-tag type-spread">Credit Spread</span>';
-        else if(isDebitSpread) typeTag = '<span class="type-tag type-debit">Debit Spread</span>';
-        else typeTag = '<span class="type-tag type-naked">Naked</span>';
+        const setupLabel = setupMap[setup] || setup || '&#129302; GPT';
 
         const score = p.smart_score || p.entry_score || p.p_score || null;
         const mlDir = p.ml_scored_direction || p.ml_direction || '';
@@ -958,32 +904,8 @@ async function loadPositions() {
         }
         if(!scoreHtml) scoreHtml = DASH;
 
-        // Entry time + hold duration from raw timestamp
-        const rawTs = p.timestamp || '';
-        let entryTime = '', holdStr = '';
-        if(rawTs) {
-          try {
-            const d = new Date(rawTs);
-            const hh = String(d.getHours()).padStart(2,'0');
-            const mm = String(d.getMinutes()).padStart(2,'0');
-            entryTime = hh + ':' + mm;
-            const diffMs = Date.now() - d.getTime();
-            const diffMins = Math.floor(diffMs / 60000);
-            if(diffMins > 0) {
-              const dh = Math.floor(diffMins / 60);
-              const dm = diffMins % 60;
-              holdStr = dh > 0 ? (dh + 'h ' + dm + 'm') : (dm + 'm');
-            }
-          } catch(e) {}
-        }
-        const timeHtml = entryTime
-          ? '<strong>' + entryTime + '</strong>' + (holdStr ? '<br><span style="font-size:.6rem;color:var(--txt3)">' + holdStr + ' ago</span>' : '')
-          : DASH;
-
         return '<tr>' +
-          '<td>' + timeHtml + '</td>' +
           '<td><strong>' + sym + '</strong>' + (p.option_type ? ' <span class="badge" style="font-size:.65rem">' + p.strike + ' ' + p.option_type + '</span>' : '') + '</td>' +
-          '<td>' + typeTag + '</td>' +
           '<td>' + underlying + '</td>' +
           '<td><span class="badge ' + (dir==='SELL'?'badge-loss':'badge-win') + '">' + dir + '</span></td>' +
           '<td>' + qty.toLocaleString() + ' (' + lots + 'L)</td>' +
@@ -1098,48 +1020,6 @@ setInterval(checkVersion, 10000);
 // ==========================================================
 loadOverview();
 setInterval(loadOverview, 30000);
-
-// Auto-refresh positions when that tab is active (every 15s)
-setInterval(() => {
-  const posTab = document.getElementById('tab-positions');
-  if(posTab && posTab.classList.contains('active')) {
-    loadPositions();
-  }
-}, 15000);
-
-// -- Manual refresh for positions tab --
-let _posLastUpdated = null;
-function updateLastUpdatedLabel() {
-  const el = document.getElementById('pos-last-updated');
-  if(!el) return;
-  if(!_posLastUpdated) { el.textContent = ''; return; }
-  const ago = Math.round((Date.now() - _posLastUpdated) / 1000);
-  if(ago < 5) el.textContent = 'Updated just now';
-  else if(ago < 60) el.textContent = 'Updated ' + ago + 's ago';
-  else el.textContent = 'Updated ' + Math.round(ago/60) + 'm ago';
-}
-setInterval(updateLastUpdatedLabel, 5000);
-
-// Wrap original loadPositions to track time
-const _origLoadPositions = loadPositions;
-loadPositions = async function() {
-  await _origLoadPositions();
-  _posLastUpdated = Date.now();
-  updateLastUpdatedLabel();
-};
-
-async function manualRefreshPositions() {
-  const btn = document.getElementById('btn-refresh-pos');
-  btn.classList.add('spinning');
-  btn.disabled = true;
-  try {
-    await loadPositions();
-    await loadOverview();
-  } finally {
-    btn.classList.remove('spinning');
-    btn.disabled = false;
-  }
-}
 
 </script>
 

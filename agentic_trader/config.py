@@ -1,6 +1,25 @@
 """
-AGENTIC TRADING SYSTEM
+AGENTIC TRADING SYSTEM — TITAN
 Uses OpenAI GPT for reasoning + Zerodha for execution
+
+══════════════════════════════════════════════════════════════════════════════
+  TITAN'S CORE GOAL (NEVER FORGET — READ THIS BEFORE EVERY CONFIG CHANGE):
+══════════════════════════════════════════════════════════════════════════════
+  Titan exists to generate CONSISTENT DAILY PROFIT through HIGH-CONVICTION,
+  SELECTIVE trades. Every trade must have a real statistical edge.
+
+  QUALITY > QUANTITY. Always.
+
+  Principles:
+    1. Capital preservation FIRST — never risk capital on weak signals
+    2. Fewer trades with high conviction >> many trades with loose filters
+    3. ROI is the metric — not trade count, not "activity"
+    4. If a strategy isn't profitable, TIGHTEN it — don't loosen to get volume
+    5. Never relax thresholds just to see trades flow — that destroys capital
+    6. Proven strategies (ORB_BREAKOUT, WATCHER, SNIPER) get priority capital
+    7. Experimental strategies (TEST_GMM, TEST_XGB) stay on TIGHT leash:
+       small size, low daily cap, high conviction required
+══════════════════════════════════════════════════════════════════════════════
 
 PRIORITY: Capital preservation > consistent execution > performance
 """
@@ -97,7 +116,7 @@ HARD_RULES = {
     "MAX_POSITIONS_TRENDING": 80,    # Max positions in BULLISH/BEARISH regime
     "STALE_DATA_SECONDS": 60,       # Data older than this is stale
     "API_RATE_LIMIT_MS": 350,       # Min ms between API calls (Kite allows ~3/s, 350ms is safe)
-    "CAPITAL": 500000,              # Starting capital ₹5,00,000
+    "CAPITAL": 500000,              # Starting capital ₹5,00,000 — don't inflate for exposure tricks
     "REENTRY_COOLDOWN_MINUTES": 30, # Skip same underlying for 30 min after any exit
     # === PENNY PREMIUM PROTECTION (Feb 24 fix) ===
     # Cheap options (<₹3) create position-size bombs:
@@ -135,10 +154,15 @@ BREAKOUT_WATCHER = {
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
     "day_extreme_min_move_pct": 0.25, # Day extreme must also show ≥0.25% move from baseline (was 0.4)
     "volume_surge_multiplier": 3.0,   # Trigger if tick volume ≥ 3.0x rolling average (was 3.5)
-    # --- Sustain Filter (differentiated Mar-05: vol surges need lower bar) ---
-    "sustain_seconds": 15,            # Price must HOLD the move for 15s before triggering (was 20)
+    # --- Sustain Filter ---
+    # [FIX Mar 6] 15s was too short — BDL reversed 4 min after entry.
+    # 60s confirms real momentum, not just a volume blip.
+    "sustain_seconds": 60,            # Price must HOLD the move for 60s before triggering (was 15 — too short)
     "sustain_recheck_pct": 0.5,       # Spike/extreme: price must still be ≥0.5% from baseline (was 0.8)
-    "sustain_recheck_pct_volume": 0.15,  # Volume surge: price must still be ≥0.15% from baseline (NEW)
+    "sustain_recheck_pct_volume": 0.3,   # Volume surge: price must still be ≥0.3% from baseline (was 0.15 — too noisy)
+    "volume_surge_min_move_pct": 0.3,   # [NEW] VOLUME_SURGE must show ≥0.3% price move to enter sustain (prevents tiny-move fakeouts)
+    # --- Slow Grind Detection (NEW Mar-05: catches persistent moves the 60s window misses) ---
+    "slow_grind_pct": 1.0,              # 1%+ move over 5-minute window triggers SLOW_GRIND
     # --- Cooldown (anti-spam) ---
     "cooldown_seconds": 180,          # Don't re-trigger same stock within 3 minutes
     "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days (was 3)
@@ -246,6 +270,8 @@ DOWN_RISK_GATING = {
     # === ALL_AGREE AMPLIFIED BET ===
     # All 3 models agree (Titan + GMM + XGB) = strongest conviction → amplified lot sizing
     "all_agree_lot_multiplier": 1.5,   # 1.5x lots for ALL_AGREE (strongest conviction)
+    "all_agree_min_down_score": 0.30,    # Down_Flag (bounce) floor for ALL_AGREE BUY — raised from 0.26 (POWERINDIA 0.260 was too weak)
+    "all_agree_min_up_score": 0.30,      # UP_Flag (crash) floor for ALL_AGREE SELL — strong crash signal required
 }
 
 # === ML DIRECTION CONFLICT FILTER ===
@@ -310,24 +336,24 @@ GMM_CONTRARIAN = {
 TEST_GMM = {
     "enabled": True,
     # DOWN model signal: down_flag confirms → BUY PUT
-    "down_min_score": 0.35,              # DOWN model must show strong signal (was 0.25 — too loose)
-    "down_max_opposite": 0.08,           # UP model must be very clean (was 0.10)
+    "down_min_score": 0.25,              # Tightened: require stronger DOWN signal (quality > quantity)
+    "down_max_opposite": 0.10,           # Tightened: clean side must be genuinely clean
     # UP model signal: up_flag confirms → BUY CALL
-    "up_min_score": 0.32,                # UP model must show strong signal (was 0.22 — AUROC=0.56 needs higher bar)
-    "up_max_opposite": 0.08,             # DOWN model must be very clean (was 0.10)
+    "up_min_score": 0.22,                # Tightened: UP model AUROC=0.56, need stronger signal
+    "up_max_opposite": 0.10,             # Tightened: clean side must be genuinely clean
     # Divergence quality
-    "min_divergence_gap": 0.30,          # |signaling_score - clean_score| minimum (was 0.20 — tighter separation)
+    "min_divergence_gap": 0.12,          # Require meaningful gap between regimes (not just noise)
     # FLAG-based conviction gates (model-calibrated thresholds)
     "require_signaling_flag": True,      # Signaling regime must FIRE its own anomaly flag
-    "require_clean_no_flag": True,       # Clean regime must NOT fire its flag (no conflicting signal)
+    "require_clean_no_flag": True,       # Tightened: clean side must NOT be flagging (reduces noise)
     # Pure GMM play — NO XGB involvement
     "require_xgb_agree": False,          # No XGB gating — pure regime divergence signal
     "min_gate_prob": 0.0,                # No P(MOVE) requirement — bypass XGB entirely
-    "max_gate_prob": 0.75,               # Cap P(MOVE) — too-high gate = confirmed momentum, contrarian fails
-    "max_ml_confidence": 0.55,           # Cap XGB confidence — high confidence = fighting real trend
+    "max_gate_prob": 1.0,                # No cap needed
+    "max_ml_confidence": 1.0,            # No cap needed
     "min_smart_score": 0,                # No smart score — divergence IS the signal
-    "max_trades_per_day": 6,            # Hard cap — was 999, quality gates alone weren't sufficient
-    "lot_multiplier": 1.5,               # Slight boost — divergence is unique differentiated signal
+    "max_trades_per_day": 50,            # Uncapped for paper tracking — conviction thresholds do the filtering
+    "lot_multiplier": 1.0,               # Standard lots — paper tracking, not sizing up
     "score_tier": "standard",
 }
 
@@ -343,12 +369,12 @@ TEST_GMM = {
 #   TEST_XGB      = pure XGB conviction, no GMM
 TEST_XGB = {
     "enabled": True,
-    "min_move_prob": 0.65,               # P(MOVE) floor (was 0.58 — too easy on volatile days)
-    "min_directional_prob": 0.48,        # prob_up or prob_down must exceed this (was 0.42)
-    "min_directional_margin": 0.15,      # |prob_up - prob_down| minimum (was 0.10 — need clearer lean)
-    "min_ml_confidence": 0.60,           # XGB confidence floor — model must be sure, not just sensing movement
-    "max_trades_per_day": 6,            # Hard cap — was 999, allowed 11 PEs against BULLISH market
-    "lot_multiplier": 1.0,               # Standard lots — testing phase
+    "min_move_prob": 0.48,               # Tightened: only trade when XGB sees clear movement signal
+    "min_directional_prob": 0.25,        # Tightened: need real directional lean, not coin-flip
+    "min_directional_margin": 0.06,      # Tightened: direction must be meaningfully lopsided
+    "min_ml_confidence": 0.50,           # Tightened: require genuine model confidence
+    "max_trades_per_day": 50,            # Uncapped for paper tracking — conviction thresholds do the filtering
+    "lot_multiplier": 1.0,               # Standard lots — paper tracking, not sizing up
     "score_tier": "standard",
     # --- IV Crush Overrides (tighter than global IV_CRUSH_GATE) ---
     # SIEMENS PE had IV=33% but RV was low → IV/RV was high → IV crush killed it (-9.3% in 35min).
@@ -368,15 +394,15 @@ TEST_XGB = {
 # Separate budget from model-tracker trades.
 GMM_SNIPER = {
     "enabled": True,
-    "max_sniper_trades_per_day": 8,    # Max GMM sniper trades per day
-    "lot_multiplier": 5.0,             # 5x normal lot size (was 3.0x, +2 lots Feb 26)
-    "min_smart_score": 58,             # Smart score floor for 5x lots — needs real conviction (was 52)
-    "max_updr_score": 0.08,             # Tight upside cap — clean low-risk setups (was 0.07)
-    "max_downdr_score": 0.13,           # Tight downside cap — ONGC 0.141 still blocked (was 0.12)
-    "min_gate_prob": 0.55,             # XGB gate floor — 5x lots needs strong P(MOVE) (was 0.50)
+    "max_sniper_trades_per_day": 4,    # ⚠️ Tightened: sniper = SELECTIVE, 4 max (was 8)
+    "lot_multiplier": 3.0,             # Reduced from 5x → 3x. Earn bigger size with proven P&L
+    "min_smart_score": 50,             # Tightened: need real conviction (was 45)
+    "max_updr_score": 0.12,            # Tightened: GMM must show cleaner signal (was 0.15)
+    "max_downdr_score": 0.15,          # Tightened: cleaner downside (was 0.18)
+    "min_gate_prob": 0.50,             # Tightened: XGB must see real movement (was 0.45)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
-    "separate_capital": 300000,        # ₹3 Lakh reserved exclusively for sniper trades
-    "max_exposure_pct": 90,            # Max % of sniper capital usable (₹2.7L)
+    "separate_capital": 200000,        # ₹2 Lakh — sniper capital reduced, must prove ROI
+    "max_exposure_pct": 85,            # Max % of sniper capital usable
 }
 
 # === SECTOR BREADTH PENALTY ===
@@ -462,25 +488,25 @@ SNIPER_PCR_EXTREME = {
 # the stop fires fast).
 ARBTR_CONFIG = {
     "enabled": True,
-    "max_trades_per_day": 6,              # Max ARBTR entries per day
-    "lot_multiplier": 1.0,                # Conservative sizing — 1x lots to start
+    "max_trades_per_day": 4,              # ⚠️ Tightened: 5 ARBTR today = -₹4.6K. Quality > quantity
+    "lot_multiplier": 1.0,                # Standard lots — ARBTR needs to prove itself profitable first
 
     # --- Sector Move Detection ---
-    "min_sector_move_pct": 1.5,           # Sector index must move ≥1.5% from prev close
-    "min_sector_stocks_aligned": 0.60,    # ≥60% of sector stocks must have moved WITH sector
+    "min_sector_move_pct": 0.6,           # Sector index must move ≥0.6% from prev close
+    "min_sector_stocks_aligned": 0.65,    # Tightened: ≥65% of sector must align (was 60%)
 
     # --- Laggard Detection ---
-    "max_laggard_move_pct": 0.50,         # Laggard stock moved <0.50% (barely budged)
-    "min_divergence_pct": 1.0,            # |sector_move - stock_move| must be ≥1.0%
+    "max_laggard_move_pct": 0.8,          # Tightened: laggard must genuinely lag, not just slow (was 1.0)
+    "min_divergence_pct": 0.5,            # Tightened: require real divergence gap (was 0.4)
     "max_divergence_pct": 5.0,            # If gap >5% the stock is decoupled (skip)
 
     # --- Confirmation Gates (reduce failure trades) ---
     "require_volume_confirmation": True,  # Laggard must have ≥0.8x normal volume (not halted/illiquid)
     "min_volume_ratio": 0.8,              # Volume vs 20-day avg must be ≥0.8
-    "require_ml_move_signal": True,       # XGB must show ≥40% P(move) — dead stocks stay dead
-    "min_ml_move_prob": 0.40,             # ML move probability floor
-    "min_ml_confidence": 0.45,            # ML confidence floor
-    "max_ml_flat_prob": 0.55,             # If ML says >55% flat → stock won't catch up, skip
+    "require_ml_move_signal": False,      # ML removed — ARBTR signal is sector divergence, not ML
+    "min_ml_move_prob": 0.40,             # ML move probability floor (unused when require_ml=False)
+    "min_ml_confidence": 0.45,            # ML confidence floor (unused when require_ml=False)
+    "max_ml_flat_prob": 0.55,             # (unused when require_ml=False)
     "require_no_chop_zone": True,         # Laggard must NOT be in chop zone
     "require_htf_not_opposed": True,      # HTF must not oppose sector direction
     "min_smart_score": 35,                # Low floor — ARBTR signal is primary, score is secondary
@@ -496,10 +522,10 @@ ARBTR_CONFIG = {
 
     # --- Risk / Sizing ---
     "score_tier": "standard",             # Standard sizing (3% risk)
-    "target_multiplier": 1.5,             # Target = 1.5x SL distance (quick convergence play)
+    "target_multiplier": 1.5,             # Conservative target — take profit when available
     "sl_multiplier": 1.0,                 # Tight SL — if thesis wrong, exit fast
-    "max_simultaneous_arbtr": 3,          # Max 3 ARBTR trades open at once
-    "separate_capital": 200000,           # ₹2L reserved for ARBTR
+    "max_simultaneous_arbtr": 3,          # Tightened: fewer concurrent = better capital allocation
+    "separate_capital": 200000,           # ₹2L — ARBTR hasn't earned more capital yet
 }
 
 # Sector definitions for ARBTR — must match _sector_stock_map in scan_and_trade
@@ -630,8 +656,7 @@ TIER_2_OPTIONS = [
     "NSE:TATAMOTORS",  # Auto - high beta, deep OI, global exposure
     # Pharma
     "NSE:CIPLA",       # Pharma - liquid options, consistent trending
-    # Telecom
-    "NSE:IDEA",        # Telecom - high volume, volatile moves
+    # "NSE:IDEA",      # REMOVED Mar 6 — not F&O eligible, watcher keeps failing on it
 ]
 
 TIER_2_MIN_TREND_SCORE = 60  # Tier-2 stocks need BULLISH/BEARISH trend to trade

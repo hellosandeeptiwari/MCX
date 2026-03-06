@@ -193,6 +193,7 @@ class ZerodhaTools:
         self._positions_lock = threading.RLock()  # Thread safety for paper_positions (reentrant)
         self._scorer_rejected_symbols = set()  # Track scorer rejections for retry filtering
         self._exit_cooldowns: dict = {}  # underlying -> datetime of last exit (20-min re-entry cooldown)
+        self._exited_symbols_today: set = set()  # Safety net: all symbols closed from paper_positions today
         
         # Load saved token
         self._load_token()
@@ -1033,6 +1034,7 @@ class ZerodhaTools:
                             if gtt_id and GTT_CONFIG.get('cleanup_on_exit', True):
                                 self._cancel_gtt(gtt_id, symbol)
                             self.paper_positions.pop(i)
+                            self._exited_symbols_today.add(symbol)  # Track for orphan reconciliation safety
                     
                     self._save_active_trades()
                     return True

@@ -844,16 +844,15 @@ class AutonomousTrader:
                     continue
             
             # === FOLLOW-THROUGH GATE (prevents auto-firing dead momentum) ===
-            # Pro trader rule: don't auto-fire if breakout has ZERO follow-through.
-            # 8 TIME_STOP losses had MaxR=0 — stock never moved after entry.
-            # Require at least 1 follow-through candle for auto-fire confidence.
+            # FT measures candles since ORB breakout — only relevant for ORB-based entries.
+            # ELITE auto-fire comes from scan_and_trade (score-based), not from watcher
+            # ticker triggers. The FT gate still applies here because ELITE entries
+            # are fundamentally about ORB/technical breakouts, not live momentum events.
             if isinstance(data, dict):
                 ft_candles = data.get('follow_through_candles', 0)
                 adx_val = data.get('adx', 20)
                 oi_signal = data.get('oi_signal', 'NEUTRAL')
                 
-                # Block auto-fire if: zero follow-through AND not a fresh breakout
-                # (orb_hold_candles > 2 means breakout happened a while ago)
                 orb_hold = data.get('orb_hold_candles', 0)
                 if ft_candles == 0 and orb_hold > 2:
                     self._log_decision(cycle_time, sym, score, 'ELITE_NO_FOLLOWTHROUGH',
@@ -1159,7 +1158,7 @@ class AutonomousTrader:
           ✅ OI conflict veto (institutions vs direction)
           ✅ ML flat veto (high P(flat) blocks auto-fire)
           ✅ XGB direction conflict veto (strong opposing signal blocks)
-          ✅ XGB move probability floor (P(move) >= 0.40)
+          ✅ XGB move probability floor (P(move) >= 0.55)
           ✅ GMM down-risk veto (extreme anomaly opposes direction → block)
           ✅ Position limit (regime-aware)
         
@@ -1245,7 +1244,7 @@ class AutonomousTrader:
                         vwap_slope_steepening=_d.get('vwap_slope_steepening', False),
                         atr=_d.get('atr_14', 0.0)
                     )
-                    _dec = _scorer.score_intraday_signal(_sig, market_data=_d, caller_direction=None)
+                    _dec = _scorer.score_intraday_signal(_sig, market_data=_d, caller_direction=None, source='watcher')
                     _pre_scores[_sym] = _dec.confidence_score
                     _cycle_decisions[_sym] = {
                         'decision': _dec,
@@ -1530,35 +1529,72 @@ class AutonomousTrader:
                                       direction=direction)
                     continue
                 
-                # --- GATE C: Setup validation (same as ELITE) ---
+                # --- GATE C: Setup validation (relaxed for watcher) ---
+                # The watcher already confirmed a real-time trigger (volume surge,
+                # new day extreme, or price spike). These ARE setups — the ticker
+                # detected them from raw ticks, so we grant implicit setup credit
+                # for strong trigger types or VWAP alignment, not just classic ORB.
                 orb = _data.get('orb_signal', 'INSIDE_ORB')
                 vwap = _data.get('price_vs_vwap', 'AT_VWAP')
                 vol = _data.get('volume_regime', 'NORMAL')
                 ema = _data.get('ema_regime', 'NORMAL')
-                has_setup = (
+                _rsi = _data.get('rsi_14', 50)
+                
+                # Classic setups (same as ELITE)
+                _classic_setup = (
                     orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') or
                     (vwap in ('ABOVE_VWAP', 'BELOW_VWAP') and vol in ('HIGH', 'EXPLOSIVE')) or
                     ema == 'COMPRESSED' or
-                    _data.get('rsi_14', 50) < 30 or _data.get('rsi_14', 50) > 70
+                    _rsi < 30 or _rsi > 70
                 )
+                
+                # Watcher-implicit setups: the ticker's trigger IS the setup evidence
+                # VOLUME_SURGE + VWAP alignment = institutional activity + trend
+                # NEW_DAY_LOW/HIGH = structural break of day's range
+                # PRICE_SPIKE = momentum event
+                # SLOW_GRIND = persistent multi-minute move detected
+                _watcher_setup = (
+                    _trigger_type in ('NEW_DAY_LOW', 'NEW_DAY_HIGH', 'PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN', 'SLOW_GRIND_UP', 'SLOW_GRIND_DOWN') or
+                    (_trigger_type == 'VOLUME_SURGE' and vwap in ('ABOVE_VWAP', 'BELOW_VWAP')) or
+                    (_trigger_type == 'VOLUME_SURGE' and _data.get('adx', 0) >= 30)
+                )
+                
+                has_setup = _classic_setup or _watcher_setup
                 if not has_setup:
-                    self._wlog(f"  BLOCKED(C-SETUP): {_stock_name} no setup | ORB={orb} VWAP={vwap} VOL={vol} EMA={ema} RSI={_data.get('rsi_14', 50):.0f}")
+                    self._wlog(f"  BLOCKED(C-SETUP): {_stock_name} no setup | ORB={orb} VWAP={vwap} VOL={vol} EMA={ema} RSI={_rsi:.0f} trigger={_trigger_type}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_SETUP',
-                                      reason=f'Breakout {_trigger_type} but no ORB/VWAP/EMA/RSI setup',
+                                      reason=f'Breakout {_trigger_type} but no setup (classic or watcher-implicit)',
                                       direction=direction)
                     continue
                 
-                # --- GATE D: Follow-through candle gate (same as ELITE) ---
+                # Log which setup pathway qualified
+                _setup_path = 'classic' if _classic_setup else f'watcher-implicit({_trigger_type})'
+                self._wlog(f"  PASSED(C-SETUP): {_stock_name} via {_setup_path}")
+                
+                # --- GATE D: Follow-through candle gate ---
+                # FT measures candles since ORB breakout. This is ONLY relevant
+                # when the trade thesis is ORB-based. For VOLUME_SURGE, SLOW_GRIND,
+                # NEW_DAY_HIGH triggers, the ORB age is irrelevant — the trigger
+                # is fresh momentum, not an old breakout.
+                # [FIX Mar 6] UNITDSPR scored 68 with EXPLOSIVE vol, triggered by
+                # VOLUME_SURGE, but was blocked because ORB breakout was from morning.
+                # FT from the morning ORB has nothing to do with an afternoon volume surge.
                 ft_candles = _data.get('follow_through_candles', 0)
                 orb_hold = _data.get('orb_hold_candles', 0)
-                if ft_candles == 0 and orb_hold > 2:
-                    self._wlog(f"  BLOCKED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} — stale breakout")
+                _is_orb_trigger = orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') and _trigger_type not in (
+                    'VOLUME_SURGE', 'SLOW_GRIND_UP', 'SLOW_GRIND_DOWN',
+                    'NEW_DAY_HIGH', 'NEW_DAY_LOW', 'PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN'
+                )
+                if ft_candles == 0 and orb_hold > 2 and _is_orb_trigger:
+                    self._wlog(f"  BLOCKED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} — stale ORB breakout")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_FOLLOWTHROUGH',
-                                      reason=f'FT=0, ORB hold={orb_hold} candles — stale breakout',
+                                      reason=f'FT=0, ORB hold={orb_hold} candles — stale ORB breakout',
                                       direction=direction)
                     continue
+                if ft_candles == 0 and orb_hold > 2 and not _is_orb_trigger:
+                    self._wlog(f"  PASSED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} but trigger={_trigger_type} — FT gate N/A for non-ORB triggers")
                 
                 # --- GATE E: ADX trend strength gate (same as ELITE: ≥25) ---
                 adx_val = _data.get('adx', 20)
@@ -1633,16 +1669,18 @@ class AutonomousTrader:
                 
                 # --- GATE G3: XGB Move Probability Floor (watcher-specific) ---
                 # XGB must show minimum conviction that a move (up OR down) will happen.
-                # Watcher threshold: 0.40 (relaxed vs elite 0.55 — catching early signals).
+                # Watcher threshold: 0.55 (tightened from 0.40 — Mar-5 data shows
+                # all winners had P(move)>=0.568, all IV-crush losers had <=0.52).
+                _G3_MIN_MOVE_PROB = 0.55
                 try:
                     _xgb_ml = _ml_results.get(_sym, {})
                     _xgb_move_prob = _xgb_ml.get('ml_move_prob', 0)
                     # Only gate if ML data is available (don't block when ML fails)
-                    if _xgb_ml and _xgb_move_prob > 0 and _xgb_move_prob < 0.40:
-                        self._wlog(f"  BLOCKED(G3-XGB_PROB): {_stock_name} P(move)={_xgb_move_prob:.2f} < 0.40")
+                    if _xgb_ml and _xgb_move_prob > 0 and _xgb_move_prob < _G3_MIN_MOVE_PROB:
+                        self._wlog(f"  BLOCKED(G3-XGB_PROB): {_stock_name} P(move)={_xgb_move_prob:.2f} < {_G3_MIN_MOVE_PROB}")
                         self._watcher_total_gate_blocked += 1
                         self._log_decision(_ts, _sym, _final_score, 'WATCHER_XGB_LOW_PROB',
-                                          reason=f'XGB P(move)={_xgb_move_prob:.2f} < 0.40',
+                                          reason=f'XGB P(move)={_xgb_move_prob:.2f} < {_G3_MIN_MOVE_PROB}',
                                           direction=direction)
                         continue
                 except Exception:
@@ -2053,6 +2091,19 @@ class AutonomousTrader:
 
             if _xgb_aligns:
                 # Cases 3, 11: Anomaly + XGB + Titan TRIPLE ALIGN → ALL_AGREE
+                # [TIGHTENED Mar 6] Direction-specific GMM confirm score floors
+                # BUY needs strong Down_Flag (bounce ≥ 0.30), SELL needs strong UP_Flag (crash ≥ 0.30)
+                if direction == 'BUY':
+                    _aa_min_confirm = self._down_risk_cfg.get('all_agree_min_down_score', 0.30)
+                else:
+                    _aa_min_confirm = self._down_risk_cfg.get('all_agree_min_up_score', 0.30)
+                if _confirm_score < _aa_min_confirm:
+                    sym_clean_tmp = sym.replace('NSE:', '')
+                    print(f"      ⛔ ALL_AGREE BLOCKED: {sym_clean_tmp} — {_confirm_tag}={_confirm_score:.3f} < {_aa_min_confirm} (weak GMM signal)")
+                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ALL_AGREE_WEAK_GMM',
+                                      reason=f"{_confirm_tag}={_confirm_score:.3f} < {_aa_min_confirm} floor",
+                                      direction=direction)
+                    continue
                 # [TIGHTENED Mar 2] Tech floor: pre_score must be ≥ 45 to qualify as ALL_AGREE
                 _aa_p_score = pre_scores.get(sym, 0)
                 if _aa_p_score < 45:
@@ -2843,8 +2894,15 @@ class AutonomousTrader:
                 },
             })
         
+        # ── Diagnostic logging: always show status ──
+        _total_syms = len(ml_results) if ml_results else 0
         if not candidates:
+            print(f"   🧪 TEST_GMM: 0 candidates from {_total_syms} symbols "
+                  f"| thresholds: dn≥{dn_min}/up≥{up_min} opp≤{dn_max_opp} gap≥{min_gap} "
+                  f"flag={require_signaling_flag} budget={budget}")
             return []
+        
+        print(f"   🧪 TEST_GMM: {len(candidates)} candidates from {_total_syms} symbols | budget={budget}")
         
         # Sort by divergence strength (largest gap → highest priority)
         candidates.sort(key=lambda c: c['divergence_score'], reverse=True)
@@ -3099,6 +3157,7 @@ class AutonomousTrader:
             })
         
         # ── Log gate summary ──
+        _total_xgb_syms = len(ml_results) if ml_results else 0
         if _xgb_skipped_herd or _xgb_skipped_breadth or _xgb_sector_override:
             _gate_parts = []
             if _xgb_skipped_herd:
@@ -3110,7 +3169,12 @@ class AutonomousTrader:
             print(f"   \U0001f6e1 TEST_XGB GATES: {' | '.join(_gate_parts)} → {len(candidates)} candidates remaining")
         
         if not candidates:
+            print(f"   🧪 TEST_XGB: 0 candidates from {_total_xgb_syms} symbols "
+                  f"| thresholds: P(move)≥{min_move} dir≥{min_dir_prob} margin≥{min_dir_margin} conf≥{min_conf} "
+                  f"breadth={_breadth} budget={budget}")
             return []
+        
+        print(f"   🧪 TEST_XGB: {len(candidates)} candidates from {_total_xgb_syms} symbols | budget={budget}")
         
         # Sort by XGB conviction: highest P(MOVE) * directional_margin first
         candidates.sort(key=lambda c: c['ml_move_prob'] * c['margin'], reverse=True)
@@ -3208,6 +3272,19 @@ class AutonomousTrader:
         if now_str < earliest or now_str > latest:
             return []
 
+        # ── ARBTR diagnostic: log every 10th cycle (reduce noise) ──
+        _arbtr_diag_counter = getattr(self, '_arbtr_diag_counter', 0) + 1
+        self._arbtr_diag_counter = _arbtr_diag_counter
+        _arbtr_diag = (_arbtr_diag_counter % 10 == 1)  # First call + every 10th
+
+        # Diagnostic: show sector index data availability
+        if _arbtr_diag:
+            if sector_index_changes:
+                _sec_strs = [f"{k.replace('NSE:NIFTY ', '')}:{v:+.1f}%" for k, v in sector_index_changes.items()]
+                print(f"   \U0001F504 ARBTR scan: sectors=[{', '.join(_sec_strs)}] budget={budget}")
+            else:
+                print(f"   \U0001F504 ARBTR scan: NO sector index data (empty dict) — check get_quote_batch for index symbols")
+
         # Config thresholds
         min_sector_move = cfg.get('min_sector_move_pct', 1.5)
         min_aligned_ratio = cfg.get('min_sector_stocks_aligned', 0.60)
@@ -3237,6 +3314,39 @@ class AutonomousTrader:
         active_syms = {p.get('underlying', '') for p in getattr(self.tools, 'paper_positions', [])
                       if p.get('status', 'OPEN') == 'OPEN'}
 
+        # ── ARBTR data enrichment: use ticker as fallback for sector stocks ──
+        # market_data only has ~40 stocks; sector maps need ~87.
+        # Use WebSocket quote cache to fill gaps (zero API cost).
+        _arbtr_market = dict(market_data)  # shallow copy, don't pollute original
+        _missing_syms = []
+        for _sec_info in self._arbtr_sector_map.values():
+            for _stk in _sec_info.get('stocks', []):
+                _sk = f'NSE:{_stk}'
+                if _sk not in _arbtr_market and _stk not in _arbtr_market:
+                    _missing_syms.append(_sk)
+        if _missing_syms and self.tools.ticker:
+            try:
+                _ws_quotes = self.tools.ticker.get_quote_batch(_missing_syms)
+                _filled = 0
+                for _mk_sym, _mk_q in _ws_quotes.items():
+                    if _mk_q:
+                        _ohlc = _mk_q.get('ohlc', {})
+                        _prev = _ohlc.get('close', 0)
+                        _ltp = _mk_q.get('last_price', 0)
+                        if _prev > 0 and _ltp > 0:
+                            _chg_pct = ((_ltp - _prev) / _prev) * 100
+                            _arbtr_market[_mk_sym] = {
+                                'last_price': _ltp, 'change_pct': _chg_pct,
+                                'ohlc': _ohlc, 'volume': _mk_q.get('volume', 0),
+                                '_arbtr_ws_fill': True,  # marker for diagnostic
+                            }
+                            _filled += 1
+                if _arbtr_diag:
+                    print(f"   \U0001F504 ARBTR data: {_filled}/{len(_missing_syms)} missing stocks filled from ticker cache")
+            except Exception as _e:
+                if _arbtr_diag:
+                    print(f"   \U0001F504 ARBTR data fill error: {_e}")
+
         # Reverse map: index symbol → sector name
         _idx_to_sector = {}
         for _sec_name, _sec_info in self._arbtr_sector_map.items():
@@ -3253,13 +3363,20 @@ class AutonomousTrader:
             # 1. Check if sector index has moved enough
             sec_change = sector_index_changes.get(idx_symbol, 0)
             if abs(sec_change) < min_sector_move:
+                if _arbtr_diag and abs(sec_change) >= 0.5:
+                    print(f"      ARBTR {sector_name}: {sec_change:+.1f}% < {min_sector_move}% threshold (skip)")
                 continue
+
+            if _arbtr_diag:
+                print(f"      ARBTR {sector_name}: {sec_change:+.1f}% \u2265 {min_sector_move}% \u2713 checking laggards...")
 
             sector_direction = 'BUY' if sec_change > 0 else 'SELL'  # Trade laggard in same direction
 
             # Sector cooldown check
             last_entry = self._arbtr_sector_cooldowns.get(sector_name)
             if last_entry and (now - last_entry).total_seconds() < cooldown_mins * 60:
+                if _arbtr_diag:
+                    print(f"      ARBTR {sector_name}: on cooldown (skip)")
                 continue
 
             # 2. Count aligned stocks in this sector
@@ -3267,7 +3384,7 @@ class AutonomousTrader:
             total_checked = 0
             for stk in stocks:
                 stk_sym = f'NSE:{stk}'
-                stk_data = market_data.get(stk_sym, market_data.get(stk, {}))
+                stk_data = _arbtr_market.get(stk_sym, _arbtr_market.get(stk, {}))
                 if not stk_data:
                     continue
                 total_checked += 1
@@ -3279,110 +3396,144 @@ class AutonomousTrader:
                     aligned_count += 1
 
             if total_checked < 3:
+                if _arbtr_diag:
+                    print(f"      ARBTR {sector_name}: only {total_checked} stocks with data (need 3+, skip)")
                 continue  # Not enough data to judge breadth
             alignment_ratio = aligned_count / total_checked
             if alignment_ratio < min_aligned_ratio:
+                if _arbtr_diag:
+                    print(f"      ARBTR {sector_name}: alignment {aligned_count}/{total_checked}={alignment_ratio:.0%} < {min_aligned_ratio:.0%} (skip)")
                 continue  # Sector not broadly aligned — don't trade laggards
 
             # 3. Find laggards — stocks that barely moved despite sector moving
+            _laggard_rejects = {}   # reason → count (for diagnostics)
             for stk in stocks:
                 stk_sym = f'NSE:{stk}'
-                stk_data = market_data.get(stk_sym, market_data.get(stk, {}))
+                stk_data = _arbtr_market.get(stk_sym, _arbtr_market.get(stk, {}))
                 if not stk_data or not isinstance(stk_data, dict):
+                    _laggard_rejects['no_data'] = _laggard_rejects.get('no_data', 0) + 1
                     continue
 
                 stk_change = stk_data.get('change_pct', 0)
 
                 # Laggard: moved less than threshold, and within max divergence from sector
                 if abs(stk_change) > max_laggard_move:
+                    _laggard_rejects['moved_too_much'] = _laggard_rejects.get('moved_too_much', 0) + 1
                     continue  # Stock already moved significantly — not a laggard
                 # Check for opposing movers: laggard should not be moving AGAINST sector
                 if sec_change > 0 and stk_change < -max_laggard_move:
+                    _laggard_rejects['counter_move'] = _laggard_rejects.get('counter_move', 0) + 1
                     continue  # Counter-moving — might have stock-specific bad news, skip
                 if sec_change < 0 and stk_change > max_laggard_move:
+                    _laggard_rejects['counter_move'] = _laggard_rejects.get('counter_move', 0) + 1
                     continue  # Counter-moving upward
 
                 divergence = abs(sec_change) - abs(stk_change)
                 if divergence < min_divergence:
+                    _laggard_rejects['low_divergence'] = _laggard_rejects.get('low_divergence', 0) + 1
                     continue  # Not enough gap
                 if divergence > max_divergence:
+                    _laggard_rejects['high_divergence'] = _laggard_rejects.get('high_divergence', 0) + 1
                     continue  # Too large — might be stock-specific reason
 
                 # === QUALITY GATES ===
 
                 # Gate: Skip already traded symbols
                 if stk_sym in self._arbtr_symbols:
+                    _laggard_rejects['already_traded'] = _laggard_rejects.get('already_traded', 0) + 1
                     continue
                 if stk_sym in active_syms:
+                    _laggard_rejects['active_pos'] = _laggard_rejects.get('active_pos', 0) + 1
                     continue
                 if stk_sym in self._model_tracker_symbols:
+                    _laggard_rejects['model_tracker'] = _laggard_rejects.get('model_tracker', 0) + 1
                     continue
                 if stk_sym in self._test_gmm_symbols:
+                    _laggard_rejects['test_gmm'] = _laggard_rejects.get('test_gmm', 0) + 1
                     continue
                 if stk_sym in self._test_xgb_symbols:
+                    _laggard_rejects['test_xgb'] = _laggard_rejects.get('test_xgb', 0) + 1
                     continue
                 if stk_sym in self._gmm_sniper_symbols:
+                    _laggard_rejects['gmm_sniper'] = _laggard_rejects.get('gmm_sniper', 0) + 1
                     continue
 
                 # Gate: Volume regime
                 vol_regime = stk_data.get('volume_regime', 'NORMAL')
                 if min_volume_ratio > 0 and vol_regime in ('LOW', 'DEAD'):
+                    _laggard_rejects['low_volume'] = _laggard_rejects.get('low_volume', 0) + 1
                     continue  # Low volume = no conviction to converge
 
                 # Gate: Chop zone
                 if require_no_chop and stk_data.get('chop_zone', False):
+                    _laggard_rejects['chop_zone'] = _laggard_rejects.get('chop_zone', 0) + 1
                     continue
 
                 # Gate: HTF not opposed
                 if require_htf_not_opposed:
                     htf = stk_data.get('htf_trend', 'NEUTRAL')
                     if sector_direction == 'BUY' and htf == 'BEARISH':
+                        _laggard_rejects['htf_opposed'] = _laggard_rejects.get('htf_opposed', 0) + 1
                         continue
                     if sector_direction == 'SELL' and htf == 'BULLISH':
+                        _laggard_rejects['htf_opposed'] = _laggard_rejects.get('htf_opposed', 0) + 1
                         continue
 
-                # Gate: ML results
+                # Gate: ML results (skipped when require_ml_move_signal=False)
+                _require_ml = cfg.get('require_ml_move_signal', True)
                 ml = ml_results.get(stk_sym, {})
-                if not ml:
+                if _require_ml:
+                    if not ml:
+                        _laggard_rejects['no_ml'] = _laggard_rejects.get('no_ml', 0) + 1
+                        continue
+
+                    ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+                    if ml_move_prob < min_ml_move:
+                        _laggard_rejects['ml_move_low'] = _laggard_rejects.get('ml_move_low', 0) + 1
+                        continue
+
+                    ml_conf = ml.get('ml_confidence', 0.0)
+                    if ml_conf < min_ml_conf:
+                        _laggard_rejects['ml_conf_low'] = _laggard_rejects.get('ml_conf_low', 0) + 1
+                        continue
+
+                    ml_flat = ml.get('ml_prob_flat', 0.5)
+                    if ml_flat > max_ml_flat:
+                        _laggard_rejects['ml_flat_high'] = _laggard_rejects.get('ml_flat_high', 0) + 1
+                        continue
+
+                # Gate: GMM down-risk veto (only when ML data available)
+                dr_score = ml.get('ml_down_risk_score', ml.get('dr_score', 0.15)) if ml else 0.15
+                if use_gmm_veto and ml and dr_score > max_dr:
+                    _laggard_rejects['gmm_dr_high'] = _laggard_rejects.get('gmm_dr_high', 0) + 1
                     continue
 
-                ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-                if ml_move_prob < min_ml_move:
-                    continue
-
-                ml_conf = ml.get('ml_confidence', 0.0)
-                if ml_conf < min_ml_conf:
-                    continue
-
-                ml_flat = ml.get('ml_prob_flat', 0.5)
-                if ml_flat > max_ml_flat:
-                    continue
-
-                # Gate: GMM down-risk veto
-                dr_score = ml.get('ml_down_risk_score', ml.get('dr_score', 0.5))
-                if use_gmm_veto and dr_score > max_dr:
-                    continue
-
-                # Gate: Smart score floor
+                # Gate: Smart score floor (only when pre_scores available for this stock)
                 p_score = pre_scores.get(stk_sym, 0)
-                if p_score < min_smart:
+                if p_score > 0 and p_score < min_smart:
+                    _laggard_rejects['score_low'] = _laggard_rejects.get('score_low', 0) + 1
                     continue
 
-                # Gate: ML direction should not strongly oppose sector direction
-                xgb_hint = ml.get('ml_direction_hint', 'NEUTRAL')
-                if sector_direction == 'BUY' and xgb_hint == 'DOWN':
-                    prob_down = ml.get('ml_prob_down', 0.33)
-                    prob_up = ml.get('ml_prob_up', 0.33)
-                    if prob_down > prob_up * 1.3:
-                        continue  # XGB strongly bearish — don't fight it
-                if sector_direction == 'SELL' and xgb_hint == 'UP':
-                    prob_up = ml.get('ml_prob_up', 0.33)
-                    prob_down = ml.get('ml_prob_down', 0.33)
-                    if prob_up > prob_down * 1.3:
-                        continue  # XGB strongly bullish — don't fight it
+                # Gate: ML direction should not strongly oppose sector direction (only with ML)
+                if _require_ml and ml:
+                    xgb_hint = ml.get('ml_direction_hint', 'NEUTRAL')
+                    if sector_direction == 'BUY' and xgb_hint == 'DOWN':
+                        prob_down = ml.get('ml_prob_down', 0.33)
+                        prob_up = ml.get('ml_prob_up', 0.33)
+                        if prob_down > prob_up * 1.3:
+                            _laggard_rejects['xgb_opposed'] = _laggard_rejects.get('xgb_opposed', 0) + 1
+                            continue  # XGB strongly bearish — don't fight it
+                    if sector_direction == 'SELL' and xgb_hint == 'UP':
+                        prob_up = ml.get('ml_prob_up', 0.33)
+                        prob_down = ml.get('ml_prob_down', 0.33)
+                        if prob_up > prob_down * 1.3:
+                            _laggard_rejects['xgb_opposed'] = _laggard_rejects.get('xgb_opposed', 0) + 1
+                            continue  # XGB strongly bullish — don't fight it
 
                 # Build candidate
                 side_tag = 'CALL' if sector_direction == 'BUY' else 'PUT'
+                ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0)) if ml else 0.0
+                ml_conf = ml.get('ml_confidence', 0.0) if ml else 0.0
                 candidates.append({
                     'sym': stk_sym,
                     'sym_clean': stk,
@@ -3441,6 +3592,11 @@ class AutonomousTrader:
                     },
                 })
 
+            # Diagnostic: per-sector laggard rejection summary
+            if _arbtr_diag and _laggard_rejects:
+                _rej_str = ', '.join(f"{k}={v}" for k, v in sorted(_laggard_rejects.items(), key=lambda x: -x[1]))
+                print(f"      ARBTR {sector_name} laggard rejects: {_rej_str}")
+
         if not candidates:
             return []
 
@@ -3460,7 +3616,7 @@ class AutonomousTrader:
 
             _dir_label = f"{cand['direction']}({cand['side_tag']})"
             try:
-                _sym_md = market_data.get(cand['sym'], market_data.get(cand['sym_clean'], {}))
+                _sym_md = _arbtr_market.get(cand['sym'], _arbtr_market.get(cand['sym_clean'], {}))
                 result = self.tools.place_option_order(
                     underlying=cand['sym'],
                     direction=cand['direction'],
@@ -4439,6 +4595,10 @@ class AutonomousTrader:
             for t in self.tools.paper_positions:
                 if t.get('status', 'OPEN') != 'OPEN':
                     exited_symbols.add(t.get('symbol', ''))
+        
+        # Safety net: also check symbols exited from paper_positions this session
+        # (covers trades where ledger write failed but exit DID happen in memory)
+        exited_symbols.update(getattr(self.tools, '_exited_symbols_today', set()))
         
         # Find orphaned entries
         orphaned = []
@@ -8067,53 +8227,61 @@ class AutonomousTrader:
                     # elif orb_sig == "BREAKOUT_DOWN" and vol_reg == "EXPLOSIVE":
                     #     setup_type = "ORB_BREAKOUT"
                     #     direction = "SELL"
-                    # [TIGHTENED Mar 2] VWAP needs ADX > 20 + HTF not NEUTRAL
-                    if pvw == "ABOVE_VWAP" and vs == "RISING" and ema_reg in ["EXPANDING", "COMPRESSED"]:
-                        _adx_val = data.get('adx', 20)
-                        if _adx_val >= 20 and htf_a != "NEUTRAL":
-                            setup_type = "VWAP_TREND"
-                            direction = "BUY"
-                    elif pvw == "BELOW_VWAP" and vs == "FALLING" and ema_reg in ["EXPANDING", "COMPRESSED"]:
-                        _adx_val = data.get('adx', 20)
-                        if _adx_val >= 20 and htf_a != "NEUTRAL":
-                            setup_type = "VWAP_TREND"
-                            direction = "SELL"
-                    elif pvw == "ABOVE_VWAP" and vs == "RISING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
-                        setup_type = "MOMENTUM"
-                        direction = "BUY"
-                    elif pvw == "BELOW_VWAP" and vs == "FALLING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
-                        setup_type = "MOMENTUM"
-                        direction = "SELL"
-                    elif ema_reg == "COMPRESSED" and vol_reg in ["HIGH", "EXPLOSIVE"]:
-                        setup_type = "EMA_SQUEEZE"
-                        direction = "BUY" if data.get('change_pct', 0) > 0 else "SELL"
-                    elif rsi < 30 and htf_a != "BEARISH_ALIGNED":
-                        setup_type = "RSI_REVERSAL"
-                        direction = "BUY"
-                    elif rsi > 70 and htf_a != "BULLISH_ALIGNED":
-                        setup_type = "RSI_REVERSAL"
-                        direction = "SELL"
+                    # [DISABLED Mar 6] VWAP_TREND removed from GPT pipeline.
+                    # Root cause: GPT path places at smart_score=0, bypasses all ML/OI gates,
+                    # and orphaned trades lose SL management. ASTRAL lost ₹24,482 (49% against).
+                    # VWAP signals should only fire through watcher pipeline (if re-enabled).
+                    # if pvw == "ABOVE_VWAP" and vs == "RISING" and ema_reg == "EXPANDING":
+                    #     _adx_val = data.get('adx', 20)
+                    #     if _adx_val >= 25 and htf_a not in ["NEUTRAL", "BEARISH_ALIGNED"]:
+                    #         setup_type = "VWAP_TREND"
+                    #         direction = "BUY"
+                    # elif pvw == "BELOW_VWAP" and vs == "FALLING" and ema_reg == "EXPANDING":
+                    #     _adx_val = data.get('adx', 20)
+                    #     if _adx_val >= 25 and htf_a not in ["NEUTRAL", "BULLISH_ALIGNED"]:
+                    #         setup_type = "VWAP_TREND"
+                    #         direction = "SELL"
+                    # [DISABLED Mar 6] ALL GPT pipeline setup detection removed.
+                    # GPT path bypasses all quality gates (smart_score=0, no ML veto, no OI check).
+                    # Trades placed via GPT lost ₹27K+ on VWAP alone. Only watcher + model-tracker
+                    # pipelines have proper gating. GPT now only provides analysis, not trade placement.
+                    # if pvw == "ABOVE_VWAP" and vs == "RISING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                    #     setup_type = "MOMENTUM"
+                    #     direction = "BUY"
+                    # elif pvw == "BELOW_VWAP" and vs == "FALLING" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                    #     setup_type = "MOMENTUM"
+                    #     direction = "SELL"
+                    # elif ema_reg == "COMPRESSED" and vol_reg in ["HIGH", "EXPLOSIVE"]:
+                    #     setup_type = "EMA_SQUEEZE"
+                    #     direction = "BUY" if data.get('change_pct', 0) > 0 else "SELL"
+                    # elif rsi < 30 and htf_a != "BEARISH_ALIGNED":
+                    #     setup_type = "RSI_REVERSAL"
+                    #     direction = "BUY"
+                    # elif rsi > 70 and htf_a != "BULLISH_ALIGNED":
+                    #     setup_type = "RSI_REVERSAL"
+                    #     direction = "SELL"
+                    #
+                    # WILDCARD MOMENTUM SETUP: disabled with all GPT setups
+                    # if not setup_type and is_wildcard:
+                    #     wc_chg = self._wildcard_change.get(symbol, 0)
+                    #     if abs(wc_chg) >= 2.0 and vol_reg in ['HIGH', 'EXPLOSIVE']:
+                    #         setup_type = "WILDCARD_MOMENTUM"
+                    #         direction = "BUY" if wc_chg > 0 else "SELL"
                     
-                    # WILDCARD MOMENTUM SETUP: if no standard setup detected but wildcard has strong momentum
-                    if not setup_type and is_wildcard:
-                        wc_chg = self._wildcard_change.get(symbol, 0)
-                        if abs(wc_chg) >= 2.0 and vol_reg in ['HIGH', 'EXPLOSIVE']:
-                            setup_type = "WILDCARD_MOMENTUM"
-                            direction = "BUY" if wc_chg > 0 else "SELL"
-                    
-                    # S4 FIX: VWAP GRIND SETUP — catches INSIDE_ORB stocks grinding with volume
-                    # (e.g., HINDALCO -5.7% but never broke ORB range)
-                    if not setup_type and orb_sig == "INSIDE_ORB" and vol_reg in ('HIGH', 'EXPLOSIVE'):
-                        _grind_ltp = data.get('ltp', 0)
-                        _grind_open = data.get('open', _grind_ltp)
-                        _grind_vwap = data.get('vwap', 0)
-                        _grind_move = abs((_grind_ltp - _grind_open) / _grind_open * 100) if _grind_open > 0 else 0
-                        if _grind_move >= 0.8 and _grind_ltp < _grind_vwap and _grind_ltp < _grind_open:
-                            setup_type = "VWAP_GRIND"
-                            direction = "SELL"
-                        elif _grind_move >= 0.8 and _grind_ltp > _grind_vwap and _grind_ltp > _grind_open:
-                            setup_type = "VWAP_GRIND"
-                            direction = "BUY"
+                    # [DISABLED Mar 6] VWAP_GRIND removed from GPT pipeline.
+                    # Same issue as VWAP_TREND: bypasses all quality gates, smart_score=0.
+                    # BLUESTARCO won +₹7,170 but VEDL/ASTRAL lost ₹27,047 combined.
+                    # if not setup_type and orb_sig == "INSIDE_ORB" and vol_reg == 'EXPLOSIVE':
+                    #     _grind_ltp = data.get('ltp', 0)
+                    #     _grind_open = data.get('open', _grind_ltp)
+                    #     _grind_vwap = data.get('vwap', 0)
+                    #     _grind_move = abs((_grind_ltp - _grind_open) / _grind_open * 100) if _grind_open > 0 else 0
+                    #     if _grind_move >= 1.2 and _grind_ltp < _grind_vwap and _grind_ltp < _grind_open:
+                    #         setup_type = "VWAP_GRIND"
+                    #         direction = "SELL"
+                    #     elif _grind_move >= 1.2 and _grind_ltp > _grind_vwap and _grind_ltp > _grind_open:
+                    #         setup_type = "VWAP_GRIND"
+                    #         direction = "BUY"
                     
                     if setup_type and direction:
                         # XGB Direction override REMOVED — direction comes from technicals only.
@@ -8949,7 +9117,10 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                            and f'NSE:{s}' in retry_eligible
                            and s not in self._rejected_this_cycle]
                 
-                if unplaced and len(unplaced) <= 5:
+                # [DISABLED Mar 6] GPT direct-placement completely disabled.
+                # GPT path bypasses all quality gates — no smart_score, no ML veto,
+                # no OI alignment, no GMM gating. Only watcher + model-tracker place trades.
+                if False and unplaced and len(unplaced) <= 5:
                     print(f"\n🔄 Detected {len(unplaced)} unplaced trades in response: {unplaced}")
                     fno_prefer_set = {s.replace('NSE:', '') for s in FNO_CONFIG.get('prefer_options_for', [])} | {s.replace('NSE:', '') for s in _all_fo_syms}                    
                     # Parse direction from GPT's response text for each symbol

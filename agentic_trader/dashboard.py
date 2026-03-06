@@ -756,6 +756,14 @@ def trade_summary():
         except Exception:
             pass
 
+        # Format entry time for display (HH:MM)
+        _entry_time_str = ''
+        try:
+            if ts:
+                _entry_time_str = datetime.fromisoformat(ts).strftime('%H:%M')
+        except Exception:
+            pass
+
         open_positions.append({
             'symbol': sym,
             'direction': d,
@@ -769,6 +777,7 @@ def trade_summary():
             'setup': p.get('setup_type', p.get('strategy_type', '')),
             'score': p.get('smart_score', p.get('entry_score', 0)),
             'hold_minutes': hold_mins,
+            'entry_time': _entry_time_str,
             'is_spread': bool(spread),
             'status': 'winning' if unreal >= 0 else 'losing',
         })

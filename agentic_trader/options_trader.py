@@ -293,7 +293,8 @@ class IntradayOptionScorer:
     def score_intraday_signal(self, signal: IntradaySignal, 
                               market_data: Dict = None,
                               option_data: OptionMicrostructure = None,
-                              caller_direction: str = None) -> IntradayOptionDecision:
+                              caller_direction: str = None,
+                              source: str = 'scanner') -> IntradayOptionDecision:
         """
         Score intraday signals and recommend option parameters
         
@@ -1095,8 +1096,17 @@ class IntradayOptionScorer:
             vwap = market_data.get('vwap', 0)
             day_range = day_high - day_low if day_high > day_low else 0.01
 
-            # --- NEW: Calculate intraday move from open ---
-            intraday_move_pct = abs((ltp - day_open) / day_open * 100) if day_open > 0 and ltp > 0 else 0
+            # --- Calculate intraday move reference ---
+            # WATCHER FIX: For watcher triggers, use VWAP as baseline instead of open.
+            # After 5+ hours, open price is stale — a stock can drop 3% from open,
+            # consolidate, then start a fresh uptrend. The exhaustion filter would
+            # penalise the watcher for "chasing" when the move is actually fresh.
+            # VWAP = volume-weighted average of where it ACTUALLY traded today
+            # → distance from VWAP = true stretch, not historical noise.
+            if source == 'watcher' and vwap > 0 and ltp > 0:
+                intraday_move_pct = abs((ltp - vwap) / vwap * 100)
+            else:
+                intraday_move_pct = abs((ltp - day_open) / day_open * 100) if day_open > 0 and ltp > 0 else 0
             # Total exhaustion signal = max of gap and intraday move
             # (captures both gap plays AND intraday runners)
             total_move_pct = max(gap_pct, intraday_move_pct)
@@ -1203,6 +1213,14 @@ class IntradayOptionScorer:
                 elif not is_bullish and ltp > vwap:
                     exhaustion_score -= 10
                     warnings.append(f"🚫 EXHAUSTION: Moved down BUT above VWAP ₹{vwap:.0f} (-10)")
+
+            # --- WATCHER SAFETY CAP ---
+            # Even with VWAP-based calculation, cap watcher exhaustion at -12
+            # as a safety net (scanner has no cap — full penalty applies).
+            if source == 'watcher' and exhaustion_score < -12:
+                _uncapped = exhaustion_score
+                exhaustion_score = -12
+                warnings.append(f"🔧 WATCHER CAP: exhaustion {_uncapped} → {exhaustion_score} (live trigger, VWAP-based)")
 
             score += exhaustion_score
 
