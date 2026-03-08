@@ -238,6 +238,8 @@ class AutonomousTrader:
         self._dynamic_max_picks_cfg = DYNAMIC_MAX_PICKS
         self._auto_fired_this_session = set()   # Symbols auto-fired today (no re-fire)
         self._watcher_fired_this_session = set()    # All symbols traded via breakout watcher today
+        self._watcher_momentum_tracker = {}          # opt_symbol → {underlying, direction, entry_ul_price, entry_time, peak_price, trough_price}
+        self._wme_session_start = time.time()        # WME: skip positions that pre-existed this session
         self._last_watcher_scan_time = 0             # Cooldown between watcher focused scans (epoch)
         self._watcher_drain_count = 0                # Total drain calls today
         self._watcher_total_drained = 0              # Total triggers drained today
@@ -246,6 +248,11 @@ class AutonomousTrader:
         self._watcher_total_gate_blocked = 0         # Total blocked by pipeline gates
         self._watcher_total_placed = 0               # Total trades successfully placed
         self._watcher_total_pos_exhausted = 0        # Times blocked by position limit
+
+        # === SETTINGS HOT-RELOAD (titan_settings.json) ===
+        self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'titan_settings.json')
+        self._settings_mtime = 0  # Tracks file modification time
+        self._apply_settings_overrides()  # Apply on startup
         self._last_market_breadth = 'MIXED'          # Cached market breadth from last scan_and_trade
         self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
         
@@ -1120,8 +1127,9 @@ class AutonomousTrader:
         
         self._watcher_total_actionable += len(actionable)
         
-        # Process up to 3 triggers per drain
-        _batch = actionable[:3]
+        # Dynamic batch: use configurable max, capped by free position slots
+        _max_batch = BREAKOUT_WATCHER.get('max_triggers_per_batch', 6)
+        _batch = actionable[:min(_pos_slots_free, _max_batch)]
         self._watcher_total_pipeline_sent += len(_batch)
         
         _actionable_summary = ', '.join(
@@ -1454,13 +1462,29 @@ class AutonomousTrader:
             #    Score threshold: min_score (default 66) from BREAKOUT_WATCHER config
             # ================================================================
             _min_score = BREAKOUT_WATCHER.get('min_score', 66)
-            _max_per_scan = 2  # Rate limit: max 2 watcher trades per focused scan
+            _max_per_scan = BREAKOUT_WATCHER.get('max_trades_per_scan', 2)
             _fired_count = 0
             
+            # ── VIX-based score penalty: elevated VIX = expensive options ──
+            _vix = getattr(self, '_current_vix', 14.0)
+            _vix_penalty_above = BREAKOUT_WATCHER.get('vix_penalty_above', 18.0)
+            _vix_penalty_per_pt = BREAKOUT_WATCHER.get('vix_penalty_per_point', 3)
+            _vix_hard_block = BREAKOUT_WATCHER.get('vix_hard_block_above', 28.0)
+            _vix_penalty = 0
+            if _vix > _vix_hard_block:
+                self._wlog(f"🚫 VIX BLOCK: India VIX={_vix:.1f} > {_vix_hard_block} — blocking ALL watcher entries")
+                return
+            if _vix > _vix_penalty_above:
+                _vix_penalty = round((_vix - _vix_penalty_above) * _vix_penalty_per_pt)
+                self._wlog(f"⚠️ VIX PENALTY: India VIX={_vix:.1f} → -{_vix_penalty} score penalty on all candidates")
+            
+            # ════════════════════════════════════════════════════════════════
+            # TWO-PASS PIPELINE: Run all gates first, collect candidates,
+            # then RANK by P(move) and place BEST trades only.
+            # ════════════════════════════════════════════════════════════════
+            _candidates = []  # [{sym, direction, score, ml_move_prob, ...}]
+            
             for _sym, _score in sorted(_pre_scores.items(), key=lambda x: x[1], reverse=True):
-                if _fired_count >= _max_per_scan:
-                    break
-                
                 _trig = _trigger_map.get(_sym, {})
                 _trigger_type = _trig.get('trigger_type', '?')
                 _move_pct = _trig.get('move_pct', 0)
@@ -1475,6 +1499,8 @@ class AutonomousTrader:
                 
                 # Score from decision (includes ML boost, OI penalty, sector penalty, DR nudge)
                 _final_score = _pre_scores.get(_sym, 0)
+                # Apply VIX penalty
+                _final_score -= _vix_penalty
                 
                 # --- Direction from scorer (authoritative, not from trigger) ---
                 direction = None
@@ -1808,39 +1834,430 @@ class AutonomousTrader:
                                           direction=direction)
                         continue
                 
-                result = self.tools.place_option_order(
-                    underlying=_sym,
-                    direction=direction,
-                    strike_selection="ATM",
-                    rationale=(f"WATCHER→FULL_PIPELINE: {_trigger_type} ({_move_pct:+.1f}%) — "
-                              f"Score {_final_score:.0f}, all gates passed (setup+FT+ADX+OI+ML+sector+DR)"),
-                    setup_type=_setup_type,
-                    ml_data=_ml_data
+                # All gates passed — add to candidates for P(move) ranking
+                _cand_pmove = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
+                _candidates.append({
+                    'sym': _sym,
+                    'direction': direction,
+                    'score': _final_score,
+                    'ml_move_prob': _cand_pmove,
+                    'trigger_type': _trigger_type,
+                    'move_pct': _move_pct,
+                    'setup_type': _setup_type,
+                    'ml_data': _ml_data,
+                })
+                self._wlog(f"  ✅ PASSED ALL GATES: {_sym.replace('NSE:', '')} "
+                           f"score={_final_score:.0f} P(move)={_cand_pmove:.2f} "
+                           f"trigger={_trigger_type}({_move_pct:+.1f}%)")
+            
+            # ════════════════════════════════════════════════════════════════
+            # RANK CANDIDATES BY P(move) DESCENDING — place best trades first
+            # ════════════════════════════════════════════════════════════════
+            if not _candidates:
+                self._wlog(f"  ⚠️ No candidates passed all gates")
+            else:
+                _candidates.sort(key=lambda c: c['ml_move_prob'], reverse=True)
+                _rank_summary = ' > '.join(
+                    f"{c['sym'].replace('NSE:', '')}(P={c['ml_move_prob']:.2f},S={c['score']:.0f})"
+                    for c in _candidates
                 )
+                self._wlog(f"  📊 P(move) RANKING: {_rank_summary}")
                 
-                if result and result.get('success'):
-                    self._wlog(f"  🎯 TRADE PLACED: {_sym.replace('NSE:', '')} ({direction}) "
-                               f"score={_final_score:.0f} trigger={_trigger_type}({_move_pct:+.1f}%) "
-                               f"order={result.get('order_id', '?')} setup={_setup_type}")
-                    self._watcher_fired_this_session.add(_sym)
-                    self._auto_fired_this_session.add(_sym)  # Prevent ELITE re-fire
-                    _fired_count += 1
-                    self._watcher_total_placed += 1
-                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_FIRED',
-                                      reason=(f'Breakout {_trigger_type} ({_move_pct:+.1f}%) — '
-                                             f'FULL PIPELINE: score+ML+OI+sector+DR+setup+FT+ADX all passed'),
-                                      direction=direction, setup=_setup_type)
-                else:
-                    _err = result.get('error', 'unknown') if result else 'no result'
-                    self._wlog(f"  ⚠️ TRADE FAILED: {_sym.replace('NSE:', '')} — {_err}")
-                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_TRADE_FAILED',
-                                      reason=f'{_trigger_type}: {str(_err)[:80]}',
-                                      direction=direction)
+                for _cand in _candidates:
+                    if _fired_count >= _max_per_scan:
+                        self._wlog(f"  ⏸ Max trades per scan ({_max_per_scan}) reached — skipping remaining")
+                        break
+                    
+                    _sym = _cand['sym']
+                    _direction = _cand['direction']
+                    _trigger_type = _cand['trigger_type']
+                    _move_pct = _cand['move_pct']
+                    _setup_type = _cand['setup_type']
+                    _final_score = _cand['score']
+                    _ml_data = _cand['ml_data']
+                    
+                    result = self.tools.place_option_order(
+                        underlying=_sym,
+                        direction=_direction,
+                        strike_selection="ATM",
+                        rationale=(f"WATCHER→FULL_PIPELINE: {_trigger_type} ({_move_pct:+.1f}%) — "
+                                  f"Score {_final_score:.0f} P(move)={_cand['ml_move_prob']:.2f}, "
+                                  f"ranked #{_candidates.index(_cand)+1}/{len(_candidates)} by P(move)"),
+                        setup_type=_setup_type,
+                        ml_data=_ml_data
+                    )
+                    
+                    if result and result.get('success'):
+                        self._wlog(f"  🎯 TRADE PLACED: {_sym.replace('NSE:', '')} ({_direction}) "
+                                   f"score={_final_score:.0f} P(move)={_cand['ml_move_prob']:.2f} "
+                                   f"trigger={_trigger_type}({_move_pct:+.1f}%) "
+                                   f"rank=#{_candidates.index(_cand)+1}/{len(_candidates)} "
+                                   f"order={result.get('order_id', '?')} setup={_setup_type}")
+                        self._watcher_fired_this_session.add(_sym)
+                        self._auto_fired_this_session.add(_sym)  # Prevent ELITE re-fire
+                        _fired_count += 1
+                        self._watcher_total_placed += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_FIRED',
+                                          reason=(f'Breakout {_trigger_type} ({_move_pct:+.1f}%) — '
+                                                 f'FULL PIPELINE: score+ML+OI+sector+DR+setup+FT+ADX all passed | '
+                                                 f'P(move)={_cand["ml_move_prob"]:.2f} rank #{_candidates.index(_cand)+1}/{len(_candidates)}'),
+                                          direction=_direction, setup=_setup_type)
+                    else:
+                        _err = result.get('error', 'unknown') if result else 'no result'
+                        self._wlog(f"  ⚠️ TRADE FAILED: {_sym.replace('NSE:', '')} — {_err}")
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_TRADE_FAILED',
+                                          reason=f'{_trigger_type}: {str(_err)[:80]}',
+                                          direction=_direction)
         
         except Exception as _e:
             self._wlog(f"PIPELINE ERROR: {_e}")
             import traceback
             traceback.print_exc()
+    
+    # ========== WATCHER MOMENTUM EXIT (spike peaked / crater bottomed) ==========
+    def _check_watcher_momentum_exits(self):
+        """Check open WATCHER positions for momentum reversal and exit.
+        
+        Detects when a spike has peaked (for CE/BUY trades) or a crater has
+        bottomed (for PE/SELL trades) by tracking the underlying's extreme since
+        entry and triggering exit on reversal.
+        
+        After exit, cooldown is BYPASSED — the watcher can immediately re-enter
+        if another spike/crater forms on the same symbol.
+        """
+        from config import BREAKOUT_WATCHER
+        _cfg = BREAKOUT_WATCHER.get('momentum_exit', {})
+        if not _cfg.get('enabled', False):
+            return
+        
+        import time as _wme_time
+        
+        # --- Auto-discover new WATCHER trades not yet tracked ---
+        with self.tools._positions_lock:
+            _active = [t.copy() for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        
+        _watcher_trades = [t for t in _active
+                           if t.get('setup_type') in ('WATCHER', 'ORB_BREAKOUT')
+                           and t.get('is_option', False)
+                           and not t.get('is_debit_spread', False)
+                           and not t.get('is_credit_spread', False)]
+        
+        # Register any new watcher trades
+        for _t in _watcher_trades:
+            _opt_sym = _t['symbol']
+            if _opt_sym in self._watcher_momentum_tracker:
+                continue
+            _ul = _t.get('underlying', '')
+            if not _ul:
+                continue
+            # Parse entry time
+            try:
+                _entry_epoch = datetime.fromisoformat(_t.get('timestamp', '')).timestamp()
+            except Exception:
+                _entry_epoch = _wme_time.time()
+            # Skip positions that existed before this bot session (stale UL price on restart)
+            if _entry_epoch < self._wme_session_start:
+                continue
+            # Get underlying LTP from WebSocket cache
+            _ul_ltp = 0
+            if self.tools.ticker and self.tools.ticker.connected:
+                _ul_prices = self.tools.ticker.get_ltp_batch([_ul])
+                _ul_ltp = _ul_prices.get(_ul, 0)
+            if _ul_ltp <= 0:
+                continue
+            
+            _direction = _t.get('direction', 'BUY')
+            self._watcher_momentum_tracker[_opt_sym] = {
+                'underlying': _ul,
+                'direction': _direction,
+                'entry_ul_price': _ul_ltp,
+                'entry_time': _entry_epoch,
+                'peak_price': _ul_ltp,
+                'trough_price': _ul_ltp,
+                # Multi-signal tracking
+                'price_samples': [(_wme_time.time(), _ul_ltp)],
+                'vol_samples': [],       # (timestamp, cumulative_volume)
+                'peak_momentum': 0.0,    # Max price velocity seen (%/s, direction-adjusted)
+            }
+            _ul_short = _ul.replace('NSE:', '')
+            print(f"   🌊 WME: Tracking {_ul_short} ({_direction}) UL=₹{_ul_ltp:.2f} opt={_opt_sym.split(':')[-1]}")
+        
+        # Clean tracker: remove entries whose positions are no longer open
+        _active_opt_syms = {t['symbol'] for t in _watcher_trades}
+        _stale = [k for k in self._watcher_momentum_tracker if k not in _active_opt_syms]
+        for _s in _stale:
+            del self._watcher_momentum_tracker[_s]
+        
+        if not self._watcher_momentum_tracker:
+            return
+        
+        # --- Get underlying QUOTES via WebSocket cache (zero API calls) ---
+        # Quotes include volume, buy_quantity, sell_quantity — needed for multi-signal detection
+        _all_ul = list({v['underlying'] for v in self._watcher_momentum_tracker.values()})
+        if not self.tools.ticker or not self.tools.ticker.connected:
+            return
+        _ul_quotes = self.tools.ticker.get_quote_batch(_all_ul)
+        _ul_prices = {sym: q.get('last_price', 0) for sym, q in _ul_quotes.items()}
+        # Fallback: symbols with quote but no LTP (shouldn't happen, but defensive)
+        for _sym in _all_ul:
+            if _sym not in _ul_prices or _ul_prices[_sym] <= 0:
+                _ltp_batch = self.tools.ticker.get_ltp_batch([_sym])
+                _ul_prices[_sym] = _ltp_batch.get(_sym, 0)
+        
+        _reversal_pct = _cfg.get('reversal_pct', 0.5) / 100
+        _confirmed_rev_pct = _cfg.get('confirmed_reversal_pct', 0.25) / 100
+        _partial_rev_pct = _cfg.get('partial_confirm_reversal_pct', 0.35) / 100
+        _min_hold_s = _cfg.get('min_hold_seconds', 60)
+        _min_move_pct = _cfg.get('min_favorable_move_pct', 0.5) / 100
+        _bypass_cooldown = _cfg.get('bypass_cooldown', True)
+        _only_profit = _cfg.get('only_in_profit', True)
+        _skip_trailing = _cfg.get('skip_trailing_active', True)
+        _vol_dryup_ratio = _cfg.get('volume_dryup_ratio', 0.30)
+        _mom_decay_thresh = _cfg.get('momentum_decay_threshold', 0.70)
+        _pressure_enabled = _cfg.get('pressure_shift_enabled', True)
+        _pressure_ratio = _cfg.get('pressure_shift_ratio', 1.5)
+        _sample_window = _cfg.get('sample_window_seconds', 90)
+        _now = _wme_time.time()
+        _exits_to_process = []
+        
+        # --- Check each tracked position ---
+        for _opt_sym, _track in list(self._watcher_momentum_tracker.items()):
+            _ul = _track['underlying']
+            _ul_ltp = _ul_prices.get(_ul, 0)
+            if _ul_ltp <= 0:
+                continue
+            
+            _direction = _track['direction']
+            _entry_ul = _track['entry_ul_price']
+            _ul_quote = _ul_quotes.get(_ul, {})
+            
+            # ── ALWAYS collect samples (even before min_hold) to build baselines ──
+            _track['price_samples'].append((_now, _ul_ltp))
+            _cum_vol = _ul_quote.get('volume', 0)
+            if _cum_vol > 0:
+                _track['vol_samples'].append((_now, _cum_vol))
+            
+            # Trim samples to rolling window
+            _cutoff = _now - _sample_window
+            _track['price_samples'] = [(t, p) for t, p in _track['price_samples'] if t >= _cutoff]
+            _track['vol_samples'] = [(t, v) for t, v in _track['vol_samples'] if t >= _cutoff]
+            
+            # ── Update peak/trough price ──
+            if _direction == 'BUY':
+                if _ul_ltp > _track['peak_price']:
+                    _track['peak_price'] = _ul_ltp
+            elif _direction == 'SELL':
+                if _ul_ltp < _track['trough_price']:
+                    _track['trough_price'] = _ul_ltp
+            
+            # ── Update peak momentum (max velocity seen over any ~15s window) ──
+            _ps = _track['price_samples']
+            if len(_ps) >= 4:
+                _p_now = _ps[-1]
+                _p_prev_idx = max(0, len(_ps) - 4)  # ~15-20s ago
+                _p_prev = _ps[_p_prev_idx]
+                _pdt = _p_now[0] - _p_prev[0]
+                if _pdt > 0 and _p_prev[1] > 0:
+                    _vel = (_p_now[1] - _p_prev[1]) / _p_prev[1] / _pdt  # %/s
+                    # Track peak velocity in favorable direction
+                    if _direction == 'BUY' and _vel > _track['peak_momentum']:
+                        _track['peak_momentum'] = _vel
+                    elif _direction == 'SELL' and _vel < _track['peak_momentum']:
+                        _track['peak_momentum'] = _vel  # Negative for SELL
+            
+            # ── Min hold time: let the trade breathe (but data is already collected above) ──
+            if (_now - _track['entry_time']) < _min_hold_s:
+                continue
+            
+            # Skip trades already managed by trailing stop (let winners run)
+            if _skip_trailing:
+                _em_state = self.exit_manager.get_trade_state(_opt_sym)
+                if _em_state and _em_state.trailing_active:
+                    continue
+            
+            # Check minimum favorable move from entry
+            if _direction == 'BUY':
+                _favorable = (_track['peak_price'] - _entry_ul) / _entry_ul if _entry_ul > 0 else 0
+            else:
+                _favorable = (_entry_ul - _track['trough_price']) / _entry_ul if _entry_ul > 0 else 0
+            if _favorable < _min_move_pct:
+                continue
+            
+            # ── Compute current reversal from peak/trough ──
+            if _direction == 'BUY':
+                _rev = (_track['peak_price'] - _ul_ltp) / _track['peak_price'] if _track['peak_price'] > 0 else 0
+            else:
+                _rev = (_ul_ltp - _track['trough_price']) / _track['trough_price'] if _track['trough_price'] > 0 else 0
+            
+            # ════════════════════════════════════════════════
+            # MULTI-SIGNAL REVERSAL CONFIRMATION
+            # Mirrors watcher entry: spike, volume, grind → now: price reversal, volume dry-up, momentum decay, pressure shift
+            # ════════════════════════════════════════════════
+            _confirmations = 0
+            _signal_reasons = []
+            
+            # ── Signal 1: VOLUME DRY-UP ──
+            # Compare recent volume rate vs average rate over tracking period.
+            # Spikes have explosive volume; when volume drops to < 30% of avg, the spike is over.
+            _vs = _track['vol_samples']
+            if len(_vs) >= 4:
+                # Average volume rate over all tracked data
+                _total_dt = _vs[-1][0] - _vs[0][0]
+                if _total_dt > 10:  # Need at least 10s of data
+                    _avg_vol_rate = (_vs[-1][1] - _vs[0][1]) / _total_dt
+                    # Recent volume rate (last ~15s)
+                    _rv_idx = max(0, len(_vs) - 4)
+                    _recent_dt = _vs[-1][0] - _vs[_rv_idx][0]
+                    if _recent_dt > 0 and _avg_vol_rate > 0:
+                        _recent_vol_rate = (_vs[-1][1] - _vs[_rv_idx][1]) / _recent_dt
+                        if _recent_vol_rate < _avg_vol_rate * _vol_dryup_ratio:
+                            _confirmations += 1
+                            _signal_reasons.append('VOL_DRYUP')
+            
+            # ── Signal 2: MOMENTUM DECAY ──
+            # If price velocity has decayed to < 30% of peak, or reversed direction entirely.
+            if len(_ps) >= 4 and abs(_track['peak_momentum']) > 1e-8:
+                _p_now = _ps[-1]
+                _p_prev_idx = max(0, len(_ps) - 4)
+                _p_prev = _ps[_p_prev_idx]
+                _pdt = _p_now[0] - _p_prev[0]
+                if _pdt > 0 and _p_prev[1] > 0:
+                    _cur_vel = (_p_now[1] - _p_prev[1]) / _p_prev[1] / _pdt
+                    _peak_vel = _track['peak_momentum']
+                    if _direction == 'BUY':
+                        # Momentum reversed (velocity turned negative) = full decay
+                        if _cur_vel <= 0:
+                            _confirmations += 1
+                            _signal_reasons.append('MOM_REVERSED')
+                        # Momentum decayed to < 30% of peak
+                        elif _peak_vel > 0 and _cur_vel < _peak_vel * (1 - _mom_decay_thresh):
+                            _confirmations += 1
+                            _signal_reasons.append('MOM_DECAY')
+                    elif _direction == 'SELL':
+                        if _cur_vel >= 0:
+                            _confirmations += 1
+                            _signal_reasons.append('MOM_REVERSED')
+                        elif _peak_vel < 0 and abs(_cur_vel) < abs(_peak_vel) * (1 - _mom_decay_thresh):
+                            _confirmations += 1
+                            _signal_reasons.append('MOM_DECAY')
+            
+            # ── Signal 3: PRESSURE SHIFT (buy/sell quantity imbalance) ──
+            # If opposing side's total order quantity dominates → participants are exiting.
+            if _pressure_enabled:
+                _buy_q = _ul_quote.get('buy_quantity', 0)
+                _sell_q = _ul_quote.get('sell_quantity', 0)
+                if _buy_q > 0 and _sell_q > 0:
+                    if _direction == 'BUY' and _sell_q > _buy_q * _pressure_ratio:
+                        _confirmations += 1
+                        _signal_reasons.append('SELL_PRESSURE')
+                    elif _direction == 'SELL' and _buy_q > _sell_q * _pressure_ratio:
+                        _confirmations += 1
+                        _signal_reasons.append('BUY_PRESSURE')
+            
+            # ── Adaptive reversal threshold ──
+            if _confirmations >= 2:
+                _effective_rev = _confirmed_rev_pct   # 0.25% — high confidence reversal
+            elif _confirmations == 1:
+                _effective_rev = _partial_rev_pct     # 0.35% — medium confidence
+            else:
+                _effective_rev = _reversal_pct        # 0.50% — price-only (original)
+            
+            # ── Check if reversal exceeds adaptive threshold ──
+            if _rev >= _effective_rev:
+                _exits_to_process.append((_opt_sym, _track, _ul_ltp, _rev * 100, _confirmations, _signal_reasons, _effective_rev * 100))
+        
+        # --- Process momentum exits ---
+        for _opt_sym, _track, _ul_ltp, _rev_pct, _n_confirms, _sig_reasons, _eff_rev in _exits_to_process:
+            _direction = _track['direction']
+            _ul = _track['underlying']
+            _ul_short = _ul.replace('NSE:', '')
+            
+            # Find the active trade
+            with self.tools._positions_lock:
+                _trade = next((t for t in self.tools.paper_positions
+                               if t['symbol'] == _opt_sym and t.get('status', 'OPEN') == 'OPEN'), None)
+            
+            if not _trade:
+                self._watcher_momentum_tracker.pop(_opt_sym, None)
+                continue
+            
+            # Get current option premium
+            try:
+                if self.tools.ticker and self.tools.ticker.connected:
+                    _opt_prices = self.tools.ticker.get_ltp_batch([_opt_sym])
+                    _opt_ltp = _opt_prices.get(_opt_sym, 0)
+                else:
+                    _q = self.tools.kite.ltp([_opt_sym])
+                    _opt_ltp = _q.get(_opt_sym, {}).get('last_price', 0)
+            except Exception:
+                continue
+            
+            if _opt_ltp <= 0:
+                continue
+            
+            # Calculate P&L
+            _entry_price = _trade['avg_price']
+            _qty = _trade['quantity']
+            _pnl = (_opt_ltp - _entry_price) * _qty
+            from execution_guard import calc_brokerage
+            _pnl -= calc_brokerage(_entry_price, _opt_ltp, _qty)
+            
+            # Only exit if option is in profit (don't cut losers — let exit manager handle)
+            if _only_profit and _pnl <= 0:
+                continue
+            
+            _extreme_label = 'peak' if _direction == 'BUY' else 'trough'
+            _extreme_val = _track['peak_price'] if _direction == 'BUY' else _track['trough_price']
+            _trigger_label = 'spike peaked' if _direction == 'BUY' else 'crater bottomed'
+            _signals_str = '+'.join(_sig_reasons) if _sig_reasons else 'PRICE_ONLY'
+            
+            print(f"\n🌊 WATCHER MOMENTUM EXIT: {_ul_short}")
+            print(f"   Direction: {_direction} | Trigger: {_trigger_label}")
+            print(f"   Signals: {_signals_str} ({_n_confirms}/3 confirmed) → threshold {_eff_rev:.2f}%")
+            print(f"   Underlying: entry ₹{_track['entry_ul_price']:.2f} → {_extreme_label} ₹{_extreme_val:.2f} → now ₹{_ul_ltp:.2f} ({_rev_pct:.2f}% reversal)")
+            print(f"   Option: {_opt_sym.split(':')[-1]} — entry ₹{_entry_price:.2f} → exit ₹{_opt_ltp:.2f}")
+            print(f"   P&L: ₹{_pnl:+,.0f}")
+            
+            # Execute exit
+            self.tools.update_trade_status(_opt_sym, 'WATCHER_MOMENTUM_EXIT', _opt_ltp, _pnl)
+            with self._pnl_lock:
+                self.daily_pnl += _pnl
+                self.capital += _pnl
+            
+            # Record with Risk Governor
+            _remaining = [t for t in self.tools.paper_positions
+                          if t.get('status') == 'OPEN' and t['symbol'] != _opt_sym]
+            _unrealized = self.risk_governor._calc_unrealized_pnl(_remaining)
+            self.risk_governor.record_trade_result(_opt_sym, _pnl, _pnl > 0, unrealized_pnl=_unrealized)
+            self.risk_governor.update_capital(self.capital)
+            
+            # Remove from exit manager
+            self.exit_manager.remove_trade(_opt_sym)
+            
+            # Remove from tracker
+            self._watcher_momentum_tracker.pop(_opt_sym, None)
+            
+            # === COOLDOWN BYPASS: Allow watcher to re-enter this symbol ===
+            if _bypass_cooldown:
+                _nse_sym = f"NSE:{_ul_short}"
+                self._watcher_fired_this_session.discard(_nse_sym)
+                # Also clear the ticker-level cooldown for this symbol
+                if self.tools.ticker and hasattr(self.tools.ticker, 'breakout_watcher'):
+                    _bw = self.tools.ticker.breakout_watcher
+                    if _bw and hasattr(_bw, '_cooldowns'):
+                        _bw._cooldowns.pop(_nse_sym, None)
+                print(f"   🔄 COOLDOWN BYPASSED: {_ul_short} — watcher can re-enter on next spike/crater")
+            
+            # Notify scorer
+            try:
+                from options_trader import get_intraday_scorer
+                _scorer = get_intraday_scorer()
+                if _pnl > 0:
+                    _scorer.record_symbol_win(_opt_sym)
+                else:
+                    _scorer.record_symbol_loss(_opt_sym)
+            except Exception:
+                pass
     
     # ========== DYNAMIC MAX PICKS ==========
     def _compute_max_picks(self, pre_scores: dict, breadth: str) -> int:
@@ -2259,6 +2676,13 @@ class AutonomousTrader:
                             _sector_penalty_applied = _sbp_penalty
                             # print(f"      🏭 SECTOR BREADTH: {sym_clean} BUY vs {sector} {_sec_pct:+.1f}% → −{_sbp_penalty} penalty")
             
+            # ── HIGH P(MOVE) BONUS: strong directional conviction → +25 ──
+            _pmove_bonus_threshold = self._down_risk_cfg.get('pmove_bonus_threshold', 0.80)
+            _pmove_bonus_pts = self._down_risk_cfg.get('pmove_bonus_points', 25)
+            if ml_move_prob >= _pmove_bonus_threshold:
+                smart_score += _pmove_bonus_pts
+                print(f"      🚀 P(MOVE) BONUS: {sym_clean} P(move)={ml_move_prob:.2f} ≥ {_pmove_bonus_threshold} → +{_pmove_bonus_pts} (score={smart_score:.0f})")
+
             raw_candidates.append({
                 'sym': sym,
                 'sym_clean': sym_clean,
@@ -4343,6 +4767,7 @@ class AutonomousTrader:
         _profit_target_timer = 0  # Track time for profit target check (every 60s)
         _tie_timer = 0  # Track time for TIE thesis check (every 60s instead of every 3s)
         _gcr_timer = 0  # Track time for GCR conviction recheck (every 180s / 3 min)
+        _wme_timer = 0  # Track time for watcher momentum exit check
         while self.monitor_running:
             try:
                 if self.is_trading_hours():
@@ -4387,6 +4812,17 @@ class AutonomousTrader:
                                 )
                         except Exception as _gcr_err:
                             print(f"   ⚠️ GCR error (non-fatal): {_gcr_err}")
+
+                    # === WME: Watcher Momentum Exit (configurable interval, default 5s) ===
+                    _wme_timer += self.monitor_interval
+                    from config import BREAKOUT_WATCHER as _wme_bw_cfg
+                    _wme_interval = _wme_bw_cfg.get('momentum_exit', {}).get('check_interval_seconds', 5)
+                    if _wme_timer >= _wme_interval:
+                        _wme_timer = 0
+                        try:
+                            self._check_watcher_momentum_exits()
+                        except Exception as _wme_err:
+                            print(f"   ⚠️ WME error (non-fatal): {_wme_err}")
 
                     # Increment candle counter every ~5 minutes (300s / monitor_interval)
                     candle_timer += self.monitor_interval
@@ -6307,8 +6743,11 @@ class AutonomousTrader:
             return 'Watchlist unavailable'
     
     def is_trading_hours(self) -> bool:
-        """Check if within trading hours"""
-        now = datetime.now().time()
+        """Check if within trading hours (also blocks weekends)."""
+        today = datetime.now()
+        if today.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        now = today.time()
         start = datetime.strptime(TRADING_HOURS["start"], "%H:%M").time()
         end = datetime.strptime(TRADING_HOURS["end"], "%H:%M").time()
         return start <= now <= end
@@ -6701,7 +7140,8 @@ class AutonomousTrader:
                     
                     scan_universe = list(_full_universe)
                     _skipped = len(_all_fo) - len(scan_universe)
-                    print(f"   📡 Pre-score: {len(_quality_candidates)} quality → top {_max_indicator_stocks} selected → {len(scan_universe)} universe (skipped {_skipped} flat/illiquid from {len(_all_fo)} F&O)")
+                    _qc_count = len(_quality_candidates) if _quality_candidates else 0
+                    print(f"   📡 Pre-score: {_qc_count} quality → top {_max_indicator_stocks} selected → {len(scan_universe)} universe (skipped {_skipped} flat/illiquid from {len(_all_fo)} F&O)")
                     
                 except Exception as _e:
                     _all_fo_syms = set()
@@ -9739,6 +10179,134 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         except Exception as e:
             print(f"   ⚠️ Broker position sync failed: {e}")
 
+    # ══════════════════════════════════════════════════════════════
+    #  SETTINGS HOT-RELOAD: Read titan_settings.json & apply overrides
+    # ══════════════════════════════════════════════════════════════
+    def _apply_settings_overrides(self):
+        """Read titan_settings.json and apply overrides to config module.
+        Called at startup and every 30s from the main loop.
+        Only re-applies if file has been modified since last check."""
+        import config as _cfg
+        try:
+            if not os.path.exists(self._settings_file):
+                return
+            mtime = os.path.getmtime(self._settings_file)
+            if mtime == self._settings_mtime:
+                return  # No change since last read
+            self._settings_mtime = mtime
+
+            with open(self._settings_file, 'r') as f:
+                s = json.load(f)
+
+            applied = []
+
+            # --- Kill switch ---
+            if s.get('kill_switch', False):
+                print("🚨 KILL SWITCH ACTIVE — blocking all new trades")
+                _cfg.HARD_RULES['MAX_POSITIONS'] = 0  # Zero positions = no new trades
+                return  # Don't apply other overrides
+
+            # --- Capital & Risk ---
+            for key in ['CAPITAL', 'RISK_PER_TRADE', 'MAX_DAILY_LOSS', 'MAX_POSITIONS',
+                        'REENTRY_COOLDOWN_MINUTES', 'MIN_OPTION_PREMIUM', 'PORTFOLIO_PROFIT_TARGET']:
+                if key in s and s[key] != _cfg.HARD_RULES.get(key):
+                    _cfg.HARD_RULES[key] = s[key]
+                    applied.append(f"HARD_RULES.{key}={s[key]}")
+
+            # --- Strategy toggles ---
+            strat_map = {
+                'BREAKOUT_WATCHER': 'BREAKOUT_WATCHER',
+                'ELITE_AUTO_FIRE': 'ELITE_AUTO_FIRE',
+                'DOWN_RISK_GATING': 'DOWN_RISK_GATING',
+                'GMM_SNIPER': 'GMM_SNIPER',
+                'GMM_CONTRARIAN': 'GMM_CONTRARIAN',
+                'TEST_GMM': 'TEST_GMM',
+                'TEST_XGB': 'TEST_XGB',
+                'SNIPER_OI_UNWINDING': 'SNIPER_OI_UNWINDING',
+                'SNIPER_PCR_EXTREME': 'SNIPER_PCR_EXTREME',
+                'ARBTR_CONFIG': 'ARBTR_CONFIG',
+                'IRON_CONDOR_CONFIG': 'IRON_CONDOR_CONFIG',
+                'CREDIT_SPREAD_CONFIG': 'CREDIT_SPREAD_CONFIG',
+                'DEBIT_SPREAD_CONFIG': 'DEBIT_SPREAD_CONFIG',
+                'ML_DIRECTION_CONFLICT': 'ML_DIRECTION_CONFLICT',
+                'GCR_CONFIG': 'GCR_CONFIG',
+            }
+            for key, attr_name in strat_map.items():
+                skey = f'strategy_{key}'
+                if skey in s:
+                    cfg_dict = getattr(_cfg, attr_name, None)
+                    if isinstance(cfg_dict, dict) and 'enabled' in cfg_dict:
+                        new_val = bool(s[skey])
+                        if cfg_dict['enabled'] != new_val:
+                            cfg_dict['enabled'] = new_val
+                            applied.append(f"{attr_name}.enabled={new_val}")
+
+            # --- Watcher tunables ---
+            bw = getattr(_cfg, 'BREAKOUT_WATCHER', {})
+            for skey, cfgkey in [
+                ('watcher_min_score', 'min_score'),
+                ('watcher_max_trades_per_scan', 'max_trades_per_scan'),
+                ('watcher_max_triggers_per_batch', 'max_triggers_per_batch'),
+                ('watcher_sustain_seconds', 'sustain_seconds'),
+                ('watcher_vix_hard_block', 'vix_hard_block_above'),
+            ]:
+                if skey in s and bw.get(cfgkey) != s[skey]:
+                    bw[cfgkey] = s[skey]
+                    applied.append(f"BREAKOUT_WATCHER.{cfgkey}={s[skey]}")
+            if 'watcher_momentum_exit' in s:
+                me = bw.get('momentum_exit', {})
+                new_me = bool(s['watcher_momentum_exit'])
+                if me.get('enabled') != new_me:
+                    me['enabled'] = new_me
+                    applied.append(f"momentum_exit.enabled={new_me}")
+
+            # --- Lot multipliers ---
+            for skey_prefix, attr_name in [
+                ('lots_GMM_SNIPER', 'GMM_SNIPER'),
+                ('lots_ARBTR_CONFIG', 'ARBTR_CONFIG'),
+                ('lots_SNIPER_OI_UNWINDING', 'SNIPER_OI_UNWINDING'),
+                ('lots_SNIPER_PCR_EXTREME', 'SNIPER_PCR_EXTREME'),
+                ('lots_DOWN_RISK_GATING', 'DOWN_RISK_GATING'),
+                ('lots_GMM_CONTRARIAN', 'GMM_CONTRARIAN'),
+            ]:
+                if skey_prefix in s:
+                    cfg_dict = getattr(_cfg, attr_name, None)
+                    if isinstance(cfg_dict, dict):
+                        if attr_name == 'DOWN_RISK_GATING':
+                            new_v = float(s[skey_prefix])
+                            if cfg_dict.get('all_agree_lot_multiplier') != new_v:
+                                cfg_dict['all_agree_lot_multiplier'] = new_v
+                                applied.append(f"{attr_name}.all_agree_lot_multiplier={new_v}")
+                        else:
+                            new_v = float(s[skey_prefix])
+                            if cfg_dict.get('lot_multiplier') != new_v:
+                                cfg_dict['lot_multiplier'] = new_v
+                                applied.append(f"{attr_name}.lot_multiplier={new_v}")
+
+            # --- Global lot multiplier (applied to HARD_RULES for sizer) ---
+            if 'global_lot_multiplier' in s:
+                new_gl = float(s['global_lot_multiplier'])
+                if _cfg.HARD_RULES.get('GLOBAL_LOT_MULTIPLIER') != new_gl:
+                    _cfg.HARD_RULES['GLOBAL_LOT_MULTIPLIER'] = new_gl
+                    applied.append(f"GLOBAL_LOT_MULTIPLIER={new_gl}")
+
+            # --- Trading hours ---
+            th = getattr(_cfg, 'TRADING_HOURS', {})
+            for skey, cfgkey in [
+                ('hours_start', 'start'),
+                ('hours_end', 'end'),
+                ('hours_no_new_after', 'no_new_after'),
+            ]:
+                if skey in s and th.get(cfgkey) != s[skey]:
+                    th[cfgkey] = s[skey]
+                    applied.append(f"TRADING_HOURS.{cfgkey}={s[skey]}")
+
+            if applied:
+                print(f"⚙️  Settings reloaded ({len(applied)} overrides): {', '.join(applied[:5])}"
+                      f"{'...' if len(applied) > 5 else ''}")
+        except Exception as e:
+            print(f"⚠️ Settings reload failed: {e}")
+
     def run(self, scan_interval_minutes: int = 5):
         """Run the autonomous trader with dynamic scan intervals.
         
@@ -9834,7 +10402,22 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         schedule.every(self._normal_interval).minutes.do(self.scan_and_trade)
                         _dbg(f"DEBUG: Early session ended — switching to {self._normal_interval}-min interval")
                 
+                # === SETTINGS HOT-RELOAD (every 30s — mtime check is very cheap) ===
+                if _loop_count % 30 == 0:
+                    try:
+                        self._apply_settings_overrides()
+                    except Exception:
+                        pass
+                
                 _loop_count += 1
+
+                # === WEEKEND SLEEP — skip tight loop on Sat/Sun ===
+                if datetime.now().weekday() >= 5:
+                    if _loop_count % 3600 == 1:  # Log once per hour
+                        _dbg("💤 Weekend — sleeping (60s intervals)")
+                    time.sleep(60)
+                    continue
+
                 # === AUTO-RENEW DHAN TOKEN (every ~2 hours) ===
                 if _loop_count > 0 and _loop_count % 7200 == 0:  # every 7200s = 2 hours
                     try:

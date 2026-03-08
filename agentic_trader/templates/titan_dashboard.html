@@ -251,6 +251,77 @@ a{color:var(--blue);text-decoration:none}
   background:linear-gradient(135deg,#fef2f2 0%,#fff1f2 100%);
   border:1px solid #fecaca;
 }
+
+/* -- Settings page --------------------------------------- */
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.settings-grid{grid-template-columns:1fr}}
+.setting-section{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;box-shadow:var(--shadow);
+}
+.setting-section h3{
+  font-size:.88rem;font-weight:700;margin-bottom:14px;
+  padding-bottom:8px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:8px;
+}
+.setting-section h3 .ico{font-size:1.1rem}
+.setting-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 0;border-bottom:1px solid rgba(0,0,0,.04);
+}
+.setting-row:last-child{border-bottom:none}
+.setting-label{font-size:.8rem;color:var(--txt);font-weight:500}
+.setting-sublabel{font-size:.68rem;color:var(--txt3);margin-top:1px}
+.setting-input{
+  width:100px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;
+  font-size:.82rem;text-align:right;background:var(--bg);color:var(--txt);
+  font-family:inherit;
+}
+.setting-input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
+.setting-input.wide{width:140px}
+/* Toggle switch */
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{
+  position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:24px;
+  transition:.2s;
+}
+.toggle .slider:before{
+  content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;
+  background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.15);
+}
+.toggle input:checked + .slider{background:var(--green)}
+.toggle input:checked + .slider:before{transform:translateX(20px)}
+/* Kill switch */
+.kill-switch-btn{
+  background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;
+  border:none;padding:14px 32px;border-radius:10px;font-size:1rem;font-weight:700;
+  cursor:pointer;letter-spacing:.5px;width:100%;
+  transition:all .15s;box-shadow:0 4px 15px rgba(220,38,38,.3);
+}
+.kill-switch-btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(220,38,38,.4)}
+.kill-switch-btn:active{transform:translateY(0)}
+.kill-switch-btn.armed{
+  background:linear-gradient(135deg,#059669,#047857);
+  box-shadow:0 4px 15px rgba(5,150,105,.3);
+}
+.kill-switch-btn.armed:hover{box-shadow:0 6px 20px rgba(5,150,105,.4)}
+/* Settings actions bar */
+.settings-actions{
+  display:flex;gap:10px;margin-top:16px;justify-content:flex-end;align-items:center;
+}
+.btn-save{
+  background:var(--blue);color:#fff;border:none;padding:10px 28px;border-radius:8px;
+  font-size:.85rem;font-weight:600;cursor:pointer;transition:all .15s;
+}
+.btn-save:hover{background:#1d4ed8}
+.btn-save:disabled{opacity:.5;cursor:wait}
+.btn-reset{
+  background:var(--bg3);color:var(--txt2);border:1px solid var(--border);
+  padding:10px 20px;border-radius:8px;font-size:.82rem;font-weight:500;cursor:pointer;
+}
+.btn-reset:hover{background:var(--bg4)}
+.settings-status{font-size:.78rem;color:var(--txt3);margin-right:auto}
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -293,6 +364,7 @@ a{color:var(--blue);text-decoration:none}
   <button class="tab" data-tab="logs">Live Logs</button>
   <button class="tab" data-tab="positions">Positions</button>
   <button class="tab" data-tab="trades">Trade History</button>
+  <button class="tab" data-tab="settings">&#9881; Settings</button>
 </div>
 
 <!-- =============== TAB: OVERVIEW =============== -->
@@ -459,6 +531,217 @@ a{color:var(--blue);text-decoration:none}
   </div>
 </div>
 
+<!-- =============== TAB: SETTINGS =============== -->
+<div id="tab-settings" class="tab-content">
+
+  <!-- Kill Switch — top priority -->
+  <div class="setting-section" style="margin-bottom:16px;border:2px solid #fecaca;background:linear-gradient(135deg,#fff5f5,#fff)">
+    <h3><span class="ico">&#128680;</span> Emergency Kill Switch</h3>
+    <p style="font-size:.78rem;color:var(--txt2);margin-bottom:12px">
+      Immediately stops the bot and halts all trading. All open positions remain (manual exit required).
+    </p>
+    <div style="display:flex;align-items:center;gap:16px">
+      <button class="kill-switch-btn" id="btn-kill-switch" onclick="activateKillSwitch()">
+        &#9888; ACTIVATE KILL SWITCH
+      </button>
+      <button class="kill-switch-btn armed" id="btn-disarm-kill" style="display:none" onclick="disarmKillSwitch()">
+        &#9989; DISARM &amp; RESUME
+      </button>
+    </div>
+  </div>
+
+  <div class="settings-grid">
+
+    <!-- Capital & Risk -->
+    <div class="setting-section">
+      <h3><span class="ico">&#128176;</span> Capital &amp; Risk</h3>
+      <div class="setting-row">
+        <div><div class="setting-label">Total Capital</div><div class="setting-sublabel">Base capital for position sizing</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><span style="font-size:.82rem;color:var(--txt2)">&#8377;</span><input type="number" class="setting-input wide" id="s-capital" step="10000" min="50000"></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Risk per Trade</div><div class="setting-sublabel">Max % of capital risked per trade</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-risk-per-trade" step="0.01" min="0.01" max="0.15"><span style="font-size:.78rem;color:var(--txt3)">%</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Max Daily Loss</div><div class="setting-sublabel">Circuit breaker — halt all trading</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-max-daily-loss" step="0.01" min="0.05" max="0.50"><span style="font-size:.78rem;color:var(--txt3)">%</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Portfolio Profit Target</div><div class="setting-sublabel">Kill all &amp; book profit at this %</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-profit-target" step="0.01" min="0.05" max="0.50"><span style="font-size:.78rem;color:var(--txt3)">%</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Max Positions</div><div class="setting-sublabel">Maximum simultaneous open positions</div></div>
+        <input type="number" class="setting-input" id="s-max-positions" step="1" min="1" max="200">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Re-entry Cooldown</div><div class="setting-sublabel">Minutes before re-entering same stock</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-reentry-cooldown" step="5" min="0" max="120"><span style="font-size:.78rem;color:var(--txt3)">min</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Min Option Premium</div><div class="setting-sublabel">Reject options below this price</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><span style="font-size:.82rem;color:var(--txt2)">&#8377;</span><input type="number" class="setting-input" id="s-min-premium" step="0.5" min="1" max="50"></div>
+      </div>
+    </div>
+
+    <!-- Lot Sizing -->
+    <div class="setting-section">
+      <h3><span class="ico">&#128200;</span> Lot Sizing</h3>
+      <div class="setting-row">
+        <div><div class="setting-label">Global Lot Multiplier</div><div class="setting-sublabel">Scales ALL position sizes (1.0 = normal)</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-global-lots" step="0.25" min="0.25" max="5.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">GMM Sniper Lots</div><div class="setting-sublabel">Multiplier for sniper trades</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-lots-sniper" step="0.5" min="0.5" max="10.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">ARBTR Lots</div><div class="setting-sublabel">Multiplier for sector arbitrage</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-lots-arbtr" step="0.5" min="0.5" max="10.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">OI Sniper Lots</div><div class="setting-sublabel">Multiplier for OI unwinding sniper</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-lots-oi-sniper" step="0.5" min="0.5" max="10.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">PCR Sniper Lots</div><div class="setting-sublabel">Multiplier for PCR extreme sniper</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-lots-pcr-sniper" step="0.5" min="0.5" max="10.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">All-Agree Lots</div><div class="setting-sublabel">Multiplier for all-agree trades</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-lots-all-agree" step="0.5" min="0.5" max="10.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Contrarian Lots</div><div class="setting-sublabel">Multiplier for GMM contrarian</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-lots-contrarian" step="0.5" min="0.5" max="10.0"><span style="font-size:.78rem;color:var(--txt3)">x</span></div>
+      </div>
+    </div>
+
+    <!-- Strategy Toggles -->
+    <div class="setting-section" style="grid-column:1/-1">
+      <h3><span class="ico">&#9889;</span> Strategy Toggles</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:2px">
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#9889; Breakout Watcher</div><div class="setting-sublabel">WebSocket-driven real-time breakout entries</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-BREAKOUT_WATCHER"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#11088; Elite Auto-Fire</div><div class="setting-sublabel">Auto-execute high-scoring setups (76+)</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-ELITE_AUTO_FIRE"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#129504; Model Tracker (DR Gating)</div><div class="setting-sublabel">GMM/XGB model-confirmed score trades</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-DOWN_RISK_GATING"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#127919; GMM Sniper</div><div class="setting-sublabel">High-conviction cleanest GMM candidate</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-GMM_SNIPER"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128260; GMM Contrarian</div><div class="setting-sublabel">DR flip — trade against anomaly signal</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-GMM_CONTRARIAN"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#129514; TEST GMM</div><div class="setting-sublabel">Flag-confirmed regime divergence bets</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-TEST_GMM"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#129514; TEST XGB</div><div class="setting-sublabel">Pure XGBoost directional conviction</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-TEST_XGB"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#127919; OI Unwinding Sniper</div><div class="setting-sublabel">OI support/resistance reversal entries</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-SNIPER_OI_UNWINDING"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#127919; PCR Extreme Sniper</div><div class="setting-sublabel">Put-Call ratio extreme fade entries</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-SNIPER_PCR_EXTREME"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128257; ARBTR</div><div class="setting-sublabel">Sector arbitrage — laggard catch-up</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-ARBTR_CONFIG"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128181; Iron Condor</div><div class="setting-sublabel">Intraday IV crush + premium capture</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-IRON_CONDOR_CONFIG"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128181; Credit Spreads</div><div class="setting-sublabel">Theta-positive selling with hedges</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-CREDIT_SPREAD_CONFIG"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128200; Debit Spreads</div><div class="setting-sublabel">Directional momentum spreads</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-DEBIT_SPREAD_CONFIG"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128260; ML Direction Conflict</div><div class="setting-sublabel">XGB/GMM direction disagreement filter</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-ML_DIRECTION_CONFLICT"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row" style="padding:10px 12px">
+          <div><div class="setting-label">&#128260; GCR (GMM Conviction Recheck)</div><div class="setting-sublabel">Re-check losing positions with GMM</div></div>
+          <label class="toggle"><input type="checkbox" id="s-strat-GCR_CONFIG"><span class="slider"></span></label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Watcher Tuning -->
+    <div class="setting-section">
+      <h3><span class="ico">&#128161;</span> Watcher Tuning</h3>
+      <div class="setting-row">
+        <div><div class="setting-label">Min Score</div><div class="setting-sublabel">Minimum score for watcher entries</div></div>
+        <input type="number" class="setting-input" id="s-watcher-minscore" step="5" min="20" max="80">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Max Trades per Scan</div><div class="setting-sublabel">Best N placed per drain cycle</div></div>
+        <input type="number" class="setting-input" id="s-watcher-max-trades" step="1" min="1" max="10">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Max Triggers per Batch</div><div class="setting-sublabel">Triggers fed to pipeline per drain</div></div>
+        <input type="number" class="setting-input" id="s-watcher-max-triggers" step="1" min="1" max="20">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Sustain Seconds</div><div class="setting-sublabel">Price must hold move this long</div></div>
+        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-watcher-sustain" step="10" min="10" max="300"><span style="font-size:.78rem;color:var(--txt3)">sec</span></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">VIX Hard Block</div><div class="setting-sublabel">Block ALL watcher entries above this VIX</div></div>
+        <input type="number" class="setting-input" id="s-watcher-vix-block" step="1" min="15" max="50">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Momentum Exit (WME)</div><div class="setting-sublabel">Multi-signal spike reversal exit</div></div>
+        <label class="toggle"><input type="checkbox" id="s-watcher-wme"><span class="slider"></span></label>
+      </div>
+    </div>
+
+    <!-- Trading Hours -->
+    <div class="setting-section">
+      <h3><span class="ico">&#128339;</span> Trading Hours</h3>
+      <div class="setting-row">
+        <div><div class="setting-label">Market Start</div><div class="setting-sublabel">Begin scanning for trades</div></div>
+        <input type="time" class="setting-input wide" id="s-hours-start">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Market End</div><div class="setting-sublabel">Stop all monitoring</div></div>
+        <input type="time" class="setting-input wide" id="s-hours-end">
+      </div>
+      <div class="setting-row">
+        <div><div class="setting-label">No New Trades After</div><div class="setting-sublabel">Stop opening new positions</div></div>
+        <input type="time" class="setting-input wide" id="s-hours-nonew">
+      </div>
+    </div>
+
+  </div><!-- /settings-grid -->
+
+  <!-- Save / Reset bar -->
+  <div class="settings-actions">
+    <span class="settings-status" id="settings-status"></span>
+    <button class="btn-reset" onclick="resetSettings()">&#8634; Reset to Defaults</button>
+    <button class="btn-save" id="btn-save-settings" onclick="saveSettings()">&#128190; Save Settings</button>
+  </div>
+
+</div><!-- /tab-settings -->
+
 </div><!-- /container -->
 
 <!-- ================== JAVASCRIPT ================== -->
@@ -559,6 +842,7 @@ $$('.tabs .tab[data-tab]').forEach(btn => {
     if(btn.dataset.tab === 'logs' && !logSSE) startLogSSE('main');
     if(btn.dataset.tab === 'positions') loadPositions();
     if(btn.dataset.tab === 'trades') loadTradeHistory();
+    if(btn.dataset.tab === 'settings') loadSettings();
   });
 });
 
@@ -1172,6 +1456,199 @@ async function loadDayTrades(dateStr) {
       '<td>' + (t.hold_minutes||0) + 'm</td>' +
       '</tr>';
   }).join('');
+}
+
+// -- SETTINGS ----------------------------------------------
+let _settingsLoaded = false;
+
+async function loadSettings() {
+  const data = await api('/api/settings');
+  if(!data) return;
+  _settingsLoaded = true;
+
+  // Capital & Risk
+  const cr = data.capital_risk || {};
+  $('#s-capital').value = cr.CAPITAL || 500000;
+  $('#s-risk-per-trade').value = ((cr.RISK_PER_TRADE || 0.07) * 100).toFixed(0);
+  $('#s-max-daily-loss').value = ((cr.MAX_DAILY_LOSS || 0.20) * 100).toFixed(0);
+  $('#s-profit-target').value = ((cr.PORTFOLIO_PROFIT_TARGET || 0.15) * 100).toFixed(0);
+  $('#s-max-positions').value = cr.MAX_POSITIONS || 80;
+  $('#s-reentry-cooldown').value = cr.REENTRY_COOLDOWN_MINUTES || 30;
+  $('#s-min-premium').value = cr.MIN_OPTION_PREMIUM || 3.0;
+
+  // Global lot multiplier
+  $('#s-global-lots').value = data.global_lot_multiplier || 1.0;
+
+  // Per-strategy lot multipliers
+  const lots = data.lot_multipliers || {};
+  $('#s-lots-sniper').value = lots.GMM_SNIPER || 3.0;
+  $('#s-lots-arbtr').value = lots.ARBTR_CONFIG || 1.0;
+  $('#s-lots-oi-sniper').value = lots.SNIPER_OI_UNWINDING || 1.5;
+  $('#s-lots-pcr-sniper').value = lots.SNIPER_PCR_EXTREME || 1.5;
+  $('#s-lots-all-agree').value = lots.DOWN_RISK_GATING || 1.5;
+  $('#s-lots-contrarian').value = lots.GMM_CONTRARIAN || 1.0;
+
+  // Strategy toggles
+  const strats = data.strategies || {};
+  const stratNames = [
+    'BREAKOUT_WATCHER','ELITE_AUTO_FIRE','DOWN_RISK_GATING','GMM_SNIPER','GMM_CONTRARIAN',
+    'TEST_GMM','TEST_XGB','SNIPER_OI_UNWINDING','SNIPER_PCR_EXTREME','ARBTR_CONFIG',
+    'IRON_CONDOR_CONFIG','CREDIT_SPREAD_CONFIG','DEBIT_SPREAD_CONFIG','ML_DIRECTION_CONFLICT','GCR_CONFIG'
+  ];
+  stratNames.forEach(name => {
+    const el = $(`#s-strat-${name}`);
+    if(el) el.checked = strats[name] !== false;
+  });
+
+  // Watcher tuning
+  const wt = data.watcher || {};
+  $('#s-watcher-minscore').value = wt.min_score || 40;
+  $('#s-watcher-max-trades').value = wt.max_trades_per_scan || 2;
+  $('#s-watcher-max-triggers').value = wt.max_triggers_per_batch || 6;
+  $('#s-watcher-sustain').value = wt.sustain_seconds || 60;
+  $('#s-watcher-vix-block').value = wt.vix_hard_block_above || 28;
+  $('#s-watcher-wme').checked = wt.momentum_exit_enabled !== false;
+
+  // Trading hours
+  const hrs = data.hours || {};
+  $('#s-hours-start').value = hrs.start || '09:15';
+  $('#s-hours-end').value = hrs.end || '15:25';
+  $('#s-hours-nonew').value = hrs.no_new_after || '15:10';
+
+  // Kill switch state
+  const killActive = data.kill_switch || false;
+  $('#btn-kill-switch').style.display = killActive ? 'none' : '';
+  $('#btn-disarm-kill').style.display = killActive ? '' : 'none';
+
+  // Status
+  if(data.last_updated) {
+    const ts = new Date(data.last_updated);
+    $('#settings-status').textContent = 'Last saved: ' + ts.toLocaleString('en-IN');
+  } else {
+    $('#settings-status').textContent = 'Using config.py defaults';
+  }
+}
+
+async function saveSettings() {
+  const btn = $('#btn-save-settings');
+  btn.disabled = true;
+  btn.innerHTML = '&#9203; Saving...';
+
+  // Read % inputs and convert back to decimal
+  const riskPct = parseFloat($('#s-risk-per-trade').value);
+  const lossPct = parseFloat($('#s-max-daily-loss').value);
+  const profitPct = parseFloat($('#s-profit-target').value);
+
+  const payload = {
+    capital_risk: {
+      CAPITAL: parseInt($('#s-capital').value),
+      RISK_PER_TRADE: riskPct / 100,
+      MAX_DAILY_LOSS: lossPct / 100,
+      PORTFOLIO_PROFIT_TARGET: profitPct / 100,
+      MAX_POSITIONS: parseInt($('#s-max-positions').value),
+      REENTRY_COOLDOWN_MINUTES: parseInt($('#s-reentry-cooldown').value),
+      MIN_OPTION_PREMIUM: parseFloat($('#s-min-premium').value),
+    },
+    global_lot_multiplier: parseFloat($('#s-global-lots').value),
+    lot_multipliers: {
+      GMM_SNIPER: parseFloat($('#s-lots-sniper').value),
+      ARBTR_CONFIG: parseFloat($('#s-lots-arbtr').value),
+      SNIPER_OI_UNWINDING: parseFloat($('#s-lots-oi-sniper').value),
+      SNIPER_PCR_EXTREME: parseFloat($('#s-lots-pcr-sniper').value),
+      DOWN_RISK_GATING: parseFloat($('#s-lots-all-agree').value),
+      GMM_CONTRARIAN: parseFloat($('#s-lots-contrarian').value),
+    },
+    strategies: {},
+    watcher: {
+      min_score: parseInt($('#s-watcher-minscore').value),
+      max_trades_per_scan: parseInt($('#s-watcher-max-trades').value),
+      max_triggers_per_batch: parseInt($('#s-watcher-max-triggers').value),
+      sustain_seconds: parseInt($('#s-watcher-sustain').value),
+      vix_hard_block_above: parseFloat($('#s-watcher-vix-block').value),
+      momentum_exit_enabled: $('#s-watcher-wme').checked,
+    },
+    hours: {
+      start: $('#s-hours-start').value,
+      end: $('#s-hours-end').value,
+      no_new_after: $('#s-hours-nonew').value,
+    },
+  };
+
+  // Collect strategy toggles
+  const stratNames = [
+    'BREAKOUT_WATCHER','ELITE_AUTO_FIRE','DOWN_RISK_GATING','GMM_SNIPER','GMM_CONTRARIAN',
+    'TEST_GMM','TEST_XGB','SNIPER_OI_UNWINDING','SNIPER_PCR_EXTREME','ARBTR_CONFIG',
+    'IRON_CONDOR_CONFIG','CREDIT_SPREAD_CONFIG','DEBIT_SPREAD_CONFIG','ML_DIRECTION_CONFLICT','GCR_CONFIG'
+  ];
+  stratNames.forEach(name => {
+    const el = $(`#s-strat-${name}`);
+    if(el) payload.strategies[name] = el.checked;
+  });
+
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    showToast(d.msg || (d.ok ? 'Saved!' : 'Failed'), d.ok);
+    if(d.ok) {
+      $('#settings-status').textContent = 'Saved: ' + new Date().toLocaleString('en-IN');
+    }
+  } catch(e) {
+    showToast('Save failed: ' + e.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '&#128190; Save Settings';
+  }
+}
+
+async function resetSettings() {
+  if(!confirm('Reset all settings to config.py defaults? This cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/settings/reset', {method:'POST'});
+    const d = await r.json();
+    showToast(d.msg || 'Reset', d.ok);
+    if(d.ok) loadSettings();
+  } catch(e) {
+    showToast('Reset failed: ' + e.message, false);
+  }
+}
+
+async function activateKillSwitch() {
+  if(!confirm('⚠️ KILL SWITCH: This will STOP the bot and halt ALL trading immediately. Continue?')) return;
+  try {
+    const r = await fetch('/api/settings/kill-switch', {method:'POST'});
+    const d = await r.json();
+    showToast(d.msg || 'Kill switch activated', d.ok);
+    if(d.ok) {
+      $('#btn-kill-switch').style.display = 'none';
+      $('#btn-disarm-kill').style.display = '';
+      setTimeout(loadOverview, 2000);
+    }
+  } catch(e) {
+    showToast('Kill switch failed: ' + e.message, false);
+  }
+}
+
+async function disarmKillSwitch() {
+  if(!confirm('Disarm kill switch and allow trading to resume on next bot start?')) return;
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kill_switch: false}),
+    });
+    const d = await r.json();
+    showToast('Kill switch disarmed. Start the bot to resume trading.', d.ok);
+    if(d.ok) {
+      $('#btn-kill-switch').style.display = '';
+      $('#btn-disarm-kill').style.display = 'none';
+    }
+  } catch(e) {
+    showToast('Disarm failed: ' + e.message, false);
+  }
 }
 
 // ==========================================================

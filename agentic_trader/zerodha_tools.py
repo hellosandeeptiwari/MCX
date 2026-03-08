@@ -759,11 +759,28 @@ class ZerodhaTools:
                     _hold_mins = int((datetime.now() - datetime.fromisoformat(_et)).total_seconds() / 60)
             except Exception:
                 pass
+
+            # Re-derive strategy_type from flags (safety net for positions missing the field)
+            _strat = trade.get('strategy_type', '')
+            if not _strat:
+                if trade.get('is_iron_condor'):
+                    _strat = 'IRON_CONDOR'
+                elif trade.get('is_credit_spread'):
+                    _strat = 'CREDIT_SPREAD'
+                elif trade.get('hedged_from_tie'):
+                    _strat = 'THP_HEDGED_SPREAD'
+                elif trade.get('is_debit_spread'):
+                    _strat = 'DEBIT_SPREAD'
+            _source = trade.get('setup_type', '') or _strat
+
+            # For THP-hedged trades, use original_symbol so EXIT matches the original ENTRY
+            _exit_symbol = trade.get('original_symbol', '') or trade.get('symbol', '')
+
             get_trade_ledger().log_exit(
-                symbol=trade.get('symbol', ''),
+                symbol=_exit_symbol,
                 underlying=trade.get('underlying', trade.get('symbol', '')),
                 direction=trade.get('direction', trade.get('side', '')),
-                source=trade.get('setup_type', trade.get('strategy_type', '')),
+                source=_source,
                 sector=trade.get('sector', ''),
                 exit_type=result,
                 entry_price=_entry_price,
@@ -775,7 +792,7 @@ class ZerodhaTools:
                 final_score=trade.get('entry_score', 0),
                 dr_score=trade.get('dr_score', trade.get('entry_metadata', {}).get('dr_score', 0)),
                 score_tier=trade.get('score_tier', ''),
-                strategy_type=trade.get('strategy_type', ''),
+                strategy_type=_strat,
                 is_sniper=trade.get('is_sniper', False),
                 candles_held=_ed.get('candles_held', 0),
                 r_multiple=_ed.get('r_multiple_achieved', 0),
@@ -4775,6 +4792,20 @@ class ZerodhaTools:
                     'status': 'OPEN',
                     'rationale': rationale or plan.rationale,
                     'total_premium': 0,  # Net credit strategy - no premium paid
+                    # === ENTRY METADATA (parity with live mode) ===
+                    'strategy_type': 'CREDIT_SPREAD',
+                    'setup_type': 'CREDIT_SPREAD',
+                    'trade_id': f"CS_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'entry_score': getattr(plan, '_score', 0),
+                    'score_tier': 'premium' if getattr(plan, '_score', 0) >= 70 else 'standard',
+                    'sector': getattr(plan, 'sector', ''),
+                    'smart_score': getattr(plan, '_score', 0),
+                    'entry_metadata': {
+                        'strategy_type': 'CREDIT_SPREAD',
+                        'spread_type': plan.spread_type,
+                        'credit_pct': plan.credit_pct,
+                        'dte': plan.dte,
+                    },
                 }
                 with self._positions_lock:
                     self.paper_positions.append(spread_position)
@@ -4823,9 +4854,12 @@ class ZerodhaTools:
                     'total_premium': 0,
                     # === ENTRY METADATA (parity with paper mode) ===
                     'strategy_type': 'CREDIT_SPREAD',
+                    'setup_type': 'CREDIT_SPREAD',
                     'trade_id': f"CS_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                     'entry_score': getattr(plan, '_score', 0),
                     'score_tier': 'premium' if getattr(plan, '_score', 0) >= 70 else 'standard',
+                    'sector': getattr(plan, 'sector', ''),
+                    'smart_score': getattr(plan, '_score', 0),
                     'entry_metadata': {
                         'strategy_type': 'CREDIT_SPREAD',
                         'spread_type': plan.spread_type,
@@ -5348,6 +5382,7 @@ class ZerodhaTools:
                 if pos.get('symbol') == symbol and pos.get('status') == 'OPEN':
                     # Convert to debit spread
                     old_symbol = pos['symbol']
+                    pos['original_symbol'] = old_symbol  # Preserve for ledger EXIT matching
                     pos['symbol'] = f"{old_symbol}|{sell_symbol}"
                     pos['is_debit_spread'] = True
                     pos['hedged_from_tie'] = True
@@ -5373,6 +5408,30 @@ class ZerodhaTools:
                     pos['strategy_type'] = 'THP_HEDGED_SPREAD'
                     break
             self._save_active_trades()
+
+        # Log CONVERSION event to trade ledger
+        try:
+            from trade_ledger import get_trade_ledger
+            get_trade_ledger()._append({
+                'event': 'CONVERSION',
+                'ts': datetime.now().isoformat(),
+                'symbol': f"{symbol}|{sell_symbol}",
+                'original_symbol': symbol,
+                'underlying': pos.get('underlying', ''),
+                'direction': pos.get('direction', ''),
+                'conversion_type': 'NAKED_TO_THP_SPREAD',
+                'tie_check': tie_check,
+                'sell_symbol': sell_symbol,
+                'sell_strike': sell_strike,
+                'sell_premium': sell_premium,
+                'net_debit': net_debit,
+                'spread_width': spread_width,
+                'strategy_type': 'THP_HEDGED_SPREAD',
+                'order_id': pos.get('order_id', ''),
+                'trade_id': pos.get('trade_id', ''),
+            })
+        except Exception as _e:
+            print(f"\u26a0\ufe0f THP ledger conversion log error: {_e}")
         
         # Subscribe sell leg to WebSocket
         self._subscribe_position_symbols()
@@ -5667,6 +5726,12 @@ class ZerodhaTools:
                     'status': 'OPEN',
                     'rationale': rationale or plan.rationale,
                     'total_premium': 0,
+                    'setup_type': 'IRON_CONDOR',
+                    'trade_id': f"IC_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'entry_score': getattr(plan, 'directional_score', 0),
+                    'score_tier': 'premium' if getattr(plan, 'credit_pct', 0) >= 0.15 else 'standard',
+                    'sector': getattr(plan, 'sector', ''),
+                    'smart_score': getattr(plan, 'directional_score', 0),
                     'entry_metadata': {
                         'strategy_type': 'IRON_CONDOR',
                         'directional_score': plan.directional_score,
@@ -5728,6 +5793,12 @@ class ZerodhaTools:
                     'status': 'OPEN',
                     'rationale': rationale or plan.rationale,
                     'total_premium': 0,
+                    'setup_type': 'IRON_CONDOR',
+                    'trade_id': f"IC_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'entry_score': getattr(plan, 'directional_score', 0),
+                    'score_tier': 'premium' if getattr(plan, 'credit_pct', 0) >= 0.15 else 'standard',
+                    'sector': getattr(plan, 'sector', ''),
+                    'smart_score': getattr(plan, 'directional_score', 0),
                     'entry_metadata': {
                         'strategy_type': 'IRON_CONDOR',
                         'directional_score': plan.directional_score,

@@ -121,6 +121,8 @@ class MarketScanner:
         self._fo_cache_time: Optional[datetime] = None
         self._last_scan: Optional[ScanSummary] = None
         self._all_results: List[ScannerResult] = []  # ALL scanned stocks (for heat map)
+        self._metal_is_hot: bool = False
+        self._avg_metal_move: float = 0.0
         self._exclude = set(self.config["exclude_symbols"])
 
     # ------------------------------------------------------------------

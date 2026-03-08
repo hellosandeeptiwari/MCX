@@ -177,6 +177,54 @@ BREAKOUT_WATCHER = {
     "orb_min_score": 40,               # ORB_BREAKOUT floor — matches watcher min (BDL=40, RVNL=41 were winners)
     "orb_min_move_prob": 0.65,         # ORB trades need P(move)≥65% — winners avg 0.85, loser was 0.64
     "watcher_min_move_prob": 0.57,     # WATCHER P(move) floor — winners avg 0.62, losers avg 0.59
+    # --- Dynamic Batch ---
+    "max_triggers_per_batch": 6,      # Max triggers fed to pipeline per drain (was hard 3)
+    "max_trades_per_scan": 2,         # Max trades PLACED per scan (rank by P(move), take best N)
+    # --- VIX-based score penalty for elevated options pricing ---
+    "vix_penalty_above": 18.0,        # If India VIX > 18, apply -3 score penalty per VIX point above 18
+    "vix_penalty_per_point": 3,       # Penalty per VIX point (VIX=20 → -6 penalty, VIX=25 → -21 penalty)
+    "vix_hard_block_above": 28.0,     # Block ALL watcher entries if VIX > 28 (crash territory)
+    # --- Watcher Momentum Exit (exit on spike peak / crater bottom reversal) ---
+    "momentum_exit": {
+        "enabled": True,
+        "reversal_pct": 0.5,               # % reversal from peak/trough — PRICE-ONLY threshold (no signal confirmation)
+        "min_hold_seconds": 60,             # Min seconds after entry before checking (let trade breathe)
+        "min_favorable_move_pct": 0.5,      # Underlying must have moved ≥0.5% in our direction (real spike, not noise)
+        "check_interval_seconds": 5,        # How often to check (in monitor loop)
+        "bypass_cooldown": True,            # Remove symbol from _watcher_fired_this_session after exit
+        "only_in_profit": True,             # Only trigger WME if option premium is in profit (don't cut losers early)
+        "skip_trailing_active": True,       # Don't WME trades already managed by trailing stop (let winners run)
+        # --- Multi-Signal Confirmation (mirrors watcher entry signals but in reverse) ---
+        "volume_dryup_ratio": 0.30,         # Vol rate < 30% of avg spike rate → volume dried up
+        "momentum_decay_threshold": 0.70,   # Momentum < 30% of peak velocity → momentum decayed (70% decay)
+        "pressure_shift_enabled": True,     # Buy/sell qty imbalance as 3rd signal
+        "pressure_shift_ratio": 1.5,        # Opposing qty > 1.5× favorable qty → pressure shifted
+        "confirmed_reversal_pct": 0.25,     # Lower threshold when 2+ signals confirm reversal
+        "partial_confirm_reversal_pct": 0.35,  # Mid threshold when 1 signal confirms
+        "sample_window_seconds": 90,        # Rolling window for price/volume history samples
+    },
+}
+
+# === WATCHER IV CRUSH OVERRIDES (more lenient — breakouts naturally have elevated IV) ===
+# These override the global IV_CRUSH_GATE when setup_type='WATCHER'.
+# Breakout entries inherently happen DURING volatility spikes, so the normal IV gate
+# is too strict — it would block many valid watcher trades.
+WATCHER = {
+    "iv_crush_overrides": {
+        "iv_rv_ratio_hard_block": 2.2,     # Global=1.8 → watcher=2.2 (lenient: breakouts have elevated IV)
+        "iv_rv_ratio_reduce_lots": 1.5,    # Global=1.3 → watcher=1.5 (tolerate higher ratio)
+        "max_atm_iv_pct": 55,              # Global=50 → watcher=55 (allow slightly higher absolute IV)
+        "reduce_atm_iv_pct": 42,           # Global=38 → watcher=42 (halve lots less aggressively)
+    },
+}
+
+ORB_BREAKOUT = {
+    "iv_crush_overrides": {
+        "iv_rv_ratio_hard_block": 2.0,     # Slightly more lenient than global, but tighter than WATCHER
+        "iv_rv_ratio_reduce_lots": 1.4,
+        "max_atm_iv_pct": 52,
+        "reduce_atm_iv_pct": 40,
+    },
 }
 
 # === GTT SAFETY NET (Server-Side SL + Target) ===
@@ -275,6 +323,8 @@ DOWN_RISK_GATING = {
     "all_agree_lot_multiplier": 1.5,   # 1.5x lots for ALL_AGREE (strongest conviction)
     "all_agree_min_down_score": 0.30,    # Down_Flag (bounce) floor for ALL_AGREE BUY — raised from 0.26 (POWERINDIA 0.260 was too weak)
     "all_agree_min_up_score": 0.30,      # UP_Flag (crash) floor for ALL_AGREE SELL — strong crash signal required
+    "pmove_bonus_threshold": 0.80,       # P(move) >= this triggers score bonus for score-type trades
+    "pmove_bonus_points": 25,            # Points added when P(move) exceeds threshold
 }
 
 # === ML DIRECTION CONFLICT FILTER ===

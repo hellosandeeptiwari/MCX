@@ -23,6 +23,7 @@ from config import (
     TRADING_HOURS, TIER_1_OPTIONS, TIER_2_OPTIONS,
     ZERODHA_API_KEY,
 )
+import config as _config_module
 from state_db import get_state_db
 from trade_ledger import get_trade_ledger
 
@@ -952,6 +953,241 @@ def config_route():
         'trading_hours': TRADING_HOURS,
         'paper_mode': PAPER_MODE,
     })
+
+
+# ══════════════════════════════════════════════════════════════
+#  SETTINGS — Persistent overrides (titan_settings.json)
+# ══════════════════════════════════════════════════════════════
+
+SETTINGS_FILE = Path(__file__).parent / 'titan_settings.json'
+
+# All strategy config dicts that can be toggled on/off or adjusted
+_STRATEGY_CONFIGS = [
+    'BREAKOUT_WATCHER', 'ELITE_AUTO_FIRE', 'DOWN_RISK_GATING',
+    'GMM_SNIPER', 'GMM_CONTRARIAN', 'TEST_GMM', 'TEST_XGB',
+    'SNIPER_OI_UNWINDING', 'SNIPER_PCR_EXTREME', 'ARBTR_CONFIG',
+    'IRON_CONDOR_CONFIG', 'CREDIT_SPREAD_CONFIG', 'DEBIT_SPREAD_CONFIG',
+    'GCR_CONFIG', 'ML_DIRECTION_CONFLICT',
+]
+
+
+def _load_settings() -> dict:
+    """Load saved settings overrides from disk."""
+    try:
+        if SETTINGS_FILE.exists():
+            with open(SETTINGS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Failed to load settings: {e}")
+    return {}
+
+
+def _save_settings(settings: dict):
+    """Atomically save settings overrides to disk."""
+    tmp = SETTINGS_FILE.with_suffix('.tmp')
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(settings, f, indent=2, default=str)
+        # Atomic rename
+        if os.name == 'nt':
+            if SETTINGS_FILE.exists():
+                SETTINGS_FILE.unlink()
+        tmp.rename(SETTINGS_FILE)
+    except Exception as e:
+        print(f"⚠️ Failed to save settings: {e}")
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def _get_current_settings() -> dict:
+    """Build full settings view: config.py defaults merged with overrides."""
+    saved = _load_settings()
+
+    # Capital & Risk
+    capital_risk = {
+        'CAPITAL': saved.get('CAPITAL', HARD_RULES.get('CAPITAL', 500000)),
+        'RISK_PER_TRADE': saved.get('RISK_PER_TRADE', HARD_RULES.get('RISK_PER_TRADE', 0.07)),
+        'MAX_DAILY_LOSS': saved.get('MAX_DAILY_LOSS', HARD_RULES.get('MAX_DAILY_LOSS', 0.20)),
+        'MAX_POSITIONS': saved.get('MAX_POSITIONS', HARD_RULES.get('MAX_POSITIONS', 80)),
+        'REENTRY_COOLDOWN_MINUTES': saved.get('REENTRY_COOLDOWN_MINUTES', HARD_RULES.get('REENTRY_COOLDOWN_MINUTES', 30)),
+        'MIN_OPTION_PREMIUM': saved.get('MIN_OPTION_PREMIUM', HARD_RULES.get('MIN_OPTION_PREMIUM', 3.0)),
+        'PORTFOLIO_PROFIT_TARGET': saved.get('PORTFOLIO_PROFIT_TARGET', HARD_RULES.get('PORTFOLIO_PROFIT_TARGET', 0.15)),
+    }
+
+    # Strategy toggles (enabled/disabled)
+    strategies = {}
+    for name in _STRATEGY_CONFIGS:
+        cfg = getattr(_config_module, name, {})
+        default_enabled = cfg.get('enabled', True) if isinstance(cfg, dict) else True
+        strategies[name] = saved.get(f'strategy_{name}', default_enabled)
+
+    # Watcher-specific tunables
+    bw = getattr(_config_module, 'BREAKOUT_WATCHER', {})
+    watcher = {
+        'min_score': saved.get('watcher_min_score', bw.get('min_score', 40)),
+        'max_trades_per_scan': saved.get('watcher_max_trades_per_scan', bw.get('max_trades_per_scan', 2)),
+        'max_triggers_per_batch': saved.get('watcher_max_triggers_per_batch', bw.get('max_triggers_per_batch', 6)),
+        'sustain_seconds': saved.get('watcher_sustain_seconds', bw.get('sustain_seconds', 60)),
+        'vix_hard_block_above': saved.get('watcher_vix_hard_block', bw.get('vix_hard_block_above', 28.0)),
+        'momentum_exit_enabled': saved.get('watcher_momentum_exit', bw.get('momentum_exit', {}).get('enabled', True)),
+    }
+
+    # Lot multipliers per strategy
+    lot_multipliers = {}
+    for name in ['GMM_SNIPER', 'ARBTR_CONFIG', 'SNIPER_OI_UNWINDING', 'SNIPER_PCR_EXTREME',
+                  'DOWN_RISK_GATING', 'GMM_CONTRARIAN']:
+        cfg = getattr(_config_module, name, {})
+        if isinstance(cfg, dict):
+            if name == 'DOWN_RISK_GATING':
+                default_mult = cfg.get('all_agree_lot_multiplier', 1.5)
+            else:
+                default_mult = cfg.get('lot_multiplier', 1.0)
+        else:
+            default_mult = 1.0
+        lot_multipliers[name] = saved.get(f'lots_{name}', default_mult)
+
+    # Trading hours
+    th = getattr(_config_module, 'TRADING_HOURS', {})
+    hours = {
+        'start': saved.get('hours_start', th.get('start', '09:15')),
+        'end': saved.get('hours_end', th.get('end', '15:25')),
+        'no_new_after': saved.get('hours_no_new_after', th.get('no_new_after', '15:10')),
+    }
+
+    # Kill switch
+    kill_switch = saved.get('kill_switch', False)
+
+    # Global lot multiplier (scale ALL positions)
+    global_lot_multiplier = saved.get('global_lot_multiplier', 1.0)
+
+    return {
+        'capital_risk': capital_risk,
+        'strategies': strategies,
+        'watcher': watcher,
+        'lot_multipliers': lot_multipliers,
+        'hours': hours,
+        'kill_switch': kill_switch,
+        'global_lot_multiplier': global_lot_multiplier,
+        'last_updated': saved.get('_last_updated', None),
+    }
+
+
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    """Return current settings (defaults merged with overrides)."""
+    return jsonify(_get_current_settings())
+
+
+@app.route('/api/settings', methods=['POST'])
+def save_settings():
+    """Save settings overrides to titan_settings.json.
+    Bot reads this file periodically and applies overrides."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        saved = _load_settings()
+
+        # Capital & Risk
+        cr = data.get('capital_risk', {})
+        if 'CAPITAL' in cr:
+            saved['CAPITAL'] = max(50000, min(10000000, int(cr['CAPITAL'])))
+        if 'RISK_PER_TRADE' in cr:
+            saved['RISK_PER_TRADE'] = max(0.01, min(0.15, float(cr['RISK_PER_TRADE'])))
+        if 'MAX_DAILY_LOSS' in cr:
+            saved['MAX_DAILY_LOSS'] = max(0.05, min(0.50, float(cr['MAX_DAILY_LOSS'])))
+        if 'MAX_POSITIONS' in cr:
+            saved['MAX_POSITIONS'] = max(1, min(200, int(cr['MAX_POSITIONS'])))
+        if 'REENTRY_COOLDOWN_MINUTES' in cr:
+            saved['REENTRY_COOLDOWN_MINUTES'] = max(0, min(120, int(cr['REENTRY_COOLDOWN_MINUTES'])))
+        if 'MIN_OPTION_PREMIUM' in cr:
+            saved['MIN_OPTION_PREMIUM'] = max(1.0, min(50.0, float(cr['MIN_OPTION_PREMIUM'])))
+        if 'PORTFOLIO_PROFIT_TARGET' in cr:
+            saved['PORTFOLIO_PROFIT_TARGET'] = max(0.05, min(0.50, float(cr['PORTFOLIO_PROFIT_TARGET'])))
+
+        # Strategy toggles
+        strats = data.get('strategies', {})
+        for name in _STRATEGY_CONFIGS:
+            if name in strats:
+                saved[f'strategy_{name}'] = bool(strats[name])
+
+        # Watcher tunables
+        wt = data.get('watcher', {})
+        if 'min_score' in wt:
+            saved['watcher_min_score'] = max(20, min(80, int(wt['min_score'])))
+        if 'max_trades_per_scan' in wt:
+            saved['watcher_max_trades_per_scan'] = max(1, min(10, int(wt['max_trades_per_scan'])))
+        if 'max_triggers_per_batch' in wt:
+            saved['watcher_max_triggers_per_batch'] = max(1, min(20, int(wt['max_triggers_per_batch'])))
+        if 'sustain_seconds' in wt:
+            saved['watcher_sustain_seconds'] = max(10, min(300, int(wt['sustain_seconds'])))
+        if 'vix_hard_block_above' in wt:
+            saved['watcher_vix_hard_block'] = max(15, min(50, float(wt['vix_hard_block_above'])))
+        if 'momentum_exit_enabled' in wt:
+            saved['watcher_momentum_exit'] = bool(wt['momentum_exit_enabled'])
+
+        # Lot multipliers
+        lots = data.get('lot_multipliers', {})
+        for name in lots:
+            if name in _STRATEGY_CONFIGS or name in ['GMM_SNIPER', 'ARBTR_CONFIG',
+                    'SNIPER_OI_UNWINDING', 'SNIPER_PCR_EXTREME', 'DOWN_RISK_GATING', 'GMM_CONTRARIAN']:
+                saved[f'lots_{name}'] = max(0.5, min(10.0, float(lots[name])))
+
+        # Trading hours
+        hrs = data.get('hours', {})
+        for key in ['start', 'end', 'no_new_after']:
+            if key in hrs:
+                val = str(hrs[key]).strip()
+                # Basic HH:MM validation
+                if len(val) == 5 and val[2] == ':':
+                    saved[f'hours_{key}'] = val
+
+        # Global lot multiplier
+        if 'global_lot_multiplier' in data:
+            saved['global_lot_multiplier'] = max(0.25, min(5.0, float(data['global_lot_multiplier'])))
+
+        # Kill switch
+        if 'kill_switch' in data:
+            saved['kill_switch'] = bool(data['kill_switch'])
+
+        saved['_last_updated'] = datetime.now().isoformat()
+        _save_settings(saved)
+
+        return jsonify({'ok': True, 'msg': 'Settings saved. Bot will pick up changes within 30 seconds.'})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'Save failed: {e}'}), 500
+
+
+@app.route('/api/settings/kill-switch', methods=['POST'])
+def kill_switch():
+    """Emergency kill switch: stop all trading immediately."""
+    try:
+        saved = _load_settings()
+        saved['kill_switch'] = True
+        saved['_last_updated'] = datetime.now().isoformat()
+        saved['_kill_switch_activated'] = datetime.now().isoformat()
+        _save_settings(saved)
+
+        # Also stop the bot service immediately
+        try:
+            subprocess.run(['sudo', 'systemctl', 'stop', 'titan-bot'],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+        return jsonify({'ok': True, 'msg': '🚨 KILL SWITCH ACTIVATED — Bot stopped, all trading halted.'})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'Kill switch failed: {e}'}), 500
+
+
+@app.route('/api/settings/reset', methods=['POST'])
+def reset_settings():
+    """Reset all settings to config.py defaults."""
+    try:
+        if SETTINGS_FILE.exists():
+            SETTINGS_FILE.unlink()
+        return jsonify({'ok': True, 'msg': 'Settings reset to defaults. Restart bot to apply.'})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'Reset failed: {e}'}), 500
 
 
 # ── Pre-market health check ─────────────────────────────────
