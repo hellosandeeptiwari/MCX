@@ -248,6 +248,7 @@ class AutonomousTrader:
         self._watcher_total_gate_blocked = 0         # Total blocked by pipeline gates
         self._watcher_total_placed = 0               # Total trades successfully placed
         self._watcher_total_pos_exhausted = 0        # Times blocked by position limit
+        self._watcher_score_history = {}              # sym → [(timestamp, score), ...] for momentum detection
 
         # === SETTINGS HOT-RELOAD (titan_settings.json) ===
         self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'titan_settings.json')
@@ -697,21 +698,11 @@ class AutonomousTrader:
         """
         cfg = self._ml_ovr_cfg
         
-        # Resolve directional DR score: pick the regime that CONFIRMS the flip
-        # XGB=UP → flip to BUY → down_score (bounce) confirms BUY
-        # XGB=DOWN → flip to SELL → up_score (crash) confirms SELL
-        _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
+        # Use max DR score (direction-agnostic) — XGB direction removed
         _up_score = ml.get('ml_up_score', dr_score)
         _down_score = ml.get('ml_down_score', dr_score)
-        if _xgb_signal == 'UP':
-            _confirm_dr = _down_score   # bounce signal confirms BUY
-            _confirm_tag = 'down_score'
-        elif _xgb_signal == 'DOWN':
-            _confirm_dr = _up_score     # crash signal confirms SELL
-            _confirm_tag = 'up_score'
-        else:
-            _confirm_dr = dr_score      # fallback to max(both)
-            _confirm_tag = 'dr_score'
+        _confirm_dr = max(_up_score, _down_score, dr_score)
+        _confirm_tag = 'dr_score'
         
         # Gate 1: Max concurrent open ML_OVERRIDE_WGMM positions
         _max_concurrent = cfg.get('max_concurrent_open', 3)
@@ -737,16 +728,7 @@ class AutonomousTrader:
             if _confirm_dr < _min_dr:
                 return False, f"{_confirm_tag} {_confirm_dr:.3f} < {_min_dr} (need confirming regime signal)"
         
-        # Gate 4: XGB directional probability
-        _min_dir_prob = cfg.get('min_directional_prob', 0.30)
-        if _xgb_signal == 'UP':
-            _dir_prob = ml.get('ml_prob_up', 0.0)
-        elif _xgb_signal == 'DOWN':
-            _dir_prob = ml.get('ml_prob_down', 0.0)
-        else:
-            _dir_prob = 0.0
-        if _dir_prob < _min_dir_prob - 0.001:  # >= with epsilon for float safety
-            return False, f"dir_prob({_xgb_signal}) {_dir_prob:.2f} < {_min_dir_prob}"
+        # Gate 4 (XGB directional probability) — REMOVED, XGB direction no longer used
         
         # Gate 5: Smart score floor — estimate smart_score from available data
         # Uses confirming dr_score for safety (higher confirm = more edge = higher safety)
@@ -1465,18 +1447,20 @@ class AutonomousTrader:
             _max_per_scan = BREAKOUT_WATCHER.get('max_trades_per_scan', 2)
             _fired_count = 0
             
-            # ── VIX-based score penalty: elevated VIX = expensive options ──
+            # ── VIX-based score penalty: direction-aware ──
+            # High VIX hurts CE buyers (expensive) but helps PE buyers (premium expands)
+            # Only penalize when direction opposes VIX regime (buying CEs in high-VIX bearish)
             _vix = getattr(self, '_current_vix', 14.0)
             _vix_penalty_above = BREAKOUT_WATCHER.get('vix_penalty_above', 18.0)
-            _vix_penalty_per_pt = BREAKOUT_WATCHER.get('vix_penalty_per_point', 3)
-            _vix_hard_block = BREAKOUT_WATCHER.get('vix_hard_block_above', 28.0)
-            _vix_penalty = 0
+            _vix_penalty_per_pt = BREAKOUT_WATCHER.get('vix_penalty_per_point', 2)
+            _vix_hard_block = BREAKOUT_WATCHER.get('vix_hard_block_above', 32.0)
+            _vix_raw_penalty = 0
             if _vix > _vix_hard_block:
                 self._wlog(f"🚫 VIX BLOCK: India VIX={_vix:.1f} > {_vix_hard_block} — blocking ALL watcher entries")
                 return
             if _vix > _vix_penalty_above:
-                _vix_penalty = round((_vix - _vix_penalty_above) * _vix_penalty_per_pt)
-                self._wlog(f"⚠️ VIX PENALTY: India VIX={_vix:.1f} → -{_vix_penalty} score penalty on all candidates")
+                _vix_raw_penalty = round((_vix - _vix_penalty_above) * _vix_penalty_per_pt)
+            _market_breadth = getattr(self, '_last_market_breadth', 'MIXED')
             
             # ════════════════════════════════════════════════════════════════
             # TWO-PASS PIPELINE: Run all gates first, collect candidates,
@@ -1485,9 +1469,9 @@ class AutonomousTrader:
             _candidates = []  # [{sym, direction, score, ml_move_prob, ...}]
             
             for _sym, _score in sorted(_pre_scores.items(), key=lambda x: x[1], reverse=True):
-                _trig = _trigger_map.get(_sym, {})
-                _trigger_type = _trig.get('trigger_type', '?')
-                _move_pct = _trig.get('move_pct', 0)
+                _trigger = _trigger_map.get(_sym, {})
+                _trigger_type = _trigger.get('trigger_type', '?')
+                _move_pct = _trigger.get('move_pct', 0)
                 _data = market_data.get(_sym, {})
                 if not isinstance(_data, dict):
                     continue
@@ -1499,50 +1483,163 @@ class AutonomousTrader:
                 
                 # Score from decision (includes ML boost, OI penalty, sector penalty, DR nudge)
                 _final_score = _pre_scores.get(_sym, 0)
-                # Apply VIX penalty
-                _final_score -= _vix_penalty
+
+                # ── Trigger-strength score bonus (Mar-09) ──
+                # The watcher detected real-time momentum. Strong trigger types
+                # deserve a score bonus — the ticker's 60s sustain IS evidence.
+                _trigger_bonus = 0
+                if _trigger_type in ('PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN'):
+                    _trigger_bonus = 10  # Strongest: ≥0.7% move sustained 60s
+                    # Accelerating spikes are stronger (recent ticks moving faster than earlier ticks)
+                    _spike_accel = _trigger.get('spike_accel', 0)
+                    if _spike_accel >= 1.5:
+                        _trigger_bonus += 2  # Still accelerating at trigger time
+                    # Large spikes (≥1.2%) get extra credit
+                    _spike_mag = _trigger.get('spike_magnitude', 0)
+                    if _spike_mag >= 1.2:
+                        _trigger_bonus += 2
+                elif _trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN'):
+                    _trigger_bonus = 8   # Persistent multi-minute directional move
+                    # Volume-confirmed grinds are stronger signals
+                    if _trigger.get('vol_confirmed', False):
+                        _trigger_bonus += 3
+                elif _trigger_type in ('NEW_DAY_HIGH', 'NEW_DAY_LOW'):
+                    _trigger_bonus = 7   # Structural break of day's range
+                    # First break of the day is much stronger than the 5th incremental
+                    _break_count = _trigger.get('break_count', 1)
+                    if _break_count <= 2:
+                        _trigger_bonus += 3  # Fresh breakout — strongest
+                    elif _break_count >= 5:
+                        _trigger_bonus -= 2  # 5th+ marginal new extreme — less meaningful
+                    # Larger margin above previous extreme = more conviction
+                    _break_margin = _trigger.get('break_margin', 0)
+                    if _break_margin >= 0.3:
+                        _trigger_bonus += 1
+                elif _trigger_type == 'VOLUME_SURGE' and abs(_move_pct) >= 0.5:
+                    _trigger_bonus = 5   # Volume surge with meaningful price move
+                    # Higher surge ratios deserve more bonus (5x is much stronger than 3x)
+                    _surge_ratio = _trigger.get('surge_ratio', 3.0)
+                    if _surge_ratio >= 6.0:
+                        _trigger_bonus += 3
+                    elif _surge_ratio >= 4.5:
+                        _trigger_bonus += 1
+                _final_score += _trigger_bonus
                 
-                # --- Direction from scorer (authoritative, not from trigger) ---
+                # Post-restart caution: baselines are thin for first 2 min after restart
+                # Apply a score penalty to avoid low-confidence triggers during warmup
+                _restart_penalty = 0
+                if _trigger.get('post_restart', False):
+                    _restart_penalty = 5
+                    _final_score -= _restart_penalty
+
+                # --- Direction: reconcile scorer vs trigger ---
+                # The scorer uses 5-min candle indicators (lagging).
+                # The trigger is real-time tick data (the watcher SAW the move).
+                # When they conflict, trust the trigger direction.
                 direction = None
+                _trigger_dir = None  # What the trigger implies
+                if _trigger_type in ('PRICE_SPIKE_UP', 'NEW_DAY_HIGH', 'SLOW_GRIND_UP'):
+                    _trigger_dir = 'BUY'
+                elif _trigger_type in ('PRICE_SPIKE_DOWN', 'NEW_DAY_LOW', 'SLOW_GRIND_DOWN'):
+                    _trigger_dir = 'SELL'
+                else:
+                    _trigger_dir = 'BUY' if _move_pct > 0 else 'SELL'
+                
+                _scorer_dir = None
                 if hasattr(_decision, 'recommended_direction') and _decision.recommended_direction not in ('HOLD', None, ''):
-                    direction = _decision.recommended_direction
-                if not direction:
-                    # Fallback: infer from trigger
-                    if _trigger_type in ('PRICE_SPIKE_UP', 'NEW_DAY_HIGH'):
-                        direction = 'BUY'
-                    elif _trigger_type in ('PRICE_SPIKE_DOWN', 'NEW_DAY_LOW'):
-                        direction = 'SELL'
+                    _scorer_dir = _decision.recommended_direction
+                
+                if _scorer_dir and _scorer_dir == _trigger_dir:
+                    # Agreement — strongest signal, use scorer direction
+                    direction = _scorer_dir
+                elif _scorer_dir and _scorer_dir != _trigger_dir:
+                    # CONFLICT: scorer says one thing, trigger says another
+                    # Trust the trigger — it's real-time evidence of the move
+                    direction = _trigger_dir
+                    self._wlog(f"⚠️ DIR CONFLICT: {_sym} scorer={_scorer_dir} vs trigger={_trigger_dir}({_trigger_type}) → using trigger dir")
+                else:
+                    # Scorer said HOLD — use trigger direction
+                    direction = _trigger_dir
+                
+                # ── Direction-aware VIX penalty ──
+                # High VIX + SELL direction on bearish day = PE buying = VIX helps → no penalty
+                # High VIX + BUY direction on bearish day = CE buying = VIX hurts → full penalty
+                _vix_penalty = 0
+                if _vix_raw_penalty > 0:
+                    _vix_dir_helps = (
+                        (direction == 'SELL' and _market_breadth in ('BEARISH',))
+                        or (direction == 'BUY' and _market_breadth in ('BULLISH',))
+                    )
+                    if _vix_dir_helps:
+                        _vix_penalty = 0  # VIX aligns with trade direction — no penalty
                     else:
-                        direction = 'BUY' if _move_pct > 0 else 'SELL'
+                        _vix_penalty = _vix_raw_penalty
+                    _final_score -= _vix_penalty
                 
                 # Score audit from scorer (shows component breakdown)
                 _score_audit = getattr(_scorer, '_last_score_audit', '')
                 _stock_name = _sym.replace('NSE:', '')
                 _ml_pred = _ml_results.get(_sym, {})
-                _ml_signal = _ml_pred.get('ml_signal', 'N/A')
-                _ml_conf = _ml_pred.get('ml_confidence', 0)
                 _ml_move_prob = _ml_pred.get('ml_move_prob', 0)
                 _dr_score = _ml_pred.get('ml_down_risk_score', 0)
                 _up_score = _ml_pred.get('ml_up_score', 0)
                 _down_score = _ml_pred.get('ml_down_score', 0)
-                _prob_up = _ml_pred.get('ml_prob_up', 0)
-                _prob_down = _ml_pred.get('ml_prob_down', 0)
-                self._wlog(f"GATE CHECK: {_stock_name} | score={_final_score:.0f} dir={direction} "
-                           f"trigger={_trigger_type}({_move_pct:+.1f}%) | "
-                           f"XGB={_ml_signal} conf={_ml_conf:.2f} P(move)={_ml_move_prob:.2f} P(up)={_prob_up:.2f} P(dn)={_prob_down:.2f} | "
+                self._wlog(f"GATE CHECK: {_stock_name} | score={_final_score:.0f}(+{_trigger_bonus}{f' restart-{_restart_penalty}' if _restart_penalty else ''}) dir={direction}(scorer={_scorer_dir or 'HOLD'}) "
+                           f"trigger={_trigger_type}({_move_pct:+.1f}%) VIX={_vix:.0f}(pen={_vix_penalty}) "
+                           f"vc={_trigger.get('vol_confirmed', '-')} sr={_trigger.get('surge_ratio', '-')} di={_trigger.get('depth_imbalance', '-')} "
+                           f"accel={_trigger.get('spike_accel', '-')} mag={_trigger.get('spike_magnitude', '-')} "
+                           f"brk={_trigger.get('break_count', '-')}/{_trigger.get('break_margin', '-')} | "
+                           f"P(move)={_ml_move_prob:.2f} | "
                            f"GMM DR={_dr_score:.3f} up={_up_score:.3f} dn={_down_score:.3f} | "
                            f"ORB={_data.get('orb_signal', '?')} VWAP={_data.get('price_vs_vwap', '?')} "
                            f"VOL={_data.get('volume_regime', '?')} ADX={_data.get('adx', 0):.0f} "
-                           f"FT={_data.get('follow_through_candles', 0)} RSI={_data.get('rsi_14', 50):.0f}")
+                           f"FT={_data.get('follow_through_candles', 0)} RSI={_data.get('rsi_14', 50):.0f} "
+                           f"peak={_trigger.get('_peak_move_pct', '-')} held={_trigger.get('_sustain_held_pct', '-')}")
                 if _score_audit:
                     self._wlog(f"  AUDIT: {_score_audit}")
                 
+                # --- Score Momentum Tracking ---
+                # Track score history per symbol. If score is rising across
+                # consecutive checks, the stock is building conviction.
+                # On 4th+ rising check, boost score to reward persistence.
+                _now_ts = time.time()
+                _hist = self._watcher_score_history.get(_sym, [])
+                # Prune entries older than 30 minutes
+                _hist = [(t, s) for t, s in _hist if _now_ts - t < 1800]
+                _hist.append((_now_ts, _final_score))
+                self._watcher_score_history[_sym] = _hist
+                
+                _momentum_boost = 0
+                if len(_hist) >= 3:
+                    # Count consecutive rising scores with meaningful delta (≥3 pts).
+                    # Tiny +1 noise doesn't count — only real conviction buildup.
+                    # Also track total delta for velocity-based bonus.
+                    _rising = 0
+                    _total_delta = 0.0
+                    for i in range(len(_hist) - 1, 0, -1):
+                        _delta = _hist[i][1] - _hist[i-1][1]
+                        if _delta >= 3:          # Minimum +3 per check to count
+                            _rising += 1
+                            _total_delta += _delta
+                        else:
+                            break
+                    # 3+ meaningful consecutive rises → boost
+                    if _rising >= 3:
+                        _avg_delta = _total_delta / _rising
+                        # Base: +3 per rise beyond 2nd (same as before)
+                        _base_boost = (_rising - 2) * 3
+                        # Velocity bonus: avg delta ≥10 → extra +3 (strong acceleration)
+                        _velocity_bonus = 3 if _avg_delta >= 10 else 0
+                        _momentum_boost = min(_base_boost + _velocity_bonus, 15)  # Cap at +15
+                        _final_score += _momentum_boost
+                        self._wlog(f"  MOMENTUM: {_stock_name} {_rising} rising(Δ≥3) avg_Δ={_avg_delta:.0f} → boost +{_momentum_boost} → {_final_score:.0f}")
+                
                 # --- GATE A: Score threshold ---
-                if _final_score < _min_score:
-                    self._wlog(f"  BLOCKED(A-SCORE): {_stock_name} score={_final_score:.0f} < {_min_score}")
+                if _final_score <= _min_score:
+                    self._wlog(f"  BLOCKED(A-SCORE): {_stock_name} score={_final_score:.0f} <= {_min_score}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_SCORE',
-                                      reason=f'Breakout {_trigger_type} but score {_final_score:.0f} < {_min_score}',
+                                      reason=f'Breakout {_trigger_type} but score {_final_score:.0f} <= {_min_score}',
                                       direction=direction)
                     continue
                 
@@ -1575,14 +1672,11 @@ class AutonomousTrader:
                 )
                 
                 # Watcher-implicit setups: the ticker's trigger IS the setup evidence
-                # VOLUME_SURGE + VWAP alignment = institutional activity + trend
-                # NEW_DAY_LOW/HIGH = structural break of day's range
-                # PRICE_SPIKE = momentum event
-                # SLOW_GRIND = persistent multi-minute move detected
+                # The ticker confirmed 60s sustained movement — that IS a setup.
+                # All non-tiny triggers qualify (watcher already filtered noise).
                 _watcher_setup = (
                     _trigger_type in ('NEW_DAY_LOW', 'NEW_DAY_HIGH', 'PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN', 'SLOW_GRIND_UP', 'SLOW_GRIND_DOWN') or
-                    (_trigger_type == 'VOLUME_SURGE' and vwap in ('ABOVE_VWAP', 'BELOW_VWAP')) or
-                    (_trigger_type == 'VOLUME_SURGE' and _data.get('adx', 0) >= 30)
+                    _trigger_type == 'VOLUME_SURGE'  # Volume surge with sustained price move = real momentum
                 )
                 
                 has_setup = _classic_setup or _watcher_setup
@@ -1608,27 +1702,54 @@ class AutonomousTrader:
                 # FT from the morning ORB has nothing to do with an afternoon volume surge.
                 ft_candles = _data.get('follow_through_candles', 0)
                 orb_hold = _data.get('orb_hold_candles', 0)
+                adx_val = _data.get('adx', 20)
                 _is_orb_trigger = orb in ('BREAKOUT_UP', 'BREAKOUT_DOWN') and _trigger_type not in (
                     'VOLUME_SURGE', 'SLOW_GRIND_UP', 'SLOW_GRIND_DOWN',
                     'NEW_DAY_HIGH', 'NEW_DAY_LOW', 'PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN'
                 )
+                # FT gate only applies to ORB-based triggers
+                _ft_blocked = False
                 if ft_candles == 0 and orb_hold > 2 and _is_orb_trigger:
-                    self._wlog(f"  BLOCKED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} — stale ORB breakout")
-                    self._watcher_total_gate_blocked += 1
-                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_FOLLOWTHROUGH',
-                                      reason=f'FT=0, ORB hold={orb_hold} candles — stale ORB breakout',
-                                      direction=direction)
-                    continue
-                if ft_candles == 0 and orb_hold > 2 and not _is_orb_trigger:
+                    # --- Smart FT relaxation ---
+                    # 1) High ADX (>=30) = strong trend — grind-ups don't need FT candles
+                    # 2) ORB breakout aligned with VWAP = multiple confirmation, relax FT
+                    # 3) Raise stale threshold from 2 to 4 candles (20 min)
+                    # 4) Score momentum (stock showing up repeatedly with rising scores)
+                    _ft_relax_adx = adx_val >= 30
+                    _ft_relax_alignment = (
+                        (orb == 'BREAKOUT_UP' and vwap == 'ABOVE_VWAP') or
+                        (orb == 'BREAKOUT_DOWN' and vwap == 'BELOW_VWAP')
+                    )
+                    _ft_relax_momentum = _momentum_boost > 0
+                    _ft_stale_threshold = 4  # Was 2 — give more time before calling stale
+                    
+                    if _ft_relax_adx:
+                        self._wlog(f"  RELAXED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} but ADX={adx_val:.0f}>=30 — strong trend, FT waived")
+                    elif _ft_relax_alignment:
+                        self._wlog(f"  RELAXED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} but ORB+VWAP aligned — FT waived")
+                    elif _ft_relax_momentum:
+                        self._wlog(f"  RELAXED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} but score momentum +{_momentum_boost} — FT waived")
+                    elif orb_hold <= _ft_stale_threshold:
+                        self._wlog(f"  PASSED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} <= {_ft_stale_threshold} — not yet stale")
+                    else:
+                        _ft_blocked = True
+                        self._wlog(f"  BLOCKED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold}>{_ft_stale_threshold} ADX={adx_val:.0f} — stale ORB breakout")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_NO_FOLLOWTHROUGH',
+                                          reason=f'FT=0, ORB hold={orb_hold}>{_ft_stale_threshold}, ADX={adx_val:.0f} — stale ORB',
+                                          direction=direction)
+                        continue
+                elif ft_candles == 0 and orb_hold > 2 and not _is_orb_trigger:
                     self._wlog(f"  PASSED(D-FT): {_stock_name} FT=0 ORB_hold={orb_hold} but trigger={_trigger_type} — FT gate N/A for non-ORB triggers")
                 
-                # --- GATE E: ADX trend strength gate (same as ELITE: ≥25) ---
-                adx_val = _data.get('adx', 20)
-                if adx_val < 25:
-                    self._wlog(f"  BLOCKED(E-ADX): {_stock_name} ADX={adx_val:.0f} < 25")
+                # --- GATE E: ADX trend strength gate (relaxed for WATCHER) ---
+                # adx_val already fetched above for FT gate
+                _adx_min = BREAKOUT_WATCHER.get('watcher_min_adx', 20)
+                if adx_val < _adx_min:
+                    self._wlog(f"  BLOCKED(E-ADX): {_stock_name} ADX={adx_val:.0f} < {_adx_min}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_WEAK_ADX',
-                                      reason=f'ADX={adx_val:.0f} < 25',
+                                      reason=f'ADX={adx_val:.0f} < {_adx_min}',
                                       direction=direction)
                     continue
                 
@@ -1649,55 +1770,124 @@ class AutonomousTrader:
                                       direction=direction)
                     continue
                 
-                # --- GATE G: ML flat veto (same as ELITE) ---
+                # --- GATE G: ML flat veto — DISABLED for watcher (Mar-09) ---
+                # The ticker detected a real sustained price move. ML saying "flat"
+                # contradicts observable reality. Log it but don't block.
                 try:
                     _cached_ml = _cycle_decisions.get(_sym, {}).get('ml_prediction', {})
                     if _cached_ml.get('ml_elite_ok') is False:
                         _ml_flat_p = _cached_ml.get('ml_prob_flat', 0)
-                        self._wlog(f"  BLOCKED(G-ML): {_stock_name} P(flat)={_ml_flat_p:.0%}")
-                        self._watcher_total_gate_blocked += 1
-                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_ML_FLAT',
-                                          reason=f'ML FLAT ({_ml_flat_p:.0%} flat prob)',
-                                          direction=direction)
-                        continue
+                        self._wlog(f"  NOTE(G-ML): {_stock_name} P(flat)={_ml_flat_p:.0%} — BYPASSED (watcher saw real move)")
                 except Exception:
                     pass
                 
-                # --- GATE G2: XGB Direction Conflict (watcher-specific) ---
-                # If XGB strongly predicts the OPPOSITE direction, block.
-                # Relaxed vs main scan (0.55→0.50 move_prob, needs strong opposing prob).
-                try:
-                    _xgb_ml = _ml_results.get(_sym, {})
-                    _xgb_signal = _xgb_ml.get('ml_signal', 'UNKNOWN')
-                    _xgb_move_prob = _xgb_ml.get('ml_move_prob', 0)
-                    _xgb_prob_up = _xgb_ml.get('ml_prob_up', 0)
-                    _xgb_prob_down = _xgb_ml.get('ml_prob_down', 0)
-                    _xgb_conf = _xgb_ml.get('ml_confidence', 0)
-                    
-                    # Hard block: XGB says opposite with strong conviction
-                    _xgb_opposes = False
-                    if direction == 'BUY' and _xgb_signal == 'DOWN' and _xgb_prob_down >= 0.40 and _xgb_conf >= 0.50:
-                        _xgb_opposes = True
-                    elif direction == 'SELL' and _xgb_signal == 'UP' and _xgb_prob_up >= 0.40 and _xgb_conf >= 0.50:
-                        _xgb_opposes = True
-                    
-                    if _xgb_opposes:
-                        self._wlog(f"  BLOCKED(G2-XGB): {_stock_name} XGB={_xgb_signal} opposes {direction} "
-                                   f"(P_up={_xgb_prob_up:.2f} P_down={_xgb_prob_down:.2f} conf={_xgb_conf:.2f})")
-                        self._watcher_total_gate_blocked += 1
-                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_XGB_CONFLICT',
-                                          reason=f'XGB {_xgb_signal} opposes {direction} '
-                                                 f'(P_up={_xgb_prob_up:.2f} P_down={_xgb_prob_down:.2f} conf={_xgb_conf:.2f})',
-                                          direction=direction)
-                        continue
-                except Exception:
-                    pass
+                # --- GATE G2b: Scorer-Trigger Conflict for weak scores ---
+                # If the technical scorer actively disagrees with the trigger direction
+                # AND the score is below threshold, block. Don't override scorer with
+                # weak evidence.
+                _scorer_conflict_max = BREAKOUT_WATCHER.get('scorer_conflict_max_score', 50)
+                if (_scorer_dir and _scorer_dir != _trigger_dir and
+                        _final_score < _scorer_conflict_max):
+                    self._wlog(f"  BLOCKED(G2b-SCORER): {_stock_name} scorer={_scorer_dir} vs trigger={_trigger_dir} with weak score={_final_score:.0f}<{_scorer_conflict_max}")
+                    self._watcher_total_gate_blocked += 1
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_SCORER_CONFLICT',
+                                      reason=f'Scorer {_scorer_dir} opposes trigger {_trigger_dir}, score {_final_score:.0f} < {_scorer_conflict_max}',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE G2c: RSI Extreme Guard (NEW Mar-10) ---
+                # Don't buy PEs at oversold extremes (bounce imminent) or CEs at
+                # overbought extremes (pullback imminent). IndiGo bought PE at RSI=28
+                # right at the V-bottom.
+                _rsi_pe_max = BREAKOUT_WATCHER.get('rsi_extreme_pe_max', 25)
+                _rsi_ce_min = BREAKOUT_WATCHER.get('rsi_extreme_ce_min', 75)
+                _rsi_val = _data.get('rsi_14', 50)
+                _rsi_blocks = False
+                if direction == 'SELL' and _rsi_val < _rsi_pe_max:
+                    _rsi_blocks = True
+                    self._wlog(f"  BLOCKED(G2c-RSI): {_stock_name} SELL/PE with RSI={_rsi_val:.0f} < {_rsi_pe_max} — oversold bounce risk")
+                elif direction == 'BUY' and _rsi_val > _rsi_ce_min:
+                    _rsi_blocks = True
+                    self._wlog(f"  BLOCKED(G2c-RSI): {_stock_name} BUY/CE with RSI={_rsi_val:.0f} > {_rsi_ce_min} — overbought pullback risk")
+                if _rsi_blocks:
+                    self._watcher_total_gate_blocked += 1
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_RSI_EXTREME',
+                                      reason=f'RSI extreme: RSI={_rsi_val:.0f} direction={direction}',
+                                      direction=direction)
+                    continue
+                
+                # --- GATE G2d: Exhaustion Index (NEW Mar-10) ---
+                # Statistical composite of 4 signals to detect "chasing a done move".
+                # Each component is 0-1, weighted to sum to 0-100 Exhaustion Index (EI).
+                #
+                # Components:
+                #   A) Intraday move from open (weight 35): big drop/rally already done
+                #   B) Trigger freshness ratio (weight 25): trigger_move / intraday_move
+                #      Low ratio = tiny trigger after massive move = chasing crumbs
+                #   C) Position in day range (weight 25): near day extreme = exhausted
+                #   D) RSI extreme proximity (weight 15): oversold/overbought confirmation
+                #
+                # IndiGo PE at 10:12: open=4500, ltp=4348, intraday=-3.4%
+                #   A) 3.4%/5% = 0.68 * 35 = 23.8
+                #   B) trigger=-0.3%, ratio=0.09, (1-0.09) * 25 = 22.8
+                #   C) pos_in_range ≈ 0.15, (1-0.15) * 25 = 21.3
+                #   D) RSI=28, (30-28)/30 * 15 = 1.0
+                #   EI = 68.9 → BLOCKED (>60)
+                _open_price = _data.get('open', 0)
+                _cur_ltp = _data.get('ltp', 0)
+                _day_high = _data.get('high', _cur_ltp)
+                _day_low = _data.get('low', _cur_ltp)
+                _rsi_ei = _data.get('rsi_14', 50)
+                _intraday_move = ((_cur_ltp - _open_price) / _open_price * 100) if _open_price > 0 else 0
+                _day_range = _day_high - _day_low if _day_high > _day_low else 0.01
+                _pos_in_range = max(0, min(1, (_cur_ltp - _day_low) / _day_range))
+                _trig_abs = abs(_move_pct)
+                _intra_abs = abs(_intraday_move)
+                _trig_ratio = min(_trig_abs / _intra_abs, 1.0) if _intra_abs > 0.01 else 1.0
+                
+                # Component A: Intraday move magnitude (directional — only counts if move is in trigger direction)
+                if direction == 'SELL':
+                    _comp_a = min(abs(min(_intraday_move, 0)) / 5.0, 1.0)  # Capped at 5%
+                    _comp_c = 1.0 - _pos_in_range  # Near day LOW = exhausted for SELL
+                    _comp_d = max(0, (30 - _rsi_ei) / 30) if _rsi_ei < 30 else 0  # Oversold
+                else:
+                    _comp_a = min(max(_intraday_move, 0) / 5.0, 1.0)
+                    _comp_c = _pos_in_range  # Near day HIGH = exhausted for BUY
+                    _comp_d = max(0, (_rsi_ei - 70) / 30) if _rsi_ei > 70 else 0  # Overbought
+                
+                # Component B: Trigger freshness (lower = chasing crumbs)
+                _comp_b = 1.0 - _trig_ratio  # 1.0 = 100% chasing, 0.0 = trigger IS the move
+                
+                # Weighted Exhaustion Index (0-100)
+                _ei = (_comp_a * 35) + (_comp_b * 25) + (_comp_c * 25) + (_comp_d * 15)
+                _ei = round(_ei, 1)
+                
+                # Store for logging in GATE CHECK line
+                _ei_detail = (f'EI={_ei} [intra={_intraday_move:+.1f}%({_comp_a:.2f}) '
+                              f'trig={_move_pct:+.1f}%/{_intra_abs:.1f}%({_comp_b:.2f}) '
+                              f'range={_pos_in_range:.0%}({_comp_c:.2f}) '
+                              f'RSI={_rsi_ei:.0f}({_comp_d:.2f})]')
+                
+                _ei_threshold = BREAKOUT_WATCHER.get('exhaustion_index_block', 60)
+                if _ei > _ei_threshold:
+                    self._wlog(f"  BLOCKED(G2d-EXHAUST): {_stock_name} {_ei_detail}")
+                    self._watcher_total_gate_blocked += 1
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_EXHAUSTION',
+                                      reason=f'Exhaustion Index {_ei} > {_ei_threshold}: {_ei_detail}',
+                                      direction=direction)
+                    continue
+                elif _ei > 40:
+                    # Log warning for borderline cases (visible but not blocking)
+                    self._wlog(f"  ⚠️ EXHAUST-WARN: {_stock_name} {_ei_detail} (below {_ei_threshold} threshold)")
                 
                 # --- GATE G3: XGB Move Probability Floor (watcher-specific) ---
                 # XGB must show minimum conviction that a move (up OR down) will happen.
-                # Watcher threshold: 0.55 (tightened from 0.40 — Mar-5 data shows
-                # all winners had P(move)>=0.568, all IV-crush losers had <=0.52).
-                _G3_MIN_MOVE_PROB = 0.55
+                # Relax when breadth confirms direction (crash day PEs don't need XGB to agree)
+                _breadth_confirms_dir = (
+                    (direction == 'SELL' and _market_breadth == 'BEARISH')
+                    or (direction == 'BUY' and _market_breadth == 'BULLISH')
+                )
+                _G3_MIN_MOVE_PROB = 0.30 if _breadth_confirms_dir else 0.35
                 try:
                     _xgb_ml = _ml_results.get(_sym, {})
                     _xgb_move_prob = _xgb_ml.get('ml_move_prob', 0)
@@ -1747,6 +1937,24 @@ class AutonomousTrader:
                 except Exception:
                     pass
                 
+                # --- GATE G5: Opening period cap (NEW Mar-10) ---
+                # Limit trades before 10:00 to prevent concentrated risk at open
+                _max_before_10 = BREAKOUT_WATCHER.get('max_trades_before_1000', 3)
+                try:
+                    from datetime import datetime as _dt_g5
+                    _now_g5 = _dt_g5.now()
+                    if _now_g5.hour < 10:
+                        _open_trades = sum(1 for t in self.tools.paper_positions
+                                         if t.get('status') == 'OPEN'
+                                         and 'WATCHER' in t.get('setup_type', '').upper() + t.get('rationale', '').upper()
+                                         and t.get('timestamp', '').startswith(_now_g5.strftime('%Y-%m-%d')))
+                        if _open_trades >= _max_before_10:
+                            self._wlog(f"  BLOCKED(G5-OPEN_CAP): {_stock_name} already {_open_trades}/{_max_before_10} watcher trades before 10:00")
+                            self._watcher_total_gate_blocked += 1
+                            continue
+                except Exception:
+                    pass
+                
                 # --- GATE H: Position limit (regime-aware, same as ELITE) ---
                 active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
                 if _breadth == 'MIXED':
@@ -1773,15 +1981,15 @@ class AutonomousTrader:
                     'ml_move_prob': _elite_ml.get('ml_move_prob', 0),
                     'ml_confidence': _elite_ml.get('ml_confidence', 0),
                     'xgb_model': {
-                        'signal': _elite_ml.get('ml_signal', 'UNKNOWN'),
+                        'signal': 'N/A',
                         'move_prob': _elite_ml.get('ml_move_prob', 0),
-                        'prob_up': _elite_ml.get('ml_prob_up', 0),
-                        'prob_down': _elite_ml.get('ml_prob_down', 0),
+                        'prob_up': 0,
+                        'prob_down': 0,
                         'prob_flat': _elite_ml.get('ml_prob_flat', 0),
-                        'direction_bias': _elite_ml.get('ml_direction_bias', 0),
+                        'direction_bias': 0,
                         'confidence': _elite_ml.get('ml_confidence', 0),
                         'score_boost': _elite_ml.get('ml_score_boost', 0),
-                        'direction_hint': _elite_ml.get('ml_direction_hint', 'NEUTRAL'),
+                        'direction_hint': 'NEUTRAL',
                         'model_type': _elite_ml.get('ml_model_type', 'unknown'),
                         'sizing_factor': _elite_ml.get('ml_sizing_factor', 1.0),
                     },
@@ -1805,7 +2013,9 @@ class AutonomousTrader:
                 # --- GATE I: ORB-specific tightening (higher bar for ORB_BREAKOUT) ---
                 if _setup_type == 'ORB_BREAKOUT':
                     _orb_min_score = BREAKOUT_WATCHER.get('orb_min_score', 45)
-                    _orb_min_move = BREAKOUT_WATCHER.get('orb_min_move_prob', 0.65)
+                    _orb_min_move_base = BREAKOUT_WATCHER.get('orb_min_move_prob', 0.65)
+                    # Relax ORB P(move) when breadth confirms direction
+                    _orb_min_move = 0.50 if _breadth_confirms_dir else _orb_min_move_base
                     _xgb_mp = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
                     if _final_score < _orb_min_score:
                         self._wlog(f"  BLOCKED(I-ORB_SCORE): {_stock_name} ORB score={_final_score:.0f} < {_orb_min_score}")
@@ -1919,8 +2129,15 @@ class AutonomousTrader:
         """Check open WATCHER positions for momentum reversal and exit.
         
         Detects when a spike has peaked (for CE/BUY trades) or a crater has
-        bottomed (for PE/SELL trades) by tracking the underlying's extreme since
-        entry and triggering exit on reversal.
+        bottomed (for PE/SELL trades) using multi-signal confirmation:
+        
+        Signals: price reversal, volume dry-up, momentum decay, pressure shift,
+                 reversal acceleration, option premium reversal.
+        
+        Adaptive thresholds:
+        - Profit-tiered: bigger gains = tighter stops (protect large profits)
+        - CE/PE asymmetric: CE dies faster on reversal, PE bounces are sharp
+        - Multi-signal: more confirmations = lower threshold needed
         
         After exit, cooldown is BYPASSED — the watcher can immediately re-enter
         if another spike/crater forms on the same symbol.
@@ -1967,20 +2184,27 @@ class AutonomousTrader:
                 continue
             
             _direction = _t.get('direction', 'BUY')
+            _entry_price = _t.get('avg_price', 0)
+            _opt_type = 'CE' if 'CE' in _opt_sym.upper() else 'PE' if 'PE' in _opt_sym.upper() else '?'
             self._watcher_momentum_tracker[_opt_sym] = {
                 'underlying': _ul,
                 'direction': _direction,
+                'opt_type': _opt_type,
                 'entry_ul_price': _ul_ltp,
+                'entry_opt_price': _entry_price,
                 'entry_time': _entry_epoch,
                 'peak_price': _ul_ltp,
                 'trough_price': _ul_ltp,
+                'peak_opt_price': _entry_price,  # Track option premium peak
                 # Multi-signal tracking
                 'price_samples': [(_wme_time.time(), _ul_ltp)],
+                'opt_price_samples': [(_wme_time.time(), _entry_price)],  # Option premium history
                 'vol_samples': [],       # (timestamp, cumulative_volume)
                 'peak_momentum': 0.0,    # Max price velocity seen (%/s, direction-adjusted)
+                'reversal_samples': [],  # Track reversal speed over time for acceleration detection
             }
             _ul_short = _ul.replace('NSE:', '')
-            print(f"   🌊 WME: Tracking {_ul_short} ({_direction}) UL=₹{_ul_ltp:.2f} opt={_opt_sym.split(':')[-1]}")
+            print(f"   🌊 WME: Tracking {_ul_short} ({_direction}/{_opt_type}) UL=₹{_ul_ltp:.2f} opt={_opt_sym.split(':')[-1]} entry=₹{_entry_price:.2f}")
         
         # Clean tracker: remove entries whose positions are no longer open
         _active_opt_syms = {t['symbol'] for t in _watcher_trades}
@@ -1991,19 +2215,22 @@ class AutonomousTrader:
         if not self._watcher_momentum_tracker:
             return
         
-        # --- Get underlying QUOTES via WebSocket cache (zero API calls) ---
-        # Quotes include volume, buy_quantity, sell_quantity — needed for multi-signal detection
+        # --- Get underlying + option QUOTES via WebSocket cache ---
         _all_ul = list({v['underlying'] for v in self._watcher_momentum_tracker.values()})
+        _all_opts = list(self._watcher_momentum_tracker.keys())
         if not self.tools.ticker or not self.tools.ticker.connected:
             return
         _ul_quotes = self.tools.ticker.get_quote_batch(_all_ul)
         _ul_prices = {sym: q.get('last_price', 0) for sym, q in _ul_quotes.items()}
-        # Fallback: symbols with quote but no LTP (shouldn't happen, but defensive)
+        # Get option prices for premium tracking
+        _opt_prices_batch = self.tools.ticker.get_ltp_batch(_all_opts)
+        # Fallback for missing UL prices
         for _sym in _all_ul:
             if _sym not in _ul_prices or _ul_prices[_sym] <= 0:
                 _ltp_batch = self.tools.ticker.get_ltp_batch([_sym])
                 _ul_prices[_sym] = _ltp_batch.get(_sym, 0)
         
+        # --- Load config parameters ---
         _reversal_pct = _cfg.get('reversal_pct', 0.5) / 100
         _confirmed_rev_pct = _cfg.get('confirmed_reversal_pct', 0.25) / 100
         _partial_rev_pct = _cfg.get('partial_confirm_reversal_pct', 0.35) / 100
@@ -2016,7 +2243,21 @@ class AutonomousTrader:
         _mom_decay_thresh = _cfg.get('momentum_decay_threshold', 0.70)
         _pressure_enabled = _cfg.get('pressure_shift_enabled', True)
         _pressure_ratio = _cfg.get('pressure_shift_ratio', 1.5)
-        _sample_window = _cfg.get('sample_window_seconds', 90)
+        _sample_window = _cfg.get('sample_window_seconds', 180)
+        _premium_rev_pct = _cfg.get('premium_reversal_pct', 8.0) / 100
+        _premium_rev_confirmed = _cfg.get('premium_reversal_confirmed_pct', 5.0) / 100
+        _profit_tiers = _cfg.get('profit_tiers', [])
+        _ce_mult = _cfg.get('ce_reversal_multiplier', 0.85)
+        _pe_mult = _cfg.get('pe_reversal_multiplier', 0.90)
+        _accel_enabled = _cfg.get('reversal_accel_enabled', True)
+        _accel_threshold = _cfg.get('reversal_accel_threshold', 1.5)
+        # --- Trend Shield params ---
+        _retrace_enabled = _cfg.get('retracement_floor_enabled', True)
+        _ul_retrace_factor = _cfg.get('ul_retracement_factor', 0.382)
+        _prem_retrace_factor = _cfg.get('premium_retracement_factor', 0.382)
+        _min_prem_gain = _cfg.get('min_premium_gain_pct', 5.0)
+        _grace_seconds = _cfg.get('armed_grace_seconds', 30)
+        _deepen_mult = _cfg.get('armed_deepen_multiplier', 1.5)
         _now = _wme_time.time()
         _exits_to_process = []
         
@@ -2028,27 +2269,39 @@ class AutonomousTrader:
                 continue
             
             _direction = _track['direction']
+            _opt_type = _track.get('opt_type', '?')
             _entry_ul = _track['entry_ul_price']
+            _entry_opt = _track.get('entry_opt_price', 0)
             _ul_quote = _ul_quotes.get(_ul, {})
+            _opt_ltp = _opt_prices_batch.get(_opt_sym, 0)
             
             # ── ALWAYS collect samples (even before min_hold) to build baselines ──
             _track['price_samples'].append((_now, _ul_ltp))
             _cum_vol = _ul_quote.get('volume', 0)
             if _cum_vol > 0:
                 _track['vol_samples'].append((_now, _cum_vol))
+            if _opt_ltp > 0:
+                _track['opt_price_samples'].append((_now, _opt_ltp))
             
             # Trim samples to rolling window
             _cutoff = _now - _sample_window
             _track['price_samples'] = [(t, p) for t, p in _track['price_samples'] if t >= _cutoff]
             _track['vol_samples'] = [(t, v) for t, v in _track['vol_samples'] if t >= _cutoff]
+            _track['opt_price_samples'] = [(t, p) for t, p in _track.get('opt_price_samples', []) if t >= _cutoff]
+            # Keep reversal samples shorter (60s window)
+            _track['reversal_samples'] = [(t, r) for t, r in _track.get('reversal_samples', []) if t >= _now - 60]
             
-            # ── Update peak/trough price ──
+            # ── Update peak/trough price (underlying) ──
             if _direction == 'BUY':
                 if _ul_ltp > _track['peak_price']:
                     _track['peak_price'] = _ul_ltp
             elif _direction == 'SELL':
                 if _ul_ltp < _track['trough_price']:
                     _track['trough_price'] = _ul_ltp
+            
+            # ── Update option premium peak ──
+            if _opt_ltp > 0 and _opt_ltp > _track.get('peak_opt_price', 0):
+                _track['peak_opt_price'] = _opt_ltp
             
             # ── Update peak momentum (max velocity seen over any ~15s window) ──
             _ps = _track['price_samples']
@@ -2065,7 +2318,7 @@ class AutonomousTrader:
                     elif _direction == 'SELL' and _vel < _track['peak_momentum']:
                         _track['peak_momentum'] = _vel  # Negative for SELL
             
-            # ── Min hold time: let the trade breathe (but data is already collected above) ──
+            # ── Min hold time: let the trade breathe ──
             if (_now - _track['entry_time']) < _min_hold_s:
                 continue
             
@@ -2083,29 +2336,53 @@ class AutonomousTrader:
             if _favorable < _min_move_pct:
                 continue
             
-            # ── Compute current reversal from peak/trough ──
+            # ── TREND SHIELD Gate 1: Min premium gain floor ──
+            # Don't WME-exit trades with tiny premium gains — nothing worth protecting.
+            # Let exit_manager handle normally, giving the trade room to develop.
+            _cur_prem_gain = 0.0
+            if _entry_opt > 0 and _opt_ltp > 0:
+                _cur_prem_gain = ((_opt_ltp - _entry_opt) / _entry_opt) * 100
+            _peak_prem_gain = 0.0
+            if _entry_opt > 0:
+                _peak_opt_for_gate = _track.get('peak_opt_price', _entry_opt)
+                _peak_prem_gain = ((_peak_opt_for_gate - _entry_opt) / _entry_opt) * 100
+            if _peak_prem_gain < _min_prem_gain:
+                # Tiny gain — clear any armed state and skip
+                _track.pop('wme_armed_at', None)
+                continue
+            
+            # ── Compute current reversal from peak/trough (underlying) ──
             if _direction == 'BUY':
                 _rev = (_track['peak_price'] - _ul_ltp) / _track['peak_price'] if _track['peak_price'] > 0 else 0
             else:
                 _rev = (_ul_ltp - _track['trough_price']) / _track['trough_price'] if _track['trough_price'] > 0 else 0
             
+            # Record reversal for acceleration detection
+            _track.setdefault('reversal_samples', []).append((_now, _rev))
+            
+            # ── Compute option premium reversal from peak ──
+            _peak_opt = _track.get('peak_opt_price', _entry_opt)
+            _opt_rev = 0.0
+            if _opt_ltp > 0 and _peak_opt > 0:
+                _opt_rev = (_peak_opt - _opt_ltp) / _peak_opt  # How much premium dropped from peak
+            
+            # ── Compute option premium gain from entry ──
+            _opt_gain_pct = 0.0
+            if _entry_opt > 0 and _peak_opt > 0:
+                _opt_gain_pct = ((_peak_opt - _entry_opt) / _entry_opt) * 100  # % gain at peak
+            
             # ════════════════════════════════════════════════
             # MULTI-SIGNAL REVERSAL CONFIRMATION
-            # Mirrors watcher entry: spike, volume, grind → now: price reversal, volume dry-up, momentum decay, pressure shift
             # ════════════════════════════════════════════════
             _confirmations = 0
             _signal_reasons = []
             
             # ── Signal 1: VOLUME DRY-UP ──
-            # Compare recent volume rate vs average rate over tracking period.
-            # Spikes have explosive volume; when volume drops to < 30% of avg, the spike is over.
             _vs = _track['vol_samples']
             if len(_vs) >= 4:
-                # Average volume rate over all tracked data
                 _total_dt = _vs[-1][0] - _vs[0][0]
-                if _total_dt > 10:  # Need at least 10s of data
+                if _total_dt > 10:
                     _avg_vol_rate = (_vs[-1][1] - _vs[0][1]) / _total_dt
-                    # Recent volume rate (last ~15s)
                     _rv_idx = max(0, len(_vs) - 4)
                     _recent_dt = _vs[-1][0] - _vs[_rv_idx][0]
                     if _recent_dt > 0 and _avg_vol_rate > 0:
@@ -2115,7 +2392,6 @@ class AutonomousTrader:
                             _signal_reasons.append('VOL_DRYUP')
             
             # ── Signal 2: MOMENTUM DECAY ──
-            # If price velocity has decayed to < 30% of peak, or reversed direction entirely.
             if len(_ps) >= 4 and abs(_track['peak_momentum']) > 1e-8:
                 _p_now = _ps[-1]
                 _p_prev_idx = max(0, len(_ps) - 4)
@@ -2125,11 +2401,9 @@ class AutonomousTrader:
                     _cur_vel = (_p_now[1] - _p_prev[1]) / _p_prev[1] / _pdt
                     _peak_vel = _track['peak_momentum']
                     if _direction == 'BUY':
-                        # Momentum reversed (velocity turned negative) = full decay
                         if _cur_vel <= 0:
                             _confirmations += 1
                             _signal_reasons.append('MOM_REVERSED')
-                        # Momentum decayed to < 30% of peak
                         elif _peak_vel > 0 and _cur_vel < _peak_vel * (1 - _mom_decay_thresh):
                             _confirmations += 1
                             _signal_reasons.append('MOM_DECAY')
@@ -2142,7 +2416,6 @@ class AutonomousTrader:
                             _signal_reasons.append('MOM_DECAY')
             
             # ── Signal 3: PRESSURE SHIFT (buy/sell quantity imbalance) ──
-            # If opposing side's total order quantity dominates → participants are exiting.
             if _pressure_enabled:
                 _buy_q = _ul_quote.get('buy_quantity', 0)
                 _sell_q = _ul_quote.get('sell_quantity', 0)
@@ -2154,21 +2427,121 @@ class AutonomousTrader:
                         _confirmations += 1
                         _signal_reasons.append('BUY_PRESSURE')
             
-            # ── Adaptive reversal threshold ──
-            if _confirmations >= 2:
-                _effective_rev = _confirmed_rev_pct   # 0.25% — high confidence reversal
-            elif _confirmations == 1:
-                _effective_rev = _partial_rev_pct     # 0.35% — medium confidence
-            else:
-                _effective_rev = _reversal_pct        # 0.50% — price-only (original)
+            # ── Signal 4: REVERSAL ACCELERATION (NEW) ──
+            # If the reversal is getting faster over consecutive checks, it's accelerating
+            if _accel_enabled:
+                _rsamps = _track.get('reversal_samples', [])
+                if len(_rsamps) >= 4:
+                    # Compare reversal speed in last half vs first half of samples
+                    _mid = len(_rsamps) // 2
+                    _first_half = _rsamps[:_mid]
+                    _second_half = _rsamps[_mid:]
+                    if len(_first_half) >= 2 and len(_second_half) >= 2:
+                        _fh_dt = _first_half[-1][0] - _first_half[0][0]
+                        _sh_dt = _second_half[-1][0] - _second_half[0][0]
+                        if _fh_dt > 0 and _sh_dt > 0:
+                            _fh_speed = abs(_first_half[-1][1] - _first_half[0][1]) / _fh_dt
+                            _sh_speed = abs(_second_half[-1][1] - _second_half[0][1]) / _sh_dt
+                            if _fh_speed > 0 and _sh_speed > _fh_speed * _accel_threshold:
+                                _confirmations += 1
+                                _signal_reasons.append('REV_ACCEL')
             
-            # ── Check if reversal exceeds adaptive threshold ──
+            # ── Determine adaptive reversal threshold ──
+            # Start with base thresholds
+            if _confirmations >= 2:
+                _effective_rev = _confirmed_rev_pct      # 0.25%
+                _effective_prem_rev = _premium_rev_confirmed  # 5%
+            elif _confirmations == 1:
+                _effective_rev = _partial_rev_pct         # 0.35%
+                _effective_prem_rev = (_premium_rev_pct + _premium_rev_confirmed) / 2  # 6.5%
+            else:
+                _effective_rev = _reversal_pct            # 0.50%
+                _effective_prem_rev = _premium_rev_pct    # 8%
+            
+            # ── TREND SHIELD Gate 2: Fibonacci retracement floor ──
+            # Scale reversal threshold with move size: big moves get proportionally more room.
+            # A stock up +5% gets 1.91% pullback room (5% × 0.382) instead of fixed 0.5%.
+            if _retrace_enabled and _favorable > 0:
+                _fib_ul_floor = _favorable * _ul_retrace_factor     # e.g. 5% move × 0.382 = 1.91%
+                _effective_rev = max(_effective_rev, _fib_ul_floor)
+            if _retrace_enabled and _opt_gain_pct > 0:
+                _fib_prem_floor = (_opt_gain_pct / 100) * _prem_retrace_factor  # e.g. 20% gain × 0.382 = 7.64%
+                _effective_prem_rev = max(_effective_prem_rev, _fib_prem_floor)
+            
+            # ── Profit-tiered override: bigger profits = tighter stops ──
+            for _tier in sorted(_profit_tiers, key=lambda x: -x.get('min_gain_pct', 0)):
+                if _opt_gain_pct >= _tier.get('min_gain_pct', 999):
+                    _effective_rev = min(_effective_rev, _tier.get('reversal_pct', 99) / 100)
+                    _effective_prem_rev = min(_effective_prem_rev, _tier.get('premium_rev_pct', 99) / 100)
+                    break
+            
+            # ── CE/PE asymmetric multiplier ──
+            if _opt_type == 'CE':
+                _effective_rev *= _ce_mult    # CE: tighter (0.85x)
+                _effective_prem_rev *= _ce_mult
+            elif _opt_type == 'PE':
+                _effective_rev *= _pe_mult    # PE: tighter (0.90x)
+                _effective_prem_rev *= _pe_mult
+            
+            # ── Check exit conditions ──
+            _exit_reason = None
+            
+            # Check 1: Underlying reversal from peak/trough
             if _rev >= _effective_rev:
-                _exits_to_process.append((_opt_sym, _track, _ul_ltp, _rev * 100, _confirmations, _signal_reasons, _effective_rev * 100))
+                _exit_reason = 'UL_REVERSAL'
+            
+            # Check 2: Option premium reversal from peak (independent of underlying)
+            # This catches IV crush: underlying holds but premium drops
+            if not _exit_reason and _opt_rev >= _effective_prem_rev:
+                _exit_reason = 'PREMIUM_REVERSAL'
+            
+            # ── TREND SHIELD Gate 3: Armed grace period (V-shape filter) ──
+            # Instead of instant exit, enter ARMED state. Wait for grace period.
+            # If price recovers → DISARM (it was just a healthy pullback).
+            # If reversal deepens beyond threshold → exit immediately.
+            if _exit_reason:
+                _armed_at = _track.get('wme_armed_at', None)
+                if _armed_at is None:
+                    # First trigger → ARM the exit, don't fire yet
+                    _track['wme_armed_at'] = _now
+                    _track['wme_armed_reason'] = _exit_reason
+                    _track['wme_armed_rev'] = _effective_rev
+                    _track['wme_armed_prem_rev'] = _effective_prem_rev
+                    _ul_short = _track['underlying'].replace('NSE:', '')
+                    print(f"   ⏳ WME ARMED: {_ul_short} ({_track.get('opt_type','?')}) — waiting {_grace_seconds}s grace for recovery")
+                    print(f"      UL rev: {_rev*100:.2f}% (thresh {_effective_rev*100:.2f}%) | Prem rev: {_opt_rev*100:.1f}% (thresh {_effective_prem_rev*100:.1f}%)")
+                    continue  # Don't exit yet — wait for next check
+                else:
+                    _elapsed_armed = _now - _armed_at
+                    # Check if reversal deepened dangerously (1.5× threshold → exit NOW)
+                    _armed_rev_thresh = _track.get('wme_armed_rev', _effective_rev)
+                    _armed_prem_thresh = _track.get('wme_armed_prem_rev', _effective_prem_rev)
+                    _deepened = (_rev >= _armed_rev_thresh * _deepen_mult or 
+                                 _opt_rev >= _armed_prem_thresh * _deepen_mult)
+                    if _deepened:
+                        _exit_reason = _track.get('wme_armed_reason', _exit_reason) + '_DEEP'
+                        # Fall through to exit
+                    elif _elapsed_armed < _grace_seconds:
+                        continue  # Still within grace period, keep waiting
+                    # else: grace expired, reversal held → proceed with exit
+                _exits_to_process.append((_opt_sym, _track, _ul_ltp, _opt_ltp, _rev * 100, _opt_rev * 100,
+                                          _opt_gain_pct, _confirmations, _signal_reasons,
+                                          _effective_rev * 100, _effective_prem_rev * 100, _exit_reason))
+            else:
+                # Exit conditions NOT met → DISARM if previously armed (price recovered!)
+                if _track.get('wme_armed_at') is not None:
+                    _ul_short = _track['underlying'].replace('NSE:', '')
+                    print(f"   ✅ WME DISARMED: {_ul_short} ({_track.get('opt_type','?')}) — price recovered during grace! Continuing to hold.")
+                    _track.pop('wme_armed_at', None)
+                    _track.pop('wme_armed_reason', None)
+                    _track.pop('wme_armed_rev', None)
+                    _track.pop('wme_armed_prem_rev', None)
         
         # --- Process momentum exits ---
-        for _opt_sym, _track, _ul_ltp, _rev_pct, _n_confirms, _sig_reasons, _eff_rev in _exits_to_process:
+        for (_opt_sym, _track, _ul_ltp, _opt_ltp_cached, _rev_pct, _prem_rev_pct,
+             _opt_gain_pct, _n_confirms, _sig_reasons, _eff_rev, _eff_prem_rev, _exit_reason) in _exits_to_process:
             _direction = _track['direction']
+            _opt_type = _track.get('opt_type', '?')
             _ul = _track['underlying']
             _ul_short = _ul.replace('NSE:', '')
             
@@ -2181,7 +2554,7 @@ class AutonomousTrader:
                 self._watcher_momentum_tracker.pop(_opt_sym, None)
                 continue
             
-            # Get current option premium
+            # Get current option premium (fresh, not cached)
             try:
                 if self.tools.ticker and self.tools.ticker.connected:
                     _opt_prices = self.tools.ticker.get_ltp_batch([_opt_sym])
@@ -2199,7 +2572,6 @@ class AutonomousTrader:
             _entry_price = _trade['avg_price']
             _qty = _trade['quantity']
             _pnl = (_opt_ltp - _entry_price) * _qty
-            from execution_guard import calc_brokerage
             _pnl -= calc_brokerage(_entry_price, _opt_ltp, _qty)
             
             # Only exit if option is in profit (don't cut losers — let exit manager handle)
@@ -2210,13 +2582,14 @@ class AutonomousTrader:
             _extreme_val = _track['peak_price'] if _direction == 'BUY' else _track['trough_price']
             _trigger_label = 'spike peaked' if _direction == 'BUY' else 'crater bottomed'
             _signals_str = '+'.join(_sig_reasons) if _sig_reasons else 'PRICE_ONLY'
+            _peak_opt = _track.get('peak_opt_price', _entry_price)
             
-            print(f"\n🌊 WATCHER MOMENTUM EXIT: {_ul_short}")
-            print(f"   Direction: {_direction} | Trigger: {_trigger_label}")
-            print(f"   Signals: {_signals_str} ({_n_confirms}/3 confirmed) → threshold {_eff_rev:.2f}%")
-            print(f"   Underlying: entry ₹{_track['entry_ul_price']:.2f} → {_extreme_label} ₹{_extreme_val:.2f} → now ₹{_ul_ltp:.2f} ({_rev_pct:.2f}% reversal)")
-            print(f"   Option: {_opt_sym.split(':')[-1]} — entry ₹{_entry_price:.2f} → exit ₹{_opt_ltp:.2f}")
-            print(f"   P&L: ₹{_pnl:+,.0f}")
+            print(f"\n🌊 WATCHER MOMENTUM EXIT: {_ul_short} ({_opt_type})")
+            print(f"   Reason: {_exit_reason} | Direction: {_direction} | Trigger: {_trigger_label}")
+            print(f"   Signals: {_signals_str} ({_n_confirms}/4 confirmed)")
+            print(f"   UL: entry ₹{_track['entry_ul_price']:.2f} → {_extreme_label} ₹{_extreme_val:.2f} → now ₹{_ul_ltp:.2f} ({_rev_pct:.2f}% rev, thresh {_eff_rev:.2f}%)")
+            print(f"   Premium: entry ₹{_entry_price:.2f} → peak ₹{_peak_opt:.2f} → now ₹{_opt_ltp:.2f} ({_prem_rev_pct:.1f}% drop, thresh {_eff_prem_rev:.1f}%)")
+            print(f"   Peak gain: {_opt_gain_pct:.0f}% | P&L: ₹{_pnl:+,.0f}")
             
             # Execute exit
             self.tools.update_trade_status(_opt_sym, 'WATCHER_MOMENTUM_EXIT', _opt_ltp, _pnl)
@@ -2530,77 +2903,42 @@ class AutonomousTrader:
                 continue
 
             # At this point: anomaly CONFIRMS trade direction (6 surviving cases: 3,5,9,11,15,17)
-            # ── Step C: XGB alignment decides trade type ──
-            _xgb_aligns = ((_xgb_signal == 'UP' and direction == 'BUY') or
-                           (_xgb_signal == 'DOWN' and direction == 'SELL'))
+            # ── Step C: XGB direction removed — all confirmed anomalies are GMM trades ──
 
             # ── Confirm score floor: anomaly must be strong enough ──
             _min_confirm = self._down_risk_cfg.get('min_confirm_score', 0.0)
             if _confirm_score < _min_confirm:
                 continue  # Anomaly too weak — borderline flag
 
-            if _xgb_aligns:
-                # Cases 3, 11: Anomaly + XGB + Titan TRIPLE ALIGN → ALL_AGREE
-                # [TIGHTENED Mar 6] Direction-specific GMM confirm score floors
-                # BUY needs strong Down_Flag (bounce ≥ 0.30), SELL needs strong UP_Flag (crash ≥ 0.30)
-                if direction == 'BUY':
-                    _aa_min_confirm = self._down_risk_cfg.get('all_agree_min_down_score', 0.30)
-                else:
-                    _aa_min_confirm = self._down_risk_cfg.get('all_agree_min_up_score', 0.30)
-                if _confirm_score < _aa_min_confirm:
-                    sym_clean_tmp = sym.replace('NSE:', '')
-                    print(f"      ⛔ ALL_AGREE BLOCKED: {sym_clean_tmp} — {_confirm_tag}={_confirm_score:.3f} < {_aa_min_confirm} (weak GMM signal)")
-                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'ALL_AGREE_WEAK_GMM',
-                                      reason=f"{_confirm_tag}={_confirm_score:.3f} < {_aa_min_confirm} floor",
-                                      direction=direction)
-                    continue
-                # [TIGHTENED Mar 2] Tech floor: pre_score must be ≥ 45 to qualify as ALL_AGREE
-                _aa_p_score = pre_scores.get(sym, 0)
-                if _aa_p_score < 45:
-                    sym_clean_tmp = sym.replace('NSE:', '')
-                    print(f"      ⛔ ALL_AGREE BLOCKED: {sym_clean_tmp} — tech={_aa_p_score:.0f} < 45 (weak technical setup)")
-                    self._log_decision(cycle_time, sym, _aa_p_score, 'ALL_AGREE_WEAK_TECH',
-                                      reason=f"tech={_aa_p_score:.0f} < 45 floor despite XGB+GMM+Titan align",
-                                      direction=direction)
-                    continue
-                trade_type = 'ALL_AGREE'
-                gmm_action = 'BOOST'
-                sym_clean_tmp = sym.replace('NSE:', '')
-                print(f"      ✅ ALL_AGREE: {sym_clean_tmp} — XGB={_xgb_signal} + Titan={direction} + "
-                      f"{_confirm_tag}={_confirm_score:.3f} → BOOST (tech={_aa_p_score:.0f})")
-                self._log_decision(cycle_time, sym, _aa_p_score, 'ALL_AGREE',
-                                  reason=f"XGB={_xgb_signal} + Titan={direction} + {_confirm_tag}={_confirm_score:.3f}",
-                                  direction=direction)
-            else:
-                # Cases 5, 9, 15, 17: Anomaly confirms Titan, XGB opposes/flat → GMM_CONTRARIAN
-                from config import GMM_CONTRARIAN as _contr_cfg
-                _contr_ok = False
-                _contr_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-                if _contr_cfg.get('enabled', False) and _confirm_score >= _contr_cfg.get('min_dr_score', 0.15):
-                    _contr_today = getattr(self, '_dr_flip_trades_today', 0)
-                    _contr_max_day = _contr_cfg.get('max_trades_per_day', 4)
-                    _contr_open = sum(1 for t in (getattr(self.tools, 'paper_positions', []) or [])
-                                     if t.get('setup_type') in ('DR_FLIP', 'GMM_CONTRARIAN') and t.get('status', 'OPEN') == 'OPEN')
-                    _contr_max_concurrent = _contr_cfg.get('max_concurrent_open', 3)
-                    _contr_min_gate = _contr_cfg.get('min_gate_prob', 0.50)
-                    _contr_confidence = ml.get('ml_confidence', 0.0)
+            # Check GMM_CONTRARIAN gates for all anomaly-confirmed trades
+            from config import GMM_CONTRARIAN as _contr_cfg
+            _contr_ok = False
+            _contr_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
+            if _contr_cfg.get('enabled', False) and _confirm_score >= _contr_cfg.get('min_dr_score', 0.15):
+                _contr_today = getattr(self, '_dr_flip_trades_today', 0)
+                _contr_max_day = _contr_cfg.get('max_trades_per_day', 4)
+                _contr_open = sum(1 for t in (getattr(self.tools, 'paper_positions', []) or [])
+                                 if t.get('setup_type') in ('DR_FLIP', 'GMM_CONTRARIAN', 'MODEL_TRACKER') and t.get('status', 'OPEN') == 'OPEN')
+                _contr_max_concurrent = _contr_cfg.get('max_concurrent_open', 3)
+                _contr_min_gate = _contr_cfg.get('min_gate_prob', 0.50)
+                _contr_confidence = ml.get('ml_confidence', 0.0)
 
-                    if (_contr_today < _contr_max_day
-                        and _contr_open < _contr_max_concurrent
-                        and _contr_move_prob >= _contr_min_gate
-                        and _contr_confidence >= 0.45):  # [TIGHTENED Mar 2] Confidence floor — weak ML conviction blocks contrarian
-                        _contr_ok = True
-                        trade_type = 'GMM_CONTRARIAN'
-                        gmm_action = 'BOOST'
-                        sym_clean_tmp = sym.replace('NSE:', '')
-                        print(f"      🎯 GMM_CONTRARIAN: {sym_clean_tmp} — XGB={_xgb_signal} but "
-                              f"{_confirm_tag}={_confirm_score:.3f} confirms {direction} | P(MOVE)={_contr_move_prob:.2f}")
-                        self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'GMM_CONTRARIAN',
-                                          reason=f"XGB={_xgb_signal} but {_confirm_tag}={_confirm_score:.3f} confirms {direction}",
-                                          direction=direction)
+                if (_contr_today < _contr_max_day
+                    and _contr_open < _contr_max_concurrent
+                    and _contr_move_prob >= _contr_min_gate
+                    and _contr_confidence >= 0.45):
+                    _contr_ok = True
+                    trade_type = 'MODEL_TRACKER'
+                    gmm_action = 'BOOST'
+                    sym_clean_tmp = sym.replace('NSE:', '')
+                    print(f"      🎯 MODEL_TRACKER: {sym_clean_tmp} — "
+                          f"{_confirm_tag}={_confirm_score:.3f} confirms {direction} | P(MOVE)={_contr_move_prob:.2f}")
+                    self._log_decision(cycle_time, sym, pre_scores.get(sym, 0), 'MODEL_TRACKER',
+                                      reason=f"{_confirm_tag}={_confirm_score:.3f} confirms {direction}",
+                                      direction=direction)
 
-                if not _contr_ok:
-                    continue  # GMM_CONTRARIAN gates failed → BLOCK
+            if not _contr_ok:
+                continue  # Gates failed → BLOCK
             
             # Gather available ML metrics (Gate model still runs)
             ml_confidence = ml.get('ml_confidence', 0.0)  # Gate confidence
@@ -2610,8 +2948,7 @@ class AutonomousTrader:
             sector = _get_sector_mt(sym_clean)
 
             # ── Gate floor: P(MOVE) must be meaningful ──
-            # [TIGHTENED Mar 2] ALL_AGREE needs higher gate (0.55) since it bypasses scanner
-            _gate_floor = 0.55 if trade_type == 'ALL_AGREE' else 0.40
+            _gate_floor = 0.40
             if ml_move_prob < _gate_floor:
                 continue  # Gate says stock unlikely to move — skip
             
@@ -2634,12 +2971,8 @@ class AutonomousTrader:
             
             smart_score = conviction + safety + technical + move_bonus
             
-            # ── ALIGNMENT BONUS: triple/dual-agree gets extra conviction ──
-            # ALL_AGREE (XGB + Titan + GMM anomaly) = strongest possible signal → +15 pts
-            # GMM_CONTRARIAN (Titan + GMM anomaly, XGB flat/opposed) = strong GMM edge → +10 pts
-            if trade_type == 'ALL_AGREE':
-                smart_score += 15.0
-            elif trade_type == 'GMM_CONTRARIAN':
+            # ── GMM EDGE BONUS: anomaly-confirmed trades get extra conviction ──
+            if trade_type == 'MODEL_TRACKER':
                 smart_score += 10.0
             
             # ── SECTOR BREADTH PENALTY: penalize trades against sector direction ──
@@ -2776,10 +3109,9 @@ class AutonomousTrader:
         if selected:
             buy_count = sum(1 for c in selected if c['direction'] == 'BUY')
             sell_count = len(selected) - buy_count
-            boost_count = sum(1 for c in selected if c['trade_type'] == 'ALL_AGREE')
             sectors_used = set(c['sector'] for c in selected)
             print(f"\n   🧠 MODEL-TRACKER SMART SELECT: {len(selected)} picks from {len(raw_candidates)} candidates")
-            print(f"      Direction mix: {buy_count} BUY(CALL) / {sell_count} SELL(PUT) | ALL_AGREE: {boost_count}")
+            print(f"      Direction mix: {buy_count} BUY(CALL) / {sell_count} SELL(PUT)")
             print(f"      Sectors: {', '.join(sorted(sectors_used))}")
             for i, c in enumerate(selected, 1):
                 _type_tag = f" [{c['trade_type']}]" if c['trade_type'] != 'MODEL_TRACKER' else ''
@@ -2798,11 +3130,8 @@ class AutonomousTrader:
                 _type_label = f" [{trade_type}]" if trade_type != 'MODEL_TRACKER' else ''
                 print(f"\n   📊 MODEL-TRACKER TRADE: {cand['sym_clean']} ({direction}, smart={cand['smart_score']:.1f}){_type_label}")
                 
-                # ALL_AGREE = strongest conviction (all 3 models) → amplified lot sizing
+                # ALL_AGREE removed — unified MODEL_TRACKER lot sizing
                 _lot_mult = 1.0
-                if trade_type == 'ALL_AGREE':
-                    _lot_mult = self._down_risk_cfg.get('all_agree_lot_multiplier', 1.5)
-                    print(f"   🚀 ALL_AGREE AMPLIFIED: {_lot_mult}x lots (strongest conviction)")
                 
                 result = self.tools.place_option_order(
                     underlying=sym,
@@ -2949,38 +3278,11 @@ class AutonomousTrader:
                 _sniper_reject_counts['hold'] += 1
                 continue
             
-            # ── XGB DIRECTION ALIGNMENT CHECK (Sniper) ──
-            # Check actual XGB signal, not gmm_regime. FLAT signals default to
-            # UP regime routing in predictor — treating that as "XGB says UP"
-            # would incorrectly block all SELL snipers when XGB is indecisive.
+            # ── XGB DIRECTION CHECK REMOVED ──
+            # XGB direction (UP/DOWN) no longer used for trade decisions.
+            # Direction comes purely from IntradayScorer. Only P(move) gate remains.
             _sniper_was_flipped = False
-            _xgb_signal = ml.get('ml_signal', 'UNKNOWN')
-            if _xgb_signal in ('FLAT', 'UNKNOWN'):
-                pass  # No XGB directional opinion — proceed on GMM cleanliness + IntradayScorer
-            elif (_xgb_signal == 'UP' and direction == 'SELL') or (_xgb_signal == 'DOWN' and direction == 'BUY'):
-                # XGB actively opposes trade direction
-                # FIXED: use gmm_confirms_direction (clean = confirms XGB), not raw dr_flag
-                sym_clean_tmp = sym.replace('NSE:', '')
-                _sniper_gmm_confirms = ml.get('ml_gmm_confirms_direction', False)
-                if _sniper_gmm_confirms:
-                    # GMM clean (no anomaly) → confirms XGB direction → check ML_OVERRIDE gates → FLIP
-                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym_clean_tmp, ml, dr_score, path='SNIPER', p_score=pre_scores.get(sym, 0))
-                    if not _ovr_ok:
-                        print(f"      🚫 SNIPER ML_OVR BLOCKED: {sym_clean_tmp} — {_ovr_reason} ({self._dr_tag(ml)}={dr_score:.3f})")
-                        _sniper_reject_counts['xgb_block'] += 1
-                        continue
-                    old_direction = direction
-                    direction = 'BUY' if _xgb_signal == 'UP' else 'SELL'
-                    _sniper_was_flipped = True
-                    print(f"      🔄 SNIPER ML_OVERRIDE_WGMM: {sym_clean_tmp} — XGB={_xgb_signal} + GMM clean "
-                          f"({self._dr_tag(ml)}={dr_score:.4f}) → FLIPPED {old_direction}→{direction}")
-                else:
-                    # GMM flagged anomaly → hidden risk in XGB's direction too → unreliable
-                    # Sniper needs full alignment — block on unconfirmed XGB opposition
-                    print(f"      🚫 SNIPER XGB_OPPOSE: {sym_clean_tmp} — XGB={_xgb_signal} vs {direction}, "
-                          f"GMM anomaly ({self._dr_tag(ml)}={dr_score:.3f}) → BLOCK")
-                    _sniper_reject_counts['xgb_block'] += 1
-                    continue
+            _xgb_signal = ml.get('ml_signal', 'UNKNOWN')  # Keep for logging/ml_data only
             
             # XGB gate probability floor
             ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
@@ -2989,28 +3291,9 @@ class AutonomousTrader:
                 _sniper_near_misses.append(f"{sym_diag}(gate={ml_move_prob:.2f}<{min_gate}, {self._dr_tag(ml)}={dr_score:.3f})")
                 continue
             
-            # ── ML DIRECTION CONFLICT FILTER (Sniper) ──
-            from config import ML_DIRECTION_CONFLICT
-            _dir_conflict_cfg = ML_DIRECTION_CONFLICT
+            # ── ML DIRECTION CONFLICT FILTER REMOVED (Sniper) ──
+            # XGB direction (UP/DOWN) no longer used. Only P(move) gate above is kept.
             _xgb_disagrees = False
-            if _dir_conflict_cfg.get('enabled', False):
-                _ml_signal = ml.get('ml_signal', 'UNKNOWN')
-                sym_clean_chk = sym.replace('NSE:', '')
-                if direction == 'BUY' and _ml_signal == 'DOWN' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
-                    _xgb_disagrees = True
-                elif direction == 'SELL' and _ml_signal == 'UP' and ml_move_prob >= _dir_conflict_cfg.get('min_xgb_confidence', 0.55):
-                    _xgb_disagrees = True
-                if _xgb_disagrees:
-                    # For sniper, any XGB disagreement is a hard block (high-conviction trades only)
-                    _gmm_caution = dr_score > _dir_conflict_cfg.get('gmm_caution_threshold', 0.15)
-                    if _gmm_caution:
-                        print(f"      🚫 SNIPER DIRECTION BLOCK: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
-                              f"GMM {self._dr_tag(ml)}={dr_score:.3f} → BOTH disagree")
-                        _sniper_reject_counts['dir_block'] += 1
-                        continue
-                    else:
-                        print(f"      ⚠️ SNIPER XGB CONFLICT: {sym_clean_chk} — XGB={_ml_signal} vs scored={direction}, "
-                              f"GMM clean ({self._dr_tag(ml)}={dr_score:.3f}) → −{_dir_conflict_cfg.get('xgb_penalty', 15)} penalty")
             
             # Compute smart score (same formula as model-tracker)
             p_score = pre_scores.get(sym, 0)
@@ -3019,10 +3302,6 @@ class AutonomousTrader:
             technical = min(p_score, 100) * 0.20
             move_bonus = ml_move_prob * 15.0
             smart_score = conviction + safety + technical + move_bonus
-            
-            # Apply XGB direction conflict penalty for sniper
-            if _dir_conflict_cfg.get('enabled', False) and _xgb_disagrees:
-                smart_score -= _dir_conflict_cfg.get('xgb_penalty', 15)
             
             if smart_score < min_smart:
                 _sniper_reject_counts['smart_low'] += 1
@@ -3271,21 +3550,8 @@ class AutonomousTrader:
             if max_confidence < 1.0 and ml_conf > max_confidence:
                 continue
             
-            # Gate: XGB direction agreement (or neutral)
-            if require_xgb:
-                xgb_hint = ml.get('ml_direction_hint', 'NEUTRAL')
-                prob_up = ml.get('ml_prob_up', 0.33)
-                prob_down = ml.get('ml_prob_down', 0.33)
-                # Hard block: XGB strongly opposes our divergence direction
-                if direction == 'BUY' and xgb_hint == 'DOWN':
-                    continue
-                if direction == 'SELL' and xgb_hint == 'UP':
-                    continue
-                # Soft block: XGB leans opposite by 30%+ probability margin
-                if direction == 'BUY' and prob_down > prob_up * 1.3:
-                    continue
-                if direction == 'SELL' and prob_up > prob_down * 1.3:
-                    continue
+            # Gate: XGB direction agreement — REMOVED (XGB direction no longer used)
+            # Only P(move) gate above is kept for TEST_GMM.
             
             # Gate: minimum smart score (low bar — divergence IS the signal)
             p_score = pre_scores.get(sym, 0)
@@ -3405,18 +3671,12 @@ class AutonomousTrader:
         return placed
 
     def _place_test_xgb_trades(self, ml_results: dict, pre_scores: dict, market_data: dict, cycle_time: str):
-        """Place trades purely based on XGBoost model — bypass GMM, smart_score, all other gates.
+        """DISABLED — XGB direction removed from system. P(move) and P(threshold) only.
         
-        Direction from XGB directional probabilities (prob_up vs prob_down).
-        Conviction from gate model P(MOVE).
-        No GMM/DR gating, no smart_score, no IntradayScorer direction.
-        Pure XGB conviction play for testing XGB accuracy in isolation.
-        
-        Tagged as 'TEST_XGB' for P&L tracking.
+        This strategy derived trade direction from XGB prob_up/prob_down which
+        is no longer used for decisions. Returns empty immediately.
         """
-        cfg = self._test_xgb_cfg
-        if not cfg.get('enabled', False):
-            return []
+        return []
         
         # Reset on new day
         today = datetime.now().date()
@@ -3836,9 +4096,10 @@ class AutonomousTrader:
                     print(f"      ARBTR {sector_name}: on cooldown (skip)")
                 continue
 
-            # 2. Count aligned stocks in this sector
+            # 2. Count aligned stocks in this sector + collect peer moves
             aligned_count = 0
             total_checked = 0
+            _peer_moves = {}  # stk → change_pct (for peer verification)
             for stk in stocks:
                 stk_sym = f'NSE:{stk}'
                 stk_data = _arbtr_market.get(stk_sym, _arbtr_market.get(stk, {}))
@@ -3846,6 +4107,7 @@ class AutonomousTrader:
                     continue
                 total_checked += 1
                 stk_change = stk_data.get('change_pct', 0) if isinstance(stk_data, dict) else 0
+                _peer_moves[stk] = stk_change
                 # Stock is "aligned" if it moved in same direction as sector, at least 50% of sector move
                 if sec_change > 0 and stk_change >= sec_change * 0.5:
                     aligned_count += 1
@@ -3861,6 +4123,22 @@ class AutonomousTrader:
                 if _arbtr_diag:
                     print(f"      ARBTR {sector_name}: alignment {aligned_count}/{total_checked}={alignment_ratio:.0%} < {min_aligned_ratio:.0%} (skip)")
                 continue  # Sector not broadly aligned — don't trade laggards
+
+            # ── Peer verification data: median peer move & laggard count ──
+            # The index can be dragged by 1-2 heavyweights. Compare laggards
+            # against ACTUAL MEDIAN PEER move, not just the index.
+            _sorted_moves = sorted(_peer_moves.values(), key=lambda x: abs(x), reverse=True)
+            _n = len(_sorted_moves)
+            if _n >= 3:
+                _median_peer_move = _sorted_moves[_n // 2]  # median by magnitude
+            else:
+                _median_peer_move = sec_change  # fallback to index
+            # Count how many peers also barely moved (potential false laggards)
+            _barely_moved_peers = sum(1 for mv in _peer_moves.values() if abs(mv) <= max_laggard_move)
+
+            if _arbtr_diag:
+                print(f"      ARBTR {sector_name}: median_peer={_median_peer_move:+.1f}% "
+                      f"barely_moved_count={_barely_moved_peers}/{total_checked}")
 
             # 3. Find laggards — stocks that barely moved despite sector moving
             _laggard_rejects = {}   # reason → count (for diagnostics)
@@ -3892,6 +4170,23 @@ class AutonomousTrader:
                 if divergence > max_divergence:
                     _laggard_rejects['high_divergence'] = _laggard_rejects.get('high_divergence', 0) + 1
                     continue  # Too large — might be stock-specific reason
+
+                # === PEER VERIFICATION GATES ===
+
+                # Gate A: Compare against MEDIAN peer, not just index.
+                # If median peer also barely moved, the index is being dragged
+                # by heavyweights — this stock isn't actually a laggard.
+                _peer_div = abs(_median_peer_move) - abs(stk_change)
+                if _peer_div < min_divergence * 0.5:
+                    _laggard_rejects['peer_div_low'] = _laggard_rejects.get('peer_div_low', 0) + 1
+                    continue  # Not a real laggard vs actual peers
+
+                # Gate B: If too many peers also barely moved, the "laggard" is
+                # the norm — sector breadth is fake (index dragged by 1-2 stocks).
+                # Skip if >40% of sector stocks barely moved.
+                if total_checked >= 4 and _barely_moved_peers >= total_checked * 0.4:
+                    _laggard_rejects['too_many_laggards'] = _laggard_rejects.get('too_many_laggards', 0) + 1
+                    continue  # Not an isolated laggard — sector move is narrow
 
                 # === QUALITY GATES ===
 
@@ -3936,6 +4231,15 @@ class AutonomousTrader:
                         _laggard_rejects['htf_opposed'] = _laggard_rejects.get('htf_opposed', 0) + 1
                         continue
 
+                # Gate: RSI extreme — don't buy CE into overbought or PE into oversold
+                _arbtr_rsi = stk_data.get('rsi_14', 50)
+                if sector_direction == 'BUY' and _arbtr_rsi > 75:
+                    _laggard_rejects['rsi_overbought'] = _laggard_rejects.get('rsi_overbought', 0) + 1
+                    continue
+                if sector_direction == 'SELL' and _arbtr_rsi < 25:
+                    _laggard_rejects['rsi_oversold'] = _laggard_rejects.get('rsi_oversold', 0) + 1
+                    continue
+
                 # Gate: ML results (skipped when require_ml_move_signal=False)
                 _require_ml = cfg.get('require_ml_move_signal', True)
                 ml = ml_results.get(stk_sym, {})
@@ -3971,21 +4275,8 @@ class AutonomousTrader:
                     _laggard_rejects['score_low'] = _laggard_rejects.get('score_low', 0) + 1
                     continue
 
-                # Gate: ML direction should not strongly oppose sector direction (only with ML)
-                if _require_ml and ml:
-                    xgb_hint = ml.get('ml_direction_hint', 'NEUTRAL')
-                    if sector_direction == 'BUY' and xgb_hint == 'DOWN':
-                        prob_down = ml.get('ml_prob_down', 0.33)
-                        prob_up = ml.get('ml_prob_up', 0.33)
-                        if prob_down > prob_up * 1.3:
-                            _laggard_rejects['xgb_opposed'] = _laggard_rejects.get('xgb_opposed', 0) + 1
-                            continue  # XGB strongly bearish — don't fight it
-                    if sector_direction == 'SELL' and xgb_hint == 'UP':
-                        prob_up = ml.get('ml_prob_up', 0.33)
-                        prob_down = ml.get('ml_prob_down', 0.33)
-                        if prob_up > prob_down * 1.3:
-                            _laggard_rejects['xgb_opposed'] = _laggard_rejects.get('xgb_opposed', 0) + 1
-                            continue  # XGB strongly bullish — don't fight it
+                # Gate: ML direction opposition — REMOVED (XGB direction no longer used)
+                # Only GMM down-risk and P(move) gates are kept for ARBTR.
 
                 # Build candidate
                 side_tag = 'CALL' if sector_direction == 'BUY' else 'PUT'
@@ -4000,6 +4291,8 @@ class AutonomousTrader:
                     'sec_change': sec_change,
                     'stk_change': stk_change,
                     'divergence': divergence,
+                    'peer_divergence': _peer_div,
+                    'median_peer_move': _median_peer_move,
                     'alignment_ratio': alignment_ratio,
                     'dr_score': dr_score,
                     'ml_move_prob': ml_move_prob,
@@ -4044,6 +4337,8 @@ class AutonomousTrader:
                             'sector_change_pct': round(sec_change, 2),
                             'stock_change_pct': round(stk_change, 2),
                             'divergence_pct': round(divergence, 2),
+                            'peer_divergence_pct': round(_peer_div, 2),
+                            'median_peer_move_pct': round(_median_peer_move, 2),
                             'alignment_ratio': round(alignment_ratio, 2),
                         },
                     },
@@ -4082,7 +4377,9 @@ class AutonomousTrader:
                     lot_multiplier=lot_mult,
                     rationale=(f"ARBTR_{cand['sector']}_{cand['side_tag']}: "
                               f"Sector {cand['sec_change']:+.1f}% vs Stock {cand['stk_change']:+.1f}% "
-                              f"gap={cand['divergence']:.1f}% align={cand['alignment_ratio']:.0%} "
+                              f"gap={cand['divergence']:.1f}% peer_gap={cand['peer_divergence']:.1f}% "
+                              f"median_peer={cand['median_peer_move']:+.1f}% "
+                              f"align={cand['alignment_ratio']:.0%} "
                               f"move={cand['ml_move_prob']:.2f} score={cand['p_score']:.0f}"),
                     setup_type='ARBTR',
                     ml_data=cand.get('ml_data', {}),
@@ -4100,7 +4397,8 @@ class AutonomousTrader:
                                       direction=cand['direction'], setup='ARBTR')
                     print(f"\n   🔄 ARBTR: {cand['sym_clean']} {_dir_label} | "
                           f"Sector {cand['sector']} {cand['sec_change']:+.1f}% → Stock {cand['stk_change']:+.1f}% "
-                          f"| Gap {cand['divergence']:.1f}% | Align {cand['alignment_ratio']:.0%} "
+                          f"| Gap {cand['divergence']:.1f}% (peer:{cand['peer_divergence']:.1f}%) "
+                          f"| Align {cand['alignment_ratio']:.0%} "
                           f"| ML={cand['ml_move_prob']:.2f} Score={cand['p_score']:.0f}")
                 else:
                     error = result.get('error', 'unknown') if result else 'no result'
@@ -5714,7 +6012,7 @@ class AutonomousTrader:
         if getattr(self, '_scanning', False):
             show_status = False
         else:
-            show_status = (self._monitor_count % 10 == 0)  # Every 30 seconds
+            show_status = (self._monitor_count % 3 == 0)  # Every ~10 seconds
         
         # === CHECK OPTION EXITS (Greeks-based) ===
         # Only check naked option trades — credit spreads use exit_manager
@@ -6048,54 +6346,61 @@ class AutonomousTrader:
                         )
                         _thp_sl_enabled = _thp_sl_cfg.get('enabled', False)
                         if _is_naked_opt_sl and _thp_sl_enabled:
-                            _sl_ltp = price_dict.get(symbol, 0) or signal.exit_price
-                            _sl_entry = trade.get('avg_price', 0)
-                            _sl_loss_pct = ((_sl_entry - _sl_ltp) / _sl_entry * 100) if _sl_entry > 0 and _sl_ltp > 0 else 999
-                            _max_sl_hedge_loss = _thp_sl_cfg.get('max_hedge_loss_pct', 20)
-                            # Underlying confirmation gate
-                            _sl_can_hedge = True
-                            _sl_em = self.exit_manager.get_trade_state(symbol)
-                            if _sl_em:
-                                _sl_adverse, _sl_ul_rsn = check_underlying_adverse(_sl_em, underlying_prices.get(symbol, 0))
-                                if _sl_adverse:
-                                    _sl_can_hedge = False
-                                    print(f"   🔴 THP: {symbol} — {_sl_ul_rsn} — exiting at SL instead of hedging")
-                            if _sl_loss_pct <= _max_sl_hedge_loss and _sl_can_hedge:
-                                print(f"\n🛡️ THP SL_HIT INTERCEPT: {symbol} — SL hit ({_sl_loss_pct:.1f}% loss), converting to spread instead of exiting")
-                                try:
-                                    hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="SL_HIT_HEDGE")
-                                    if hedge_result.get('success'):
-                                        em_state = self.exit_manager.get_trade_state(symbol)
-                                        if em_state:
-                                            new_symbol = hedge_result['symbol']
-                                            em_state.symbol = new_symbol
-                                            em_state.is_debit_spread = True
-                                            em_state.hedged_from_tie = True
-                                            em_state.net_debit = hedge_result['net_debit']
-                                            em_state.spread_width = hedge_result['spread_width']
-                                            em_state.current_sl = hedge_result['hedged_sl']
-                                            em_state.target = hedge_result['hedged_target']
-                                            em_state.initial_sl = hedge_result['hedged_sl']
-                                            em_state.highest_price = hedge_result['net_debit']
-                                            em_state.trailing_active = False
-                                            em_state.breakeven_applied = False
-                                            em_state.candles_since_entry = 0  # Reset candle count
-                                            if new_symbol != symbol:
-                                                self.exit_manager.trade_states[new_symbol] = em_state
-                                                if symbol in self.exit_manager.trade_states:
-                                                    del self.exit_manager.trade_states[symbol]
-                                            self.exit_manager._persist_state()
-                                        print(f"   ✅ THP: {symbol} hedged at SL → {hedge_result['symbol']}")
-                                        print(f"      Sell: {hedge_result['sell_symbol']} @ ₹{hedge_result['sell_premium']:.2f}")
-                                        print(f"      Net debit: ₹{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
-                                        print(f"      Max loss now capped | 20 candle window for recovery")
-                                        continue  # SKIP exit — position is now a hedged spread
-                                    else:
-                                        print(f"   ⚠️ THP SL hedge failed: {hedge_result.get('error', 'unknown')} — proceeding with SL exit")
-                                except Exception as e:
-                                    print(f"   ⚠️ THP SL exception: {e} — proceeding with SL exit")
+                            # Skip THP if trailing SL or break-even was active — trade was in profit,
+                            # respect the trail exit instead of converting to a spread
+                            _sl_em_check = self.exit_manager.get_trade_state(symbol)
+                            _trail_or_be = _sl_em_check and (_sl_em_check.trailing_active or _sl_em_check.breakeven_applied)
+                            if _trail_or_be:
+                                print(f"\n🛡️ THP SKIP: {symbol} — trailing SL/break-even active, exiting at trailed SL (not hedging)")
                             else:
-                                print(f"   📉 THP: SL_HIT loss {_sl_loss_pct:.1f}% > {_max_sl_hedge_loss}% cap — too deep, exiting at SL")
+                                _sl_ltp = price_dict.get(symbol, 0) or signal.exit_price
+                                _sl_entry = trade.get('avg_price', 0)
+                                _sl_loss_pct = ((_sl_entry - _sl_ltp) / _sl_entry * 100) if _sl_entry > 0 and _sl_ltp > 0 else 999
+                                _max_sl_hedge_loss = _thp_sl_cfg.get('max_hedge_loss_pct', 20)
+                                # Underlying confirmation gate
+                                _sl_can_hedge = True
+                                _sl_em = self.exit_manager.get_trade_state(symbol)
+                                if _sl_em:
+                                    _sl_adverse, _sl_ul_rsn = check_underlying_adverse(_sl_em, underlying_prices.get(symbol, 0))
+                                    if _sl_adverse:
+                                        _sl_can_hedge = False
+                                        print(f"   🔴 THP: {symbol} — {_sl_ul_rsn} — exiting at SL instead of hedging")
+                                if _sl_loss_pct <= _max_sl_hedge_loss and _sl_can_hedge:
+                                    print(f"\n🛡️ THP SL_HIT INTERCEPT: {symbol} — SL hit ({_sl_loss_pct:.1f}% loss), converting to spread instead of exiting")
+                                    try:
+                                        hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="SL_HIT_HEDGE")
+                                        if hedge_result.get('success'):
+                                            em_state = self.exit_manager.get_trade_state(symbol)
+                                            if em_state:
+                                                new_symbol = hedge_result['symbol']
+                                                em_state.symbol = new_symbol
+                                                em_state.is_debit_spread = True
+                                                em_state.hedged_from_tie = True
+                                                em_state.net_debit = hedge_result['net_debit']
+                                                em_state.spread_width = hedge_result['spread_width']
+                                                em_state.current_sl = hedge_result['hedged_sl']
+                                                em_state.target = hedge_result['hedged_target']
+                                                em_state.initial_sl = hedge_result['hedged_sl']
+                                                em_state.highest_price = hedge_result['net_debit']
+                                                em_state.trailing_active = False
+                                                em_state.breakeven_applied = False
+                                                em_state.candles_since_entry = 0  # Reset candle count
+                                                if new_symbol != symbol:
+                                                    self.exit_manager.trade_states[new_symbol] = em_state
+                                                    if symbol in self.exit_manager.trade_states:
+                                                        del self.exit_manager.trade_states[symbol]
+                                                self.exit_manager._persist_state()
+                                            print(f"   ✅ THP: {symbol} hedged at SL → {hedge_result['symbol']}")
+                                            print(f"      Sell: {hedge_result['sell_symbol']} @ ₹{hedge_result['sell_premium']:.2f}")
+                                            print(f"      Net debit: ₹{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
+                                            print(f"      Max loss now capped | 20 candle window for recovery")
+                                            continue  # SKIP exit — position is now a hedged spread
+                                        else:
+                                            print(f"   ⚠️ THP SL hedge failed: {hedge_result.get('error', 'unknown')} — proceeding with SL exit")
+                                    except Exception as e:
+                                        print(f"   ⚠️ THP SL exception: {e} — proceeding with SL exit")
+                                else:
+                                    print(f"   📉 THP: SL_HIT loss {_sl_loss_pct:.1f}% > {_max_sl_hedge_loss}% cap — too deep, exiting at SL")
                     
                     ltp = price_dict.get(symbol, 0) or signal.exit_price
                     # Guard: never exit at price 0 (quote failure)
@@ -6590,8 +6895,8 @@ class AutonomousTrader:
                 _type_tag = '🎯SNIPER'
             elif _setup == 'ML_OVERRIDE_WGMM':
                 _type_tag = '🔄ML_GMM'
-            elif _setup == 'ALL_AGREE':
-                _type_tag = '🧬ALL3'
+            elif _setup == 'ALL_AGREE':  # Legacy tag from old trades
+                _type_tag = '🧠SCORE'
             elif _setup == 'MODEL_TRACKER':
                 _type_tag = '🧠SCORE'
             elif _setup == 'ORB_BREAKOUT':
@@ -6859,8 +7164,6 @@ class AutonomousTrader:
 
     def scan_and_trade(self):
         """Main trading loop - scan market and execute trades"""
-        import traceback as _scan_tb
-        _dbg_ts = datetime.now().strftime('%H:%M:%S')
         _debug_log = 'bot_debug.log'
         def _scan_dbg(msg):
             _ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -7044,12 +7347,9 @@ class AutonomousTrader:
                     # that match what the scorer actually rewards (trend/ORB/volume).
                     # NOTE: Gate D (scanner category) was REMOVED — it passed everything since
                     # scanner assigns score>0 to all categorized stocks, defeating the gate.
+                    _quality_candidates = []
                     if scan_result and hasattr(self.market_scanner, '_all_results'):
-                        _quality_candidates = []
                         _all_raw = self.market_scanner._all_results
-                        _gate_a_count = 0  # strong movers (≥1.0%)
-                        _gate_b_count = 0  # near day extreme
-                        _gate_c_count = 0  # volume top 25%
                         _below_min_change = 0  # filtered by min_change
                         
                         # First: compute volume percentile for relative volume check
@@ -7081,19 +7381,13 @@ class AutonomousTrader:
                             _is_b = _near_extreme
                             _is_c = _vol_surge
                             
-                            if _is_a: _gate_a_count += 1
-                            if _is_b: _gate_b_count += 1
-                            if _is_c: _gate_c_count += 1
-                            
                             if _is_a or _is_b or _is_c:
                                 _quality_candidates.append(r)
                         
                         _after_min = len(_all_raw) - _below_min_change
-                        _dropped = _after_min - len(_quality_candidates)
                         
                         # ALWAYS print gate stats for diagnostics
-                        # print(f"   🔍 Quality gate: {_after_min} above min_change → {len(_quality_candidates)} passed, {_dropped} dropped")
-                        # print(f"      Gate A (≥1.0% chg): {_gate_a_count} | Gate B (day extreme): {_gate_b_count} | Gate C (vol top25): {_gate_c_count}")
+                        # print(f"   🔍 Quality gate: {_after_min} above min_change → {len(_quality_candidates)} passed")
                         
                         if _quality_candidates:
                             # Rank by scorer-aligned composite (matters when >50 quality candidates)
@@ -7451,97 +7745,12 @@ class AutonomousTrader:
                                 if _pred:
                                     _ml_predictions[_sym] = _pred
                         
-                        # ── HERD DETECTION: Detect when ML gives same signal to all stocks ──
-                        # When >80% of DIRECTIONAL stocks get the same signal, it MIGHT mean the
-                        # model is responding to a market-wide factor (nifty crash, OI stale,
-                        # extreme day returns) rather than stock-specific signals.
-                        # FIX Mar-05: TIERED response instead of nuclear flatten-all.
-                        #   - Sector-aligned stocks KEEP their signal (genuine sector play)
-                        #   - High-confidence stocks KEEP signal (stock-specific alpha)
-                        #   - Low-confidence stocks get boost reduced (not zeroed)
-                        #   - Signals are NEVER blanket-forced to FLAT (kills all trading)
-                        # FIX Mar-04: Only count directional signals (UP/DOWN) for herd ratio.
+                        # ── HERD DETECTION — DISABLED (XGB direction removed) ──
+                        # Previously detected when 80%+ stocks got same XGB direction signal.
+                        # With XGB direction removed, herd detection is no longer applicable.
+                        # P(move) and P(threshold) are still used by downstream strategies.
                         _herd_mode = False
                         _herd_signal = None
-                        _directional_signals = [p.get('ml_signal') for p in _ml_predictions.values() if p.get('ml_signal') in ('UP', 'DOWN')]
-                        _all_valid = [p.get('ml_signal') for p in _ml_predictions.values() if p.get('ml_signal') not in ('UNKNOWN', None)]
-                        if len(_directional_signals) >= 8:
-                            from collections import Counter as _Counter
-                            _signal_counts = _Counter(_directional_signals)
-                            _dominant_signal, _dominant_count = _signal_counts.most_common(1)[0]
-                            _herd_ratio = _dominant_count / len(_directional_signals)
-                            if _herd_ratio >= 0.80:
-                                _herd_mode = True
-                                _herd_signal = _dominant_signal
-                                
-                                _cur_breadth = getattr(self, '_last_market_breadth', 'MIXED')
-                                _herd_vs_breadth_conflict = (
-                                    (_dominant_signal == 'UP' and _cur_breadth == 'BEARISH') or
-                                    (_dominant_signal == 'DOWN' and _cur_breadth == 'BULLISH')
-                                )
-                                
-                                # Sector + confidence caches for tiered response
-                                _h_stock_to_sector = getattr(self, '_stock_to_sector', {})
-                                _h_sector_changes = getattr(self, '_sector_index_changes_cache', {})
-                                _h_survived = 0
-                                _h_reduced = 0
-                                _h_sector_kept = 0
-                                _h_conf_kept = 0
-                                
-                                for _hp_sym, _hp in _ml_predictions.items():
-                                    _hp['ml_herd_signal'] = True
-                                    _hp_conf = _hp.get('ml_confidence', 0)
-                                    _hp_sig = _hp.get('ml_signal')
-                                    _hp_sym_clean = _hp_sym.replace('NSE:', '')
-                                    
-                                    # --- Tier 1: Sector-aligned → KEEP signal ---
-                                    # If stock's sector is moving in the SAME direction as herd,
-                                    # this is a genuine sector play, not noise.
-                                    _hp_sector_aligned = False
-                                    _hp_sec_match = _h_stock_to_sector.get(_hp_sym_clean)
-                                    if _hp_sec_match and _h_sector_changes:
-                                        _hp_sec_name, _hp_sec_idx = _hp_sec_match
-                                        _hp_sec_chg = _h_sector_changes.get(_hp_sec_idx)
-                                        if _hp_sec_chg is not None:
-                                            if _dominant_signal == 'DOWN' and _hp_sec_chg <= -0.8:
-                                                _hp_sector_aligned = True
-                                            elif _dominant_signal == 'UP' and _hp_sec_chg >= 0.8:
-                                                _hp_sector_aligned = True
-                                    
-                                    if _hp_sector_aligned and _hp_sig == _dominant_signal:
-                                        # Sector confirms direction → keep signal, halve boost
-                                        _hp['ml_score_boost'] = round(_hp.get('ml_score_boost', 0) * 0.5, 2)
-                                        _hp['ml_herd_survived'] = True
-                                        _hp['ml_herd_reason'] = 'sector_aligned'
-                                        _h_sector_kept += 1
-                                        _h_survived += 1
-                                        continue
-                                    
-                                    # --- Tier 2: High confidence → KEEP signal ---
-                                    # Stock with ml_confidence >= 0.72 may have genuine
-                                    # stock-specific features, not just market-wide noise.
-                                    if _hp_conf >= 0.72 and _hp_sig == _dominant_signal:
-                                        _hp['ml_score_boost'] = round(_hp.get('ml_score_boost', 0) * 0.5, 2)
-                                        _hp['ml_herd_survived'] = True
-                                        _hp['ml_herd_reason'] = 'high_confidence'
-                                        _h_conf_kept += 1
-                                        _h_survived += 1
-                                        continue
-                                    
-                                    # --- Tier 3: Everyone else → reduce boost, keep signal direction ---
-                                    # Don't flatten to FLAT — that kills all trading.
-                                    # Instead: reduce boost by 70%, mark herd_caution.
-                                    # Downstream strategies (TEST_XGB, etc.) have their own
-                                    # sector/breadth gates to filter bad trades.
-                                    _hp['ml_score_boost'] = round(_hp.get('ml_score_boost', 0) * 0.3, 2)
-                                    _hp['ml_herd_caution'] = True
-                                    _h_reduced += 1
-                                
-                                if _herd_vs_breadth_conflict:
-                                    _surv_detail = f"sector_kept={_h_sector_kept}, conf_kept={_h_conf_kept}"
-                                    print(f"   ⚠️ ML HERD + BREADTH CONFLICT: {_dominant_count}/{len(_directional_signals)} predict {_dominant_signal} but breadth={_cur_breadth} → {_h_survived} survived ({_surv_detail}), {_h_reduced} boost-reduced")
-                                else:
-                                    print(f"   ⚠️ ML HERD DETECTED: {_dominant_count}/{len(_directional_signals)} directional ({_herd_ratio:.0%}) predict {_dominant_signal} → boosts halved/reduced ({_h_survived} survived, {_h_reduced} reduced)")
                         
                         # Merge predictions into scores (single-threaded — modifies shared state)
                         for _sym, _ml_pred in _ml_predictions.items():
@@ -7705,33 +7914,33 @@ class AutonomousTrader:
                         'index': 'NSE:NIFTY METAL',
                         'stocks': {'TATASTEEL', 'JSWSTEEL', 'HINDALCO', 'VEDL', 'JINDALSTEL',
                                    'NMDC', 'NATIONALUM', 'HINDZINC', 'SAIL', 'HINDCOPPER',
-                                   'APLAPOLLO', 'RATNAMANI', 'WELCORP', 'COALINDIA'},
+                                   'APLAPOLLO', 'RATNAMANI', 'WELCORP', 'ADANIENT'},
                     },
                     'IT': {
                         'index': 'NSE:NIFTY IT',
                         'stocks': {'INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM',
-                                   'KPITTECH', 'COFORGE', 'MPHASIS', 'PERSISTENT'},
+                                   'COFORGE', 'MPHASIS', 'PERSISTENT'},
                     },
                     'BANKS': {
                         'index': 'NSE:NIFTY BANK',
                         'stocks': {'SBIN', 'HDFCBANK', 'ICICIBANK', 'AXISBANK', 'KOTAKBANK',
                                    'BANKBARODA', 'PNB', 'IDFCFIRSTB', 'INDUSINDBK', 'FEDERALBNK',
-                                   'RBLBANK', 'UNIONBANK', 'CANBK', 'AUBANK'},
+                                   'UNIONBANK', 'CANBK', 'AUBANK'},
                     },
                     'AUTO': {
                         'index': 'NSE:NIFTY AUTO',
                         'stocks': {'MARUTI', 'TATAMOTORS', 'M&M', 'BAJAJ-AUTO', 'HEROMOTOCO',
-                                   'EICHERMOT', 'ASHOKLEY', 'BHARATFORG', 'MOTHERSON', 'BALKRISIND'},
+                                   'EICHERMOT', 'ASHOKLEY', 'BHARATFORG', 'MOTHERSON'},
                     },
                     'PHARMA': {
                         'index': 'NSE:NIFTY PHARMA',
                         'stocks': {'SUNPHARMA', 'CIPLA', 'DRREDDY', 'DIVISLAB', 'AUROPHARMA',
-                                   'BIOCON', 'LUPIN', 'APOLLOHOSP', 'MAXHEALTH', 'LALPATHLAB'},
+                                   'BIOCON', 'LUPIN'},
                     },
                     'ENERGY': {
                         'index': 'NSE:NIFTY ENERGY',
                         'stocks': {'RELIANCE', 'ONGC', 'NTPC', 'POWERGRID', 'ADANIGREEN',
-                                   'TATAPOWER', 'ADANIENT', 'BPCL', 'IOC', 'GAIL'},
+                                   'TATAPOWER', 'BPCL', 'IOC', 'GAIL', 'COALINDIA'},
                     },
                     'FMCG': {
                         'index': 'NSE:NIFTY FMCG',
@@ -7746,8 +7955,7 @@ class AutonomousTrader:
                     'INFRA': {
                         'index': 'NSE:NIFTY INFRA',
                         'stocks': {'LT', 'ADANIPORTS', 'ULTRACEMCO', 'GRASIM', 'SHREECEM',
-                                   'AMBUJACEM', 'ACC', 'SIEMENS', 'ABB', 'BEL', 'HAL',
-                                   'BHEL', 'INOXWIND'},
+                                   'AMBUJACEM'},
                     },
                 }
                 # Build reverse lookup: stock_name → sector info
@@ -7886,55 +8094,50 @@ class AutonomousTrader:
                 # === MODEL-TRACKER TRADES: Place up to 7 smart-selected model-only trades ===
                 # Independent of main workflow — purely for evaluating down-risk model.
                 try:
-                    _model_tracker_placed = self._place_model_tracker_trades(
+                    self._place_model_tracker_trades(
                         _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
                     )
                 except Exception as _mt_err:
                     print(f"   ⚠️ Model-tracker error (non-fatal): {_mt_err}")
-                    _model_tracker_placed = []
                 
                 # === GMM SNIPER TRADE: 1 highest-conviction trade per cycle, 2x lots ===
                 # Picks the cleanest GMM candidate (lowest dr_score) with strict gates.
                 # Separate from model-tracker — this is the alpha trade.
                 try:
-                    _sniper_placed = self._place_gmm_sniper_trade(
+                    self._place_gmm_sniper_trade(
                         _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
                     )
                 except Exception as _snp_err:
                     print(f"   ⚠️ GMM Sniper error (non-fatal): {_snp_err}")
-                    _sniper_placed = None
                 
                 # === TEST_GMM: Pure DR model play (bypass ALL gates) ===
                 # DR < 6% = model extremely confident no downside → BUY CALL
                 # No risk gates, no scores, no XGB — pure GMM conviction play.
                 try:
-                    _test_gmm_placed = self._place_test_gmm_trades(
+                    self._place_test_gmm_trades(
                         _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
                     )
                 except Exception as _tg_err:
                     print(f"   ⚠️ TEST_GMM error (non-fatal): {_tg_err}")
-                    _test_gmm_placed = []
 
                 # === TEST_XGB: Pure XGBoost play (bypass GMM, smart_score) ===
                 # High P(MOVE) + clear directional lean → pure XGB conviction trade.
                 try:
-                    _test_xgb_placed = self._place_test_xgb_trades(
+                    self._place_test_xgb_trades(
                         _ml_results, _pre_scores, market_data, datetime.now().strftime('%H:%M:%S')
                     )
                 except Exception as _tx_err:
                     print(f"   ⚠️ TEST_XGB error (non-fatal): {_tx_err}")
-                    _test_xgb_placed = []
 
                 # === ARBTR: Sector Arbitrage — laggard convergence play ===
                 # When sector index moves but peer stock lags, trade the laggard.
                 try:
-                    _arbtr_placed = self._place_arbtr_trades(
+                    self._place_arbtr_trades(
                         _ml_results, _pre_scores, market_data,
                         _sector_index_changes, datetime.now().strftime('%H:%M:%S')
                     )
                 except Exception as _arb_err:
                     print(f"   ⚠️ ARBTR error (non-fatal): {_arb_err}")
-                    _arbtr_placed = []
 
                 # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
                 # Scans OI data for high-edge reversal / contrarian setups.
@@ -8149,6 +8352,8 @@ class AutonomousTrader:
                 self.tools._cached_cycle_decisions = {}
                 _ml_results = {}  # Ensure defined even on scoring failure
             
+            _cycle_time = datetime.now().strftime('%H:%M:%S')
+            
             # === REVERSAL SNIPE MANAGEMENT: Trailing SL + Time Guard ===
             # Snipe trades target 10% with trailing SL. Time guard cuts at 12 min if < 3%.
             try:
@@ -8308,6 +8513,94 @@ class AutonomousTrader:
             except Exception as _snipe_guard_err:
                 print(f"   ⚠️ Snipe management error (non-fatal): {_snipe_guard_err}")
             
+            # === ARBTR SPEED GATE: Exit ARBTR if no +3% premium gain in 15 min ===
+            # Mar 10 lesson: NATIONALUM held 87min (-₹9,538), MPHASIS 65min (-₹4,347),
+            # BHARATFORG 107min (-₹5,750). ARBTR thesis is "laggard converges to sector" —
+            # if convergence hasn't started in 15 min, the thesis is dead. Cut early.
+            try:
+                from config import ARBTR_CONFIG as _arb_cfg
+                _arb_speed_min = _arb_cfg.get('speed_gate_minutes', 15)
+                _arb_speed_gain = _arb_cfg.get('speed_gate_min_gain_pct', 3.0)
+                _arbtr_positions = [t for t in self.tools.paper_positions 
+                                   if t.get('status', 'OPEN') == 'OPEN' 
+                                   and t.get('setup_type') == 'ARBTR'
+                                   and not t.get('is_credit_spread') and not t.get('is_debit_spread')
+                                   and not t.get('is_iron_condor')]
+                for _arb_pos in _arbtr_positions:
+                    _arb_sym = _arb_pos.get('symbol', '')
+                    _arb_entry_price = _arb_pos.get('avg_price', 0)
+                    _arb_entry_time_str = _arb_pos.get('entry_time', '')
+                    if not _arb_entry_time_str or not _arb_entry_price:
+                        continue
+                    
+                    try:
+                        _arb_entry_dt = datetime.fromisoformat(_arb_entry_time_str)
+                    except Exception:
+                        continue
+                    
+                    _arb_held_min = (datetime.now() - _arb_entry_dt).total_seconds() / 60
+                    
+                    # Only check after configured minutes
+                    if _arb_held_min < _arb_speed_min:
+                        continue
+                    
+                    # Get current price
+                    try:
+                        _arb_ltp_data = self.tools.kite.ltp([_arb_sym])
+                        if _arb_sym not in _arb_ltp_data:
+                            continue
+                        _arb_ltp = _arb_ltp_data[_arb_sym]['last_price']
+                    except Exception:
+                        continue
+                    
+                    _arb_pnl_pct = ((_arb_ltp - _arb_entry_price) / _arb_entry_price) * 100
+                    
+                    # If premium gained enough, thesis is working — let it ride
+                    if _arb_pnl_pct >= _arb_speed_gain:
+                        continue
+                    
+                    # Thesis not playing out — cut the position
+                    _arb_qty = _arb_pos.get('quantity', 0)
+                    _arb_pnl = (_arb_ltp - _arb_entry_price) * _arb_qty
+                    
+                    from config import calc_brokerage
+                    _arb_brokerage = calc_brokerage(_arb_entry_price, _arb_ltp, _arb_qty)
+                    _arb_pnl -= _arb_brokerage
+                    
+                    _arb_underlying = _arb_pos.get('underlying', '')
+                    print(f"\n   ⏱️ ARBTR SPEED GATE: {_arb_underlying} held {_arb_held_min:.0f}min, "
+                          f"P&L {_arb_pnl_pct:+.1f}% (< {_arb_speed_gain}%) — cutting stale ARBTR")
+                    print(f"      Entry: ₹{_arb_entry_price:.2f} → ₹{_arb_ltp:.2f} | P&L: ₹{_arb_pnl:+,.0f}")
+                    
+                    _arb_exit_detail = {
+                        'exit_type': 'ARBTR_SPEED_GATE',
+                        'exit_reason': (f'ARBTR held {_arb_held_min:.0f}min with only {_arb_pnl_pct:+.1f}% gain '
+                                       f'— convergence thesis not playing out, speed gate exit'),
+                        'held_minutes': round(_arb_held_min, 1),
+                        'pnl_pct_at_exit': round(_arb_pnl_pct, 2),
+                        'brokerage': round(_arb_brokerage, 2),
+                    }
+                    
+                    self.tools.update_trade_status(_arb_sym, 'ARBTR_SPEED_GATE', _arb_ltp, _arb_pnl, exit_detail=_arb_exit_detail)
+                    with self._pnl_lock:
+                        self.daily_pnl += _arb_pnl
+                        self.capital += _arb_pnl
+                    
+                    _arb_was_win = _arb_pnl > 0
+                    _arb_open = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != _arb_sym]
+                    _arb_unreal = self.risk_governor._calc_unrealized_pnl(_arb_open)
+                    self.risk_governor.record_trade_result(_arb_sym, _arb_pnl, _arb_was_win, unrealized_pnl=_arb_unreal)
+                    self.risk_governor.update_capital(self.capital)
+                    
+                    self._log_decision(_cycle_time, _arb_underlying, 0, 'ARBTR_SPEED_GATE',
+                                      reason=f'ARBTR held {_arb_held_min:.0f}min, {_arb_pnl_pct:+.1f}%, P&L={_arb_pnl:+,.0f}',
+                                      direction=_arb_pos.get('direction', ''), setup='ARBTR')
+                    
+                    print(f"      ✅ ARBTR speed gate exit | {'Profit' if _arb_was_win else 'Cut loss'}: ₹{_arb_pnl:+,.0f}")
+                    
+            except Exception as _arb_speed_err:
+                print(f"   ⚠️ ARBTR speed gate error (non-fatal): {_arb_speed_err}")
+            
             # === CONVICTION REVERSAL EXIT: Your own system says you're wrong ===
             # Pro trader rule: if your system flips direction on a stock you're holding
             # with HIGH conviction (score ≥ 70), exit IMMEDIATELY. Don't wait for SL.
@@ -8453,7 +8746,6 @@ class AutonomousTrader:
                 print(f"   ⚠️ Conviction reversal check error (non-fatal): {_conv_err}")
             
             # === ELITE AUTO-FIRE: Execute top-scoring stocks BEFORE GPT ===
-            _cycle_time = datetime.now().strftime('%H:%M:%S')
             _auto_fired_syms = self._elite_auto_fire(
                 pre_scores=_pre_scores,
                 cycle_decisions=_cycle_decisions,
@@ -8859,24 +9151,18 @@ class AutonomousTrader:
                             if vol_reg in ("HIGH", "EXPLOSIVE"):
                                 ds_priority += 10
                             
-                            # === ML DIRECTION PREDICTION BOOST (FAIL-SAFE) ===
-                            # ML UP/DOWN = perfect for debit spreads (directional move expected)
-                            # ML FLAT = soft skip (stock likely flat, debit spread loses)
+                            # === ML P(MOVE) BOOST FOR DEBIT SPREADS (FAIL-SAFE) ===
+                            # High P(move) = expected big move → good for debit spreads
+                            # Low P(move) = expected flat → debit spread loses theta
                             try:
                                 _ds_ml = getattr(self, '_cycle_ml_results', {}).get(symbol, {})
-                                _ds_ml_signal = _ds_ml.get('ml_signal', 'UNKNOWN')
-                                _ds_prob_up = _ds_ml.get('ml_prob_up', 0.33)
-                                _ds_prob_down = _ds_ml.get('ml_prob_down', 0.33)
-                                _ds_prob_flat = _ds_ml.get('ml_prob_flat', 0.34)
-                                _ds_max_dir = max(_ds_prob_up, _ds_prob_down)
-                                if _ds_ml_signal in ('UP', 'DOWN') and _ds_max_dir >= 0.50:
-                                    ds_priority += 20  # Strong directional ML confirmation
-                                    # print(f"      🧠 ML BOOST: {symbol} {_ds_ml_signal} prob={_ds_max_dir:.0%} → +20 priority")
-                                elif _ds_ml_signal in ('UP', 'DOWN') and _ds_max_dir >= 0.40:
-                                    ds_priority += 10  # Moderate ML confirmation
-                                elif _ds_ml_signal == 'FLAT' and _ds_prob_flat >= 0.70:
-                                    # print(f"      🧠 ML SKIP: {symbol} FLAT prob={_ds_prob_flat:.0%} → skipping debit spread")
-                                    continue  # Soft skip — stock likely flat
+                                _ds_move_prob = _ds_ml.get('ml_move_prob', _ds_ml.get('ml_p_move', 0.0))
+                                if _ds_move_prob >= 0.60:
+                                    ds_priority += 20  # Strong move expected → boost
+                                elif _ds_move_prob >= 0.45:
+                                    ds_priority += 10  # Moderate move expected
+                                elif _ds_move_prob < 0.25 and _ds_move_prob > 0:
+                                    continue  # Very low P(move) → skip debit spread
                             except Exception:
                                 pass  # ML crash → no impact, proceed normally
                             
@@ -9185,20 +9471,19 @@ class AutonomousTrader:
                                 if is_chop:
                                     ic_quality += 10; ic_reasons.append("CHOP_CONFIRMED")
                                 
-                                # FACTOR 9: ML MOVE PREDICTION (0-15 pts bonus for FLAT, -10 penalty for UP/DOWN)
-                                # ML FLAT = ideal for IC (stock predicted flat)
-                                # ML UP/DOWN = dangerous for IC (breakout could blow through wings)
+                                # FACTOR 9: ML P(MOVE) PREDICTION (0-15 pts bonus for low P(move), -15 penalty for high)
+                                # Low P(move) = ideal for IC (stock predicted to stay flat)
+                                # High P(move) = dangerous for IC (breakout could blow through wings)
                                 try:
                                     _ic_ml = getattr(self, '_cycle_ml_results', {}).get(symbol, {})
-                                    _ic_move_prob = _ic_ml.get('ml_move_prob', 0.5)
-                                    _ic_ml_signal = _ic_ml.get('ml_signal', 'UNKNOWN')
-                                    if _ic_ml_signal == 'FLAT' and _ic_move_prob < 0.30:
-                                        ic_quality += 15; ic_reasons.append(f"ML_FLAT({_ic_move_prob:.0%})")
-                                    elif _ic_ml_signal == 'FLAT':
-                                        ic_quality += 8; ic_reasons.append(f"ML_FLAT_MILD({_ic_move_prob:.0%})")
-                                    elif _ic_ml_signal in ('UP', 'DOWN') and _ic_move_prob >= 0.60:
+                                    _ic_move_prob = _ic_ml.get('ml_move_prob', _ic_ml.get('ml_p_move', 0.5))
+                                    if _ic_move_prob < 0.25:
+                                        ic_quality += 15; ic_reasons.append(f"ML_LOW_MOVE({_ic_move_prob:.0%})")
+                                    elif _ic_move_prob < 0.40:
+                                        ic_quality += 8; ic_reasons.append(f"ML_MILD_MOVE({_ic_move_prob:.0%})")
+                                    elif _ic_move_prob >= 0.60:
                                         ic_quality -= 15; ic_reasons.append(f"ML_MOVE_DANGER({_ic_move_prob:.0%})")
-                                    elif _ic_ml_signal in ('UP', 'DOWN'):
+                                    elif _ic_move_prob >= 0.45:
                                         ic_quality -= 8; ic_reasons.append(f"ML_MOVE_WARN({_ic_move_prob:.0%})")
                                 except Exception:
                                     pass  # ML crash → no impact on IC quality
@@ -9435,8 +9720,8 @@ class AutonomousTrader:
                     
                     # Per-stock buildups (only for F&O candidates in the prompt)
                     _fno_syms_in_prompt = set()
+                    import re as _re_bld
                     for _opp in fno_opportunities:
-                        import re as _re_bld
                         _m = _re_bld.search(r'🎯\s*(\S+):', _opp)
                         if _m:
                             _fno_syms_in_prompt.add(_m.group(1))
@@ -9566,228 +9851,9 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         print(f"   🚫 Scorer rejected (won't retry): {self.tools._scorer_rejected_symbols}")
                 self.tools._scorer_rejected_symbols.clear()
             
-            if response and not self.agent.get_pending_approvals():
-                # Check if response mentions trade symbols but no orders were placed
-                import re
-                mentioned_symbols = re.findall(r'NSE:([A-Z]+)', response)
-                # Build active set from BOTH equity symbols (NSE:X) AND option underlying (NSE:X)
-                active_symbols_set = set()
-                for t in self.tools.paper_positions:
-                    if t.get('status', 'OPEN') != 'OPEN':
-                        continue
-                    sym = t.get('symbol', '')
-                    # Equity: NSE:INFY → INFY
-                    if sym.startswith('NSE:'):
-                        active_symbols_set.add(sym.replace('NSE:', ''))
-                    # Options: NFO:ICICIBANK26FEB1410CE → check underlying field
-                    underlying = t.get('underlying', '')
-                    if underlying:
-                        active_symbols_set.add(underlying.replace('NSE:', ''))
-                # Include ALL F&O stocks in retry — scanner covers them all
-                retry_eligible = set(APPROVED_UNIVERSE) | set(self._wildcard_symbols) | _all_fo_syms
-                unplaced = [s for s in set(mentioned_symbols) 
-                           if s not in active_symbols_set 
-                           and f'NSE:{s}' in retry_eligible
-                           and s not in self._rejected_this_cycle]
-                
-                # [DISABLED Mar 6] GPT direct-placement completely disabled.
-                # GPT path bypasses all quality gates — no smart_score, no ML veto,
-                # no OI alignment, no GMM gating. Only watcher + model-tracker place trades.
-                if False and unplaced and len(unplaced) <= 5:
-                    print(f"\n🔄 Detected {len(unplaced)} unplaced trades in response: {unplaced}")
-                    fno_prefer_set = {s.replace('NSE:', '') for s in FNO_CONFIG.get('prefer_options_for', [])} | {s.replace('NSE:', '') for s in _all_fo_syms}                    
-                    # Parse direction from GPT's response text for each symbol
-                    def _parse_direction_from_response(text, symbol):
-                        """Extract BUY/SELL direction for a symbol from GPT response text"""
-                        import re
-                        # Look for patterns like "NSE:PAYTM | ... | SELL" or "direction: SELL" near symbol
-                        # Search within 200 chars of the symbol mention
-                        patterns = [
-                            rf'{symbol}[^{{}}]{{0,200}}(?:direction|side|action)[:\s]*["\']?(SELL|BUY|BEARISH|BULLISH)',
-                            rf'{symbol}[^{{}}]{{0,200}}direction["\s:=]*["\']?(BUY|SELL)',
-                            rf'{symbol}[^{{}}]{{0,100}}\]\s*\[?(CE|PE)\b',
-                            rf'{symbol}[^{{}}]{{0,200}}(SELL|SHORT|BEARISH|PUT|Breakdown|breakdown|fade)',
-                            rf'{symbol}[^{{}}]{{0,200}}(BUY|LONG|BULLISH|CALL|Breakout|breakout|momentum up)',
-                            rf'(SELL|SHORT|BEARISH)[^{{}}]{{0,100}}{symbol}',
-                            rf'(BUY|LONG|BULLISH)[^{{}}]{{0,100}}{symbol}',
-                        ]
-                        for i, pattern in enumerate(patterns):
-                            match = re.search(pattern, text, re.IGNORECASE)
-                            if match:
-                                found = match.group(1) if i > 0 else match.group(1)
-                                if found.upper() in ('SELL', 'SHORT', 'BEARISH', 'PUT', 'BREAKDOWN', 'FADE', 'PE'):
-                                    return 'SELL'
-                                elif found.upper() in ('BUY', 'LONG', 'BULLISH', 'CALL', 'BREAKOUT', 'MOMENTUM UP', 'CE'):
-                                    return 'BUY'
-                        return None
-                    
-                    for sym in unplaced[:3]:  # Max 3 retries
-                        direction = _parse_direction_from_response(response, sym)
-                        # Fallback: use scored direction from cycle decisions
-                        if not direction:
-                            _cd = _cycle_decisions.get(f'NSE:{sym}')
-                            if _cd and _cd.get('decision'):
-                                _scored_dir = _cd['decision'].recommended_direction
-                                if _scored_dir in ('BUY', 'SELL'):
-                                    direction = _scored_dir
-                                    # print(f"   🔄 Using scored direction for {sym}: {direction} (GPT text unparseable)")
-                        if not direction:
-                            print(f"   ⚠️ Could not parse direction for {sym} from GPT response, skipping")
-                            continue
-                        
-                        print(f"   🔄 Direct-placing {sym} ({direction}) — parsed from GPT analysis")
-                        
-                        # ── ML DIRECTION CONFLICT FILTER (GPT direct-place) ──
-                        _gpt_was_flipped = False
-                        from config import ML_DIRECTION_CONFLICT
-                        _gpt_dir_cfg = ML_DIRECTION_CONFLICT
-                        if _gpt_dir_cfg.get('enabled', False) and _gpt_dir_cfg.get('block_gpt_trades', True):
-                            _gpt_ml = getattr(self, '_cycle_ml_results', {}).get(f'NSE:{sym}', {})
-                            _gpt_ml_signal = _gpt_ml.get('ml_signal', 'UNKNOWN')
-                            _gpt_move_prob = _gpt_ml.get('ml_move_prob', _gpt_ml.get('ml_p_move', 0.0))
-                            _gpt_dr_score = _gpt_ml.get('ml_down_risk_score', 0.0)
-                            _gpt_dr_lbl = self._dr_tag(_gpt_ml)
-                            _gpt_xgb_disagrees = False
-                            if direction == 'BUY' and _gpt_ml_signal == 'DOWN' and _gpt_move_prob >= _gpt_dir_cfg.get('min_xgb_confidence', 0.55):
-                                _gpt_xgb_disagrees = True
-                            elif direction == 'SELL' and _gpt_ml_signal == 'UP' and _gpt_move_prob >= _gpt_dir_cfg.get('min_xgb_confidence', 0.55):
-                                _gpt_xgb_disagrees = True
-                            
-                            if _gpt_xgb_disagrees:
-                                # XGB actively opposes GPT trade direction.
-                                # FIXED: use gmm_confirms (clean = confirms XGB), not raw dr_flag
-                                _gpt_gmm_confirms = _gpt_ml.get('ml_gmm_confirms_direction', False)
-                                if _gpt_gmm_confirms:
-                                    # GMM clean (no anomaly) → confirms XGB's opposing direction
-                                    # XGB + GMM both oppose → either FLIP or BLOCK
-                                    _ovr_ok, _ovr_reason = self._ml_override_allowed(sym, _gpt_ml, _gpt_dr_score, path='GPT', p_score=_pre_scores.get(f'NSE:{sym}', 0))
-                                    if _ovr_ok:
-                                        # Gates passed → FLIP to XGB direction
-                                        old_direction = direction
-                                        direction = 'BUY' if _gpt_ml_signal == 'UP' else 'SELL'
-                                        _gpt_was_flipped = True
-                                        print(f"   🔄 GPT ML_OVERRIDE_WGMM: {sym} — XGB={_gpt_ml_signal} + GMM clean "
-                                              f"({_gpt_dr_lbl}={_gpt_dr_score:.3f}) → FLIPPED {old_direction}→{direction}")
-                                    else:
-                                        # Gates failed → BLOCK (XGB+GMM both oppose but gates not met)
-                                        print(f"   🚫 GPT ML_OVR BLOCKED: {sym} — {_ovr_reason}")
-                                        continue
-                                else:
-                                    # GMM anomaly → check if anomaly actually CONFIRMS GPT direction
-                                    _gpt_up_flag = _gpt_ml.get('ml_up_flag', False)
-                                    _gpt_down_flag = _gpt_ml.get('ml_down_flag', False)
-                                    _gpt_anomaly_confirms = False
-                                    if direction == 'BUY' and _gpt_down_flag and not _gpt_up_flag:
-                                        _gpt_anomaly_confirms = True  # bounce confirms BUY
-                                    elif direction == 'SELL' and _gpt_up_flag and not _gpt_down_flag:
-                                        _gpt_anomaly_confirms = True  # crash confirms SELL
-                                    
-                                    if _gpt_anomaly_confirms:
-                                        print(f"   🎯 GPT GMM_CONTRARIAN: {sym} — XGB={_gpt_ml_signal} opposes but "
-                                              f"anomaly CONFIRMS GPT={direction} (UP={_gpt_ml.get('ml_up_score',0):.3f} DN={_gpt_ml.get('ml_down_score',0):.3f})")
-                                    else:
-                                        # Anomaly opposes or conflicting → BLOCK
-                                        print(f"   🚫 GPT ANOMALY_OPPOSE: {sym} — anomaly does NOT confirm {direction} "
-                                              f"(UP_Flag={_gpt_up_flag} Down_Flag={_gpt_down_flag}) → BLOCK")
-                                        continue
-                        
-                        try:
-                            # Build ML data for GPT direct-place trades
-                            _gpt_ml_full = getattr(self, '_cycle_ml_results', {}).get(f'NSE:{sym}', {})
-                            _gpt_ml_data = {
-                                'smart_score': None,
-                                'p_score': getattr(self, '_cycle_pre_scores', {}).get(f'NSE:{sym}', 0),
-                                'dr_score': _gpt_ml_full.get('ml_down_risk_score', 0),
-                                'ml_move_prob': _gpt_ml_full.get('ml_move_prob', 0),
-                                'ml_confidence': _gpt_ml_full.get('ml_confidence', 0),
-                                'xgb_model': {
-                                    'signal': _gpt_ml_full.get('ml_signal', 'UNKNOWN'),
-                                    'move_prob': _gpt_ml_full.get('ml_move_prob', 0),
-                                    'prob_up': _gpt_ml_full.get('ml_prob_up', 0),
-                                    'prob_down': _gpt_ml_full.get('ml_prob_down', 0),
-                                    'prob_flat': _gpt_ml_full.get('ml_prob_flat', 0),
-                                    'direction_bias': _gpt_ml_full.get('ml_direction_bias', 0),
-                                    'confidence': _gpt_ml_full.get('ml_confidence', 0),
-                                    'score_boost': _gpt_ml_full.get('ml_score_boost', 0),
-                                    'direction_hint': _gpt_ml_full.get('ml_direction_hint', 'NEUTRAL'),
-                                    'model_type': _gpt_ml_full.get('ml_model_type', 'unknown'),
-                                    'sizing_factor': _gpt_ml_full.get('ml_sizing_factor', 1.0),
-                                },
-                                'gmm_model': {
-                                    'down_risk_score': _gpt_ml_full.get('ml_down_risk_score', 0),
-                                    'down_risk_flag': _gpt_ml_full.get('ml_down_risk_flag', False),
-                                    'up_flag': _gpt_ml_full.get('ml_up_flag', False),
-                                    'down_flag': _gpt_ml_full.get('ml_down_flag', False),
-                                    'up_score': _gpt_ml_full.get('ml_up_score', 0),
-                                    'down_score': _gpt_ml_full.get('ml_down_score', 0),
-                                    'down_risk_bucket': _gpt_ml_full.get('ml_down_risk_bucket', 'LOW'),
-                                    'gmm_confirms_direction': _gpt_ml_full.get('ml_gmm_confirms_direction', False),
-                                    'gmm_regime_used': _gpt_ml_full.get('ml_gmm_regime_used', 'BOTH'),
-                                    'gmm_action': 'GPT_DIRECT',
-                                },
-                                'scored_direction': direction,
-                                'xgb_disagrees': _gpt_xgb_disagrees if '_gpt_xgb_disagrees' in dir() else False,
-                            } if _gpt_ml_full else {}
-                            # Use detected setup_type from scanning (ORB_BREAKOUT, VWAP_TREND, etc.)
-                            # so routing in place_option_order can reverse for ORB/ELITE
-                            _detected_setup = getattr(self, '_cycle_detected_setups', {}).get(f'NSE:{sym}', '') or getattr(self, '_cycle_detected_setups', {}).get(sym, '')
-                            _gpt_setup_type = 'ML_OVERRIDE_WGMM' if _gpt_was_flipped else (_detected_setup or 'GPT')
-                            # ML_OVERRIDE gates already checked before flip above
-                            
-                            # [FIX Mar 4] GPT ML QUALITY GATE — safety net for all GPT-selected trades
-                            # Prevents zero-score, low-ML-conviction entries from leaking through GPT pipeline.
-                            # Watcher/ELITE/SNIPER/TEST paths have their own ML gates; GPT had NONE.
-                            _gpt_pre_score = getattr(self, '_cycle_pre_scores', {}).get(f'NSE:{sym}', 0)
-                            _gpt_ml_move = _gpt_ml_full.get('ml_move_prob', 0) if _gpt_ml_full else 0
-                            _gpt_ml_conf = _gpt_ml_full.get('ml_confidence', 0) if _gpt_ml_full else 0
-                            _gpt_ml_flat = _gpt_ml_full.get('ml_prob_flat', 0) if _gpt_ml_full else 0
-                            
-                            # Gate 1: ML flat veto — if ML says >60% chance flat, don't enter
-                            if _gpt_ml_flat > 0.60:
-                                print(f"   🚫 GPT ML_FLAT_VETO: {sym} — P(flat)={_gpt_ml_flat:.0%} > 60% → SKIP")
-                                continue
-                            
-                            # Gate 2: ML move probability floor — need >35% move probability
-                            if _gpt_ml_full and _gpt_ml_move < 0.35:
-                                print(f"   🚫 GPT ML_LOW_MOVE: {sym} — move_prob={_gpt_ml_move:.0%} < 35% → SKIP")
-                                continue
-                            
-                            # Gate 3: Pre-score sanity — if score exists and is very low, skip
-                            # (score=0 means not scored yet, allow through; but if scored low, block)
-                            if _gpt_pre_score > 0 and _gpt_pre_score < 45:
-                                print(f"   🚫 GPT LOW_SCORE: {sym} — pre_score={_gpt_pre_score:.0f} < 45 → SKIP")
-                                continue
-                            
-                            if sym in fno_prefer_set:
-                                result = self.tools.place_option_order(
-                                    underlying=f"NSE:{sym}",
-                                    direction=direction,
-                                    strike_selection="ATM",
-                                    rationale=f"GPT identified {sym} as top setup ({direction})" + (" [ML-FLIPPED]" if _gpt_was_flipped else ""),
-                                    setup_type=_gpt_setup_type,
-                                    ml_data=_gpt_ml_data
-                                )
-                            else:
-                                # For non-F&O, try option first then cash
-                                result = self.tools.place_option_order(
-                                    underlying=f"NSE:{sym}",
-                                    direction=direction,
-                                    strike_selection="ATM",
-                                    rationale=f"GPT identified {sym} as top setup ({direction})" + (" [ML-FLIPPED]" if _gpt_was_flipped else ""),
-                                    setup_type=_gpt_setup_type,
-                                    ml_data=_gpt_ml_data
-                                )
-                            if result:
-                                status = "PLACED" if result.get('success') else result.get('error', 'unknown')[:80]
-                                print(f"   ✅ Direct-place {sym}: {status}")
-                                # If not F&O eligible, blacklist for this session
-                                if not result.get('success') and 'not F&O eligible' in result.get('error', ''):
-                                    self._rejected_this_cycle.add(sym)
-                                    print(f"   🚫 {sym} blacklisted: not F&O eligible")
-                            else:
-                                print(f"   ❌ Direct-place {sym}: No result returned")
-                        except Exception as e:
-                            print(f"   ❌ Direct-place {sym} failed: {str(e)[:100]}")
+            # [REMOVED Mar 9] GPT direct-placement block deleted.
+            # GPT path was disabled since Mar 6 (if False guard). All trades now flow
+            # through watcher pipeline or model-tracker — both have proper quality gates.
             
             # Check if agent created any trades
             pending = self.agent.get_pending_approvals()
@@ -9855,7 +9921,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             _total_open = len(_active_now)
             _sniper_positions = [t for t in _active_now if t.get('is_sniper') or t.get('setup_type') == 'GMM_SNIPER']
             _ml_override_positions = [t for t in _active_now if t.get('setup_type') == 'ML_OVERRIDE_WGMM']
-            _model_tracker_positions = [t for t in _active_now if t.get('setup_type') in ('MODEL_TRACKER', 'ALL_AGREE')]
+            _model_tracker_positions = [t for t in _active_now if t.get('setup_type') in ('MODEL_TRACKER', 'ALL_AGREE')]  # ALL_AGREE kept for legacy trades
             _gpt_positions = [t for t in _active_now if t.get('setup_type') in ('', 'MANUAL', 'GPT') or not t.get('setup_type')]
             if _total_open > 0:
                 _breakdown_parts = []

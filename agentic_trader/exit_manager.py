@@ -961,10 +961,12 @@ class ExitManager:
         if not cfg.get('enabled') or not cfg.get('velocity_kill_enabled'):
             return None
         
-        min_candles = cfg.get('velocity_min_candles', 3)
+        min_candles = cfg.get('velocity_min_candles', 4)
         threshold = cfg.get('velocity_threshold_pct', -1.5)
-        consecutive_needed = cfg.get('velocity_consecutive', 3)
+        consecutive_needed = cfg.get('velocity_consecutive', 4)
         check_underlying = cfg.get('velocity_underlying_confirm', True)
+        ul_trend_bypass = cfg.get('velocity_ul_trend_bypass_pct', 0.3)
+        min_total_loss = cfg.get('velocity_min_total_loss_pct', 12.0)
         
         history = state.premium_history
         if len(history) < min_candles:
@@ -1001,8 +1003,26 @@ class ExitManager:
                 if opt_type == 'PE' and ul_dir < -0.05:  # underlying falling > 0.05%
                     return None  # Underlying supportive, premium may catch up
         
+        # Underlying TREND bypass: if UL moved significantly in our favor from ENTRY,
+        # premium is likely lagging (IV adjusting) and will catch up. Don't kill trending winners.
+        if check_underlying and underlying_ltp > 0:
+            ul_entry = getattr(state, 'underlying_entry_ltp', 0)
+            if ul_entry <= 0 and hasattr(state, 'underlying_history') and state.underlying_history:
+                ul_entry = state.underlying_history[0]
+            if ul_entry > 0:
+                opt_type = state.option_type_str
+                ul_from_entry = (underlying_ltp - ul_entry) / ul_entry * 100
+                if opt_type == 'CE' and ul_from_entry > ul_trend_bypass:
+                    return None  # UL trending up from entry — premium will catch up
+                if opt_type == 'PE' and ul_from_entry < -ul_trend_bypass:
+                    return None  # UL trending down from entry — premium will catch up
+        
         avg_velocity = sum(recent) / len(recent)
         total_loss_pct = (current_price - entry) / entry * 100
+        
+        # Min total loss gate: don't kill for small bleeds (e.g. -6% over 4 candles in a trending stock)
+        if abs(total_loss_pct) < min_total_loss:
+            return None
         
         return ExitSignal(
             symbol=state.symbol,
@@ -1159,7 +1179,10 @@ class ExitManager:
                 )
             
             should_exit, reason = should_exit_on_greeks(
-                greeks, current_price, state.entry_price, state.candles_since_entry
+                greeks, current_price, state.entry_price, state.candles_since_entry,
+                underlying_ltp=getattr(state, 'underlying_ltp', 0.0),
+                underlying_entry=getattr(state, 'underlying_entry_ltp', 0.0),
+                option_type=getattr(state, 'option_type_str', ''),
             )
             if should_exit:
                 return ExitSignal(

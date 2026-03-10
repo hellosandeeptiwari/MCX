@@ -134,7 +134,7 @@ HARD_RULES = {
 # First cold cycle: ~45-60s, subsequent cached cycles: ~15-25s.
 FULL_FNO_SCAN = {
     "enabled": True,               # True = scan ALL F&O stocks, False = curated + wildcards only
-    "max_indicator_stocks": 40,     # Top 50 F&O stocks by composite rank (no fixed list bias)
+    "max_indicator_stocks": 10,     # Top 10 F&O stocks by composite rank (reduced from 40 — watcher-first strategy)
     "min_change_pct_filter": 0.5,   # Minimum change% to even consider (dead stocks filtered)
     "indicator_threads": 12,        # Thread pool size for parallel historical_data fetches
     "prefer_ws_quotes": True,       # Use WebSocket quote cache for initial screen (skip REST batch)
@@ -149,41 +149,55 @@ FULL_FNO_SCAN = {
 # unchanged for slower setups (sniper, model-tracker, mean-reversion).
 BREAKOUT_WATCHER = {
     "enabled": True,
-    # --- Trigger Thresholds (loosened Mar-05: afternoon moves are smaller) ---
-    "price_spike_pct": 0.7,           # Trigger if price moves ≥0.7% within 60s baseline (was 1.0)
+    # --- Trigger Thresholds (tightened Mar-10: catch sustainable moves, not opening spikes) ---
+    "price_spike_pct": 1.0,           # Trigger if price moves ≥1.0% within 60s baseline (was 0.7 — too sensitive at open)
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
-    "day_extreme_min_move_pct": 0.25, # Day extreme must also show ≥0.25% move from baseline (was 0.4)
-    "volume_surge_multiplier": 3.0,   # Trigger if tick volume ≥ 3.0x rolling average (was 3.5)
-    # --- Sustain Filter ---
-    # [FIX Mar 6] 15s was too short — BDL reversed 4 min after entry.
-    # 60s confirms real momentum, not just a volume blip.
-    "sustain_seconds": 60,            # Price must HOLD the move for 60s before triggering (was 15 — too short)
-    "sustain_recheck_pct": 0.5,       # Spike/extreme: price must still be ≥0.5% from baseline (was 0.8)
-    "sustain_recheck_pct_volume": 0.3,   # Volume surge: price must still be ≥0.3% from baseline (was 0.15 — too noisy)
-    "volume_surge_min_move_pct": 0.3,   # [NEW] VOLUME_SURGE must show ≥0.3% price move to enter sustain (prevents tiny-move fakeouts)
-    # --- Slow Grind Detection (NEW Mar-05: catches persistent moves the 60s window misses) ---
+    "day_extreme_min_move_pct": 0.35, # Day extreme must also show ≥0.35% move from baseline (was 0.25)
+    "volume_surge_multiplier": 3.0,   # Trigger if tick volume ≥ 3.0x rolling average
+    # --- Sustain Filter (SUSTAINABILITY FOCUS Mar-10) ---
+    # 120s forces the move to PROVE itself — intermittent spikes die within 60-90s.
+    # Peak tracking: if price retraces >50% of its peak move during the window, fail.
+    "sustain_seconds": 120,           # Price must HOLD the move for 120s before triggering (was 60 — caught fakeouts)
+    "sustain_recheck_pct": 0.6,       # Spike/extreme: price must still be ≥0.6% from baseline (was 0.5)
+    "sustain_recheck_pct_volume": 0.4,# Volume surge: price must still be ≥0.4% from baseline (was 0.3)
+    "sustain_retrace_max_pct": 50.0,  # Fail sustain if price retraces >50% from peak move during window
+    "volume_surge_min_move_pct": 0.3, # VOLUME_SURGE must show ≥0.3% price move to enter sustain
+    # --- Slow Grind Detection ---
     "slow_grind_pct": 1.0,              # 1%+ move over 5-minute window triggers SLOW_GRIND
     # --- Cooldown (anti-spam) ---
     "cooldown_seconds": 180,          # Don't re-trigger same stock within 3 minutes
-    "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days (was 3)
-    # --- Priority Queue (Mar-04 fix: big movers were lost to noise on crash days) ---
-    "queue_size": 100,                # Max queued triggers (up from 50) — evicts weakest when full
+    "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days
+    # --- Priority Queue ---
+    "queue_size": 100,                # Max queued triggers — evicts weakest when full
     "priority_bypass_pct": 2.0,       # Moves ≥2.0% BYPASS rate limit — always enter queue
-    # --- Timing ---
-    "active_after": "09:20",          # Don't trigger before 09:20 (let ORB range form)
+    # --- Timing (SUSTAINABILITY: wait for ORB range to fully form) ---
+    "active_after": "09:30",          # Don't trigger before 09:30 (was 09:20 — first 10 min is noise)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
-    # --- Score Gate ---
-    "min_score": 40,                  # Tightened Mar 6: was 35, raised to filter marginal setups
-    "orb_min_score": 40,               # ORB_BREAKOUT floor — matches watcher min (BDL=40, RVNL=41 were winners)
-    "orb_min_move_prob": 0.65,         # ORB trades need P(move)≥65% — winners avg 0.85, loser was 0.64
-    "watcher_min_move_prob": 0.57,     # WATCHER P(move) floor — winners avg 0.62, losers avg 0.59
+    # --- Score Gate (TIGHTENED Mar-10: require meaningful technical conviction) ---
+    "min_score": 40,                  # Minimum score to trade (was 15 — too low, passed garbage)
+    "orb_min_score": 40,              # ORB_BREAKOUT floor (was 25)
+    "orb_min_move_prob": 0.55,        # ORB trades need P(move)≥55% (was 0.50)
+    "watcher_min_move_prob": 0.40,    # WATCHER P(move) floor (was 0.30 — too permissive)
+    "watcher_min_adx": 15,            # ADX floor — watcher trigger IS trend evidence
+    # --- Scorer Conflict (NEW Mar-10: trust scorer when score is low) ---
+    "scorer_conflict_max_score": 50,  # If scorer disagrees and score < this, block trade
+    # --- RSI Extreme Guard (NEW Mar-10: don't buy into exhausted moves) ---
+    "rsi_extreme_pe_max": 25,         # Block PE (SELL) if RSI < 25 — oversold bounce imminent
+    "rsi_extreme_ce_min": 75,         # Block CE (BUY) if RSI > 75 — overbought pullback imminent
+    # --- Exhaustion Index (NEW Mar-10: statistical move exhaustion detection) ---
+    # Combines: intraday move from open + recent trigger move + position in day range + RSI
+    # Into a 0-100 index: >60 = exhausted move, don't chase.
+    # IndiGo example: EI=71 (dropped 3.3% from open, trigger only -0.3%, near day low, RSI=28)
+    "exhaustion_index_block": 60,     # Block if Exhaustion Index > this threshold
+    # --- Opening Period Cap (NEW Mar-10: limit concentrated open risk) ---
+    "max_trades_before_1000": 3,      # Max watcher trades before 10:00 IST
     # --- Dynamic Batch ---
-    "max_triggers_per_batch": 6,      # Max triggers fed to pipeline per drain (was hard 3)
-    "max_trades_per_scan": 2,         # Max trades PLACED per scan (rank by P(move), take best N)
+    "max_triggers_per_batch": 6,      # Max triggers fed to pipeline per drain
+    "max_trades_per_scan": 2,         # Max trades PLACED per scan (was 3 — quality over quantity)
     # --- VIX-based score penalty for elevated options pricing ---
-    "vix_penalty_above": 18.0,        # If India VIX > 18, apply -3 score penalty per VIX point above 18
-    "vix_penalty_per_point": 3,       # Penalty per VIX point (VIX=20 → -6 penalty, VIX=25 → -21 penalty)
-    "vix_hard_block_above": 28.0,     # Block ALL watcher entries if VIX > 28 (crash territory)
+    "vix_penalty_above": 22.0,        # If India VIX > 22, apply -2 score penalty per VIX point above 22
+    "vix_penalty_per_point": 2,       # Penalty per VIX point (VIX=25 → -6 penalty, VIX=28 → -12 penalty)
+    "vix_hard_block_above": 32.0,     # Block ALL watcher entries if VIX > 32 (extreme crash territory)
     # --- Watcher Momentum Exit (exit on spike peak / crater bottom reversal) ---
     "momentum_exit": {
         "enabled": True,
@@ -201,7 +215,39 @@ BREAKOUT_WATCHER = {
         "pressure_shift_ratio": 1.5,        # Opposing qty > 1.5× favorable qty → pressure shifted
         "confirmed_reversal_pct": 0.25,     # Lower threshold when 2+ signals confirm reversal
         "partial_confirm_reversal_pct": 0.35,  # Mid threshold when 1 signal confirms
-        "sample_window_seconds": 90,        # Rolling window for price/volume history samples
+        "sample_window_seconds": 180,       # Rolling window for price/volume history samples (was 90 — too narrow for slow grinds)
+        # --- Option Premium Tracking (NEW: track premium directly, not just underlying) ---
+        "premium_reversal_pct": 8.0,        # Exit if option premium drops ≥8% from its peak (direct profit protection)
+        "premium_reversal_confirmed_pct": 5.0,  # Lower threshold when multi-signal confirms (2+ signals)
+        # --- Profit-Tiered Thresholds (NEW: bigger profits = tighter stops) ---
+        "profit_tiers": [
+            # (min_premium_gain_pct, reversal_pct_override)
+            # Example: if option is up ≥80%, use 0.20% underlying reversal instead of 0.5%
+            {"min_gain_pct": 80, "reversal_pct": 0.20, "premium_rev_pct": 4.0},
+            {"min_gain_pct": 50, "reversal_pct": 0.25, "premium_rev_pct": 5.0},
+            {"min_gain_pct": 30, "reversal_pct": 0.30, "premium_rev_pct": 6.0},
+        ],
+        # --- CE/PE Asymmetry (NEW: different behavior for calls vs puts) ---
+        "ce_reversal_multiplier": 0.85,     # CE: tighter exit (CE dies faster on reversal). Multiply threshold by 0.85
+        "pe_reversal_multiplier": 0.90,     # PE: tighter on bounce (panic reversals are sharp). Multiply threshold by 0.90
+        # --- Reversal Acceleration (NEW: detect if reversal is speeding up) ---
+        "reversal_accel_enabled": True,     # Enable reversal acceleration as a 4th signal
+        "reversal_accel_threshold": 1.5,    # Reversal speed > 1.5x average speed → accelerating
+        # --- Trend Shield: Fibonacci Retracement Floor (smart: scale threshold with move size) ---
+        # Instead of fixed 0.25-0.50% reversal threshold, allow pullback proportional to the move.
+        # A stock up +5% gets 1.91% pullback room (5% × 0.382). Prevents killing trending winners.
+        "retracement_floor_enabled": True,
+        "ul_retracement_factor": 0.382,          # Underlying: allow 38.2% Fib retracement of the move
+        "premium_retracement_factor": 0.382,     # Premium: allow 38.2% retracement of premium gain
+        # --- Minimum Premium Gain Floor (smart: don't WME tiny gains) ---
+        # A +1.8% premium gain isn't worth protecting — the trade hasn't developed yet.
+        # Let exit_manager handle it normally, giving the trade room to run.
+        "min_premium_gain_pct": 5.0,             # Min peak premium gain % before WME can trigger
+        # --- Armed Grace Period (smart: V-shape pullback filter) ---
+        # When WME triggers, enter ARMED state for N seconds instead of instant exit.
+        # If price recovers → DISARM (it was just a pullback). If reversal deepens → exit fast.
+        "armed_grace_seconds": 90,               # Wait 90s for recovery before committing to exit
+        "armed_deepen_multiplier": 1.5,          # Exit immediately if reversal > 1.5× threshold during grace
     },
 }
 
@@ -449,10 +495,10 @@ GMM_SNIPER = {
     "enabled": True,
     "max_sniper_trades_per_day": 4,    # ⚠️ Tightened: sniper = SELECTIVE, 4 max (was 8)
     "lot_multiplier": 3.0,             # Reduced from 5x → 3x. Earn bigger size with proven P&L
-    "min_smart_score": 50,             # Tightened: need real conviction (was 45)
-    "max_updr_score": 0.12,            # Tightened: GMM must show cleaner signal (was 0.15)
-    "max_downdr_score": 0.15,          # Tightened: cleaner downside (was 0.18)
-    "min_gate_prob": 0.50,             # Tightened: XGB must see real movement (was 0.45)
+    "min_smart_score": 53,             # Strict: need solid conviction (was 50)
+    "max_updr_score": 0.11,            # Strict: GMM must show cleaner signal (was 0.12)
+    "max_downdr_score": 0.14,          # Strict: cleaner downside (was 0.15)
+    "min_gate_prob": 0.52,             # Strict: XGB must see real movement (was 0.50)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 200000,        # ₹2 Lakh — sniper capital reduced, must prove ROI
     "max_exposure_pct": 85,            # Max % of sniper capital usable
@@ -546,11 +592,11 @@ ARBTR_CONFIG = {
 
     # --- Sector Move Detection ---
     "min_sector_move_pct": 0.6,           # Sector index must move ≥0.6% from prev close
-    "min_sector_stocks_aligned": 0.65,    # Tightened: ≥65% of sector must align (was 60%)
+    "min_sector_stocks_aligned": 0.70,    # Strict: ≥70% of sector must align for conviction
 
     # --- Laggard Detection ---
-    "max_laggard_move_pct": 0.8,          # Tightened: laggard must genuinely lag, not just slow (was 1.0)
-    "min_divergence_pct": 0.5,            # Tightened: require real divergence gap (was 0.4)
+    "max_laggard_move_pct": 0.6,          # Strict: stock must barely move (<0.6%) to be a true laggard
+    "min_divergence_pct": 0.7,            # Strict: require meaningful divergence gap from sector
     "max_divergence_pct": 5.0,            # If gap >5% the stock is decoupled (skip)
 
     # --- Confirmation Gates (reduce failure trades) ---
@@ -562,7 +608,7 @@ ARBTR_CONFIG = {
     "max_ml_flat_prob": 0.55,             # (unused when require_ml=False)
     "require_no_chop_zone": True,         # Laggard must NOT be in chop zone
     "require_htf_not_opposed": True,      # HTF must not oppose sector direction
-    "min_smart_score": 35,                # Low floor — ARBTR signal is primary, score is secondary
+    "min_smart_score": 40,                # Moderate floor — need decent score to confirm divergence
 
     # --- GMM Safety Net ---
     "use_gmm_veto": True,                 # GMM anomaly model can veto if opposing
@@ -579,6 +625,10 @@ ARBTR_CONFIG = {
     "sl_multiplier": 1.0,                 # Tight SL — if thesis wrong, exit fast
     "max_simultaneous_arbtr": 3,          # Tightened: fewer concurrent = better capital allocation
     "separate_capital": 200000,           # ₹2L — ARBTR hasn't earned more capital yet
+
+    # --- Speed Gate (Mar 10 fix) ---
+    "speed_gate_minutes": 15,             # If no convergence in 15 min, thesis is dead
+    "speed_gate_min_gain_pct": 3.0,       # Need ≥3% premium gain to prove thesis is working
 }
 
 # Sector definitions for ARBTR — must match _sector_stock_map in scan_and_trade
@@ -586,12 +636,12 @@ ARBTR_SECTOR_MAP = {
     'METALS': {
         'index': 'NSE:NIFTY METAL',
         'stocks': ['TATASTEEL', 'JSWSTEEL', 'HINDALCO', 'VEDL', 'JINDALSTEL',
-                   'NMDC', 'NATIONALUM', 'HINDZINC', 'SAIL', 'HINDCOPPER', 'COALINDIA'],
+                   'NMDC', 'NATIONALUM', 'HINDZINC', 'SAIL', 'HINDCOPPER', 'ADANIENT'],
     },
     'IT': {
         'index': 'NSE:NIFTY IT',
         'stocks': ['INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM',
-                   'KPITTECH', 'COFORGE', 'MPHASIS', 'PERSISTENT'],
+                   'COFORGE', 'MPHASIS', 'PERSISTENT'],
     },
     'BANKS': {
         'index': 'NSE:NIFTY BANK',
@@ -606,12 +656,12 @@ ARBTR_SECTOR_MAP = {
     'PHARMA': {
         'index': 'NSE:NIFTY PHARMA',
         'stocks': ['SUNPHARMA', 'CIPLA', 'DRREDDY', 'DIVISLAB', 'AUROPHARMA',
-                   'BIOCON', 'LUPIN', 'APOLLOHOSP'],
+                   'BIOCON', 'LUPIN'],
     },
     'ENERGY': {
         'index': 'NSE:NIFTY ENERGY',
         'stocks': ['RELIANCE', 'ONGC', 'NTPC', 'POWERGRID', 'TATAPOWER',
-                   'ADANIENT', 'BPCL', 'IOC', 'GAIL'],
+                   'BPCL', 'IOC', 'GAIL', 'COALINDIA'],
     },
     'FMCG': {
         'index': 'NSE:NIFTY FMCG',
@@ -626,7 +676,7 @@ ARBTR_SECTOR_MAP = {
     'INFRA': {
         'index': 'NSE:NIFTY INFRA',
         'stocks': ['LT', 'ADANIPORTS', 'ULTRACEMCO', 'GRASIM', 'SHREECEM',
-                   'AMBUJACEM', 'ACC', 'SIEMENS', 'ABB', 'BEL', 'HAL', 'BHEL'],
+                   'AMBUJACEM'],
     },
 }
 
@@ -868,7 +918,7 @@ THESIS_HEDGE_CONFIG = {
 # BEFORE SL/TIE/TIME_STOP fires — catches fast moves between scan cycles.
 PROACTIVE_HEDGE_CONFIG = {
     "enabled": True,
-    "loss_trigger_pct": 8,            # Convert when loss >= 8% of entry price
+    "loss_trigger_pct": 10,           # Convert when loss >= 10% of entry price (was 8% — give trades more room to develop)
     "check_interval_seconds": 60,     # Check every 60 seconds (inside realtime monitor)
     "max_hedge_loss_pct": 50,         # Don't hedge if already > 50% loss (was 20% — too tight, let deep losses hedge too)
     "cooldown_seconds": 300,          # After a hedge, wait 5 min before checking same underlying again
@@ -964,10 +1014,12 @@ ASYMMETRIC_EXIT = {
     "enabled": True,
     # --- Premium Velocity Kill (fast-kill steady bleeders) ---
     "velocity_kill_enabled": True,
-    "velocity_min_candles": 3,          # Need at least 3 candles of data
+    "velocity_min_candles": 4,          # Need at least 4 candles of data (was 3 — too eager on trending stocks)
     "velocity_threshold_pct": -1.5,     # Kill if avg velocity < -1.5%/candle
-    "velocity_consecutive": 3,          # Must bleed for 3 consecutive candles
+    "velocity_consecutive": 4,          # Must bleed for 4 consecutive candles (was 3 — give one more candle to recover)
     "velocity_underlying_confirm": True, # Also check underlying isn't recovering
+    "velocity_ul_trend_bypass_pct": 0.3, # If UL moved >0.3% favorably from entry, skip kill (premium will catch up)
+    "velocity_min_total_loss_pct": 12.0, # Only kill if total loss > 12% (small bleeds in trending stocks are fine)
     # --- Momentum-Gated Partial Profit (don't clip accelerating winners) ---
     "momentum_gate_enabled": True,
     "momentum_lookback_candles": 2,     # Compare last 2 candles' avg change

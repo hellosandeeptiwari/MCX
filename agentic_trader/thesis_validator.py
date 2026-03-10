@@ -36,7 +36,7 @@ logger = logging.getLogger('thesis_validator')
 # ── Configuration ──────────────────────────────────────────────────
 # Activation gate
 LOSS_ACTIVATION_PCT = 8.0       # Must be down >8% to even run checks
-MIN_CANDLES = 3                 # Don't run before candle 3 (too early = noise)
+MIN_CANDLES = 5                 # Don't run before candle 5 (was 3 — IV often normalizes after 3-4 candles in a trend)
 MAX_CANDLES = 10                # After 10 candles, time_stop handles it
 
 # Check 1: R-Multiple Collapse
@@ -44,12 +44,12 @@ R_COLLAPSE_PEAK_MIN = 0.5      # Must have reached at least 0.5R
 R_COLLAPSE_CURRENT_MAX = -0.8  # Must now be at or below -0.8R
 
 # Check 2: Never Showed Life
-NEVER_LIFE_CANDLES = 5          # At least 5 candles
+NEVER_LIFE_CANDLES = 7          # At least 7 candles (was 5 — too aggressive, stocks need time to develop)
 NEVER_LIFE_MAX_R = 0.1         # Never exceeded 0.1R
 
 # Check 3: IV Crush
-IV_CRUSH_PREMIUM_DROP = 8.0    # Premium down ≥ 8%
-IV_CRUSH_UNDERLYING_MAX = 0.3  # Underlying moved < 0.3% against
+IV_CRUSH_PREMIUM_DROP = 12.0   # Premium down ≥ 12% (was 8% — too tight, 8% is normal fluctuation in high-IV options)
+IV_CRUSH_UNDERLYING_MAX = 0.8  # Underlying moved < 0.8% (was 0.3% — too tight, catches developing moves)
 
 # Check 4: Underlying BOS — uses initial_sl directly (no config needed)
 
@@ -135,6 +135,24 @@ def check_thesis(
         and state.max_favorable_move < NEVER_LIFE_MAX_R
         and premium_loss_pct >= LOSS_ACTIVATION_PCT
     ):
+        # ── TREND SHIELD: Don't kill if underlying just started trending favorably ──
+        # Premium may lag the underlying — give it room if UL is cooperating
+        if state.is_option and underlying_ltp > 0:
+            ul_entry = getattr(state, 'underlying_entry_ltp', 0)
+            if ul_entry <= 0 and hasattr(state, 'underlying_history') and state.underlying_history:
+                ul_entry = state.underlying_history[0]
+            if ul_entry > 0:
+                ul_move_pct = (underlying_ltp - ul_entry) / ul_entry * 100
+                opt_type = getattr(state, 'option_type_str', '')
+                _is_ce = opt_type.upper() in ('CE', 'CALL', '')
+                _favorable = ul_move_pct >= 0.3 if _is_ce else ul_move_pct <= -0.3
+                if _favorable:
+                    logger.info(
+                        f"NEVER_SHOWED_LIFE bypassed [{state.symbol}]: "
+                        f"UL trending {ul_move_pct:+.2f}% in favor, premium will catch up"
+                    )
+                    return None  # Skip — underlying is cooperating
+        
         reason = (
             f"Never showed life: {candles} candles, "
             f"maxR={state.max_favorable_move:.2f} (<{NEVER_LIFE_MAX_R}), "
@@ -169,12 +187,19 @@ def check_thesis(
                 # Determine if underlying is "still on our side"
                 # PE option profits from underlying going DOWN
                 # CE option profits from underlying going UP
-                if opt_type == 'PE':
-                    # For PE: adverse = underlying went UP significantly
-                    underlying_fine = ul_move_pct <= IV_CRUSH_UNDERLYING_MAX
+                # First check: is underlying trending IN OUR FAVOR?
+                # If yes, premium drop is IV normalizing (not crush) — skip.
+                underlying_fine = False
+                if opt_type == 'PE' and ul_move_pct < -IV_CRUSH_UNDERLYING_MAX:
+                    pass  # UL moving down favorably — not IV crush, premium will catch up
+                elif opt_type != 'PE' and ul_move_pct > IV_CRUSH_UNDERLYING_MAX:
+                    pass  # CE: UL moving up favorably — not IV crush, premium will catch up
                 else:
-                    # For CE: adverse = underlying went DOWN significantly
-                    underlying_fine = ul_move_pct >= -IV_CRUSH_UNDERLYING_MAX
+                    # Underlying is flat or adverse → genuine IV crush
+                    if opt_type == 'PE':
+                        underlying_fine = ul_move_pct <= IV_CRUSH_UNDERLYING_MAX
+                    else:
+                        underlying_fine = ul_move_pct >= -IV_CRUSH_UNDERLYING_MAX
                 
                 if underlying_fine:
                     reason = (

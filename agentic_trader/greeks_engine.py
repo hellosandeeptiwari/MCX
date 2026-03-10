@@ -271,6 +271,9 @@ def should_exit_on_greeks(
     current_ltp: float,
     entry_price: float,
     candles_since_entry: int = 0,
+    underlying_ltp: float = 0.0,
+    underlying_entry: float = 0.0,
+    option_type: str = '',
 ) -> Tuple[bool, str]:
     """
     Check if Greeks-based exit signals fire.
@@ -279,6 +282,8 @@ def should_exit_on_greeks(
       1. DELTA_COLLAPSE: delta < 0.08 → option is nearly worthless, no recovery possible
       2. THETA_BLEED: theta eating > 3% of LTP per hour and trade is flat/losing
       3. SPEED_GATE: moneyness-adjusted speed gate (OTM gets checked faster)
+         — with TREND SHIELD: bypasses speed gate if underlying is trending ≥0.5% in favorable direction
+         — with RECOVERY TRAJECTORY: extends gate by 3 candles if premium is positive and improving
       
     Returns:
         (should_exit: bool, reason: str)
@@ -319,6 +324,27 @@ def should_exit_on_greeks(
     if candles_since_entry >= speed_candles:
         premium_pct = (current_ltp - entry_price) / entry_price * 100 if entry_price > 0 else 0
         if premium_pct < 2.0:  # Less than 2% gain after speed gate candles
+            # ── TREND SHIELD: Don't kill trades where underlying is trending favorably ──
+            # Premium often lags underlying in building moves (IV adjusting). Give it room.
+            if underlying_ltp > 0 and underlying_entry > 0:
+                ul_move_pct = (underlying_ltp - underlying_entry) / underlying_entry * 100
+                # CE profits from UL going UP, PE from UL going DOWN
+                _is_ce = option_type.upper() in ('CE', 'CALL', '')
+                _favorable_ul = ul_move_pct >= 0.5 if _is_ce else ul_move_pct <= -0.5
+                if _favorable_ul:
+                    return False, (
+                        f"GREEKS speed gate bypassed: UL trending {ul_move_pct:+.2f}% in favor, "
+                        f"premium at {premium_pct:+.1f}% will catch up"
+                    )
+            
+            # ── RECOVERY TRAJECTORY: Extend gate if premium is positive and improving ──
+            # If premium is >0% but <2%, it's recovering — give 3 more candles
+            if premium_pct > 0 and candles_since_entry < speed_candles + 3:
+                return False, (
+                    f"GREEKS speed gate extended: premium at {premium_pct:+.1f}% (positive, recovering), "
+                    f"extended to candle {speed_candles + 3}"
+                )
+            
             return True, (
                 f"GREEKS EXIT — Speed gate ({greeks.moneyness.value}): "
                 f"{candles_since_entry} candles, only {premium_pct:+.1f}% gain "

@@ -4209,30 +4209,35 @@ class ZerodhaTools:
                         }
                     
                     # --- Sub-Gate 3: Premium Floor (IV-safety) ---
-                    _min_prem_iv = _iv_cfg.get('min_premium_for_iv_safety', 8.0)
-                    if _opt_ltp and _opt_ltp < _min_prem_iv and _opt_iv < 0.35:
-                        # print(f"   🧊 IV CRUSH GUARD (PREMIUM): {_sym} — LTP ₹{_opt_ltp:.2f} < ₹{_min_prem_iv:.0f} "
-                        #       f"with IV {_opt_iv*100:.1f}%. Cheap + low IV = amplified vega risk.")
+                    # ARBTR uses stricter premium floor (₹10) regardless of IV level
+                    # because ARBTR enters on sector divergence with score=0 — no quality conviction.
+                    _is_arbtr = (setup_type == 'ARBTR')
+                    _min_prem_iv = 10.0 if _is_arbtr else _iv_cfg.get('min_premium_for_iv_safety', 8.0)
+                    _prem_iv_check = True if _is_arbtr else (_opt_iv < 0.35)
+                    if _opt_ltp and _opt_ltp < _min_prem_iv and _prem_iv_check:
+                        _gate_label = "ARBTR IV GUARD" if _is_arbtr else "IV CRUSH GUARD"
                         return {
                             "success": False,
-                            "error": f"IV CRUSH GUARD: Premium ₹{_opt_ltp:.2f} < ₹{_min_prem_iv:.0f} with IV {_opt_iv*100:.1f}%. "
+                            "error": f"{_gate_label}: Premium ₹{_opt_ltp:.2f} < ₹{_min_prem_iv:.0f} with IV {_opt_iv*100:.1f}%. "
                                      f"Cheap OTM options suffer disproportionately from IV drops "
                                      f"(₹1 IV drop on ₹{_opt_ltp:.1f} = {1/_opt_ltp*100:.0f}% loss).",
                             "action": "Skip — choose deeper ITM or higher-premium strike"
                         }
                     
                     # --- Sub-Gate 4: Vega/Delta Ratio ---
+                    # ARBTR always checks vega/delta regardless of IV level (Mar 10 lesson:
+                    # NATIONALUM IV=31%, MPHASIS IV=39% bypassed the 30% threshold → IV crush losses).
                     _vd_iv_thresh = _iv_cfg.get('vega_delta_iv_threshold', 0.30)
                     _max_vd = _iv_cfg.get('max_vega_delta_ratio', 0.50)
-                    if (_opt_iv < _vd_iv_thresh and _opt_delta and abs(_opt_delta) > 0.01 
+                    _vd_iv_ok = _is_arbtr or (_opt_iv < _vd_iv_thresh)
+                    if (_vd_iv_ok and _opt_delta and abs(_opt_delta) > 0.01 
                             and _opt_vega and abs(_opt_vega) > 0):
                         _vd_ratio = abs(_opt_vega) / abs(_opt_delta)
                         if _vd_ratio > _max_vd:
-                            # print(f"   🧊 IV CRUSH GUARD (VEGA/Δ): {_sym} — |vega/delta|={_vd_ratio:.2f} > {_max_vd:.2f} "
-                            #       f"with IV {_opt_iv*100:.1f}%. This is a vol bet, not a direction bet.")
+                            _gate_label = "ARBTR IV GUARD" if _is_arbtr else "IV CRUSH GUARD"
                             return {
                                 "success": False,
-                                "error": f"IV CRUSH GUARD: Vega/Delta ratio {_vd_ratio:.2f} > {_max_vd:.2f} at IV {_opt_iv*100:.1f}%. "
+                                "error": f"{_gate_label}: Vega/Delta ratio {_vd_ratio:.2f} > {_max_vd:.2f} at IV {_opt_iv*100:.1f}%. "
                                          f"Vega dominates delta — trade profits need IV to rise, not just direction.",
                                 "action": "Skip — choose higher-delta (deeper ITM) strike to reduce vega exposure"
                             }
