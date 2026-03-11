@@ -249,6 +249,9 @@ class AutonomousTrader:
         self._watcher_total_placed = 0               # Total trades successfully placed
         self._watcher_total_pos_exhausted = 0        # Times blocked by position limit
         self._watcher_score_history = {}              # sym → [(timestamp, score), ...] for momentum detection
+        self._trade_lock = threading.Lock()               # Serialises order placement between scan & watcher threads
+        self._watcher_pipe_busy = False                   # True while watcher pipeline thread is running
+        self._watcher_pipe_thread = None                  # Reference to the watcher pipeline thread
 
         # === SETTINGS HOT-RELOAD (titan_settings.json) ===
         self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'titan_settings.json')
@@ -979,14 +982,15 @@ class AutonomousTrader:
                     'scored_direction': direction,
                     'xgb_disagrees': False,
                 } if _elite_ml else {}
-                result = self.tools.place_option_order(
-                    underlying=sym,
-                    direction=direction,
-                    strike_selection="ATM",
-                    rationale=f"ELITE AUTO-FIRE: Score {score:.0f} (threshold {threshold}) — bypassing GPT for immediate execution",
-                    setup_type="ELITE",
-                    ml_data=_elite_ml_data
-                )
+                with self._trade_lock:
+                    result = self.tools.place_option_order(
+                        underlying=sym,
+                        direction=direction,
+                        strike_selection="ATM",
+                        rationale=f"ELITE AUTO-FIRE: Score {score:.0f} (threshold {threshold}) — bypassing GPT for immediate execution",
+                        setup_type="ELITE",
+                        ml_data=_elite_ml_data
+                    )
                 if result and result.get('success'):
                     print(f"   ✅ ELITE AUTO-FIRED: {sym} ({direction}) score={score:.0f}")
                     auto_fired.append(sym)
@@ -1037,6 +1041,14 @@ class AutonomousTrader:
         """
         if not BREAKOUT_WATCHER.get('enabled', False):
             return
+        
+        # --- Watcher start time gate (let ORB settle before reacting) ---
+        _ws_start = BREAKOUT_WATCHER.get('watcher_start')
+        if _ws_start:
+            _now_t = datetime.now().time()
+            _ws_t = datetime.strptime(_ws_start, '%H:%M').time()
+            if _now_t < _ws_t:
+                return
         
         ticker = getattr(self.tools, 'ticker', None)
         if not ticker or not hasattr(ticker, 'breakout_watcher') or not ticker.breakout_watcher:
@@ -1121,12 +1133,31 @@ class AutonomousTrader:
         _filter_note = f" | filtered=[{', '.join(_skip_reasons)}]" if _skip_reasons else ''
         self._wlog(f"🚀 PIPELINE: Sending {len(_batch)} stocks → [{_actionable_summary}] (slots={_pos_slots_free}){_filter_note}")
         
-        # Run the FULL pipeline for these symbols (identical gates as scan_and_trade)
+        # Run the FULL pipeline in a DEDICATED THREAD so the main loop
+        # (exit monitoring, schedule, heartbeats) isn't blocked during the
+        # 10-30s focused scan.  A _trade_lock serialises order placement
+        # so scan_and_trade and the watcher never place orders simultaneously.
+        if self._watcher_pipe_busy:
+            self._wlog(f"⏳ Pipeline thread still running — triggers held in queue")
+            return
+
+        self._watcher_pipe_busy = True
         _pipe_start = _wt.time()
-        self._watcher_focused_scan(_batch)
-        _pipe_dur = _wt.time() - _pipe_start
-        self._wlog(f"✅ PIPELINE DONE in {_pipe_dur:.1f}s | placed={self._watcher_total_placed} total today")
-        self._last_watcher_scan_time = _wt.time()
+
+        def _watcher_pipe_worker():
+            try:
+                self._watcher_focused_scan(_batch)
+            except Exception as _wpe:
+                self._wlog(f"❌ Pipeline thread error: {_wpe}")
+            finally:
+                _pipe_dur = _wt.time() - _pipe_start
+                self._wlog(f"✅ PIPELINE DONE in {_pipe_dur:.1f}s | placed={self._watcher_total_placed} total today")
+                self._last_watcher_scan_time = _wt.time()
+                self._watcher_pipe_busy = False
+
+        self._watcher_pipe_thread = threading.Thread(
+            target=_watcher_pipe_worker, daemon=True, name="watcher-pipeline")
+        self._watcher_pipe_thread.start()
     
     # ========== WATCHER FOCUSED SCAN (FULL PIPELINE) ==========
     def _watcher_focused_scan(self, triggers: list):
@@ -1554,9 +1585,20 @@ class AutonomousTrader:
                     direction = _scorer_dir
                 elif _scorer_dir and _scorer_dir != _trigger_dir:
                     # CONFLICT: scorer says one thing, trigger says another
-                    # Trust the trigger — it's real-time evidence of the move
-                    direction = _trigger_dir
-                    self._wlog(f"⚠️ DIR CONFLICT: {_sym} scorer={_scorer_dir} vs trigger={_trigger_dir}({_trigger_type}) → using trigger dir")
+                    _dir_conf_val = getattr(_decision, 'direction_confidence', 0)
+                    if _dir_conf_val >= 70:
+                        # High-confidence scorer direction — REJECT this trade
+                        # Scorer is very sure; trigger is contradicting strong consensus
+                        self._wlog(f"❌ DIR REJECT: {_sym} scorer={_scorer_dir}(conf={_dir_conf_val:.0f}%) vs trigger={_trigger_dir}({_trigger_type}) → SKIPPED (high confidence conflict)")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_DIR_CONFLICT',
+                                          reason=f'Scorer {_scorer_dir} conf={_dir_conf_val:.0f}% vs trigger {_trigger_dir}({_trigger_type})',
+                                          direction=_scorer_dir)
+                        continue
+                    else:
+                        # Low/medium confidence — trigger override acceptable
+                        direction = _trigger_dir
+                        self._wlog(f"⚠️ DIR CONFLICT: {_sym} scorer={_scorer_dir}(conf={_dir_conf_val:.0f}%) vs trigger={_trigger_dir}({_trigger_type}) → using trigger dir (low conf)")
                 else:
                     # Scorer said HOLD — use trigger direction
                     direction = _trigger_dir
@@ -1634,14 +1676,36 @@ class AutonomousTrader:
                         _final_score += _momentum_boost
                         self._wlog(f"  MOMENTUM: {_stock_name} {_rising} rising(Δ≥3) avg_Δ={_avg_delta:.0f} → boost +{_momentum_boost} → {_final_score:.0f}")
                 
-                # --- GATE A: Score threshold ---
-                if _final_score <= _min_score:
-                    self._wlog(f"  BLOCKED(A-SCORE): {_stock_name} score={_final_score:.0f} <= {_min_score}")
+                # --- GATE A: Score threshold (with early-market hardening) ---
+                _now_t = datetime.now()
+                _early_mkt_end = BREAKOUT_WATCHER.get('early_market_end', '09:55')
+                _em_h, _em_m = int(_early_mkt_end.split(':')[0]), int(_early_mkt_end.split(':')[1])
+                _is_early_market = _now_t.hour < _em_h or (_now_t.hour == _em_h and _now_t.minute < _em_m)
+                if _is_early_market:
+                    _early_min_score = BREAKOUT_WATCHER.get('early_market_min_score', 50)
+                    _effective_min = max(_min_score, _early_min_score)
+                else:
+                    _effective_min = _min_score
+                if _final_score <= _effective_min:
+                    _tag = "A-SCORE-EARLY" if _is_early_market and _effective_min > _min_score else "A-SCORE"
+                    self._wlog(f"  BLOCKED({_tag}): {_stock_name} score={_final_score:.0f} <= {_effective_min}{' (early market hardening)' if _is_early_market and _effective_min > _min_score else ''}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_SCORE',
-                                      reason=f'Breakout {_trigger_type} but score {_final_score:.0f} <= {_min_score}',
+                                      reason=f'Breakout {_trigger_type} but score {_final_score:.0f} <= {_effective_min}{"(early)" if _is_early_market else ""}',
                                       direction=direction)
                     continue
+                
+                # --- GATE A2: Early-market direction confidence gate ---
+                if _is_early_market:
+                    _em_dir_conf = getattr(_decision, 'direction_confidence', 0)
+                    _em_min_conf = BREAKOUT_WATCHER.get('early_market_min_dir_conf', 45)
+                    if _em_dir_conf < _em_min_conf:
+                        self._wlog(f"  BLOCKED(A2-EARLY-DIR): {_stock_name} dir_conf={_em_dir_conf:.0f}% < {_em_min_conf}% (early market — direction unreliable)")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_EARLY_DIR',
+                                          reason=f'Early market dir_conf={_em_dir_conf:.0f}%<{_em_min_conf}%',
+                                          direction=direction)
+                        continue
                 
                 # --- GATE B: Chop zone filter ---
                 if _data.get('chop_zone', False):
@@ -1937,23 +2001,7 @@ class AutonomousTrader:
                 except Exception:
                     pass
                 
-                # --- GATE G5: Opening period cap (NEW Mar-10) ---
-                # Limit trades before 10:00 to prevent concentrated risk at open
-                _max_before_10 = BREAKOUT_WATCHER.get('max_trades_before_1000', 3)
-                try:
-                    from datetime import datetime as _dt_g5
-                    _now_g5 = _dt_g5.now()
-                    if _now_g5.hour < 10:
-                        _open_trades = sum(1 for t in self.tools.paper_positions
-                                         if t.get('status') == 'OPEN'
-                                         and 'WATCHER' in t.get('setup_type', '').upper() + t.get('rationale', '').upper()
-                                         and t.get('timestamp', '').startswith(_now_g5.strftime('%Y-%m-%d')))
-                        if _open_trades >= _max_before_10:
-                            self._wlog(f"  BLOCKED(G5-OPEN_CAP): {_stock_name} already {_open_trades}/{_max_before_10} watcher trades before 10:00")
-                            self._watcher_total_gate_blocked += 1
-                            continue
-                except Exception:
-                    pass
+                # --- GATE G5: Opening period cap — DISABLED (early-market quality gates A-SCORE-EARLY + A2-EARLY-DIR handle this) ---
                 
                 # --- GATE H: Position limit (regime-aware, same as ELITE) ---
                 active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
@@ -2086,16 +2134,17 @@ class AutonomousTrader:
                     _final_score = _cand['score']
                     _ml_data = _cand['ml_data']
                     
-                    result = self.tools.place_option_order(
-                        underlying=_sym,
-                        direction=_direction,
-                        strike_selection="ATM",
-                        rationale=(f"WATCHER→FULL_PIPELINE: {_trigger_type} ({_move_pct:+.1f}%) — "
-                                  f"Score {_final_score:.0f} P(move)={_cand['ml_move_prob']:.2f}, "
-                                  f"ranked #{_candidates.index(_cand)+1}/{len(_candidates)} by P(move)"),
-                        setup_type=_setup_type,
-                        ml_data=_ml_data
-                    )
+                    with self._trade_lock:
+                        result = self.tools.place_option_order(
+                            underlying=_sym,
+                            direction=_direction,
+                            strike_selection="ATM",
+                            rationale=(f"WATCHER→FULL_PIPELINE: {_trigger_type} ({_move_pct:+.1f}%) — "
+                                      f"Score {_final_score:.0f} P(move)={_cand['ml_move_prob']:.2f}, "
+                                      f"ranked #{_candidates.index(_cand)+1}/{len(_candidates)} by P(move)"),
+                            setup_type=_setup_type,
+                            ml_data=_ml_data
+                        )
                     
                     if result and result.get('success'):
                         self._wlog(f"  🎯 TRADE PLACED: {_sym.replace('NSE:', '')} ({_direction}) "
@@ -3212,7 +3261,7 @@ class AutonomousTrader:
         min_gate = cfg.get('min_gate_prob', 0.55)
         score_tier = cfg.get('score_tier', 'premium')
         
-        print(f"\n   🎯 SNIPER SCAN: gates → UPDR<{max_dr_up}/DownDR<{max_dr_down}, smart>={min_smart}, gate>={min_gate} | {self._gmm_sniper_trades_today}/{max_per_day} used")
+        print(f"\n   🎯 SNIPER SCAN: gates → UPDR<{max_dr_up}/DownDR<{max_dr_down}, smart>={min_smart}, gate>={min_gate}, dir_conf>={cfg.get('min_direction_confidence', 55)} | {self._gmm_sniper_trades_today}/{max_per_day} used")
         
         # Import sector mapping
         try:
@@ -3223,7 +3272,7 @@ class AutonomousTrader:
         # Build candidate pool — same logic as model-tracker but stricter thresholds
         _cycle_decs = getattr(self.tools, '_cached_cycle_decisions', {})
         candidates = []
-        _sniper_reject_counts = {'no_ml': 0, 'already_traded': 0, 'active_pos': 0, 'dr_high': 0, 'dr_flagged': 0, 'no_direction': 0, 'hold': 0, 'gate_low': 0, 'smart_low': 0, 'xgb_block': 0, 'dir_block': 0}
+        _sniper_reject_counts = {'no_ml': 0, 'already_traded': 0, 'active_pos': 0, 'dr_high': 0, 'dr_flagged': 0, 'no_direction': 0, 'hold': 0, 'gate_low': 0, 'smart_low': 0, 'xgb_block': 0, 'dir_block': 0, 'dir_low_conf': 0}
         _sniper_near_misses = []  # Symbols close to passing
         
         for sym in pre_scores:
@@ -3278,6 +3327,16 @@ class AutonomousTrader:
                 _sniper_reject_counts['hold'] += 1
                 continue
             
+            # ── DIRECTION CONFIDENCE GATE ──
+            # Smart Direction Engine measures how many signals agree on direction.
+            # Sniper requires minimum confidence to avoid trading on thin evidence.
+            _snp_dir_conf = getattr(_decision, 'direction_confidence', 100.0)
+            _snp_min_dir_conf = cfg.get('min_direction_confidence', 55)
+            if _snp_dir_conf < _snp_min_dir_conf:
+                _sniper_reject_counts['dir_low_conf'] += 1
+                _sniper_near_misses.append(f"{sym_diag}(dir_conf={_snp_dir_conf:.0f}<{_snp_min_dir_conf})")
+                continue
+            
             # ── XGB DIRECTION CHECK REMOVED ──
             # XGB direction (UP/DOWN) no longer used for trade decisions.
             # Direction comes purely from IntradayScorer. Only P(move) gate remains.
@@ -3322,6 +3381,7 @@ class AutonomousTrader:
                 'down_score': _snp_down_score,
                 'ml_move_prob': ml_move_prob,
                 'p_score': p_score,
+                'dir_conf': _snp_dir_conf,
                 'was_flipped': _sniper_was_flipped,
                 # === FULL ML DATA for trade record ===
                 'ml_data': {
@@ -3366,7 +3426,7 @@ class AutonomousTrader:
         print(f"   🎯 SNIPER RESULT: {_passed} candidates from {_total_syms} symbols | Rejected: {_reject_str or 'none'}")
         if candidates:
             for i, c in enumerate(candidates[:5]):
-                print(f"      #{i+1} {c['sym_clean']} {c['direction']} | UP={c.get('up_score',0):.4f} DN={c.get('down_score',0):.4f} smart={c['smart_score']:.1f} gate={c['ml_move_prob']:.2f} | {c['sector']}")
+                print(f"      #{i+1} {c['sym_clean']} {c['direction']} | UP={c.get('up_score',0):.4f} DN={c.get('down_score',0):.4f} smart={c['smart_score']:.1f} gate={c['ml_move_prob']:.2f} dir_conf={c.get('dir_conf',0):.0f}% | {c['sector']}")
         if _sniper_near_misses and not candidates:
             print(f"      Near misses: {' | '.join(_sniper_near_misses[:6])}")
         
@@ -5475,9 +5535,10 @@ class AutonomousTrader:
             print(f"⚠️ EOD DB maintenance error: {e}")
 
     def _check_portfolio_profit_target(self):
-        """KILL-ALL PROFIT SWITCH: Close ALL positions when cumulative unrealized P&L >= 15% of capital.
+        """KILL-ALL PROFIT SWITCH: Close ALL positions when realized + unrealized P&L >= 15% of capital.
         
-        Uses _compute_live_unrealized_pnl() for real-time unrealized P&L.
+        Uses _compute_live_unrealized_pnl() for real-time unrealized P&L
+        plus today's realized P&L from state_db.
         Runs every 60s in background. After booking profit, resets so next scan can continue.
         """
         if self._profit_target_hit:
@@ -5488,13 +5549,19 @@ class AutonomousTrader:
         target_amount = self.start_capital * target_pct
         
         unrealized = self._compute_live_unrealized_pnl()
-        if unrealized < target_amount:
+        realized = 0
+        try:
+            _, realized, _ = self.tools.state_db.load_active_trades()
+        except Exception:
+            pass
+        total_pnl = unrealized + realized
+        if total_pnl < target_amount:
             return  # Not yet at target
         
         # ═══ PROFIT TARGET HIT — CLOSE EVERYTHING ═══
         self._profit_target_hit = True
         print(f"\n{'='*70}")
-        print(f"💰💰💰 PORTFOLIO PROFIT TARGET HIT! Unrealized: ₹{unrealized:+,.0f} >= {target_pct*100:.0f}% of ₹{self.start_capital:,.0f} (₹{target_amount:,.0f})")
+        print(f"💰💰💰 PORTFOLIO PROFIT TARGET HIT! Realized: ₹{realized:+,.0f} + Unrealized: ₹{unrealized:+,.0f} = ₹{total_pnl:+,.0f} >= {target_pct*100:.0f}% of ₹{self.start_capital:,.0f} (₹{target_amount:,.0f})")
         print(f"💰💰💰 CLOSING ALL POSITIONS TO BOOK PROFIT")
         print(f"{'='*70}\n")
         
@@ -6125,9 +6192,29 @@ class AutonomousTrader:
                             _buy_leg_profit = buy_ltp - _buy_entry    # +ve = gain on buy leg
                             _net_after_unwind = _buy_leg_profit - max(0, _hedge_leg_cost)
                             
-                            if buy_ltp >= _recovery_threshold and _net_after_unwind >= _min_profit:
-                                print(f"\n🔓 HEDGE UNWIND: {t['symbol']} — buy leg ₹{buy_ltp:.2f} recovered past ₹{_recovery_threshold:.2f}")
-                                print(f"   Buy leg P&L: ₹{_buy_leg_profit:+.2f} | Hedge leg cost: ₹{_hedge_leg_cost:+.2f} | Net: ₹{_net_after_unwind:+.2f}")
+                            # PATH A: Buy leg recovery (original)
+                            _path_a = buy_ltp >= _recovery_threshold and _net_after_unwind >= _min_profit
+                            
+                            # PATH B: Spread-profit unwind (theta-resistant)
+                            # If the spread itself is profitable (current value > net debit),
+                            # unwind to capture full directional move instead of capped spread profit.
+                            _path_b = False
+                            _spread_profit_enabled = _unwind_cfg.get('unwind_spread_profit_enabled', False)
+                            _spread_profit_pct = _unwind_cfg.get('unwind_spread_profit_pct', 15)
+                            _net_debit = t.get('net_debit', 0)
+                            if _spread_profit_enabled and _net_debit > 0:
+                                _spread_profit_threshold = _net_debit * (1 + _spread_profit_pct / 100)
+                                _path_b = current_value >= _spread_profit_threshold
+                            
+                            _unwind_reason = ''
+                            if _path_a:
+                                _unwind_reason = f'PATH_A: buy_ltp ₹{buy_ltp:.2f} >= threshold ₹{_recovery_threshold:.2f}, net ₹{_net_after_unwind:+.2f}'
+                            elif _path_b:
+                                _unwind_reason = f'PATH_B: spread_value ₹{current_value:.2f} >= ₹{_spread_profit_threshold:.2f} ({_spread_profit_pct}% above debit ₹{_net_debit:.2f})'
+                            
+                            if _path_a or _path_b:
+                                print(f"\n🔓 HEDGE UNWIND: {t['symbol']} — {_unwind_reason}")
+                                print(f"   Buy leg: ₹{buy_ltp:.2f} (entry ₹{_buy_entry:.2f}) | Sell leg: ₹{sell_ltp:.2f} (entry ₹{_sell_entry:.2f}) | Spread: ₹{current_value:.2f} (debit ₹{_net_debit:.2f})")
                                 try:
                                     _old_symbol = t['symbol']
                                     unwind_result = self.tools.unwind_hedge(t, sell_ltp)
@@ -6164,6 +6251,17 @@ class AutonomousTrader:
                                         print(f"   ⚠️ Unwind failed: {unwind_result.get('error', 'unknown')}")
                                 except Exception as e:
                                     print(f"   ⚠️ Unwind exception: {e}")
+                            else:
+                                # Skip logging — diagnose why unwind didn't fire
+                                _skip_parts = []
+                                if not _path_a:
+                                    _skip_parts.append(f'PATH_A: buy_ltp ₹{buy_ltp:.2f} vs threshold ₹{_recovery_threshold:.2f} ({"OK" if buy_ltp >= _recovery_threshold else "BELOW"}), net ₹{_net_after_unwind:+.2f} vs min ₹{_min_profit} ({"OK" if _net_after_unwind >= _min_profit else "LOW"})')
+                                if not _path_b:
+                                    if _spread_profit_enabled and _net_debit > 0:
+                                        _skip_parts.append(f'PATH_B: spread ₹{current_value:.2f} vs threshold ₹{_spread_profit_threshold:.2f} ({"OK" if current_value >= _spread_profit_threshold else "BELOW"})')
+                                    else:
+                                        _skip_parts.append('PATH_B: disabled or no net_debit')
+                                print(f"   ℹ️ UNWIND SKIP: {t['symbol']} — {' | '.join(_skip_parts)}")
             else:
                 ltp_val = quotes.get(t['symbol'], {}).get('last_price', 0)
                 if ltp_val and ltp_val > 0:
@@ -10469,7 +10567,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         _dbg(f"DEBUG: Early session ended — switching to {self._normal_interval}-min interval")
                 
                 # === SETTINGS HOT-RELOAD (every 30s — mtime check is very cheap) ===
-                if _loop_count % 30 == 0:
+                if _loop_count % 60 == 0:
                     try:
                         self._apply_settings_overrides()
                     except Exception:
@@ -10479,13 +10577,13 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
 
                 # === WEEKEND SLEEP — skip tight loop on Sat/Sun ===
                 if datetime.now().weekday() >= 5:
-                    if _loop_count % 3600 == 1:  # Log once per hour
+                    if _loop_count % 7200 == 1:  # Log once per hour
                         _dbg("💤 Weekend — sleeping (60s intervals)")
                     time.sleep(60)
                     continue
 
                 # === AUTO-RENEW DHAN TOKEN (every ~2 hours) ===
-                if _loop_count > 0 and _loop_count % 7200 == 0:  # every 7200s = 2 hours
+                if _loop_count > 0 and _loop_count % 14400 == 0:  # every 14400 iters × 0.5s = 2 hours
                     try:
                         from dhan_token_manager import ensure_token_fresh
                         if ensure_token_fresh():
@@ -10494,7 +10592,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                             _dbg("DHAN_TOKEN: expired ❌ — OI degraded")
                     except Exception as _tok_loop_e:
                         _dbg(f"DHAN_TOKEN: check error: {_tok_loop_e}")
-                if _loop_count % 60 == 0:  # Log heartbeat every 60s
+                if _loop_count % 120 == 0:  # Log heartbeat every 60s
                     _watcher_stats = ''
                     _watcher_alive = ''
                     try:
@@ -10512,7 +10610,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                              f"pos_full={self._watcher_total_pos_exhausted} "
                                              f"fired={len(self._watcher_fired_this_session)}")
                             # Periodic watcher-alive banner every 5 min
-                            if _loop_count % 300 == 0 and self.is_trading_hours():
+                            if _loop_count % 600 == 0 and self.is_trading_hours():
                                 _n_subs = _tw.stats.get('subscribed', 0) if hasattr(_tw, 'stats') else 0
                                 _watcher_alive = (f"\n👁️  WATCHER ALIVE — monitoring {_n_subs} stocks | "
                                                  f"q={_wq} triggered={self._watcher_total_drained} "
@@ -10524,7 +10622,7 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                     if _watcher_alive:
                         _dbg(_watcher_alive)
                 
-                time.sleep(1)
+                time.sleep(0.5)
         except KeyboardInterrupt:
             _dbg("DEBUG: KeyboardInterrupt received, shutting down...")
             print("\n\n👋 Shutting down...")

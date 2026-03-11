@@ -258,6 +258,83 @@ class TradeLedger:
                         continue
         return events
 
+    def backfill_to_sqlite(self):
+        """Import all existing JSONL trade ledger files into SQLite trades table.
+
+        Idempotent — clears trades table first, then replays all ENTRY/EXIT/CONVERSION
+        events from all JSONL files in chronological order.
+        """
+        from state_db import get_state_db
+        db = get_state_db()
+
+        # Clear existing trades to avoid duplicates
+        with db._lock:
+            db._conn.execute("DELETE FROM trades")
+            db._conn.commit()
+
+        files = sorted(
+            f for f in os.listdir(LEDGER_DIR)
+            if f.startswith('trade_ledger_') and f.endswith('.jsonl')
+        )
+
+        total_entries = 0
+        total_exits = 0
+        total_conversions = 0
+
+        for fname in files:
+            date_str = fname.replace('trade_ledger_', '').replace('.jsonl', '')
+            filepath = os.path.join(LEDGER_DIR, fname)
+
+            entries = []
+            exits = []
+            conversions = []
+
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    event = record.get('event', '')
+                    if event == 'ENTRY':
+                        entries.append(record)
+                    elif event == 'EXIT':
+                        exits.append(record)
+                    elif event == 'CONVERSION':
+                        conversions.append(record)
+
+            # Insert entries first
+            for rec in entries:
+                try:
+                    # Override date from filename (more reliable than ts parsing)
+                    rec['_date_override'] = date_str
+                    db._insert_trade_entry_with_date(rec, date_str)
+                    total_entries += 1
+                except Exception as e:
+                    print(f"  ⚠️ Entry insert error ({fname}): {e}")
+
+            # Apply conversions
+            for rec in conversions:
+                try:
+                    db.update_trade_thp(rec)
+                    total_conversions += 1
+                except Exception:
+                    pass
+
+            # Apply exits
+            for rec in exits:
+                try:
+                    db.update_trade_exit(rec)
+                    total_exits += 1
+                except Exception:
+                    pass
+
+        print(f"✅ Backfill complete: {total_entries} entries, {total_exits} exits, "
+              f"{total_conversions} conversions from {len(files)} files")
+
     def get_entries(self, date_str: str = None) -> list:
         """Get all ENTRY events for a day."""
         return [e for e in self.read_day(date_str) if e.get('event') == 'ENTRY']
@@ -377,13 +454,27 @@ class TradeLedger:
         return os.path.join(LEDGER_DIR, f'trade_ledger_{datetime.now().strftime("%Y-%m-%d")}.jsonl')
 
     def _append(self, record: dict):
-        """Thread-safe append a single JSON line."""
+        """Thread-safe append a single JSON line + write to SQLite trades table."""
         try:
             with self._write_lock:
                 with open(self._today_file(), 'a', encoding='utf-8') as f:
                     f.write(json.dumps(record, default=str) + '\n')
         except Exception as e:
             print(f"⚠️ TradeLedger write error: {e}")
+
+        # ── Also persist to SQLite trades table ──
+        try:
+            from state_db import get_state_db
+            db = get_state_db()
+            event = record.get('event', '')
+            if event == 'ENTRY':
+                db.insert_trade_entry(record)
+            elif event == 'EXIT':
+                db.update_trade_exit(record)
+            elif event == 'CONVERSION':
+                db.update_trade_thp(record)
+        except Exception as e:
+            print(f"⚠️ TradeLedger SQLite sync error: {e}")
 
 
 # Module-level singleton accessor

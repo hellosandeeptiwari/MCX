@@ -645,14 +645,18 @@ class SniperStrategies:
         gmm_sniper_symbols: set,
         oi_unwinding_symbols: set,
     ) -> List[dict]:
-        """Scan for PCR Extreme fade candidates with REGIME-ADAPTIVE thresholds.
+        """Scan for PCR Extreme MOMENTUM candidates with REGIME-ADAPTIVE thresholds.
         
-        Key improvements over naive fixed-threshold PCR:
-          1. Rolling PCR z-scores per stock (what's extreme FOR THIS STOCK today)
-          2. VIX-adjusted thresholds (high-vol = wider thresholds)
-          3. Index PCR blending with reduced weight (stock signal primary)
-          4. Price action confirmation — don't fade a strong trend just because PCR is extreme
+        MOMENTUM logic (go WITH the crowd, not against):
+          - Low PCR (≤ overbought_thr): crowd is bullish (heavy call buying) → BUY with them
+          - High PCR (≥ oversold_thr): crowd is bearish (heavy put buying) → SELL with them
         
+        Why momentum beats contrarian intraday:
+          - Intraday crowd momentum persists — mean reversion happens overnight/multi-day
+          - Short covering / long unwinding happen at EOD, not mid-session
+          - Extreme PCR = institutional conviction → ride the wave
+        
+        Gates: RSI confirmation, price alignment, GMM quality, XGB, smart score.
         Returns list of candidate dicts ready for placement.
         """
         cfg = self._pcr_cfg
@@ -710,13 +714,13 @@ class SniperStrategies:
             else:
                 blended_pcr = stock_pcr
 
-            # --- PCR Extreme Detection ---
-            if blended_pcr >= oversold_thr:
-                direction = 'BUY'   # Market oversold → contrarian BUY
-                pcr_edge = blended_pcr - oversold_thr  # How extreme beyond threshold
-            elif blended_pcr <= overbought_thr:
-                direction = 'SELL'  # Market overbought → contrarian SELL
-                pcr_edge = overbought_thr - blended_pcr
+            # --- PCR Extreme Detection (MOMENTUM — go WITH the crowd) ---
+            if blended_pcr <= overbought_thr:
+                direction = 'BUY'   # Low PCR = heavy call buying = crowd bullish → BUY with them
+                pcr_edge = overbought_thr - blended_pcr  # How extreme beyond threshold
+            elif blended_pcr >= oversold_thr:
+                direction = 'SELL'  # High PCR = heavy put buying = crowd bearish → SELL with them
+                pcr_edge = blended_pcr - oversold_thr
             else:
                 continue  # PCR in neutral zone — no signal
 
@@ -727,12 +731,12 @@ class SniperStrategies:
                 print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: pcr_edge={pcr_edge:.3f} < min={min_edge:.3f}")
                 continue
 
-            # --- Index PCR agreement check (optional) ---
+            # --- Index PCR agreement check (momentum — index must confirm crowd direction) ---
             if require_index and index_pcr is not None:
-                if direction == 'BUY' and index_pcr < base_oversold * 0.85:
-                    continue  # Index not oversold — stock PCR extreme may be stock-specific noise
-                if direction == 'SELL' and index_pcr > base_overbought * 1.15:
-                    continue  # Index not overbought — stock PCR extreme may be noise
+                if direction == 'BUY' and index_pcr > base_overbought * 1.15:
+                    continue  # Index PCR not bullish — no momentum confirmation
+                if direction == 'SELL' and index_pcr < base_oversold * 0.85:
+                    continue  # Index PCR not bearish — no momentum confirmation
 
             # --- Symbol dedup ---
             if sym in self._pcr_symbols or sym in active_symbols:
@@ -742,22 +746,41 @@ class SniperStrategies:
             if sym in oi_unwinding_symbols:
                 continue
 
-            # --- PRICE ACTION GUARD: Don't fade a strong trending move ---
-            # If stock is trending strongly (ADX > 30, large move), PCR extreme
-            # may reflect genuine institutional conviction, not contrarian opportunity
+            # --- MOMENTUM CONFIRMATION: Price action + RSI must align with direction ---
             mkt = market_data.get(sym, {})
             if isinstance(mkt, dict):
                 adx = mkt.get('adx', 20)
                 change_pct = mkt.get('change_pct', 0)
-                follow_through = mkt.get('follow_through_candles', 0)
+                rsi = mkt.get('rsi_14', 50)
                 
-                # Strong trend guard: ADX > 35 + move > 2% + high follow-through
-                # = institutional conviction, NOT a mere sentiment extreme → skip
-                if adx > 35 and abs(change_pct) > 2.0 and follow_through >= 3:
+                # Price alignment gate: price must be moving WITH direction
+                min_align = cfg.get('min_price_alignment_pct', 0.3)
+                if direction == 'BUY' and change_pct < -min_align:
                     sym_clean = sym.replace('NSE:', '')
-                    print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: Strong trend "
-                          f"(ADX={adx:.0f}, chg={change_pct:+.1f}%, FT={follow_through}) — "
-                          f"PCR extreme may reflect conviction, not contrarian")
+                    print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: BUY but price falling "
+                          f"(chg={change_pct:+.1f}%) — no momentum confirmation")
+                    continue
+                if direction == 'SELL' and change_pct > min_align:
+                    sym_clean = sym.replace('NSE:', '')
+                    print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: SELL but price rising "
+                          f"(chg={change_pct:+.1f}%) — no momentum confirmation")
+                    continue
+                
+                # RSI confirmation gate: momentum without exhaustion
+                rsi_min_buy = cfg.get('rsi_min_buy', 40)
+                rsi_max_buy = cfg.get('rsi_max_buy', 70)
+                rsi_min_sell = cfg.get('rsi_min_sell', 30)
+                rsi_max_sell = cfg.get('rsi_max_sell', 60)
+                
+                if direction == 'BUY' and (rsi < rsi_min_buy or rsi > rsi_max_buy):
+                    sym_clean = sym.replace('NSE:', '')
+                    print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: BUY RSI={rsi:.0f} "
+                          f"outside [{rsi_min_buy}-{rsi_max_buy}] — no momentum confirmation")
+                    continue
+                if direction == 'SELL' and (rsi < rsi_min_sell or rsi > rsi_max_sell):
+                    sym_clean = sym.replace('NSE:', '')
+                    print(f"      ⚠️ PCR-Sniper SKIP {sym_clean}: SELL RSI={rsi:.0f} "
+                          f"outside [{rsi_min_sell}-{rsi_max_sell}] — no momentum confirmation")
                     continue
 
             # --- GMM quality gate (regime-proportional) ---
@@ -776,26 +799,26 @@ class SniperStrategies:
             if ml_move_prob < min_gate:
                 continue
 
-            # --- XGB direction alignment (soft — PCR is strong standalone) ---
+            # --- XGB direction alignment (momentum should agree with ML) ---
             xgb_signal = ml.get('ml_signal', 'UNKNOWN')
             xgb_penalty = 0
             if direction == 'BUY' and xgb_signal == 'DOWN' and ml_move_prob >= 0.55:
-                xgb_penalty = 10
+                xgb_penalty = 10  # ML disagrees with bullish momentum
             elif direction == 'SELL' and xgb_signal == 'UP' and ml_move_prob >= 0.55:
-                xgb_penalty = 10
+                xgb_penalty = 10  # ML disagrees with bearish momentum
 
             # --- Smart score (PCR-weighted, regime-aware) ---
             p_score = pre_scores.get(sym, 0)
             conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 30.0
             safety = (1.0 - min(dr_score, 1.0)) * 18.0 + 5.0
             pcr_boost = min(pcr_edge, 0.5) * 30.0  # PCR extremity bonus (max 15 pts)
-            # Bonus if BOTH stock and index PCR agree on extreme
+            # Bonus if BOTH stock and index PCR agree on momentum direction
             index_agree_bonus = 0
             if index_pcr is not None:
-                if direction == 'BUY' and index_pcr >= base_oversold * 0.9:
-                    index_agree_bonus = 5.0
-                elif direction == 'SELL' and index_pcr <= base_overbought * 1.1:
-                    index_agree_bonus = 5.0
+                if direction == 'BUY' and index_pcr <= base_overbought * 1.1:
+                    index_agree_bonus = 5.0  # Index also bullish flow
+                elif direction == 'SELL' and index_pcr >= base_oversold * 0.9:
+                    index_agree_bonus = 5.0  # Index also bearish flow
             technical = min(p_score, 100) * 0.12
             move_bonus = ml_move_prob * 10.0
             smart_score = (conviction + safety + pcr_boost + index_agree_bonus
@@ -821,7 +844,7 @@ class SniperStrategies:
                 'blended_pcr': round(blended_pcr, 3),
                 'index_pcr': index_pcr,
                 'pcr_edge': round(pcr_edge, 3),
-                'pcr_regime': 'OVERSOLD' if direction == 'BUY' else 'OVERBOUGHT',
+                'pcr_regime': 'BULLISH_FLOW' if direction == 'BUY' else 'BEARISH_FLOW',
                 'adaptive_oversold_thr': round(oversold_thr, 3),
                 'adaptive_overbought_thr': round(overbought_thr, 3),
                 'vix_level': vix_level,
@@ -856,7 +879,7 @@ class SniperStrategies:
                         'blended_pcr': round(blended_pcr, 3),
                         'index_pcr': index_pcr,
                         'pcr_edge': round(pcr_edge, 3),
-                        'pcr_regime': 'OVERSOLD' if direction == 'BUY' else 'OVERBOUGHT',
+                        'pcr_regime': 'BULLISH_FLOW' if direction == 'BUY' else 'BEARISH_FLOW',
                         'adaptive_thresholds': {
                             'oversold': round(oversold_thr, 3),
                             'overbought': round(overbought_thr, 3),

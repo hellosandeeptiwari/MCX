@@ -97,6 +97,9 @@ class IntradayOptionDecision:
     microstructure_block_reason: str = ""
     # Reversal zone trade (tight SL, flipped direction)
     is_reversal_trade: bool = False
+    # Smart Direction Engine
+    direction_confidence: float = 0.0     # 0-100 how strongly signals agree on direction
+    direction_sources: str = ""            # Voting breakdown: which signals support which direction
 
 
 class IntradayOptionScorer:
@@ -1129,9 +1132,18 @@ class IntradayOptionScorer:
             # with HIGH/EXPLOSIVE volume AND move aligned with direction, reduce penalty
             # by 60%. Riding a trend is NOT chasing — a 5% intraday move on a bear day
             # with explosive volume is momentum, not exhaustion.
+            #
+            # MARKET REGIME OVERRIDE: On extreme breadth days (1 up / 39 down),
+            # individual stock trend scores are low because the move is too fast/fresh
+            # for TrendFollowing to detect. But market-wide direction IS confirmed.
+            # We buy PUTs on sell-offs — penalizing "chasing" kills valid PUT entries.
             vol_regime = market_data.get('volume_regime', 'NORMAL')
+            _breadth = market_data.get('market_breadth', 'MIXED')
+            _breadth_confirms_sell = _breadth in ('BEARISH',) and direction == 'SELL'
+            _breadth_confirms_buy = _breadth in ('BULLISH',) and direction == 'BUY'
+            _breadth_override = _breadth_confirms_sell or _breadth_confirms_buy
             is_trend_momentum = (
-                raw_trend_score >= 60   # S6 FIX: match TrendFollowing's own TREND_THRESHOLD=60
+                (raw_trend_score >= 60 or _breadth_override)   # Market regime can substitute for stock-level trend
                 and vol_regime in ('HIGH', 'EXPLOSIVE')
                 and (
                     (direction == "SELL" and ltp < day_open)  # Bearish move aligned
@@ -1205,14 +1217,16 @@ class IntradayOptionScorer:
                     warnings.append("⚠️ EXHAUSTION: Move on LOW volume (-3)")
 
             # --- E. VWAP arbiter (below VWAP on move-up = move failing) ---
+            # On extreme breadth days, VWAP is skewed by the gap — reduce penalty
             if total_move_pct >= 2 and vwap > 0 and ltp > 0:
+                _vwap_penalty = 10 if not _breadth_override else 4  # Reduced on extreme breadth days
                 is_bullish = ltp > day_open if day_open > 0 else market_data.get('change_pct', 0) > 0
                 if is_bullish and ltp < vwap:
-                    exhaustion_score -= 10
-                    warnings.append(f"🚫 EXHAUSTION: Moved up BUT below VWAP ₹{vwap:.0f} (-10)")
+                    exhaustion_score -= _vwap_penalty
+                    warnings.append(f"🚫 EXHAUSTION: Moved up BUT below VWAP ₹{vwap:.0f} (-{_vwap_penalty})")
                 elif not is_bullish and ltp > vwap:
-                    exhaustion_score -= 10
-                    warnings.append(f"🚫 EXHAUSTION: Moved down BUT above VWAP ₹{vwap:.0f} (-10)")
+                    exhaustion_score -= _vwap_penalty
+                    warnings.append(f"🚫 EXHAUSTION: Moved down BUT above VWAP ₹{vwap:.0f} (-{_vwap_penalty})")
 
             # --- WATCHER SAFETY CAP ---
             # Even with VWAP-based calculation, cap watcher exhaustion at -12
@@ -1340,6 +1354,103 @@ class IntradayOptionScorer:
                 bearish_points -= _htf_contributed
             warnings.append(f"🔄 HTF CONFLICT: HTF={_htf_direction} vs direction={direction} — reversed +{_htf_contributed}→-3 (Δ{_htf_correction:+.0f})")
             _audit_after_align = score  # Update baseline
+        
+        # === SMART DIRECTION VOTING ENGINE ===
+        # Multi-signal weighted voting measures direction CONFIDENCE.
+        # Each independent signal casts a weighted vote. Confidence reflects
+        # how many signals agree, weighted margin, and source diversity.
+        # This doesn't override direction — it measures how trustworthy it is.
+        # Sniper and other strategies can gate on direction_confidence.
+        _dv_votes = {}  # signal_name → (direction, weight)
+        
+        # Vote 1: TrendFollowing (max weight 25, scaled by raw score)
+        if trend_direction in ('BUY', 'SELL'):
+            _dv_tw = max(5, int(raw_trend_score / 100 * 25))
+            _dv_votes['TREND'] = (trend_direction, _dv_tw)
+        
+        # Vote 2: ORB breakout direction (weight from ORB contribution)
+        # Time-of-day decay: ORB/VWAP unreliable in first 15 min (9:15-9:30)
+        _dv_early_market = datetime.now().hour == 9 and datetime.now().minute < 30
+        _dv_early_mult = 0.5 if _dv_early_market else 1.0
+        
+        _dv_orb_contrib = max(0, _audit_after_orb - _audit_after_micro)
+        if signal.orb_signal == "BREAKOUT_UP" and _dv_orb_contrib > 0:
+            _dv_votes['ORB'] = ('BUY', max(1, int(min(15, max(3, _dv_orb_contrib)) * _dv_early_mult)))
+        elif signal.orb_signal == "BREAKOUT_DOWN" and _dv_orb_contrib > 0:
+            _dv_votes['ORB'] = ('SELL', max(1, int(min(15, max(3, _dv_orb_contrib)) * _dv_early_mult)))
+        
+        # Vote 3: VWAP position (direction-independent)
+        if signal.vwap_position == "ABOVE_VWAP":
+            _dv_vw = 8 if signal.vwap_trend == "RISING" else (5 if signal.vwap_trend == "FLAT" else 3)
+            _dv_votes['VWAP'] = ('BUY', max(1, int(_dv_vw * _dv_early_mult)))
+        elif signal.vwap_position == "BELOW_VWAP":
+            _dv_vw = 8 if signal.vwap_trend == "FALLING" else (5 if signal.vwap_trend == "FLAT" else 3)
+            _dv_votes['VWAP'] = ('SELL', max(1, int(_dv_vw * _dv_early_mult)))
+        
+        # Vote 4: Price action (above/below open)
+        if market_data:
+            _dv_pa_ltp = market_data.get('ltp', 0)
+            _dv_pa_open = market_data.get('open', _dv_pa_ltp)
+            if _dv_pa_ltp > 0 and _dv_pa_open > 0:
+                _dv_pa_move = (_dv_pa_ltp - _dv_pa_open) / _dv_pa_open * 100
+                if abs(_dv_pa_move) >= 0.3:
+                    _dv_pa_dir = 'BUY' if _dv_pa_move > 0 else 'SELL'
+                    _dv_pa_w = min(8, max(3, int(abs(_dv_pa_move) * 2.5)))
+                    _dv_votes['PRICE'] = (_dv_pa_dir, _dv_pa_w)
+        
+        # Vote 5: OI (institutional positioning)
+        if market_data:
+            _dv_oi_map = {'LONG_BUILDUP': ('BUY', 7), 'SHORT_BUILDUP': ('SELL', 7),
+                          'SHORT_COVERING': ('BUY', 4), 'LONG_UNWINDING': ('SELL', 4)}
+            _dv_oi_sig = market_data.get('oi_signal', 'NEUTRAL')
+            if _dv_oi_sig in _dv_oi_map:
+                _dv_votes['OI'] = _dv_oi_map[_dv_oi_sig]
+        
+        # Vote 6: HTF (higher timeframe alignment)
+        if signal.htf_alignment in ("BULLISH", "BULLISH_ALIGNED"):
+            _dv_votes['HTF'] = ('BUY', 5)
+        elif signal.htf_alignment in ("BEARISH", "BEARISH_ALIGNED"):
+            _dv_votes['HTF'] = ('SELL', 5)
+        
+        # Vote 7: BOS (structural break)
+        if market_data:
+            _dv_bos_sig = market_data.get('bos_signal', 'NONE')
+            if _dv_bos_sig == 'BOS_HIGH':
+                _dv_votes['BOS'] = ('BUY', 5)
+            elif _dv_bos_sig == 'BOS_LOW':
+                _dv_votes['BOS'] = ('SELL', 5)
+        
+        # === TALLY VOTES ===
+        _dv_buy_w = sum(w for d, w in _dv_votes.values() if d == 'BUY')
+        _dv_sell_w = sum(w for d, w in _dv_votes.values() if d == 'SELL')
+        _dv_buy_n = sum(1 for d, w in _dv_votes.values() if d == 'BUY')
+        _dv_sell_n = sum(1 for d, w in _dv_votes.values() if d == 'SELL')
+        _dv_total_w = _dv_buy_w + _dv_sell_w
+        _dv_buy_src = [f"{k}({w})" for k, (d, w) in sorted(_dv_votes.items()) if d == 'BUY']
+        _dv_sell_src = [f"{k}({w})" for k, (d, w) in sorted(_dv_votes.items()) if d == 'SELL']
+        
+        # Direction confidence formula:
+        # = (agreement_ratio * 50) + (margin_ratio * 50)
+        # agreement_ratio = how many of 7 possible signals agree (breadth)
+        # margin_ratio = weighted margin strength (depth)
+        # This naturally penalizes directions with few sources OR weak margins.
+        _DVR_MAX_SOURCES = 7  # 7 possible vote sources
+        _dir_conf = 0.0
+        _dir_sources_str = ""
+        
+        if direction in ('BUY', 'SELL'):
+            _dv_winner_w = _dv_buy_w if direction == 'BUY' else _dv_sell_w
+            _dv_winner_n = _dv_buy_n if direction == 'BUY' else _dv_sell_n
+            _dv_loser_w = _dv_sell_w if direction == 'BUY' else _dv_buy_w
+            _dv_margin = _dv_winner_w - _dv_loser_w
+            
+            _dv_agreement = _dv_winner_n / _DVR_MAX_SOURCES
+            _dv_margin_ratio = max(0, _dv_margin) / (max(0, _dv_margin) + 10)
+            _dir_conf = (_dv_agreement * 50) + (_dv_margin_ratio * 50)
+            _dir_conf = min(100, max(0, _dir_conf))
+        
+        _dir_sources_str = f"BUY={_dv_buy_w}[{','.join(_dv_buy_src)}] SELL={_dv_sell_w}[{','.join(_dv_sell_src)}]"
+        reasons.append(f"🧭 DIR VOTE: {direction} conf={_dir_conf:.0f}% | {_dir_sources_str}")
         
         # === REVERSAL ZONE DETECTION (exhaustion → trade the pullback) ===
         # Detects stocks that are exhausted at resistance/support and flips
@@ -1806,10 +1917,11 @@ class IntradayOptionScorer:
             _orb_vol_notes.append(f"RG:{_orb_market_breadth}")
         if _synergy_bonus > 0:
             _orb_vol_notes.append(f"SYN:+{_synergy_bonus}")
+        _dir_audit = f" [DIR:{_dir_conf:.0f}%]"
         if _orb_vol_notes:
-            _score_audit_str = " | ".join(_audit_parts) + f" [{','.join(_orb_vol_notes)}]" + f" = {score:.0f}"
+            _score_audit_str = " | ".join(_audit_parts) + f" [{','.join(_orb_vol_notes)}]" + _dir_audit + f" = {score:.0f}"
         else:
-            _score_audit_str = " | ".join(_audit_parts) + f" = {score:.0f}"
+            _score_audit_str = " | ".join(_audit_parts) + _dir_audit + f" = {score:.0f}"
         self._last_score_audit = _score_audit_str
         
         # Cap size for reversal trades (lower conviction)
@@ -1831,7 +1943,9 @@ class IntradayOptionScorer:
             microstructure_score=microstructure_score,
             microstructure_block=microstructure_block,
             microstructure_block_reason=microstructure_block_reason,
-            is_reversal_trade=is_reversal_trade
+            is_reversal_trade=is_reversal_trade,
+            direction_confidence=_dir_conf,
+            direction_sources=_dir_sources_str
         )
         
         self.last_decisions[signal.symbol] = decision

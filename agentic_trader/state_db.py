@@ -140,6 +140,69 @@ CREATE TABLE IF NOT EXISTS live_pnl (
     last_updated    TEXT,
     PRIMARY KEY (symbol, date)
 );
+
+-- ── trades (complete trade lifecycle: entry → conversion → exit) ─────
+CREATE TABLE IF NOT EXISTS trades (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id        TEXT,
+    order_id        TEXT,
+    date            TEXT    NOT NULL,
+    -- Symbol info
+    symbol          TEXT    NOT NULL,
+    underlying      TEXT,
+    direction       TEXT,               -- BUY / SELL
+    option_type     TEXT,               -- CE / PE
+    strike          REAL    DEFAULT 0,
+    expiry          TEXT,
+    -- Strategy
+    source          TEXT,               -- MODEL_TRACKER, SNIPER, WATCHER, GMM_SNIPER, ARBTR, etc.
+    strategy_type   TEXT,               -- NAKED_OPTION, CREDIT_SPREAD, DEBIT_SPREAD, IRON_CONDOR, THP_HEDGED_SPREAD
+    is_sniper       INTEGER DEFAULT 0,
+    sector          TEXT,
+    -- Scores at entry
+    smart_score     REAL    DEFAULT 0,
+    final_score     REAL    DEFAULT 0,
+    dr_score        REAL    DEFAULT 0,
+    score_tier      TEXT,
+    ml_move_prob    REAL    DEFAULT 0,
+    ml_direction    TEXT,
+    ml_confidence   TEXT,
+    lot_multiplier  REAL    DEFAULT 1.0,
+    -- Entry
+    entry_price     REAL    DEFAULT 0,
+    entry_time      TEXT,
+    quantity        INTEGER DEFAULT 0,
+    lots            INTEGER DEFAULT 0,
+    stop_loss       REAL    DEFAULT 0,
+    target          REAL    DEFAULT 0,
+    total_premium   REAL    DEFAULT 0,
+    delta           REAL    DEFAULT 0,
+    iv              REAL    DEFAULT 0,
+    rationale       TEXT,
+    -- Exit
+    exit_price      REAL    DEFAULT 0,
+    exit_time       TEXT,
+    exit_type       TEXT,               -- SL_HIT, TARGET_HIT, TRAILING_SL, IV_CRUSH, TIME_STOP, DEBIT_SPREAD_TIME_EXIT...
+    exit_reason     TEXT,
+    pnl             REAL    DEFAULT 0,
+    pnl_pct         REAL    DEFAULT 0,
+    hold_minutes    INTEGER DEFAULT 0,
+    r_multiple      REAL    DEFAULT 0,
+    max_favorable   REAL    DEFAULT 0,
+    -- THP conversion
+    thp_converted   INTEGER DEFAULT 0,  -- 1 if THP hedge was applied
+    thp_type        TEXT,               -- TIME_STOP_HEDGE, SL_HIT_HEDGE, NEVER_SHOWED_LIFE, PROACTIVE_LOSS_HEDGE
+    thp_time        TEXT,               -- When conversion happened
+    -- Status
+    status          TEXT    DEFAULT 'OPEN',  -- OPEN, CLOSED
+    created_at      TEXT    DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_trades_date      ON trades(date);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol    ON trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_trades_source    ON trades(date, source);
+CREATE INDEX IF NOT EXISTS idx_trades_status    ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_underlying ON trades(date, underlying);
+CREATE INDEX IF NOT EXISTS idx_trades_order_id  ON trades(order_id);
 """
 
 
@@ -750,6 +813,233 @@ class TitanStateDB:
                 "SELECT realized_pnl FROM daily_state WHERE date = ?", (d,)
             ).fetchone()
         return row['realized_pnl'] if row else 0.0
+
+    # ==================================================================
+    #  10. TRADES TABLE  (queryable trade lifecycle)
+    # ==================================================================
+
+    def insert_trade_entry(self, trade: dict):
+        """Insert a new trade at ENTRY time. Called from trade_ledger."""
+        today = self._today()
+        self._insert_trade_entry_with_date(trade, today)
+
+    def _insert_trade_entry_with_date(self, trade: dict, date_str: str):
+        """Insert a trade entry for a specific date (used by backfill)."""
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO trades (
+                    trade_id, order_id, date, symbol, underlying, direction,
+                    option_type, strike, expiry, source, strategy_type, is_sniper,
+                    sector, smart_score, final_score, dr_score, score_tier,
+                    ml_move_prob, ml_direction, ml_confidence, lot_multiplier,
+                    entry_price, entry_time, quantity, lots, stop_loss, target,
+                    total_premium, delta, iv, rationale, status
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, 'OPEN'
+                )""",
+                (
+                    trade.get('trade_id', ''), trade.get('order_id', ''), date_str,
+                    trade.get('symbol', ''), trade.get('underlying', ''),
+                    trade.get('direction', ''),
+                    trade.get('option_type', ''), trade.get('strike', 0),
+                    trade.get('expiry', ''), trade.get('source', ''),
+                    trade.get('strategy_type', ''),
+                    1 if trade.get('is_sniper') else 0,
+                    trade.get('sector', ''), trade.get('smart_score', 0),
+                    trade.get('final_score', 0), trade.get('dr_score', 0),
+                    trade.get('score_tier', ''), trade.get('ml_move_prob', 0),
+                    trade.get('ml_direction', ''), trade.get('ml_confidence', ''),
+                    trade.get('lot_multiplier', 1.0),
+                    trade.get('entry_price', 0),
+                    trade.get('ts', trade.get('entry_time', '')),
+                    trade.get('quantity', 0), trade.get('lots', 0),
+                    trade.get('stop_loss', 0), trade.get('target', 0),
+                    trade.get('total_premium', 0), trade.get('delta', 0),
+                    trade.get('iv', 0), trade.get('rationale', ''),
+                ),
+            )
+            self._conn.commit()
+
+    def update_trade_exit(self, exit_data: dict):
+        """Update a trade row at EXIT time. Matches by order_id or symbol."""
+        now = self._now_iso()
+        order_id = exit_data.get('order_id', '')
+        symbol = exit_data.get('symbol', '')
+
+        with self._lock:
+            # Try matching by order_id first, then symbol
+            if order_id:
+                row = self._conn.execute(
+                    "SELECT id FROM trades WHERE order_id = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+            else:
+                row = None
+
+            if not row and symbol:
+                row = self._conn.execute(
+                    "SELECT id FROM trades WHERE symbol = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
+                    (symbol,),
+                ).fetchone()
+
+            if not row:
+                return False
+
+            self._conn.execute(
+                """UPDATE trades SET
+                    exit_price = ?, exit_time = ?, exit_type = ?, exit_reason = ?,
+                    pnl = ?, pnl_pct = ?, hold_minutes = ?, r_multiple = ?,
+                    max_favorable = ?, status = 'CLOSED'
+                WHERE id = ?""",
+                (
+                    exit_data.get('exit_price', 0), now,
+                    exit_data.get('exit_type', ''), exit_data.get('exit_reason', ''),
+                    exit_data.get('pnl', 0), exit_data.get('pnl_pct', 0),
+                    exit_data.get('hold_minutes', 0), exit_data.get('r_multiple', 0),
+                    exit_data.get('max_favorable', 0), row['id'],
+                ),
+            )
+            self._conn.commit()
+            return True
+
+    def update_trade_thp(self, conversion_data: dict):
+        """Mark a trade as THP-converted. Matches by order_id or original_symbol."""
+        order_id = conversion_data.get('order_id', '')
+        original_symbol = conversion_data.get('original_symbol', '')
+
+        with self._lock:
+            row = None
+            if order_id:
+                row = self._conn.execute(
+                    "SELECT id FROM trades WHERE order_id = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+            if not row and original_symbol:
+                row = self._conn.execute(
+                    "SELECT id FROM trades WHERE symbol = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
+                    (original_symbol,),
+                ).fetchone()
+            if not row:
+                return False
+
+            self._conn.execute(
+                """UPDATE trades SET
+                    thp_converted = 1, thp_type = ?, thp_time = ?,
+                    strategy_type = 'THP_HEDGED_SPREAD'
+                WHERE id = ?""",
+                (
+                    conversion_data.get('tie_check', ''),
+                    conversion_data.get('ts', self._now_iso()),
+                    row['id'],
+                ),
+            )
+            self._conn.commit()
+            return True
+
+    def query_trades(self, date_str: str = None, source: str = None,
+                     underlying: str = None, status: str = None,
+                     direction: str = None, limit: int = 500) -> list:
+        """Query trades with optional filters. Returns list of dicts."""
+        d = date_str or self._today()
+        conditions = ["date = ?"]
+        params = [d]
+
+        if source:
+            conditions.append("source = ?")
+            params.append(source)
+        if underlying:
+            conditions.append("underlying LIKE ?")
+            params.append(f"%{underlying}%")
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if direction:
+            conditions.append("direction = ?")
+            params.append(direction)
+
+        where = " AND ".join(conditions)
+        params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM trades WHERE {where} ORDER BY entry_time LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def daily_pnl_summary(self, date_str: str = None) -> dict:
+        """Get daily P&L summary from trades table."""
+        d = date_str or self._today()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN pnl <= 0 AND status='CLOSED' THEN 1 ELSE 0 END) as losses,
+                    SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) as open_trades,
+                    COALESCE(SUM(pnl), 0) as total_pnl,
+                    COALESCE(AVG(CASE WHEN pnl > 0 THEN pnl END), 0) as avg_win,
+                    COALESCE(AVG(CASE WHEN pnl < 0 THEN pnl END), 0) as avg_loss,
+                    COALESCE(MAX(pnl), 0) as best_trade,
+                    COALESCE(MIN(pnl), 0) as worst_trade,
+                    COALESCE(SUM(CASE WHEN thp_converted=1 THEN 1 ELSE 0 END), 0) as thp_count
+                FROM trades WHERE date = ?""",
+                (d,),
+            ).fetchone()
+
+        if not row or row['total'] == 0:
+            return {'date': d, 'total': 0}
+
+        return dict(row)
+
+    def pnl_by_source(self, date_str: str = None) -> list:
+        """P&L breakdown by strategy source."""
+        d = date_str or self._today()
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT source,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    COALESCE(SUM(pnl), 0) as pnl
+                FROM trades WHERE date = ? AND status = 'CLOSED'
+                GROUP BY source ORDER BY pnl DESC""",
+                (d,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def pnl_by_exit_type(self, date_str: str = None) -> list:
+        """P&L breakdown by exit type."""
+        d = date_str or self._today()
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT exit_type,
+                    COUNT(*) as trades,
+                    COALESCE(SUM(pnl), 0) as pnl
+                FROM trades WHERE date = ? AND status = 'CLOSED'
+                GROUP BY exit_type ORDER BY pnl""",
+                (d,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def multi_day_summary(self, days: int = 30) -> list:
+        """Get P&L summary for last N trading days."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT date,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN pnl <= 0 AND status='CLOSED' THEN 1 ELSE 0 END) as losses,
+                    COALESCE(SUM(pnl), 0) as pnl
+                FROM trades WHERE status = 'CLOSED'
+                GROUP BY date ORDER BY date DESC LIMIT ?""",
+                (days,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def vacuum(self):
         """Reclaim disk space (run occasionally, not during trading hours)."""

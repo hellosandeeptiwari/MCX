@@ -191,6 +191,59 @@ a{color:var(--blue);text-decoration:none}
 .btn-exit:disabled{opacity:.4;cursor:not-allowed}
 .btn-exit.loading{pointer-events:none;opacity:.5}
 
+/* Exit All button — prominent danger button */
+.btn-exit-all{
+  padding:5px 14px;border-radius:6px;font-size:.75rem;font-weight:700;
+  border:2px solid #dc2626;cursor:pointer;transition:all .2s;
+  background:rgba(220,38,38,.08);color:#dc2626;white-space:nowrap;
+  letter-spacing:.3px;text-transform:uppercase;
+}
+.btn-exit-all:hover{background:#dc2626;color:#fff;box-shadow:0 0 16px rgba(220,38,38,.4)}
+.btn-exit-all:disabled{opacity:.4;cursor:not-allowed;background:transparent;color:#dc2626}
+.btn-exit-all.loading{pointer-events:none;opacity:.5}
+
+/* Exit All confirmation modal */
+.exit-all-modal-overlay{
+  display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,.55);z-index:9999;
+  align-items:center;justify-content:center;
+}
+.exit-all-modal-overlay.active{display:flex}
+.exit-all-modal{
+  background:var(--bg2);border:2px solid #dc2626;border-radius:14px;
+  padding:28px 32px;min-width:380px;max-width:500px;
+  box-shadow:0 20px 60px rgba(220,38,38,.25);
+}
+.exit-all-modal h3{margin:0 0 8px;color:#dc2626;font-size:1.1rem}
+.exit-all-modal p{margin:6px 0;color:var(--txt2);font-size:.85rem;line-height:1.5}
+.exit-all-modal .exit-all-warning{
+  background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.2);
+  border-radius:8px;padding:12px 16px;margin:14px 0;
+  font-size:.82rem;color:#fca5a5;
+}
+.exit-all-modal .exit-all-confirm-input{
+  width:100%;padding:10px 14px;border-radius:8px;font-size:.85rem;font-weight:600;
+  border:1px solid var(--border);background:var(--bg3);color:var(--txt);
+  font-family:'JetBrains Mono',monospace;letter-spacing:1px;
+  margin-top:8px;box-sizing:border-box;
+}
+.exit-all-modal .exit-all-confirm-input:focus{outline:none;border-color:#dc2626}
+.exit-all-modal .btn-row{display:flex;gap:10px;margin-top:18px;justify-content:flex-end}
+.exit-all-modal .btn-cancel-all{
+  padding:8px 18px;border-radius:6px;font-size:.8rem;font-weight:600;
+  border:1px solid var(--border);cursor:pointer;
+  background:var(--bg3);color:var(--txt2);
+}
+.exit-all-modal .btn-cancel-all:hover{border-color:var(--txt3);color:var(--txt1)}
+.exit-all-modal .btn-confirm-exit-all{
+  padding:8px 22px;border-radius:6px;font-size:.8rem;font-weight:700;
+  border:2px solid #dc2626;cursor:pointer;
+  background:rgba(220,38,38,.08);color:#dc2626;
+  text-transform:uppercase;letter-spacing:.5px;transition:all .2s;
+}
+.exit-all-modal .btn-confirm-exit-all:hover:not(:disabled){background:#dc2626;color:#fff}
+.exit-all-modal .btn-confirm-exit-all:disabled{opacity:.3;cursor:not-allowed}
+
 /* Exit confirmation modal */
 .exit-modal-overlay{
   display:none;position:fixed;top:0;left:0;right:0;bottom:0;
@@ -457,6 +510,9 @@ a{color:var(--blue);text-decoration:none}
         <button class="btn-refresh" id="btn-refresh-pos" onclick="manualRefreshPositions()" title="Refresh positions">
           <span class="refresh-icon" style="display:inline-block">&#8635;</span> Refresh
         </button>
+        <button class="btn-exit-all" id="btn-exit-all" onclick="confirmExitAll()" title="Exit all open positions at market">
+          &#9888; Exit All
+        </button>
         <span id="pos-count" style="font-size:.8rem;color:var(--txt2)"></span>
       </div>
     </div>
@@ -557,7 +613,7 @@ a{color:var(--blue);text-decoration:none}
       <h3><span class="ico">&#128176;</span> Capital &amp; Risk</h3>
       <div class="setting-row">
         <div><div class="setting-label">Total Capital</div><div class="setting-sublabel">Base capital for position sizing</div></div>
-        <div style="display:flex;align-items:center;gap:4px"><span style="font-size:.82rem;color:var(--txt2)">&#8377;</span><input type="number" class="setting-input wide" id="s-capital" step="10000" min="50000"></div>
+        <div style="display:flex;align-items:center;gap:4px"><span style="font-size:.82rem;color:var(--txt2)">&#8377;</span><input type="number" class="setting-input wide" id="s-capital" step="10000" min="50000" oninput="updateProfitTargetAmount()"></div>
       </div>
       <div class="setting-row">
         <div><div class="setting-label">Risk per Trade</div><div class="setting-sublabel">Max % of capital risked per trade</div></div>
@@ -568,8 +624,15 @@ a{color:var(--blue);text-decoration:none}
         <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-max-daily-loss" step="0.01" min="0.05" max="0.50"><span style="font-size:.78rem;color:var(--txt3)">%</span></div>
       </div>
       <div class="setting-row">
-        <div><div class="setting-label">Portfolio Profit Target</div><div class="setting-sublabel">Kill all &amp; book profit at this %</div></div>
-        <div style="display:flex;align-items:center;gap:4px"><input type="number" class="setting-input" id="s-profit-target" step="0.01" min="0.05" max="0.50"><span style="font-size:.78rem;color:var(--txt3)">%</span></div>
+        <div><div class="setting-label">Portfolio Profit Target</div><div class="setting-sublabel">Kill all &amp; book profit (realized + unrealized)</div></div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:4px">
+            <input type="number" class="setting-input" id="s-profit-target" step="1" min="5" max="50" oninput="updateProfitTargetAmount()">
+            <span style="font-size:.78rem;color:var(--txt3)">%</span>
+          </div>
+          <span style="font-size:.78rem;color:var(--txt3)">=</span>
+          <span id="profit-target-amount" style="font-size:.82rem;font-weight:600;color:var(--green);font-family:'JetBrains Mono',monospace">₹75,000</span>
+        </div>
       </div>
       <div class="setting-row">
         <div><div class="setting-label">Max Positions</div><div class="setting-sublabel">Maximum simultaneous open positions</div></div>
@@ -1339,13 +1402,16 @@ async function loadPositions() {
     } else {
       tbody.innerHTML = keys.map(sym => {
         const e = typeof exits[sym] === 'string' ? JSON.parse(exits[sym]) : exits[sym];
+        const sl = e.current_sl || e.stop_loss || 0;
+        const tgt = e.target || 0;
+        const candles = e.candles_since_entry ?? e.candle_count ?? 0;
         return '<tr>' +
           '<td><strong>' + sym + '</strong></td>' +
-          '<td>' + (e.stop_loss ? fmt(e.stop_loss) : DASH) + '</td>' +
-          '<td>' + (e.target ? fmt(e.target) : DASH) + '</td>' +
+          '<td>' + (sl ? fmt(sl) : DASH) + '</td>' +
+          '<td>' + (tgt ? fmt(tgt) : DASH) + '</td>' +
           '<td>' + (e.breakeven_applied ? '&#9989;' : DASH) + '</td>' +
           '<td>' + (e.trailing_active ? '&#9989;' : DASH) + '</td>' +
-          '<td>' + (e.candle_count || 0) + '</td>' +
+          '<td>' + candles + '</td>' +
           '</tr>';
       }).join('');
     }
@@ -1472,6 +1538,7 @@ async function loadSettings() {
   $('#s-risk-per-trade').value = ((cr.RISK_PER_TRADE || 0.07) * 100).toFixed(0);
   $('#s-max-daily-loss').value = ((cr.MAX_DAILY_LOSS || 0.20) * 100).toFixed(0);
   $('#s-profit-target').value = ((cr.PORTFOLIO_PROFIT_TARGET || 0.15) * 100).toFixed(0);
+  updateProfitTargetAmount();
   $('#s-max-positions').value = cr.MAX_POSITIONS || 80;
   $('#s-reentry-cooldown').value = cr.REENTRY_COOLDOWN_MINUTES || 30;
   $('#s-min-premium').value = cr.MIN_OPTION_PREMIUM || 3.0;
@@ -1527,6 +1594,14 @@ async function loadSettings() {
   } else {
     $('#settings-status').textContent = 'Using config.py defaults';
   }
+}
+
+function updateProfitTargetAmount() {
+  const capital = parseInt($('#s-capital').value) || 500000;
+  const pct = parseFloat($('#s-profit-target').value) || 15;
+  const amount = Math.round(capital * pct / 100);
+  const el = document.getElementById('profit-target-amount');
+  if(el) el.textContent = '\u20b9' + amount.toLocaleString('en-IN');
 }
 
 async function saveSettings() {
@@ -1736,6 +1811,27 @@ async function manualRefreshPositions() {
   </div>
 </div>
 
+<!-- =========== EXIT ALL CONFIRMATION MODAL =========== -->
+<div class="exit-all-modal-overlay" id="exit-all-modal">
+  <div class="exit-all-modal">
+    <h3>&#9888;&#65039; EXIT ALL POSITIONS</h3>
+    <p>This will close <strong>every open position</strong> at market price immediately.</p>
+    <div class="exit-all-warning">
+      &#9888; This action is <strong>irreversible</strong>. All positions will be exited with market orders.
+      Broker orders will be placed immediately in LIVE mode.
+    </div>
+    <p style="font-size:.8rem;color:var(--txt2)">Type <strong style="color:#dc2626;letter-spacing:1px">EXIT ALL</strong> below to confirm:</p>
+    <input type="text" class="exit-all-confirm-input" id="exit-all-input"
+           placeholder="Type EXIT ALL" autocomplete="off" spellcheck="false">
+    <div class="btn-row">
+      <button class="btn-cancel-all" onclick="closeExitAllModal()">Cancel</button>
+      <button class="btn-confirm-exit-all" id="btn-confirm-exit-all" onclick="executeExitAll()" disabled>
+        &#9888; Confirm Exit All
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- Exit toast -->
 <div class="exit-toast" id="exit-toast"></div>
 
@@ -1804,7 +1900,66 @@ document.getElementById('exit-modal').addEventListener('click', function(e) {
 
 // Close modal on Escape key
 document.addEventListener('keydown', function(e) {
-  if(e.key === 'Escape') closeExitModal();
+  if(e.key === 'Escape') { closeExitModal(); closeExitAllModal(); }
+});
+
+// =========== EXIT ALL POSITIONS LOGIC ===========
+
+// Enable confirm button only when user types "EXIT ALL"
+document.getElementById('exit-all-input').addEventListener('input', function() {
+  const btn = document.getElementById('btn-confirm-exit-all');
+  btn.disabled = this.value.trim() !== 'EXIT ALL';
+});
+
+function confirmExitAll() {
+  // Reset input
+  document.getElementById('exit-all-input').value = '';
+  document.getElementById('btn-confirm-exit-all').disabled = true;
+  document.getElementById('exit-all-modal').classList.add('active');
+  // Focus the input after modal opens
+  setTimeout(() => document.getElementById('exit-all-input').focus(), 100);
+}
+
+function closeExitAllModal() {
+  document.getElementById('exit-all-modal').classList.remove('active');
+  document.getElementById('exit-all-input').value = '';
+  document.getElementById('btn-confirm-exit-all').disabled = true;
+}
+
+async function executeExitAll() {
+  const btn = document.getElementById('btn-confirm-exit-all');
+  const mainBtn = document.getElementById('btn-exit-all');
+  btn.disabled = true;
+  btn.innerHTML = '&#9203; Exiting All...';
+  if(mainBtn) mainBtn.disabled = true;
+
+  try {
+    const resp = await fetch('/api/exit_all', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+    const data = await resp.json();
+
+    if(data.ok) {
+      closeExitAllModal();
+      showExitToast('success', data.msg || 'All positions exited');
+      loadPositions();
+      loadOverview();
+    } else {
+      showExitToast('error', data.msg || 'Exit All failed');
+    }
+  } catch(e) {
+    showExitToast('error', 'Network error: ' + e.message);
+  } finally {
+    btn.disabled = true;  // Keep disabled — input cleared
+    btn.innerHTML = '&#9888; Confirm Exit All';
+    if(mainBtn) mainBtn.disabled = false;
+  }
+}
+
+// Close Exit All modal on overlay click
+document.getElementById('exit-all-modal').addEventListener('click', function(e) {
+  if(e.target === this) closeExitAllModal();
 });
 </script>
 

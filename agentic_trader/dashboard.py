@@ -627,6 +627,199 @@ def exit_position():
         return jsonify({'ok': False, 'msg': f'Exit failed: {str(e)}'}), 500
 
 
+@app.route('/api/exit_all', methods=['POST'])
+def exit_all_positions():
+    """Exit ALL open positions at market price — emergency kill switch.
+
+    Iterates every OPEN position, places market exit orders (live mode),
+    writes manual-exit signals for the bot, and clears active_trades.
+    Returns a summary of successes and failures.
+    """
+    try:
+        db = get_state_db()
+        today = _today()
+        positions, realized_pnl, paper_capital = db.load_active_trades(today)
+
+        open_positions = [p for p in positions if p.get('status', 'OPEN') == 'OPEN']
+        if not open_positions:
+            return jsonify({'ok': True, 'msg': 'No open positions to exit', 'results': []})
+
+        live = db.load_live_pnl() or {}
+        kite = None
+        if not PAPER_MODE:
+            kite = _get_dashboard_kite()
+
+        results = []
+        total_pnl = 0
+        pending_signals = []
+        if MANUAL_EXIT_FILE.exists():
+            try:
+                pending_signals = json.loads(MANUAL_EXIT_FILE.read_text())
+            except Exception:
+                pending_signals = []
+
+        for pos in open_positions:
+            symbol = pos.get('symbol') or pos.get('option_symbol') or ''
+            entry_price = pos.get('avg_price') or pos.get('entry_price') or 0
+            qty = abs(pos.get('quantity', 0))
+            direction = pos.get('side') or pos.get('direction', 'BUY')
+
+            # LTP from live_pnl
+            lp = live.get(symbol) or live.get(symbol.replace('NFO:', ''))
+            ltp = 0
+            if isinstance(lp, dict):
+                ltp = lp.get('ltp', 0)
+            elif isinstance(lp, (int, float)):
+                ltp = float(lp)
+
+            # P&L calculation — same logic as single exit
+            if pos.get('is_debit_spread') or pos.get('is_credit_spread'):
+                entry_price = pos.get('net_premium', entry_price)
+                pnl = 0
+                lp_spread = live.get(symbol)
+                if isinstance(lp_spread, dict) and lp_spread.get('unrealized_pnl') is not None:
+                    pnl = lp_spread['unrealized_pnl']
+                elif pos.get('unrealized_pnl'):
+                    pnl = pos['unrealized_pnl']
+            elif ltp > 0 and entry_price > 0:
+                if direction in ('BUY', 'LONG'):
+                    pnl = (ltp - entry_price) * qty
+                else:
+                    pnl = (entry_price - ltp) * qty
+            else:
+                pnl = pos.get('unrealized_pnl', 0)
+
+            exit_price = ltp if ltp > 0 else entry_price
+
+            # Place LIVE exit orders
+            live_exit_placed = False
+            live_exit_msg = ''
+            if not PAPER_MODE and kite:
+                try:
+                    sl_order_id = pos.get('sl_order_id')
+                    if sl_order_id and not str(sl_order_id).startswith('PAPER_'):
+                        try:
+                            kite.cancel_order(variety='regular', order_id=sl_order_id)
+                        except Exception:
+                            pass
+
+                    legs = []
+                    if pos.get('is_iron_condor'):
+                        for pfx, act in [('sold_ce','BUY'),('sold_pe','BUY'),('hedge_ce','SELL'),('hedge_pe','SELL')]:
+                            s = pos.get(f'{pfx}_symbol')
+                            if s: legs.append((s, act))
+                    elif pos.get('is_credit_spread'):
+                        if pos.get('sold_symbol'): legs.append((pos['sold_symbol'], 'BUY'))
+                        if pos.get('hedge_symbol'): legs.append((pos['hedge_symbol'], 'SELL'))
+                    elif pos.get('is_debit_spread'):
+                        syms = (pos.get('symbol') or '').split('|')
+                        if len(syms) == 2:
+                            legs.append((syms[0], 'SELL'))
+                            legs.append((syms[1], 'BUY'))
+                    elif '|' in symbol:
+                        syms = symbol.split('|')
+                        if len(syms) == 2:
+                            legs.append((syms[0], 'SELL' if direction in ('BUY','LONG') else 'BUY'))
+                            legs.append((syms[1], 'BUY' if direction in ('BUY','LONG') else 'SELL'))
+                    else:
+                        exit_side = 'SELL' if direction in ('BUY', 'LONG') else 'BUY'
+                        legs.append((symbol, exit_side))
+
+                    for leg_sym, leg_action in legs:
+                        exch, tsym = leg_sym.split(':')
+                        tx = kite.TRANSACTION_TYPE_SELL if leg_action == 'SELL' else kite.TRANSACTION_TYPE_BUY
+                        kite.place_order(
+                            variety=kite.VARIETY_REGULAR,
+                            exchange=exch,
+                            tradingsymbol=tsym,
+                            transaction_type=tx,
+                            quantity=qty,
+                            product=kite.PRODUCT_MIS,
+                            order_type=kite.ORDER_TYPE_MARKET,
+                            validity=kite.VALIDITY_DAY,
+                            tag='TITAN_EXITALL'
+                        )
+                    live_exit_placed = True
+                except Exception as e:
+                    live_exit_msg = str(e)
+
+            # Write signal for bot
+            signal = {
+                'symbol': symbol,
+                'exit_price': round(exit_price, 2),
+                'pnl': round(pnl, 2),
+                'exit_time': datetime.now().isoformat(),
+                'exit_type': 'MANUAL_EXIT_ALL',
+                'direction': direction,
+                'quantity': qty,
+                'entry_price': round(entry_price, 2),
+                'trade': pos,
+                'live_exit_placed': live_exit_placed,
+            }
+            pending_signals.append(signal)
+
+            # Log in trade ledger
+            try:
+                import re as _re
+                ledger = get_trade_ledger()
+                _underlying = pos.get('underlying', '')
+                if not _underlying:
+                    m = _re.match(r'(?:NFO:)?([A-Z]+)\d', symbol.replace('NFO:', ''))
+                    _underlying = f"NSE:{m.group(1)}" if m else symbol
+                _hold_mins = 0
+                try:
+                    _et = pos.get('timestamp', '')
+                    if _et:
+                        _hold_mins = int((datetime.now() - datetime.fromisoformat(_et)).total_seconds() / 60)
+                except Exception:
+                    pass
+                _pnl_pct = (pnl / (entry_price * qty) * 100) if entry_price > 0 and qty > 0 else 0
+                ledger.log_exit(
+                    symbol=symbol, underlying=_underlying, direction=direction,
+                    source=pos.get('setup_type', pos.get('strategy_type', '')),
+                    sector=pos.get('sector', ''),
+                    exit_type='MANUAL_EXIT_ALL',
+                    entry_price=entry_price, exit_price=exit_price,
+                    quantity=qty, pnl=pnl, pnl_pct=_pnl_pct,
+                    smart_score=pos.get('smart_score', 0),
+                    final_score=pos.get('entry_score', 0),
+                    dr_score=pos.get('dr_score', 0),
+                    exit_reason='Manual EXIT ALL from dashboard UI',
+                    hold_minutes=_hold_mins,
+                    entry_time=pos.get('timestamp', ''),
+                )
+            except Exception as e:
+                print(f"⚠️ Trade ledger log failed (exit_all) for {symbol}: {e}")
+
+            total_pnl += pnl
+            status = '✅' if live_exit_placed or PAPER_MODE else f'⚠️ {live_exit_msg}'
+            results.append({'symbol': symbol, 'pnl': round(pnl, 2), 'status': status})
+
+        # Write all signals at once
+        MANUAL_EXIT_FILE.write_text(json.dumps(pending_signals, indent=2, default=str))
+
+        # Clear all active trades from state_db
+        new_realized = realized_pnl + total_pnl
+        db.save_active_trades([], new_realized, paper_capital)
+
+        _mode = 'LIVE' if not PAPER_MODE else 'PAPER'
+        msg = f'[{_mode}] Exited {len(results)} positions | Net P&L: ₹{total_pnl:+,.2f}'
+        print(f"🚨 EXIT ALL: {msg}")
+
+        return jsonify({
+            'ok': True,
+            'msg': msg,
+            'results': results,
+            'total_pnl': round(total_pnl, 2),
+            'count': len(results),
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'ok': False, 'msg': f'Exit All failed: {str(e)}'}), 500
+
+
 # ── Helpers: enrich positions with exit-state LTP & unrealized P&L ──
 
 def _enrich_positions(positions: list, db) -> list:

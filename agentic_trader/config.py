@@ -110,7 +110,7 @@ def calc_brokerage(entry_price, exit_price, quantity):
 HARD_RULES = {
     "RISK_PER_TRADE": 0.07,         # 7% base risk per trade (tiered: 7% premium, 5% std, 4% base)
     "MAX_DAILY_LOSS": 0.20,         # 20% max daily loss
-    "PORTFOLIO_PROFIT_TARGET": 0.15,  # 15% unrealized profit → KILL ALL & book profit
+    "PORTFOLIO_PROFIT_TARGET": 0.15,  # 15% realized+unrealized profit → KILL ALL & book profit
     "MAX_POSITIONS": 80,            # Max simultaneous positions (spreads count as 1)
     "MAX_POSITIONS_MIXED": 80,       # Max positions in MIXED regime
     "MAX_POSITIONS_TRENDING": 80,    # Max positions in BULLISH/BEARISH regime
@@ -149,6 +149,7 @@ FULL_FNO_SCAN = {
 # unchanged for slower setups (sniper, model-tracker, mean-reversion).
 BREAKOUT_WATCHER = {
     "enabled": True,
+    "watcher_start": "09:20",            # Watcher ignores triggers before this time (let ORB settle)
     # --- Trigger Thresholds (tightened Mar-10: catch sustainable moves, not opening spikes) ---
     "price_spike_pct": 1.0,           # Trigger if price moves ≥1.0% within 60s baseline (was 0.7 — too sensitive at open)
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
@@ -159,9 +160,9 @@ BREAKOUT_WATCHER = {
     # Peak tracking: if price retraces >50% of its peak move during the window, fail.
     "sustain_seconds": 120,           # Price must HOLD the move for 120s before triggering (was 60 — caught fakeouts)
     "sustain_recheck_pct": 0.6,       # Spike/extreme: price must still be ≥0.6% from baseline (was 0.5)
-    "sustain_recheck_pct_volume": 0.4,# Volume surge: price must still be ≥0.4% from baseline (was 0.3)
+    "sustain_recheck_pct_volume": 0.5,# Volume surge: price must still be ≥0.5% from baseline (was 0.4 — 0.3% moves too weak)
     "sustain_retrace_max_pct": 50.0,  # Fail sustain if price retraces >50% from peak move during window
-    "volume_surge_min_move_pct": 0.3, # VOLUME_SURGE must show ≥0.3% price move to enter sustain
+    "volume_surge_min_move_pct": 0.5, # VOLUME_SURGE must show ≥0.5% price move to enter sustain (was 0.3 — too noisy)
     # --- Slow Grind Detection ---
     "slow_grind_pct": 1.0,              # 1%+ move over 5-minute window triggers SLOW_GRIND
     # --- Cooldown (anti-spam) ---
@@ -171,7 +172,7 @@ BREAKOUT_WATCHER = {
     "queue_size": 100,                # Max queued triggers — evicts weakest when full
     "priority_bypass_pct": 2.0,       # Moves ≥2.0% BYPASS rate limit — always enter queue
     # --- Timing (SUSTAINABILITY: wait for ORB range to fully form) ---
-    "active_after": "09:30",          # Don't trigger before 09:30 (was 09:20 — first 10 min is noise)
+    "active_after": "09:35",          # Don't trigger before 09:35 (was 09:30 — ORB needs 20 min to form, VWAP unreliable before this)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
     # --- Score Gate (TIGHTENED Mar-10: require meaningful technical conviction) ---
     "min_score": 40,                  # Minimum score to trade (was 15 — too low, passed garbage)
@@ -189,8 +190,13 @@ BREAKOUT_WATCHER = {
     # Into a 0-100 index: >60 = exhausted move, don't chase.
     # IndiGo example: EI=71 (dropped 3.3% from open, trigger only -0.3%, near day low, RSI=28)
     "exhaustion_index_block": 60,     # Block if Exhaustion Index > this threshold
-    # --- Opening Period Cap (NEW Mar-10: limit concentrated open risk) ---
-    "max_trades_before_1000": 3,      # Max watcher trades before 10:00 IST
+    # --- Opening Period Cap (early-market protection) ---
+    "max_trades_before_1000": 2,      # Max watcher trades before 10:00 IST (was 3)
+    # --- Early Market Hardening (9:35-9:55 is still dicey) ---
+    "early_market_end": "09:55",       # Early market protection window end
+    "early_market_min_score": 50,      # Higher score bar during early market (normal=40)
+    "early_market_min_dir_conf": 45,   # Min direction confidence during early market
+    "early_market_min_sustain_pct": 1.0, # Min sustained move % for spikes in early market (normal=0.6)
     # --- Dynamic Batch ---
     "max_triggers_per_batch": 6,      # Max triggers fed to pipeline per drain
     "max_trades_per_scan": 2,         # Max trades PLACED per scan (was 3 — quality over quantity)
@@ -496,9 +502,10 @@ GMM_SNIPER = {
     "max_sniper_trades_per_day": 4,    # ⚠️ Tightened: sniper = SELECTIVE, 4 max (was 8)
     "lot_multiplier": 3.0,             # Reduced from 5x → 3x. Earn bigger size with proven P&L
     "min_smart_score": 53,             # Strict: need solid conviction (was 50)
-    "max_updr_score": 0.11,            # Strict: GMM must show cleaner signal (was 0.12)
-    "max_downdr_score": 0.14,          # Strict: cleaner downside (was 0.15)
+    "max_updr_score": 0.10,            # Strict: GMM must show cleaner signal (was 0.11)
+    "max_downdr_score": 0.13,          # Strict: cleaner downside (was 0.14)
     "min_gate_prob": 0.52,             # Strict: XGB must see real movement (was 0.50)
+    "min_direction_confidence": 55,    # Smart Direction Engine: multi-signal consensus required
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 200000,        # ₹2 Lakh — sniper capital reduced, must prove ROI
     "max_exposure_pct": 85,            # Max % of sniper capital usable
@@ -539,23 +546,32 @@ SNIPER_OI_UNWINDING = {
     "separate_capital": 200000,         # ₹2L reserved for OI unwinding sniper
 }
 
-# === SNIPER: PCR EXTREME FADE (Sniper-PCRExtreme) ===
-# Fires when stock/index PCR hits extreme levels.
-# PCR >= 1.35 = oversold → contrarian BUY. PCR <= 0.65 = overbought → SELL.
+# === SNIPER: PCR EXTREME MOMENTUM (Sniper-PCRExtreme) ===
+# Fires when stock/index PCR hits extreme levels — trades WITH the crowd (momentum).
+# Low PCR (≤ 0.60) = crowd is bullish (heavy call buying) → BUY with them.
+# High PCR (≥ 1.35) = crowd is bearish (heavy put buying) → SELL with them.
+# Intraday crowd momentum persists — mean reversion happens overnight, not mid-session.
 # Blends stock PCR with NIFTY index PCR for macro confirmation.
 # Tagged as 'SNIPER_PCR_EXTREME'.
 SNIPER_PCR_EXTREME = {
     "enabled": True,
     "max_trades_per_day": 3,            # Max PCR Extreme trades per day
     "lot_multiplier": 1.5,              # 1.5x lots
-    # --- PCR Extreme Detection ---
-    "pcr_oversold_threshold": 1.35,     # PCR >= 1.35 → market oversold → BUY
-    "pcr_overbought_threshold": 0.60,   # PCR <= 0.60 → market overbought → SELL (0.55 too tight, kills strategy)
+    # --- PCR Extreme Detection (momentum thresholds) ---
+    "pcr_oversold_threshold": 1.35,     # PCR >= 1.35 → crowd bearish → SELL with momentum
+    "pcr_overbought_threshold": 0.60,   # PCR <= 0.60 → crowd bullish → BUY with momentum
     "min_pcr_edge": 0.05,               # Min distance beyond threshold — blocks hair-trigger entries (ABCAPITAL edge=0.01 lesson)
     # --- Index PCR (Macro Confirmation) ---
     "use_index_pcr": True,              # Also check NIFTY PCR for macro regime
     "index_symbol": "NIFTY",            # Index to check
     "index_pcr_weight": 0.4,            # Blend: 60% stock PCR + 40% index PCR
+    # --- RSI Momentum Confirmation ---
+    "rsi_min_buy": 40,                  # BUY: RSI must be ≥ 40 (confirms upward momentum, not dead)
+    "rsi_max_buy": 70,                  # BUY: RSI must be ≤ 70 (not exhausted/overbought)
+    "rsi_min_sell": 30,                 # SELL: RSI must be ≥ 30 (not already oversold/bouncing)
+    "rsi_max_sell": 60,                 # SELL: RSI must be ≤ 60 (confirms downward momentum, not recovering)
+    # --- Price Alignment ---
+    "min_price_alignment_pct": 0.3,     # Price must move ≥ 0.3% WITH direction (no counter-trend entries)
     # --- GMM Quality Gate ---
     "max_updr_score": 0.18,              # Slightly relaxed — PCR is strong standalone signal (UP regime, threshold 0.25)
     "max_downdr_score": 0.14,            # PCR strong standalone — DOWN regime (threshold 0.25)
@@ -857,7 +873,7 @@ DEBIT_SPREAD_CONFIG = {
     "trail_activation_pct": 40,      # Activate trailing after 40% profit (was 25% — too early)
     "trail_giveback_pct": 45,        # Allow 45% giveback of peak profit (was 30% — too tight, choking winners)
     # --- Intraday Rules ---
-    "auto_exit_time": "15:05",       # Auto-exit all debit spreads by 3:05 PM (no overnight)
+    "auto_exit_time": "15:20",       # Auto-exit all debit spreads by 3:20 PM (no overnight)
     "no_entry_after": "15:10",       # Aligned with credit spread / general no_new_after cutoff
     "min_minutes_to_play": 45,       # Need at least 45 min (was 60 — debit spreads move faster)
     # --- Expiry ---
@@ -894,7 +910,7 @@ THESIS_HEDGE_CONFIG = {
     "hedged_breakeven_trail_pct": 100, # Trail activation: when spread value >= net_debit (breakeven)
     "hedged_trail_giveback_pct": 45,  # Once trailing, give back 45% of peak profit
     # --- Auto-exit (same as debit spreads) ---
-    "auto_exit_time": "15:05",        # Hard exit time for hedged positions
+    "auto_exit_time": "15:20",        # Hard exit time for hedged positions
     # --- Universal Hedge Loss Cap ---
     "max_hedge_loss_pct": 20,          # UNIFIED: only hedge if current loss ≤ 20% (TIE + TIME_STOP)
     # --- TIME_STOP Hedge (dead-trade rescue) ---
@@ -908,8 +924,11 @@ THESIS_HEDGE_CONFIG = {
     "min_spread_rr_ratio": 0.50,      # REJECT if (spread_width - net_debit) / net_debit < 0.50 (need at least 0.5:1 R:R)
     # --- Hedge Unwind (restore full upside on recovery) ---
     "unwind_enabled": True,           # Buy back sold leg when thesis re-validates
-    "unwind_buy_leg_recovery_pct": 100, # Unwind when buy leg LTP >= 100% of entry (fully recovered)
+    "unwind_buy_leg_recovery_pct": 70, # Unwind when buy leg LTP >= 70% of entry (theta eats premium fast — 85% was still too strict)
     "unwind_min_profit_after_cost": 2,  # Min ₹ profit remaining after buyback cost (avoid pointless unwinds)
+    # --- Alternative: Spread-profit unwind (theta-resistant) ---
+    "unwind_spread_profit_enabled": True,  # Unwind if spread itself is profitable (irrespective of individual leg recovery)
+    "unwind_spread_profit_pct": 15,        # Unwind if current spread value > net_debit by 15% (clear spread profit)
 }
 
 # === PROACTIVE LOSS HEDGE CONFIGURATION ===
