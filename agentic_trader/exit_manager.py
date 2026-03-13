@@ -142,10 +142,10 @@ class ExitManager:
         self.breakeven_trigger_r = 1.0  # Move SL to entry at 1.0R (was 0.8R — too early)
         
         # === PHASED TRAILING: Build → Run → Harvest ===
-        # Build zone (0 → 1.0R): No trailing, let trade establish
-        # Run zone (1.0R → 2.0R): Moderate trail, balance room vs profit lock
+        # Build zone (0 → 0.7R): No trailing, let trade establish
+        # Run zone (0.7R → 2.0R): Moderate trail, balance room vs profit lock
         # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
-        self.trailing_start_r = 1.0    # Don't trail until 1.0R (was 0.5R — too early!)
+        self.trailing_start_r = 0.7    # Trail from 0.7R (was 1.0R — too late, giving back gains)
         self.trailing_run_pct = 0.50   # Run zone: retain 50% of peak (give back 50%) — was 0.40 (too loose, giving back 60%)
         self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
         self.trailing_harvest_pct = 0.65  # Harvest zone: retain 65% of peak (give back 35%) — was 0.55 (too loose, giving back 45%)
@@ -1253,7 +1253,13 @@ class ExitManager:
                 state.current_sl = rounded_new_sl
                 state.trailing_active = True
                 self._persist_single(state.symbol)
-                print(f"📈 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
+                # Throttle: only print when SL moves by ≥ ₹0.50 or zone changes
+                if not hasattr(self, '_trail_last_printed'):
+                    self._trail_last_printed = {}
+                _prev = self._trail_last_printed.get(state.symbol, (0, ''))
+                if abs(state.current_sl - _prev[0]) >= 0.50 or zone != _prev[1]:
+                    self._trail_last_printed[state.symbol] = (state.current_sl, zone)
+                    print(f"📈 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
         else:  # SELL
             profit = state.entry_price - state.lowest_price
             trail_distance = profit * (1 - retain_pct)
@@ -1265,7 +1271,13 @@ class ExitManager:
                 state.current_sl = rounded_new_sl
                 state.trailing_active = True
                 self._persist_single(state.symbol)
-                print(f"📉 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
+                # Throttle: only print when SL moves by ≥ ₹0.50 or zone changes
+                if not hasattr(self, '_trail_last_printed'):
+                    self._trail_last_printed = {}
+                _prev = self._trail_last_printed.get(state.symbol, (0, ''))
+                if abs(state.current_sl - _prev[0]) >= 0.50 or zone != _prev[1]:
+                    self._trail_last_printed[state.symbol] = (state.current_sl, zone)
+                    print(f"📉 {state.symbol}: Trail [{zone}] SL {old_sl} → {state.current_sl} (retain {retain_pct:.0%} of peak)")
     
     def remove_trade(self, symbol: str):
         """Remove a trade from tracking (after exit) and reset hysteresis"""

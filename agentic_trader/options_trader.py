@@ -876,6 +876,52 @@ class IntradayOptionScorer:
         
         _audit_after_accel = score
         
+        # === MACRO TREND (2-hour intraday trajectory — continuation vs counter-trend) ===
+        # The single most important filter for watcher trades: does the short-term
+        # trigger align with the stock's dominant intraday direction?
+        # Continuation triggers (aligned) get a boost; counter-trend triggers get penalty.
+        _macro_score = 0
+        _macro_trend_val = market_data.get('macro_trend_score', 0) if market_data else 0
+        _macro_align = market_data.get('macro_alignment', 'NEUTRAL') if market_data else 'NEUTRAL'
+        _macro_mono = market_data.get('macro_monotonicity', 0) if market_data else 0
+        _macro_move = market_data.get('macro_net_move_pct', 0) if market_data else 0
+        
+        if _macro_trend_val != 0 and direction in ('BUY', 'SELL'):
+            # Is the trigger aligned with the macro trend?
+            _macro_bullish = _macro_trend_val > 0
+            _trigger_bullish = (direction == 'BUY')
+            _aligned = (_macro_bullish and _trigger_bullish) or (not _macro_bullish and not _trigger_bullish)
+            
+            _abs_macro = abs(_macro_trend_val)
+            
+            if _aligned:
+                # CONTINUATION: trigger matches 2-hour trajectory
+                if _abs_macro >= 40:
+                    _macro_score = 12
+                    reasons.append(f"🌊 MACRO ALIGNED: strong 2hr {_macro_align} (score={_macro_trend_val:+d}, mono={_macro_mono:.0%}, move={_macro_move:+.2f}%) → continuation (+12)")
+                elif _abs_macro >= 15:
+                    _macro_score = 5
+                    reasons.append(f"🌊 MACRO mild align: {_macro_align} (score={_macro_trend_val:+d}, move={_macro_move:+.2f}%) (+5)")
+                # else: weak macro, no adjustment
+            else:
+                # COUNTER-TREND: trigger opposes 2-hour trajectory
+                if _abs_macro >= 40:
+                    _macro_score = -15
+                    warnings.append(f"⚠️ MACRO COUNTER: {direction} vs strong 2hr {_macro_align} (score={_macro_trend_val:+d}, mono={_macro_mono:.0%}, move={_macro_move:+.2f}%) — reversal risk (-15)")
+                elif _abs_macro >= 15:
+                    _macro_score = -8
+                    warnings.append(f"⚠️ MACRO counter: {direction} vs mild {_macro_align} (score={_macro_trend_val:+d}, move={_macro_move:+.2f}%) (-8)")
+                # else: weak macro, no penalty
+            
+            score += _macro_score
+            if _macro_score > 0:
+                if direction == 'BUY':
+                    bullish_points += _macro_score
+                else:
+                    bearish_points += _macro_score
+        
+        _audit_after_macro = score
+        
         # === RSI OVEREXTENSION PENALTY (tightened thresholds) ===
         # RSI < 30 on shorts or > 70 on longs = bounce/reversal zone.
         # Tightened from 20/80 → catches more mean-reversion setups.
@@ -949,11 +995,19 @@ class IntradayOptionScorer:
                     _vwap_note = f" [VWAP conflict: {_oi_vwap_mult:.0%}]" if _oi_vwap_mult < 1 else ""
                     reasons.append(f"OI: SHORT_COVERING supports BUY (OI-{oi_change:.1f}%) (+{oi_score}){_vwap_note}")
                 elif direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
-                    oi_score = -8
-                    warnings.append(f"OI CONFLICT: SHORT_BUILDUP vs BUY direction (OI+{oi_change:.1f}%) (-8) — institutions are SELLING")
+                    # OI FLIP: institutions selling — follow OI, flip BUY → SELL
+                    _old_dir = direction
+                    direction = 'SELL'
+                    oi_score = int(5 * oi_strength * _oi_vwap_mult)
+                    bearish_points += oi_score
+                    reasons.append(f"OI FLIP: SHORT_BUILDUP overrides {_old_dir} → SELL (OI+{oi_change:.1f}%) (+{oi_score})")
                 elif direction == 'BUY' and oi_signal == 'LONG_UNWINDING':
-                    oi_score = -5
-                    warnings.append(f"OI CONFLICT: LONG_UNWINDING vs BUY (OI-{oi_change:.1f}%) (-5) — longs exiting")
+                    # OI FLIP: longs exiting — follow OI, flip BUY → SELL
+                    _old_dir = direction
+                    direction = 'SELL'
+                    oi_score = int(3 * oi_strength * _oi_vwap_mult)
+                    bearish_points += oi_score
+                    reasons.append(f"OI FLIP: LONG_UNWINDING overrides {_old_dir} → SELL (OI-{oi_change:.1f}%) (+{oi_score})")
                     
                 elif direction in ('SELL', 'HOLD') and oi_signal == 'SHORT_BUILDUP':
                     oi_score = int(5 * oi_strength * _oi_vwap_mult)
@@ -966,11 +1020,19 @@ class IntradayOptionScorer:
                     _vwap_note = f" [VWAP conflict: {_oi_vwap_mult:.0%}]" if _oi_vwap_mult < 1 else ""
                     reasons.append(f"OI: LONG_UNWINDING supports SELL (OI-{oi_change:.1f}%) (+{oi_score}){_vwap_note}")
                 elif direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
-                    oi_score = -8
-                    warnings.append(f"OI CONFLICT: LONG_BUILDUP vs SELL direction (OI+{oi_change:.1f}%) (-8) — institutions are BUYING")
+                    # OI FLIP: institutions buying — follow OI, flip SELL → BUY
+                    _old_dir = direction
+                    direction = 'BUY'
+                    oi_score = int(5 * oi_strength * _oi_vwap_mult)
+                    bullish_points += oi_score
+                    reasons.append(f"OI FLIP: LONG_BUILDUP overrides {_old_dir} → BUY (OI+{oi_change:.1f}%) (+{oi_score})")
                 elif direction == 'SELL' and oi_signal == 'SHORT_COVERING':
-                    oi_score = -5
-                    warnings.append(f"OI CONFLICT: SHORT_COVERING vs SELL (OI-{oi_change:.1f}%) (-5) — shorts covering")
+                    # OI FLIP: shorts covering — follow OI, flip SELL → BUY
+                    _old_dir = direction
+                    direction = 'BUY'
+                    oi_score = int(3 * oi_strength * _oi_vwap_mult)
+                    bullish_points += oi_score
+                    reasons.append(f"OI FLIP: SHORT_COVERING overrides {_old_dir} → BUY (OI-{oi_change:.1f}%) (+{oi_score})")
                 
                 score += oi_score
         
@@ -1085,7 +1147,31 @@ class IntradayOptionScorer:
         
         _audit_after_bos = score
         
-        # === 8. MOMENTUM EXHAUSTION FILTER (graduated, overridable) ===
+        # === 8a. REGIME CONTINUATION BONUS ===
+        # On clearly trending days (BEARISH/BULLISH breadth), stocks moving
+        # with the market trend deserve a bonus. This compensates for ORB=0
+        # (INSIDE_ORB common on broad sell-offs/rallies) and rewards conviction.
+        _regime_bonus = 0
+        if market_data and direction in ('BUY', 'SELL'):
+            _rc_breadth = market_data.get('market_breadth', 'MIXED')
+            _rc_ltp = market_data.get('ltp', 0)
+            _rc_open = market_data.get('open', _rc_ltp)
+            _rc_move_pct = ((_rc_ltp - _rc_open) / _rc_open * 100) if _rc_open > 0 else 0
+            _rc_aligned = (
+                (direction == 'SELL' and _rc_breadth == 'BEARISH' and _rc_move_pct < -0.5)
+                or (direction == 'BUY' and _rc_breadth == 'BULLISH' and _rc_move_pct > 0.5)
+            )
+            if _rc_aligned:
+                _regime_bonus = 8
+                score += _regime_bonus
+                if direction == 'BUY':
+                    bullish_points += _regime_bonus
+                else:
+                    bearish_points += _regime_bonus
+                reasons.append(f"🌊 REGIME CONTINUATION: {direction} aligned with {_rc_breadth} breadth, {_rc_move_pct:+.1f}% from open (+{_regime_bonus})")
+        _audit_after_regime = score
+        
+        # === 8b. MOMENTUM EXHAUSTION FILTER (graduated, overridable) ===
         # Prevents chasing moves that have already exhausted their run.
         # Checks BOTH gap (from prev close) AND intraday move (from today's open).
         # A stock up +6% intraday is almost as dangerous as a 6% gap.
@@ -1228,14 +1314,13 @@ class IntradayOptionScorer:
                     exhaustion_score -= _vwap_penalty
                     warnings.append(f"🚫 EXHAUSTION: Moved down BUT above VWAP ₹{vwap:.0f} (-{_vwap_penalty})")
 
-            # --- WATCHER SAFETY CAP ---
-            # Even with VWAP-based calculation, cap watcher exhaustion at -12
-            # as a safety net (scanner has no cap — full penalty applies).
-            if source == 'watcher' and exhaustion_score < -12:
-                _uncapped = exhaustion_score
-                exhaustion_score = -12
-                warnings.append(f"🔧 WATCHER CAP: exhaustion {_uncapped} → {exhaustion_score} (live trigger, VWAP-based)")
-
+            # --- WATCHER EXHAUSTION ---
+            # Removed the artificial -5/-12 cap that was neutering exhaustion
+            # for watcher trades. The cap let late entries (after 2-3% moves)
+            # score high because only -5 pts were deducted while Trend/Accel
+            # inflated by +15-20. Now the full exhaustion penalty flows through.
+            # The Late Entry Decay in the watcher pipeline provides the
+            # primary protection against chasing extended moves.
             score += exhaustion_score
 
         _audit_after_exhaust = score
@@ -1901,9 +1986,12 @@ class IntradayOptionScorer:
         _audit_parts.append(f"EMA:{_audit_after_ema - _audit_after_vwap:+.0f}")
         _audit_parts.append(f"HTF:{_audit_after_htf - _audit_after_ema:+.0f}")
         _audit_parts.append(f"Accel:{_audit_after_accel - _audit_after_htf:+.0f}")
-        _audit_parts.append(f"RSI:{_audit_after_rsi - _audit_after_accel:+.0f}")
+        _audit_parts.append(f"Macro:{_audit_after_macro - _audit_after_accel:+.0f}")
+        _audit_parts.append(f"RSI:{_audit_after_rsi - _audit_after_macro:+.0f}")
+        _audit_parts.append(f"OI:{_audit_after_oi - _audit_after_rsi:+.0f}")
         _audit_parts.append(f"BOS:{_audit_after_bos - _audit_after_oi:+.0f}")
-        _audit_parts.append(f"Exhaust:{_audit_after_exhaust - _audit_after_bos:+.0f}")
+        _audit_parts.append(f"Regime:{_audit_after_regime - _audit_after_bos:+.0f}")
+        _audit_parts.append(f"Exhaust:{_audit_after_exhaust - _audit_after_regime:+.0f}")
         _audit_parts.append(f"Chop:{_audit_after_chop - _audit_after_exhaust:+.0f}")
         _audit_parts.append(f"Align:{_audit_after_align - _audit_after_chop:+.0f}")
         _audit_parts.append(f"Gates:{_audit_after_gates - _audit_after_align:+.0f}")

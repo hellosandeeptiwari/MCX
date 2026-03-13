@@ -1149,10 +1149,13 @@ def config_route():
 
 
 # ══════════════════════════════════════════════════════════════
-#  SETTINGS — Persistent overrides (titan_settings.json)
+#  SETTINGS — Single source of truth via settings_manager
 # ══════════════════════════════════════════════════════════════
 
-SETTINGS_FILE = Path(__file__).parent / 'titan_settings.json'
+from settings_manager import settings as _sm
+
+# Sync defaults on dashboard startup (populate missing keys from config.py)
+_sm.sync_defaults()
 
 # All strategy config dicts that can be toggled on/off or adjusted
 _STRATEGY_CONFIGS = [
@@ -1165,37 +1168,18 @@ _STRATEGY_CONFIGS = [
 
 
 def _load_settings() -> dict:
-    """Load saved settings overrides from disk."""
-    try:
-        if SETTINGS_FILE.exists():
-            with open(SETTINGS_FILE, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"⚠️ Failed to load settings: {e}")
-    return {}
+    """Load saved settings from settings_manager."""
+    return _sm.get_all()
 
 
 def _save_settings(settings: dict):
-    """Atomically save settings overrides to disk."""
-    tmp = SETTINGS_FILE.with_suffix('.tmp')
-    try:
-        with open(tmp, 'w') as f:
-            json.dump(settings, f, indent=2, default=str)
-        # Atomic rename
-        if os.name == 'nt':
-            if SETTINGS_FILE.exists():
-                SETTINGS_FILE.unlink()
-        tmp.rename(SETTINGS_FILE)
-    except Exception as e:
-        print(f"⚠️ Failed to save settings: {e}")
-        if tmp.exists():
-            tmp.unlink()
-        raise
+    """Save settings via settings_manager (updates json + config in-memory)."""
+    _sm.set_many(settings)
 
 
 def _get_current_settings() -> dict:
-    """Build full settings view: config.py defaults merged with overrides."""
-    saved = _load_settings()
+    """Build full settings view from settings_manager (single source of truth)."""
+    saved = _sm.get_all()
 
     # Capital & Risk
     capital_risk = {
@@ -1215,15 +1199,14 @@ def _get_current_settings() -> dict:
         default_enabled = cfg.get('enabled', True) if isinstance(cfg, dict) else True
         strategies[name] = saved.get(f'strategy_{name}', default_enabled)
 
-    # Watcher-specific tunables
-    bw = getattr(_config_module, 'BREAKOUT_WATCHER', {})
+    # Watcher-specific tunables (from settings_manager)
     watcher = {
-        'min_score': saved.get('watcher_min_score', bw.get('min_score', 40)),
-        'max_trades_per_scan': saved.get('watcher_max_trades_per_scan', bw.get('max_trades_per_scan', 2)),
-        'max_triggers_per_batch': saved.get('watcher_max_triggers_per_batch', bw.get('max_triggers_per_batch', 6)),
-        'sustain_seconds': saved.get('watcher_sustain_seconds', bw.get('sustain_seconds', 60)),
-        'vix_hard_block_above': saved.get('watcher_vix_hard_block', bw.get('vix_hard_block_above', 28.0)),
-        'momentum_exit_enabled': saved.get('watcher_momentum_exit', bw.get('momentum_exit', {}).get('enabled', True)),
+        'min_score': saved.get('watcher_min_score', 35),
+        'max_trades_per_scan': saved.get('watcher_max_trades_per_scan', 2),
+        'max_triggers_per_batch': saved.get('watcher_max_triggers_per_batch', 6),
+        'sustain_seconds': saved.get('watcher_sustain_seconds', 53),
+        'vix_hard_block_above': saved.get('watcher_vix_hard_block_above', saved.get('watcher_vix_hard_block', 32.0)),
+        'momentum_exit_enabled': saved.get('watcher_momentum_exit', True),
     }
 
     # Lot multipliers per strategy
@@ -1314,7 +1297,7 @@ def save_settings():
         if 'sustain_seconds' in wt:
             saved['watcher_sustain_seconds'] = max(10, min(300, int(wt['sustain_seconds'])))
         if 'vix_hard_block_above' in wt:
-            saved['watcher_vix_hard_block'] = max(15, min(50, float(wt['vix_hard_block_above'])))
+            saved['watcher_vix_hard_block_above'] = max(15, min(50, float(wt['vix_hard_block_above'])))
         if 'momentum_exit_enabled' in wt:
             saved['watcher_momentum_exit'] = bool(wt['momentum_exit_enabled'])
 
@@ -1376,8 +1359,12 @@ def kill_switch():
 def reset_settings():
     """Reset all settings to config.py defaults."""
     try:
-        if SETTINGS_FILE.exists():
-            SETTINGS_FILE.unlink()
+        from settings_manager import SETTINGS_FILE as _sf
+        if _sf.exists():
+            _sf.unlink()
+        # Re-sync defaults from config.py
+        _sm.sync_defaults()
+        _sm.apply_all()
         return jsonify({'ok': True, 'msg': 'Settings reset to defaults. Restart bot to apply.'})
     except Exception as e:
         return jsonify({'ok': False, 'msg': f'Reset failed: {e}'}), 500

@@ -61,28 +61,28 @@ GREEKS_SL_TARGET_TABLE = {
     # Delta 0.80+: 1% underlying move ≈ 0.8% premium move
     Moneyness.DEEP_ITM: {
         'sl_pct': 35,         # 35% SL (wide — low noise risk)
-        'target_pct': 50,     # 50% target (moderate — premium dense)
+        'target_pct': 150,    # 150% target
         'speed_gate_candles': 15,  # More patient — low gamma
     },
     # ITM: Good leverage. Standard SL.
     # Delta 0.55-0.80: decent directional exposure
     Moneyness.ITM: {
         'sl_pct': 28,         # 28% SL (standard)
-        'target_pct': 65,     # 65% target (good leverage) 
+        'target_pct': 150,    # 150% target
         'speed_gate_candles': 12,
     },
     # ATM: Highest gamma. Moves fast both ways. Moderate SL.
     # Delta 0.40-0.55: maximum gamma zone
     Moneyness.ATM: {
         'sl_pct': 25,         # 25% SL (slightly tighter — gamma amplifies)
-        'target_pct': 80,     # 80% target (ATM has best R:R)
+        'target_pct': 150,    # 150% target
         'speed_gate_candles': 10,
     },
     # OTM: Leveraged but fragile. Tight SL.
     # Delta 0.15-0.40: premium can evaporate
     Moneyness.OTM: {
         'sl_pct': 22,         # 22% SL (tight — premium erodes fast)
-        'target_pct': 100,    # 100% target (OTM doubles are the win scenario)
+        'target_pct': 150,    # 150% target
         'speed_gate_candles': 8,
     },
     # Deep OTM: Lottery ticket. Very tight SL.

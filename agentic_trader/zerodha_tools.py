@@ -739,6 +739,7 @@ class ZerodhaTools:
                 rationale=position.get('rationale', ''),
                 order_id=position.get('order_id', ''),
                 trade_id=position.get('trade_id', ''),
+                oi_signal=position.get('oi_signal', ''),
             )
         except Exception as e:
             print(f"⚠️ TradeLedger entry log error: {e}")
@@ -2780,6 +2781,82 @@ class ZerodhaTools:
                         # Wicked below but closed back above → SWEEP (stop hunt)
                         sweep_signal = 'SWEEP_LOW'
             
+            # === 7. MACRO TREND (2-hour intraday trajectory) ===
+            # Measures where the stock has been TRAVELING, not just where it is now.
+            # Used to distinguish continuation moves (trend-aligned triggers) from
+            # counter-trend traps (spikes against the dominant intraday direction).
+            macro_trend_score = 0    # -100 (strong down) to +100 (strong up)
+            macro_monotonicity = 0.0  # 0-1: what fraction of candles moved in trend direction
+            macro_net_move_pct = 0.0  # net price change over lookback window
+            macro_alignment = 'NEUTRAL'  # BULLISH_ALIGNED, BEARISH_ALIGNED, NEUTRAL, COUNTER
+            
+            if intraday_df is not None and len(intraday_df) >= 8:
+                _mdf = intraday_df.copy()
+                # Use up to last 24 five-min candles (2 hours), but at least 8
+                _macro_lookback = min(24, len(_mdf))
+                _mdf_window = _mdf.iloc[-_macro_lookback:]
+                
+                # 1. Directional Monotonicity: % of candles closing in one direction
+                _closes_m = _mdf_window['close'].values
+                _up_candles = sum(1 for i in range(1, len(_closes_m)) if _closes_m[i] > _closes_m[i-1])
+                _down_candles = sum(1 for i in range(1, len(_closes_m)) if _closes_m[i] < _closes_m[i-1])
+                _total_candles = len(_closes_m) - 1
+                if _total_candles > 0:
+                    _up_pct = _up_candles / _total_candles
+                    _down_pct = _down_candles / _total_candles
+                    macro_monotonicity = max(_up_pct, _down_pct)
+                
+                # 2. Net move over the window
+                _start_price = float(_closes_m[0])
+                _end_price = float(_closes_m[-1])
+                if _start_price > 0:
+                    macro_net_move_pct = (_end_price - _start_price) / _start_price * 100
+                
+                # 3. Range position: where is price vs window high/low
+                _window_high = float(_mdf_window['high'].max())
+                _window_low = float(_mdf_window['low'].min())
+                _range = _window_high - _window_low
+                _range_pos = (_end_price - _window_low) / _range if _range > 0 else 0.5
+                
+                # 4. Higher-highs/higher-lows count (structural trend)
+                _hh_count = 0
+                _ll_count = 0
+                _highs_m = _mdf_window['high'].values
+                _lows_m = _mdf_window['low'].values
+                for _mi in range(2, len(_highs_m)):
+                    if _highs_m[_mi] > _highs_m[_mi-2]:
+                        _hh_count += 1
+                    if _lows_m[_mi] < _lows_m[_mi-2]:
+                        _ll_count += 1
+                
+                # 5. Combine into composite macro score (-100 to +100)
+                # Net move component (dominant, ±40 max)
+                _move_component = max(-40, min(40, macro_net_move_pct * 20))
+                # Monotonicity component (±30 max, sign from move direction)
+                _mono_sign = 1 if macro_net_move_pct >= 0 else -1
+                _mono_component = _mono_sign * (macro_monotonicity - 0.5) * 60  # 0.5=neutral, 0.8=+18
+                _mono_component = max(-30, min(30, _mono_component))
+                # Structure component: HH-LL net (±20 max)  
+                _struct_net = _hh_count - _ll_count
+                _struct_component = max(-20, min(20, _struct_net * 5))
+                # Range position (±10 max): at top of range = bullish boost
+                _range_component = (_range_pos - 0.5) * 20  # 0→-10, 0.5→0, 1.0→+10
+                
+                macro_trend_score = int(round(_move_component + _mono_component + _struct_component + _range_component))
+                macro_trend_score = max(-100, min(100, macro_trend_score))
+                
+                # Classification for easy use
+                if macro_trend_score >= 40:
+                    macro_alignment = 'BULLISH_ALIGNED'
+                elif macro_trend_score >= 15:
+                    macro_alignment = 'MILD_BULLISH'
+                elif macro_trend_score <= -40:
+                    macro_alignment = 'BEARISH_ALIGNED'
+                elif macro_trend_score <= -15:
+                    macro_alignment = 'MILD_BEARISH'
+                else:
+                    macro_alignment = 'NEUTRAL'
+            
             _ind_result = {
                 'sma_20': round(sma_20, 2),
                 'sma_50': round(sma_50, 2),
@@ -2848,6 +2925,11 @@ class ZerodhaTools:
                 'sweep_signal': sweep_signal,
                 'swing_high_level': round(_struct_swing_high, 2),
                 'swing_low_level': round(_struct_swing_low, 2),
+                # === MACRO TREND (2-hour trajectory) ===
+                'macro_trend_score': macro_trend_score,
+                'macro_monotonicity': round(macro_monotonicity, 3),
+                'macro_net_move_pct': round(macro_net_move_pct, 3),
+                'macro_alignment': macro_alignment,
             }
             
             # === FUTURES OI SIGNAL (zero API calls — WebSocket cache) ===
@@ -3786,7 +3868,7 @@ class ZerodhaTools:
         _regime_max = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)  # Default to MIXED (conservative)
         # If market_breadth was injected into market_data, use it
         try:
-            _md_check = self.get_market_data([underlying])
+            _md_check = {underlying: pre_fetched_market_data} if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3 else self.get_market_data([underlying])
             _breadth_check = _md_check.get(underlying, {}).get('market_breadth', 'MIXED') if isinstance(_md_check.get(underlying), dict) else 'MIXED'
             if _breadth_check in ('BULLISH', 'BEARISH'):
                 _regime_max = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
@@ -3814,7 +3896,7 @@ class ZerodhaTools:
         # 4. Data health gate check
         health_gate = get_data_health_gate()
         try:
-            md_health = self.get_market_data([underlying])
+            md_health = {underlying: pre_fetched_market_data} if pre_fetched_market_data and isinstance(pre_fetched_market_data, dict) and len(pre_fetched_market_data) > 3 else self.get_market_data([underlying])
             if underlying in md_health and isinstance(md_health[underlying], dict):
                 health_ok, health_reason = health_gate.can_trade(underlying, md_health[underlying])
                 if not health_ok:
@@ -3858,13 +3940,17 @@ class ZerodhaTools:
                 print(f"   {_vix_emoji} VIX REGIME [{_vix_regime}] VIX={_vix_val:.1f}: lots ×{_vix_lot_mult:.2f}")
         
         # === CHECK FOR DUPLICATE OPTION ON SAME UNDERLYING ===
+        # Allow opposite-direction trades (CE + PE on same stock)
+        _incoming_opt_type = 'PE' if direction == 'SELL' else 'CE'
         for pos in self.paper_positions:
             if pos.get('status', 'OPEN') == 'OPEN' and pos.get('is_option') and pos.get('underlying') == underlying:
-                return {
-                    "success": False,
-                    "error": f"DUPLICATE BLOCKED: Already have option position on {underlying} ({pos['symbol']})",
-                    "action": "Skip - already holding option on this underlying"
-                }
+                _existing_opt_type = pos.get('option_type', '')
+                if _existing_opt_type == _incoming_opt_type:
+                    return {
+                        "success": False,
+                        "error": f"DUPLICATE BLOCKED: Already have {_existing_opt_type} position on {underlying} ({pos['symbol']})",
+                        "action": "Skip - already holding same option type on this underlying"
+                    }
         
         # === RE-ENTRY COOLDOWN CHECK (20-min block after exit on same underlying) ===
         _cd_time = self._exit_cooldowns.get(underlying)
@@ -4158,7 +4244,11 @@ class ZerodhaTools:
         # especially on high-breadth days where uncertainty is already low.
         # IOC CE bought at 22.8% IV on 47/50 bullish day → IV compressed → -10.7% premium loss.
         from config import IV_CRUSH_GUARD as _iv_cfg
-        if _iv_cfg.get('enabled', True):
+        # High-conviction bypass: score >= 80 means all signals strongly agree — trust it
+        _iv_smart_score = (ml_data or {}).get('smart_score', 0) or 0
+        if _iv_smart_score >= 80:
+            pass  # Skip IV crush guard entirely for high-conviction setups
+        elif _iv_cfg.get('enabled', True):
             try:
                 _opt_iv = plan.contract.iv       # IV as decimal (e.g., 0.228 = 22.8%)
                 _opt_ltp = plan.contract.ltp      # Option premium (₹)
@@ -4172,18 +4262,16 @@ class ZerodhaTools:
                     
                     # --- Sub-Gate 2: Breadth-Adjusted IV Floor ---
                     # Check market breadth to raise the IV floor on extreme-breadth days
+                    # Reuse market_data already fetched earlier (avoid redundant get_market_data call)
                     _effective_iv_floor = _iv_floor
                     _breadth_label = 'MIXED'
                     _breadth_ratio = 0.0
                     try:
-                        _md_iv = self.get_market_data([underlying])
-                        _breadth_label = _md_iv.get(underlying, {}).get('market_breadth', 'MIXED') if isinstance(_md_iv.get(underlying), dict) else 'MIXED'
-                        # Compute breadth ratio from paper_positions context or market data
-                        # Use a lightweight heuristic: BULLISH/BEARISH = extreme, MIXED = normal
+                        _breadth_label = market_data.get('market_breadth', 'MIXED') if isinstance(market_data, dict) else 'MIXED'
                         if _breadth_label in ('BULLISH', 'BEARISH'):
-                            _breadth_ratio = 0.90  # Assume ~90% when regime is strongly directional
+                            _breadth_ratio = 0.90
                         else:
-                            _breadth_ratio = 0.55  # Mixed regime = ~55%
+                            _breadth_ratio = 0.55
                     except Exception:
                         pass
                     
@@ -4229,6 +4317,8 @@ class ZerodhaTools:
                     # NATIONALUM IV=31%, MPHASIS IV=39% bypassed the 30% threshold → IV crush losses).
                     _vd_iv_thresh = _iv_cfg.get('vega_delta_iv_threshold', 0.30)
                     _max_vd = _iv_cfg.get('max_vega_delta_ratio', 0.50)
+                    if _is_arbtr:
+                        _max_vd = 2.0  # ARBTR: relax vega/delta — original 0.50 is for low-IV traps, not high-VIX crash days
                     _vd_iv_ok = _is_arbtr or (_opt_iv < _vd_iv_thresh)
                     if (_vd_iv_ok and _opt_delta and abs(_opt_delta) > 0.01 
                             and _opt_vega and abs(_opt_vega) > 0):
@@ -4484,6 +4574,8 @@ class ZerodhaTools:
                     'ml_scored_direction': (ml_data or {}).get('scored_direction', ''),
                     'ml_xgb_disagrees': (ml_data or {}).get('xgb_disagrees', False),
                     'sector': sector or '',
+                    'oi_signal': (ml_data or {}).get('oi_signal', ''),
+                    'oi_flipped': (ml_data or {}).get('oi_flipped', False),
                 }
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
@@ -4549,6 +4641,8 @@ class ZerodhaTools:
                     'ml_scored_direction': (ml_data or {}).get('scored_direction', ''),
                     'ml_xgb_disagrees': (ml_data or {}).get('xgb_disagrees', False),
                     'sector': sector or '',
+                    'oi_signal': (ml_data or {}).get('oi_signal', ''),
+                    'oi_flipped': (ml_data or {}).get('oi_flipped', False),
                 }
                 
                 # Place SL-M order for the option
@@ -5256,7 +5350,6 @@ class ZerodhaTools:
             print(f"   ⚠️ THP chain diag: {len(chain.contracts)} contracts, expiry_date={expiry_date}({type(expiry_date).__name__}), sample expiries={all_expiries}")
             return {"success": False, "error": f"No {option_type_str} strikes in chain for {underlying} (chain has {len(chain.contracts)} contracts, exp={expiry_date})"}
         
-        sell_offset = THESIS_HEDGE_CONFIG.get('sell_strike_offset', 3)
         min_hedge_premium = THESIS_HEDGE_CONFIG.get('min_hedge_premium', 3.0)
         min_hedge_premium_pct = THESIS_HEDGE_CONFIG.get('min_hedge_premium_pct', 15)
         min_oi = THESIS_HEDGE_CONFIG.get('min_oi', 500)
@@ -5265,83 +5358,117 @@ class ZerodhaTools:
         # Find the index of our buy strike (or nearest)
         buy_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - buy_strike))
         
-        # Sell leg is further OTM:
-        # CE (bullish): sell higher strike (buy_idx + offset)
-        # PE (bearish): sell lower strike (buy_idx - offset)
-        if opt_type == OptionType.CE:
-            sell_idx = buy_idx + sell_offset
-        else:
-            sell_idx = buy_idx - sell_offset
+        # === DYNAMIC SELL LEG SELECTION ===
+        # Scan offsets from 2 to max_scan_offset, pick the best strike that passes
+        # all gates (liquidity, premium, cost gate). For narrow-strike-interval stocks
+        # (5pt), fixed offset=3 gives only 15pt width with poor R:R.
+        # Scanning wider finds the optimal spread width automatically.
+        max_dtw = THESIS_HEDGE_CONFIG.get('max_debit_to_width_pct', 55)
+        min_rr = THESIS_HEDGE_CONFIG.get('min_spread_rr_ratio', 0.50)
+        min_remaining = THESIS_HEDGE_CONFIG.get('min_remaining_value_pct', 30)
+        cost_gate_on = THESIS_HEDGE_CONFIG.get('cost_gate_enabled', True)
+        min_scan_offset = THESIS_HEDGE_CONFIG.get('min_sell_offset', 2)
+        max_scan_offset = THESIS_HEDGE_CONFIG.get('max_sell_offset', 8)
         
-        if sell_idx < 0 or sell_idx >= len(strikes):
-            return {"success": False, "error": f"Sell leg index {sell_idx} out of range (total strikes: {len(strikes)})"}
-        
-        sell_strike = strikes[sell_idx]
-        sell_contract = chain.get_contract(sell_strike, opt_type, expiry)
-        if sell_contract is None:
-            return {"success": False, "error": f"No contract at sell strike {sell_strike} {option_type_str}"}
-        
-        sell_premium = sell_contract.ltp
-        sell_oi = sell_contract.oi
-        sell_bid = sell_contract.bid
-        sell_ask = sell_contract.ask
-        
-        # === LIQUIDITY VALIDATION ===
-        if sell_oi < min_oi:
-            return {"success": False, "error": f"Sell leg OI={sell_oi} < {min_oi} — illiquid"}
-        
-        if sell_premium > 0 and sell_bid > 0 and sell_ask > 0:
-            bid_ask_pct = ((sell_ask - sell_bid) / sell_premium) * 100
-            if bid_ask_pct > max_bid_ask_pct:
-                return {"success": False, "error": f"Sell leg bid-ask spread {bid_ask_pct:.1f}% > {max_bid_ask_pct}% — illiquid"}
-        
-        # === MINIMUM PREMIUM CHECK ===
-        if sell_premium < min_hedge_premium:
-            return {"success": False, "error": f"Sell leg premium ₹{sell_premium:.2f} < ₹{min_hedge_premium:.2f} — too cheap to hedge"}
-        
-        premium_ratio_pct = (sell_premium / buy_entry_price * 100) if buy_entry_price > 0 else 0
-        if premium_ratio_pct < min_hedge_premium_pct:
-            return {"success": False, "error": f"Sell leg only {premium_ratio_pct:.1f}% of buy entry — need ≥{min_hedge_premium_pct}%"}
-        
-        # === COMPUTE SPREAD METRICS ===
-        spread_width = abs(buy_strike - sell_strike)
-        # Net debit = what we paid for buy leg - what we receive for sell leg
-        net_debit = buy_entry_price - sell_premium
-        if net_debit < 0:
-            net_debit = 0  # Can't have negative debit
-        net_debit_total = net_debit * lots * lot_size_from_trade
-        
-        print(f"   Sell leg: {option_type_str} {sell_strike} @ ₹{sell_premium:.2f} (OI: {sell_oi:,})")
-        print(f"   Spread: width={spread_width} | net_debit=₹{net_debit:.2f}/share | total=₹{net_debit_total:,.0f}")
-        
-        # === COST-AWARE HEDGE GATE ===
-        # Reject hedge if the resulting spread has terrible economics.
-        # Better to EXIT outright than waste money on a corpse spread.
-        if THESIS_HEDGE_CONFIG.get('cost_gate_enabled', True):
-            # Gate 1: Debit-to-Width ratio — if net_debit eats most of the spread, R:R is terrible
-            max_dtw = THESIS_HEDGE_CONFIG.get('max_debit_to_width_pct', 55)
-            dtw_pct = (net_debit / spread_width * 100) if spread_width > 0 else 0
-            if spread_width > 0 and dtw_pct > max_dtw:
-                max_profit_pct = 100 - dtw_pct
-                return {"success": False, "error": f"COST GATE: net_debit/width={dtw_pct:.0f}% > {max_dtw}% — max profit only {max_profit_pct:.0f}% of risk, EXIT instead"}
-            
-            # Gate 2: Remaining value — if buy leg has already collapsed, don't hedge a corpse
-            min_remaining = THESIS_HEDGE_CONFIG.get('min_remaining_value_pct', 30)
-            # Use current LTP of buy leg (sell_contract's chain should have it)
+        # Pre-check: buy leg remaining value (applies to all offsets)
+        if cost_gate_on:
             buy_contract = chain.get_contract(buy_strike, opt_type, expiry)
             if buy_contract and buy_contract.ltp > 0:
                 remaining_pct = (buy_contract.ltp / buy_entry_price) * 100
                 if remaining_pct < min_remaining:
                     return {"success": False, "error": f"COST GATE: buy leg at {remaining_pct:.0f}% of entry (₹{buy_contract.ltp:.2f}/₹{buy_entry_price:.2f}) — option is a corpse, EXIT instead"}
+        
+        # Scan candidates
+        best_candidate = None
+        best_rr = -1
+        scan_log = []
+        
+        for offset in range(min_scan_offset, max_scan_offset + 1):
+            if opt_type == OptionType.CE:
+                s_idx = buy_idx + offset
+            else:
+                s_idx = buy_idx - offset
             
-            # Gate 3: Reward-to-Risk ratio on the resulting spread
-            min_rr = THESIS_HEDGE_CONFIG.get('min_spread_rr_ratio', 0.50)
-            max_profit_per_share = spread_width - net_debit
-            spread_rr = (max_profit_per_share / net_debit) if net_debit > 0 else 999
-            if net_debit > 0 and spread_rr < min_rr:
-                return {"success": False, "error": f"COST GATE: spread R:R={spread_rr:.2f} < {min_rr} — max profit ₹{max_profit_per_share:.2f} vs risk ₹{net_debit:.2f}, EXIT instead"}
+            if s_idx < 0 or s_idx >= len(strikes):
+                break  # No more strikes available
             
-            print(f"   ✅ COST GATE PASSED: debit/width={dtw_pct:.0f}%, R:R={spread_rr:.2f}")
+            s_strike = strikes[s_idx]
+            s_contract = chain.get_contract(s_strike, opt_type, expiry)
+            if s_contract is None:
+                continue
+            
+            s_premium = s_contract.ltp
+            s_oi = s_contract.oi
+            s_bid = s_contract.bid
+            s_ask = s_contract.ask
+            
+            # Skip if illiquid
+            if s_oi < min_oi:
+                scan_log.append(f"      offset {offset} strike {s_strike}: OI={s_oi} < {min_oi} — skip")
+                continue
+            if s_premium > 0 and s_bid > 0 and s_ask > 0:
+                ba_pct = ((s_ask - s_bid) / s_premium) * 100
+                if ba_pct > max_bid_ask_pct:
+                    scan_log.append(f"      offset {offset} strike {s_strike}: bid-ask {ba_pct:.1f}% — skip")
+                    continue
+            
+            # Skip if premium too low
+            if s_premium < min_hedge_premium:
+                scan_log.append(f"      offset {offset} strike {s_strike}: prem ₹{s_premium:.2f} < ₹{min_hedge_premium} — skip")
+                break  # Further OTM will be even cheaper
+            prem_ratio = (s_premium / buy_entry_price * 100) if buy_entry_price > 0 else 0
+            if prem_ratio < min_hedge_premium_pct:
+                scan_log.append(f"      offset {offset} strike {s_strike}: prem ratio {prem_ratio:.0f}% < {min_hedge_premium_pct}% — skip")
+                break  # Further OTM will be worse
+            
+            # Compute spread metrics
+            s_width = abs(buy_strike - s_strike)
+            s_net_debit = max(0, buy_entry_price - s_premium)
+            s_dtw = (s_net_debit / s_width * 100) if s_width > 0 else 999
+            s_max_profit = s_width - s_net_debit
+            s_rr = (s_max_profit / s_net_debit) if s_net_debit > 0 else 999
+            
+            # Cost gate check
+            if cost_gate_on:
+                if s_width > 0 and s_dtw > max_dtw:
+                    scan_log.append(f"      offset {offset} strike {s_strike}: DTW={s_dtw:.0f}% > {max_dtw}% — skip")
+                    continue
+                if s_net_debit > 0 and s_rr < min_rr:
+                    scan_log.append(f"      offset {offset} strike {s_strike}: R:R={s_rr:.2f} < {min_rr} — skip")
+                    continue
+            
+            scan_log.append(f"      offset {offset} strike {s_strike}: prem=₹{s_premium:.2f} DTW={s_dtw:.0f}% R:R={s_rr:.2f} ✓")
+            
+            # Pick best R:R among passing candidates
+            if s_rr > best_rr:
+                best_rr = s_rr
+                best_candidate = {
+                    'offset': offset, 'strike': s_strike, 'contract': s_contract,
+                    'premium': s_premium, 'oi': s_oi, 'bid': s_bid, 'ask': s_ask,
+                    'width': s_width, 'net_debit': s_net_debit, 'dtw': s_dtw, 'rr': s_rr,
+                }
+        
+        # Print scan summary
+        if scan_log:
+            print(f"   📊 Sell leg scan (offsets {min_scan_offset}-{max_scan_offset}):")
+            for line in scan_log:
+                print(line)
+        
+        if best_candidate is None:
+            return {"success": False, "error": f"No sell leg passed all gates (scanned offsets {min_scan_offset}-{max_scan_offset})"}
+        
+        sell_strike = best_candidate['strike']
+        sell_contract = best_candidate['contract']
+        sell_premium = best_candidate['premium']
+        sell_oi = best_candidate['oi']
+        sell_bid = best_candidate['bid']
+        sell_ask = best_candidate['ask']
+        spread_width = best_candidate['width']
+        net_debit = best_candidate['net_debit']
+        net_debit_total = net_debit * lots * lot_size_from_trade
+        
+        print(f"   ✅ BEST SELL LEG: {option_type_str} {sell_strike} (offset {best_candidate['offset']}) @ ₹{sell_premium:.2f} (OI: {sell_oi:,})")
+        print(f"   Spread: width={spread_width} | net_debit=₹{net_debit:.2f}/share | total=₹{net_debit_total:,.0f} | DTW={best_candidate['dtw']:.0f}% | R:R={best_candidate['rr']:.2f}")
         
         # === EXECUTE SELL LEG ===
         import random

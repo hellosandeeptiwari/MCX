@@ -155,10 +155,13 @@ BREAKOUT_WATCHER = {
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
     "day_extreme_min_move_pct": 0.35, # Day extreme must also show ≥0.35% move from baseline (was 0.25)
     "volume_surge_multiplier": 3.0,   # Trigger if tick volume ≥ 3.0x rolling average
-    # --- Sustain Filter (SUSTAINABILITY FOCUS Mar-10) ---
-    # 120s forces the move to PROVE itself — intermittent spikes die within 60-90s.
-    # Peak tracking: if price retraces >50% of its peak move during the window, fail.
-    "sustain_seconds": 120,           # Price must HOLD the move for 120s before triggering (was 60 — caught fakeouts)
+    # --- Sustain Filter (signal-aware — Mar 12 latency fix) ---
+    # Retrace check (>50% retrace = fail) is the real fakeout filter.
+    # Signal-specific sustain times: stronger signals need less proof time.
+    "sustain_seconds": 15,            # PRICE_SPIKE: 15s quick sanity check (OI fetched inline at drain provides real conviction)
+    "sustain_seconds_extreme": 20,    # DAY_HIGH/LOW break — 20s proof
+    "sustain_seconds_volume": 20,     # VOLUME_SURGE with confirmed ticks — 20s proof
+    "sustain_seconds_grind": 14,      # SLOW_GRIND already proved over 5min — quick sanity
     "sustain_recheck_pct": 0.6,       # Spike/extreme: price must still be ≥0.6% from baseline (was 0.5)
     "sustain_recheck_pct_volume": 0.5,# Volume surge: price must still be ≥0.5% from baseline (was 0.4 — 0.3% moves too weak)
     "sustain_retrace_max_pct": 50.0,  # Fail sustain if price retraces >50% from peak move during window
@@ -166,7 +169,7 @@ BREAKOUT_WATCHER = {
     # --- Slow Grind Detection ---
     "slow_grind_pct": 1.0,              # 1%+ move over 5-minute window triggers SLOW_GRIND
     # --- Cooldown (anti-spam) ---
-    "cooldown_seconds": 180,          # Don't re-trigger same stock within 3 minutes
+    "cooldown_seconds": 120,          # Don't re-trigger same stock within 2 minutes (was 3 — too slow)
     "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days
     # --- Priority Queue ---
     "queue_size": 100,                # Max queued triggers — evicts weakest when full
@@ -174,8 +177,8 @@ BREAKOUT_WATCHER = {
     # --- Timing (SUSTAINABILITY: wait for ORB range to fully form) ---
     "active_after": "09:35",          # Don't trigger before 09:35 (was 09:30 — ORB needs 20 min to form, VWAP unreliable before this)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
-    # --- Score Gate (TIGHTENED Mar-10: require meaningful technical conviction) ---
-    "min_score": 40,                  # Minimum score to trade (was 15 — too low, passed garbage)
+    # --- Score Gate (LOWERED Mar-12: macro trend filter now handles quality, let more setups through) ---
+    "min_score": 35,                  # Minimum score to trade (was 40 — macro trend now filters counter-trend traps)
     "orb_min_score": 40,              # ORB_BREAKOUT floor (was 25)
     "orb_min_move_prob": 0.55,        # ORB trades need P(move)≥55% (was 0.50)
     "watcher_min_move_prob": 0.40,    # WATCHER P(move) floor (was 0.30 — too permissive)
@@ -187,9 +190,9 @@ BREAKOUT_WATCHER = {
     "rsi_extreme_ce_min": 75,         # Block CE (BUY) if RSI > 75 — overbought pullback imminent
     # --- Exhaustion Index (NEW Mar-10: statistical move exhaustion detection) ---
     # Combines: intraday move from open + recent trigger move + position in day range + RSI
-    # Into a 0-100 index: >60 = exhausted move, don't chase.
-    # IndiGo example: EI=71 (dropped 3.3% from open, trigger only -0.3%, near day low, RSI=28)
-    "exhaustion_index_block": 60,     # Block if Exhaustion Index > this threshold
+    # Into a 0-100 index: >70 = exhausted move, don't chase.
+    # On trending days, +15 regime boost. High-score setups get additional +10-15 boost.
+    "exhaustion_index_block": 70,     # Block if Exhaustion Index > this threshold (was 60 — too aggressive, blocked legit momentum)
     # --- Opening Period Cap (early-market protection) ---
     "max_trades_before_1000": 2,      # Max watcher trades before 10:00 IST (was 3)
     # --- Early Market Hardening (9:35-9:55 is still dicey) ---
@@ -254,6 +257,14 @@ BREAKOUT_WATCHER = {
         # If price recovers → DISARM (it was just a pullback). If reversal deepens → exit fast.
         "armed_grace_seconds": 90,               # Wait 90s for recovery before committing to exit
         "armed_deepen_multiplier": 1.5,          # Exit immediately if reversal > 1.5× threshold during grace
+        # --- OI Reversal Exit (NEW: operators reversing position = move is done) ---
+        # Fetch OI every N seconds per tracked symbol. When OI signal flips against
+        # trade direction (e.g. SHORT_COVERING after PE trade), exit immediately.
+        # OI reversal counts as 2 confirmations (strongest signal — operators know first).
+        "oi_reversal_exit_enabled": True,
+        "oi_check_interval_seconds": 60,          # Fetch OI every 60s per symbol (not every 5s — too expensive)
+        "oi_reversal_immediate_exit": True,        # If OI reverses, trigger exit without grace period
+        "oi_reversal_min_hold_seconds": 90,        # Min hold before OI exit check (let trade develop)
     },
 }
 
@@ -441,13 +452,13 @@ GMM_CONTRARIAN = {
 TEST_GMM = {
     "enabled": True,
     # DOWN model signal: down_flag confirms → BUY PUT
-    "down_min_score": 0.25,              # Tightened: require stronger DOWN signal (quality > quantity)
-    "down_max_opposite": 0.10,           # Tightened: clean side must be genuinely clean
+    "down_min_score": 0.27,              # Tightened: require stronger DOWN signal (was 0.25)
+    "down_max_opposite": 0.10,           # Clean side must be genuinely clean
     # UP model signal: up_flag confirms → BUY CALL
-    "up_min_score": 0.22,                # Tightened: UP model AUROC=0.56, need stronger signal
-    "up_max_opposite": 0.10,             # Tightened: clean side must be genuinely clean
+    "up_min_score": 0.24,                # Tightened: UP model AUROC=0.56, need stronger signal (was 0.22)
+    "up_max_opposite": 0.10,             # Clean side must be genuinely clean
     # Divergence quality
-    "min_divergence_gap": 0.12,          # Require meaningful gap between regimes (not just noise)
+    "min_divergence_gap": 0.20,          # Require strong gap between regimes (was 0.12)
     # FLAG-based conviction gates (model-calibrated thresholds)
     "require_signaling_flag": True,      # Signaling regime must FIRE its own anomaly flag
     "require_clean_no_flag": True,       # Tightened: clean side must NOT be flagging (reduces noise)
@@ -611,7 +622,7 @@ ARBTR_CONFIG = {
     "min_sector_stocks_aligned": 0.70,    # Strict: ≥70% of sector must align for conviction
 
     # --- Laggard Detection ---
-    "max_laggard_move_pct": 0.6,          # Strict: stock must barely move (<0.6%) to be a true laggard
+    "max_laggard_move_pct": 1.2,          # Relaxed: stock must lag (<1.2%) — on crash days even laggards move 0.5-1%
     "min_divergence_pct": 0.7,            # Strict: require meaningful divergence gap from sector
     "max_divergence_pct": 5.0,            # If gap >5% the stock is decoupled (skip)
 
@@ -632,7 +643,7 @@ ARBTR_CONFIG = {
 
     # --- Timing ---
     "earliest_entry": "09:45",            # First 30 min: too noisy, let the divergence establish
-    "no_entry_after": "14:00",            # No entries after 2 PM — need time for convergence
+    "no_entry_after": "15:00",            # Extended to 3 PM — give more window on broad move days
     "cooldown_per_sector_minutes": 15,    # After entering one ARBTR in a sector, wait 15 min
 
     # --- Risk / Sizing ---
@@ -895,8 +906,10 @@ DEBIT_SPREAD_CONFIG = {
 # instead of immediately exiting — limits max loss while allowing for recovery.
 THESIS_HEDGE_CONFIG = {
     "enabled": True,
-    # --- Hedge Leg Selection ---
-    "sell_strike_offset": 3,          # Sell leg = 3 strikes OTM from current ATM
+    # --- Hedge Leg Selection (DYNAMIC SCAN) ---
+    "sell_strike_offset": 3,          # Default offset (used as starting hint)
+    "min_sell_offset": 2,             # Minimum offset to scan (2 strikes OTM)
+    "max_sell_offset": 8,             # Maximum offset to scan (8 strikes OTM for narrow-strike stocks)
     "min_hedge_premium": 3.0,         # Min ₹ premium on sell leg (too cheap = worthless hedge)
     "min_hedge_premium_pct": 15,      # Sell leg premium must be ≥15% of buy leg entry price
     # --- Liquidity Gates ---

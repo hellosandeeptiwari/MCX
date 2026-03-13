@@ -517,6 +517,7 @@ class SniperStrategies:
                         'price_validated': True,
                     },
                     'scored_direction': direction,
+                    'oi_signal': buildup,
                     'sniper_type': 'OI_UNWINDING',
                 },
             })
@@ -892,6 +893,7 @@ class SniperStrategies:
                         'flow_bias': oi_data.get('flow_bias'),
                     },
                     'scored_direction': direction,
+                    'oi_signal': oi_data.get('nse_oi_buildup', '') or ('LONG_BUILDUP' if oi_data.get('flow_bias') == 'BULLISH' else 'SHORT_BUILDUP' if oi_data.get('flow_bias') == 'BEARISH' else 'NEUTRAL'),
                     'sniper_type': 'PCR_EXTREME',
                 },
             })

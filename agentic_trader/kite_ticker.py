@@ -754,8 +754,11 @@ class BreakoutWatcher:
         
         self._day_ext_min_move = config.get('day_extreme_min_move_pct', 0.4)
         
-        # Sustain filter
-        self._sustain_secs = config.get('sustain_seconds', 15)
+        # Sustain filter (signal-aware times)
+        self._sustain_secs = config.get('sustain_seconds', 60)
+        self._sustain_secs_extreme = config.get('sustain_seconds_extreme', 45)
+        self._sustain_secs_volume = config.get('sustain_seconds_volume', 45)
+        self._sustain_secs_grind = config.get('sustain_seconds_grind', 15)
         self._sustain_recheck_pct = config.get('sustain_recheck_pct', 0.5)
         self._sustain_recheck_pct_volume = config.get('sustain_recheck_pct_volume', 0.15)
         
@@ -1149,7 +1152,17 @@ class BreakoutWatcher:
                 _prev_peak = pending.get('_peak_move_pct', 0)
                 if _cur_move > _prev_peak:
                     pending['_peak_move_pct'] = _cur_move
-            if elapsed >= self._sustain_secs:
+            # Signal-aware sustain time: stronger signals need less proof
+            _ttype_s = pending.get('trigger_type', '')
+            if 'GRIND' in _ttype_s:
+                _effective_sustain = self._sustain_secs_grind
+            elif 'DAY' in _ttype_s:
+                _effective_sustain = self._sustain_secs_extreme
+            elif 'VOLUME' in _ttype_s:
+                _effective_sustain = self._sustain_secs_volume
+            else:
+                _effective_sustain = self._sustain_secs
+            if elapsed >= _effective_sustain:
                 # Time's up — check if price still holds
                 move_pct = round(abs(ltp - baseline_price) / baseline_price * 100, 1)
                 # Volume surges use a lower sustain bar (they just need price not to crash)
@@ -1345,9 +1358,10 @@ class BreakoutWatcher:
         Big moves (≥ priority_bypass_pct) bypass the rate limit so they
         ALWAYS enter the queue even during flood conditions (crash days).
         """
-        # Gate: active window
-        if not self._is_active_window():
-            return
+        # NOTE: No active-window gate here — let triggers queue up freely.
+        # The drain gate (watcher_start in _process_breakout_triggers) controls
+        # when queued triggers are actually processed. This prevents losing
+        # valid pre-09:20 sustained triggers that would otherwise be silently dropped.
         
         # Gate: cooldown (per-symbol) — with priority escalation
         # Higher-priority trigger types can bypass cooldown set by weaker triggers.

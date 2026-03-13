@@ -81,6 +81,7 @@ class TradeLedger:
                   order_id: str = '',
                   trade_id: str = '',
                   is_sniper: bool = False,
+                  oi_signal: str = '',
                   extra: Optional[Dict] = None):
         """Log a new trade entry."""
         _r = lambda v, n=2: round(v, n) if v is not None else 0
@@ -113,6 +114,7 @@ class TradeLedger:
             'strategy_type': strategy_type,
             'is_sniper': is_sniper,
             'lot_multiplier': lot_multiplier,
+            'oi_signal': oi_signal,
             # Option details
             'option_symbol': option_symbol,
             'strike': strike,

@@ -526,7 +526,7 @@ a{color:var(--blue);text-decoration:none}
           <tr>
             <th>Time</th><th>Symbol</th><th>Type</th><th>Underlying</th><th>Dir</th><th>Qty/Lots</th>
             <th>Entry</th><th>SL</th><th>Target</th>
-            <th>Setup</th><th>Score</th><th>ML Metrics</th><th>P&amp;L</th><th>Action</th>
+            <th>Setup</th><th>Score</th><th>OI</th><th>ML Metrics</th><th>P&amp;L</th><th>Action</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -1145,7 +1145,7 @@ async function loadPositions() {
     $('#pos-count').textContent = positions.length + ' open';
 
     if(!positions.length) {
-      tbody.innerHTML = '<tr><td colspan="14" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--txt3);padding:24px">No open positions</td></tr>';
       tfoot.style.display = 'none';
       totalsBar.style.display = 'none';
     } else {
@@ -1386,6 +1386,21 @@ async function loadPositions() {
           '<td>' + (target ? fmt(target) : DASH) + '</td>' +
           '<td>' + setupLabel + '</td>' +
           '<td>' + scoreHtml + '</td>' +
+          '<td>' + (function(){
+            const oi = p.oi_signal || '';
+            if(!oi || oi==='NEUTRAL' || oi==='NO_FUTURES') return '<span style="font-size:.65rem;color:var(--txt3)">' + (oi==='NEUTRAL'?'N':oi==='NO_FUTURES'?'NF':'N/A') + '</span>';
+            const oiColors = {'LONG_BUILDUP':'#059669','SHORT_BUILDUP':'#dc2626','LONG_UNWINDING':'#d97706','SHORT_COVERING':'#2563eb'};
+            const oiLabels = {'LONG_BUILDUP':'LB','SHORT_BUILDUP':'SB','LONG_UNWINDING':'LU','SHORT_COVERING':'SC'};
+            const c = oiColors[oi] || '#8b929e';
+            const l = oiLabels[oi] || oi;
+            let tag = '';
+            if(p.oi_flipped) {
+              tag = ' <span style="font-size:.6rem;background:#f59e0b;color:#000;padding:1px 3px;border-radius:3px;font-weight:700" title="Direction was flipped by OI">FLIP</span>';
+            } else {
+              tag = ' <span style="font-size:.6rem;background:#059669;color:#fff;padding:1px 3px;border-radius:3px;font-weight:700" title="OI aligned with trade direction">ALIGNED</span>';
+            }
+            return '<span style="font-size:.72rem;font-weight:600;color:'+c+'" title="'+oi+'">'+l+'</span>'+tag;
+          })() + '</td>' +
           '<td style="white-space:nowrap;line-height:1.3">' + mlHtml + '</td>' +
           '<td class="' + upnlClass + '">' + pnlStr + '</td>' +
           '<td><button class="btn-exit" onclick="confirmExit(\'' + (p.symbol || p.option_symbol) + '\', \'' + sym + '\', ' + (ltp || entry) + ')" title="Exit at market">&#10005; Exit</button></td>' +

@@ -42,6 +42,37 @@ from trade_ledger import get_trade_ledger
 from state_db import get_state_db
 
 
+# OI signals that indicate BEARISH direction (operators positioned for down move)
+_OI_BEARISH_SIGNALS = {'SHORT_BUILDUP', 'LONG_UNWINDING'}
+# OI signals that indicate BULLISH direction (operators positioned for up move)
+_OI_BULLISH_SIGNALS = {'LONG_BUILDUP', 'SHORT_COVERING'}
+
+def _oi_signal_from_result(oi_data: dict) -> str:
+    """Extract best OI signal from OI analyzer result dict.
+    Prefers nse_oi_buildup (DhanHQ/NSE) → falls back to flow_bias mapping."""
+    if not oi_data:
+        return ''
+    sig = oi_data.get('nse_oi_buildup', '')
+    if sig and sig != 'NEUTRAL':
+        return sig
+    fb = oi_data.get('flow_bias', 'NEUTRAL')
+    if fb == 'BULLISH':
+        return 'LONG_BUILDUP'
+    if fb == 'BEARISH':
+        return 'SHORT_BUILDUP'
+    return sig or 'NEUTRAL'
+
+def _oi_direction(oi_signal: str) -> str:
+    """Get the authoritative direction from OI signal.
+    Operators build OI positions first, then move the underlying.
+    OI buildup IS the leading indicator — trust it over scorer."""
+    if oi_signal in _OI_BEARISH_SIGNALS:
+        return 'SELL'
+    if oi_signal in _OI_BULLISH_SIGNALS:
+        return 'BUY'
+    return ''
+
+
 class AutonomousTrader:
     """
     Fully autonomous trading bot that:
@@ -248,15 +279,16 @@ class AutonomousTrader:
         self._watcher_total_gate_blocked = 0         # Total blocked by pipeline gates
         self._watcher_total_placed = 0               # Total trades successfully placed
         self._watcher_total_pos_exhausted = 0        # Times blocked by position limit
-        self._watcher_score_history = {}              # sym → [(timestamp, score), ...] for momentum detection
+        self._watcher_score_history = {}              # sym → [(timestamp, score, direction), ...] for conviction & momentum
         self._trade_lock = threading.Lock()               # Serialises order placement between scan & watcher threads
         self._watcher_pipe_busy = False                   # True while watcher pipeline thread is running
         self._watcher_pipe_thread = None                  # Reference to the watcher pipeline thread
 
-        # === SETTINGS HOT-RELOAD (titan_settings.json) ===
-        self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'titan_settings.json')
-        self._settings_mtime = 0  # Tracks file modification time
-        self._apply_settings_overrides()  # Apply on startup
+        # === SETTINGS — Single source of truth via settings_manager ===
+        from settings_manager import settings as _sm
+        self._settings_manager = _sm
+        self._settings_manager.sync_defaults()  # Populate missing keys from config.py
+        self._settings_manager.apply_all()      # Push json → config in-memory
         self._last_market_breadth = 'MIXED'          # Cached market breadth from last scan_and_trade
         self._last_signal_quality = 'normal'     # Track signal quality for adaptive scan
         
@@ -843,7 +875,7 @@ class AutonomousTrader:
             if isinstance(data, dict):
                 ft_candles = data.get('follow_through_candles', 0)
                 adx_val = data.get('adx', 20)
-                oi_signal = data.get('oi_signal', 'NEUTRAL')
+                oi_signal = _oi_signal_from_result(getattr(self, '_cycle_oi_results', {}).get(sym, {}))
                 
                 orb_hold = data.get('orb_hold_candles', 0)
                 if ft_candles == 0 and orb_hold > 2:
@@ -859,17 +891,15 @@ class AutonomousTrader:
                                       direction=direction)
                     continue
                 
-                # Block auto-fire if OI conflicts with direction
-                if direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
-                    self._log_decision(cycle_time, sym, score, 'ELITE_OI_CONFLICT',
-                                      reason=f'BUY direction but OI={oi_signal} — institutions selling',
-                                      direction=direction)
-                    continue
-                if direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
-                    self._log_decision(cycle_time, sym, score, 'ELITE_OI_CONFLICT',
-                                      reason=f'SELL direction but OI={oi_signal} — institutions buying',
-                                      direction=direction)
-                    continue
+                # OI AUTHORITY — OI overrides direction unconditionally
+                _oi_auth_dir = _oi_direction(oi_signal)
+                _elite_oi_flipped = False
+                if _oi_auth_dir and _oi_auth_dir != direction:
+                    self._log_decision(cycle_time, sym, score, 'ELITE_OI_OVERRIDE',
+                                      reason=f'{direction} overridden to {_oi_auth_dir} — OI={oi_signal} (operators positioned)',
+                                      direction=_oi_auth_dir)
+                    direction = _oi_auth_dir
+                    _elite_oi_flipped = True
             
             # ML soft gate: if ML strongly says FLAT, skip auto-fire
             # (GPT can still pick this stock — just don't auto-fire it)
@@ -981,7 +1011,13 @@ class AutonomousTrader:
                     },
                     'scored_direction': direction,
                     'xgb_disagrees': False,
+                    'oi_signal': _oi_signal_from_result(getattr(self, '_cycle_oi_results', {}).get(sym, {})),
+                    'oi_flipped': _elite_oi_flipped,
                 } if _elite_ml else {}
+                if not _elite_ml_data:
+                    _elite_ml_data = {}
+                _elite_ml_data.setdefault('oi_signal', _oi_signal_from_result(getattr(self, '_cycle_oi_results', {}).get(sym, {})))
+                _elite_ml_data.setdefault('oi_flipped', _elite_oi_flipped)
                 with self._trade_lock:
                     result = self.tools.place_option_order(
                         underlying=sym,
@@ -1057,13 +1093,16 @@ class AutonomousTrader:
         # Cooldown check BEFORE draining — keeps triggers in queue until we can process
         import time as _wt
         _cooldown_elapsed = _wt.time() - self._last_watcher_scan_time
-        if _cooldown_elapsed < 5:   # 5-sec cooldown (was 20s) — fast reaction to breakouts
+        if _cooldown_elapsed < 1.5:   # 1.5-sec cooldown — minimal gap between drain cycles
             return
         
         watcher = ticker.breakout_watcher
         triggers = watcher.drain_queue()
         if not triggers:
             return
+        
+        # OI fetch moved to pipeline thread — runs in parallel with market data
+        self._watcher_drain_oi = {}
         
         # === WATCHER ACTIVITY BANNER ===
         _sym_list = ', '.join(t['symbol'].replace('NSE:', '') for t in triggers[:5])
@@ -1100,9 +1139,6 @@ class AutonomousTrader:
             sym = t['symbol']
             if self.tools.is_symbol_in_active_trades(sym):
                 _skip_reasons.append(f"{sym.replace('NSE:', '')}=held")
-                continue
-            if sym in self._watcher_fired_this_session:
-                _skip_reasons.append(f"{sym.replace('NSE:', '')}=watcher-done")
                 continue
             if not self.risk_governor.is_trading_allowed():
                 _skip_reasons.append(f"{sym.replace('NSE:', '')}=risk-gov")
@@ -1223,9 +1259,27 @@ class AutonomousTrader:
                 _symbols = [t['symbol'] for t in triggers]
 
             # ================================================================
+            # 0b) OI FETCH (BACKGROUND) — overlaps with market data below
+            #     Launches OI fetches in background threads so Kite chain
+            #     requests run concurrently with indicator computation.
+            #     DhanHQ throttle (3.2s lock) serialises itself — safe.
+            #     Results collected before Step 4 where OI is first needed.
+            # ================================================================
+            from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_done
+            _oi_futures = {}
+            _oi_executor = None
+            if self._oi_analyzer:
+                _oi_executor = _TPE(max_workers=min(3, len(_symbols)),
+                                    thread_name_prefix='oi-fetch')
+                for _sym_oi in _symbols:
+                    _oi_futures[_oi_executor.submit(
+                        self._oi_analyzer.analyze, _sym_oi)] = _sym_oi
+
+            # ================================================================
             # 1) MARKET DATA — fresh candles + indicators for triggered stocks
             #    force_fresh=True bypasses 10-min indicator cache so RSI/VWAP/ADX
             #    are computed from live candles (watcher only processes 1-3 stocks)
+            #    NOTE: OI is fetching concurrently in _oi_executor threads above
             # ================================================================
             market_data = self.tools.get_market_data(_symbols, force_fresh=True)
             _sorted_data = [(s, d) for s, d in market_data.items()
@@ -1370,14 +1424,63 @@ class AutonomousTrader:
                 pass  # ML failed — continue without it (fail-safe)
             
             # ================================================================
+            # 3b) COLLECT OI RESULTS — background threads launched in Step 0b
+            #      By now ~2-3s have elapsed (market data + scoring + ML ran
+            #      concurrently with OI). Cached OI returns instantly; cold
+            #      fetches may still be in-flight — wait up to 30s.
+            # ================================================================
+            _drain_oi_results = {}
+            if _oi_futures:
+                try:
+                    for _fut in _as_done(_oi_futures, timeout=30):
+                        _oi_sym = _oi_futures[_fut]
+                        try:
+                            _oi_result = _fut.result()
+                            if _oi_result:
+                                _drain_oi_results[_oi_sym] = _oi_result
+                                # Tag trigger dict with OI direction
+                                _t_for_oi = _trigger_map.get(_oi_sym)
+                                if _t_for_oi:
+                                    _t_oi_signal = _oi_signal_from_result(_oi_result)
+                                    _t_oi_dir = _oi_direction(_t_oi_signal)
+                                    if _t_oi_dir:
+                                        _t_for_oi['_oi_direction'] = _t_oi_dir
+                                        _t_for_oi['_oi_signal'] = _t_oi_signal
+                                        _t_type = _t_for_oi.get('trigger_type', '')
+                                        _spike_dir = 'SELL' if ('DOWN' in _t_type or 'LOW' in _t_type) else 'BUY'
+                                        if _t_oi_dir == _spike_dir:
+                                            _t_for_oi['_oi_confirmed'] = True
+                        except Exception:
+                            pass
+                except Exception:
+                    self._wlog("⚠️ OI background timeout — proceeding with partial OI data")
+                if _oi_executor:
+                    _oi_executor.shutdown(wait=False)
+            self._watcher_drain_oi = _drain_oi_results
+            # Log OI results
+            _oi_tags = []
+            for _t in triggers:
+                if _t.get('_oi_confirmed'):
+                    _oi_tags.append(f"{_t['symbol'].replace('NSE:', '')}=OI✓{_t.get('_oi_signal', '')}")
+                elif _t.get('_oi_direction'):
+                    _oi_tags.append(f"{_t['symbol'].replace('NSE:', '')}=OI✗{_t.get('_oi_signal', '')}(vs {_t.get('trigger_type', '')})")
+            if _oi_tags:
+                self._wlog(f"   📊 OI: {', '.join(_oi_tags)}")
+
+            # ================================================================
             # 4) OI FLOW OVERLAY — adjusts ML with live options chain data
+            #    Uses OI collected from background threads above
             # ================================================================
             _oi_results = {}
+            _drain_oi = self._watcher_drain_oi
             try:
                 if self._oi_analyzer:
                     for _sym in list(_pre_scores.keys()):
                         try:
-                            _oi_data = self._oi_analyzer.analyze(_sym)
+                            # Use background-fetched OI; fallback to fresh fetch if missing
+                            _oi_data = _drain_oi.get(_sym)
+                            if not _oi_data:
+                                _oi_data = self._oi_analyzer.analyze(_sym)
                             if _oi_data:
                                 _oi_results[_sym] = _oi_data
                                 if self._ml_predictor and _sym in _ml_results:
@@ -1390,28 +1493,32 @@ class AutonomousTrader:
                 pass
             
             # ================================================================
-            # 5) OI CROSS-VALIDATION — penalise direction conflicts
+            # 5) OI CROSS-VALIDATION — OI is AUTHORITATIVE direction signal
+            #    Operators build OI positions first, then move the underlying.
+            #    OI buildup = leading indicator. Trust it over scorer.
             # ================================================================
             for _oi_sym, _oi_data in _oi_results.items():
                 try:
-                    _oi_bias = _oi_data.get('flow_bias', 'NEUTRAL')
-                    _oi_conf = _oi_data.get('flow_confidence', 0.0)
-                    if _oi_bias == 'NEUTRAL' or _oi_conf < 0.55:
-                        continue
+                    # First try nse_oi_buildup (strongest signal)
+                    _oi_signal = _oi_signal_from_result(_oi_data)
+                    _oi_dir = _oi_direction(_oi_signal)
+                    if not _oi_dir:
+                        # Fall back to flow_bias with lowered confidence threshold
+                        _oi_bias = _oi_data.get('flow_bias', 'NEUTRAL')
+                        _oi_conf = _oi_data.get('flow_confidence', 0.0)
+                        if _oi_bias == 'NEUTRAL' or _oi_conf < 0.40:
+                            continue
+                        _oi_dir = 'BUY' if _oi_bias == 'BULLISH' else 'SELL'
+                        _oi_signal = f'{_oi_bias}(conf={_oi_conf:.2f})'
                     _cd = _cycle_decisions.get(_oi_sym)
                     if not _cd or not _cd.get('decision'):
                         continue
                     _scored_dir = _cd['decision'].recommended_direction
-                    if _scored_dir == 'HOLD':
-                        continue
-                    _oi_dir = 'BUY' if _oi_bias == 'BULLISH' else 'SELL'
+                    # OI overrides even HOLD — operators have positioned, follow them
                     if _scored_dir != _oi_dir:
-                        _oi_penalty = -5 if _oi_conf >= 0.70 else -3
-                        _pre_scores[_oi_sym] += _oi_penalty
-                        if _oi_sym in _cycle_decisions:
-                            _cycle_decisions[_oi_sym]['score'] = _pre_scores[_oi_sym]
-                        self._wlog(f"OI cross-val: {_oi_sym.replace('NSE:', '')} "
-                              f"penalised {_oi_penalty} (OI {_oi_bias} vs scored {_scored_dir})")
+                        _cd['decision'].recommended_direction = _oi_dir
+                        self._wlog(f"OI OVERRIDE: {_oi_sym.replace('NSE:', '')} "
+                              f"{_scored_dir} → {_oi_dir} (OI={_oi_signal})")
                 except Exception:
                     pass
             
@@ -1626,7 +1733,10 @@ class AutonomousTrader:
                 _dr_score = _ml_pred.get('ml_down_risk_score', 0)
                 _up_score = _ml_pred.get('ml_up_score', 0)
                 _down_score = _ml_pred.get('ml_down_score', 0)
-                self._wlog(f"GATE CHECK: {_stock_name} | score={_final_score:.0f}(+{_trigger_bonus}{f' restart-{_restart_penalty}' if _restart_penalty else ''}) dir={direction}(scorer={_scorer_dir or 'HOLD'}) "
+                # Pre-init variables used in GATE CHECK log (computed later in loop)
+                _conviction_bonus = 0
+                _late_decay = 0
+                self._wlog(f"GATE CHECK: {_stock_name} | score={_final_score:.0f}(+{_trigger_bonus}{f' conv+{_conviction_bonus}' if _conviction_bonus else ''}{f' decay{_late_decay}' if _late_decay else ''}{f' restart-{_restart_penalty}' if _restart_penalty else ''}) dir={direction}(scorer={_scorer_dir or 'HOLD'}) "
                            f"trigger={_trigger_type}({_move_pct:+.1f}%) VIX={_vix:.0f}(pen={_vix_penalty}) "
                            f"vc={_trigger.get('vol_confirmed', '-')} sr={_trigger.get('surge_ratio', '-')} di={_trigger.get('depth_imbalance', '-')} "
                            f"accel={_trigger.get('spike_accel', '-')} mag={_trigger.get('spike_magnitude', '-')} "
@@ -1640,41 +1750,78 @@ class AutonomousTrader:
                 if _score_audit:
                     self._wlog(f"  AUDIT: {_score_audit}")
                 
-                # --- Score Momentum Tracking ---
-                # Track score history per symbol. If score is rising across
-                # consecutive checks, the stock is building conviction.
-                # On 4th+ rising check, boost score to reward persistence.
+                # --- Repeat Conviction & Momentum Tracking ---
+                # Track every time a stock reaches the scoring pipeline.
+                # Layer 1: Repeat Conviction — a stock that keeps appearing across
+                # multiple pipeline checks is building real momentum even if the
+                # individual score stays moderate. WAAREEENER lesson: stock appeared
+                # at 09:46 (score=32, blocked by 3 pts), then re-triggered at 14:54
+                # (score=66, entered at the top). A repeat bonus would have gotten
+                # us in early when risk/reward was best.
                 _now_ts = time.time()
                 _hist = self._watcher_score_history.get(_sym, [])
-                # Prune entries older than 30 minutes
-                _hist = [(t, s) for t, s in _hist if _now_ts - t < 1800]
-                _hist.append((_now_ts, _final_score))
+                # Prune entries older than 90 minutes (wider window for conviction)
+                _hist = [(t, s, d) for t, s, d in _hist if _now_ts - t < 5400]
+                _hist.append((_now_ts, _final_score, direction))
                 self._watcher_score_history[_sym] = _hist
                 
+                # -- Layer 1a: Repeat Conviction Bonus --
+                # Count how many times this stock has reached the pipeline today
+                # (within 90-min window). Each repeat = the watcher keeps seeing it.
+                # Consistent direction across checks = higher conviction.
+                _conviction_bonus = 0
+                _n_appearances = len(_hist)
+                if _n_appearances >= 2:
+                    # Count how many prior checks had the SAME direction
+                    _same_dir = sum(1 for _, _, d in _hist[:-1] if d == direction)
+                    _dir_consistency = _same_dir / (_n_appearances - 1) if _n_appearances > 1 else 0
+                    if _dir_consistency >= 0.6:  # ≥60% same direction
+                        # +3 per repeat appearance (2nd=+3, 3rd=+6, 4th=+9), cap +12
+                        _conviction_bonus = min((_n_appearances - 1) * 3, 12)
+                    else:
+                        # Direction is flip-flopping — weaker conviction, +2 per repeat, cap +6
+                        _conviction_bonus = min((_n_appearances - 1) * 2, 6)
+                    _final_score += _conviction_bonus
+                    if _conviction_bonus > 0:
+                        self._wlog(f"  CONVICTION: {_stock_name} appeared {_n_appearances}x (dir consistency={_dir_consistency:.0%}) → +{_conviction_bonus} → {_final_score:.0f}")
+                
+                # -- Layer 1b: Score Momentum Boost (existing, unchanged) --
                 _momentum_boost = 0
-                if len(_hist) >= 3:
-                    # Count consecutive rising scores with meaningful delta (≥3 pts).
-                    # Tiny +1 noise doesn't count — only real conviction buildup.
-                    # Also track total delta for velocity-based bonus.
+                if _n_appearances >= 3:
                     _rising = 0
                     _total_delta = 0.0
-                    for i in range(len(_hist) - 1, 0, -1):
+                    for i in range(_n_appearances - 1, 0, -1):
                         _delta = _hist[i][1] - _hist[i-1][1]
-                        if _delta >= 3:          # Minimum +3 per check to count
+                        if _delta >= 3:
                             _rising += 1
                             _total_delta += _delta
                         else:
                             break
-                    # 3+ meaningful consecutive rises → boost
                     if _rising >= 3:
                         _avg_delta = _total_delta / _rising
-                        # Base: +3 per rise beyond 2nd (same as before)
                         _base_boost = (_rising - 2) * 3
-                        # Velocity bonus: avg delta ≥10 → extra +3 (strong acceleration)
                         _velocity_bonus = 3 if _avg_delta >= 10 else 0
-                        _momentum_boost = min(_base_boost + _velocity_bonus, 15)  # Cap at +15
+                        _momentum_boost = min(_base_boost + _velocity_bonus, 15)
                         _final_score += _momentum_boost
                         self._wlog(f"  MOMENTUM: {_stock_name} {_rising} rising(Δ≥3) avg_Δ={_avg_delta:.0f} → boost +{_momentum_boost} → {_final_score:.0f}")
+                
+                # -- Layer 2: Late Entry Decay --
+                # If the stock has already moved significantly intraday and we
+                # haven't entered yet, the risk/reward is deteriorating.
+                # Technicals inflate scores for extended moves (Trend, Accel,
+                # ADX all improve), but the best R:R was earlier.
+                # This counteracts the score-inflating effect of big moves.
+                _late_decay = 0
+                _abs_change = abs(_data.get('change_pct', 0))
+                if _abs_change >= 3.5:
+                    _late_decay = -18
+                elif _abs_change >= 2.5:
+                    _late_decay = -12
+                elif _abs_change >= 1.8:
+                    _late_decay = -6
+                if _late_decay < 0:
+                    _final_score += _late_decay
+                    self._wlog(f"  LATE-DECAY: {_stock_name} already moved {_abs_change:+.1f}% intraday → {_late_decay} → {_final_score:.0f}")
                 
                 # --- GATE A: Score threshold (with early-market hardening) ---
                 _now_t = datetime.now()
@@ -1817,22 +1964,20 @@ class AutonomousTrader:
                                       direction=direction)
                     continue
                 
-                # --- GATE F: OI conflict veto (same as ELITE) ---
-                oi_signal = _data.get('oi_signal', 'NEUTRAL')
-                if direction == 'BUY' and oi_signal == 'SHORT_BUILDUP':
-                    self._wlog(f"  BLOCKED(F-OI): {_stock_name} BUY vs SHORT_BUILDUP")
-                    self._watcher_total_gate_blocked += 1
-                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_CONFLICT',
-                                      reason=f'BUY direction but OI={oi_signal}',
-                                      direction=direction)
-                    continue
-                if direction == 'SELL' and oi_signal == 'LONG_BUILDUP':
-                    self._wlog(f"  BLOCKED(F-OI): {_stock_name} SELL vs LONG_BUILDUP")
-                    self._watcher_total_gate_blocked += 1
-                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_CONFLICT',
-                                      reason=f'SELL direction but OI={oi_signal}',
-                                      direction=direction)
-                    continue
+                # --- GATE F: OI AUTHORITY — OI overrides direction unconditionally ---
+                # Operators build OI positions first, then move the underlying.
+                # SHORT_BUILDUP / LONG_UNWINDING → SELL direction
+                # LONG_BUILDUP / SHORT_COVERING → BUY direction
+                oi_signal = _oi_signal_from_result(_oi_results.get(_sym, {}))
+                _oi_auth_dir = _oi_direction(oi_signal)
+                _watcher_oi_flipped = False
+                if _oi_auth_dir and _oi_auth_dir != direction:
+                    self._wlog(f"  OI OVERRIDE(F): {_stock_name} {direction} → {_oi_auth_dir} (OI={oi_signal})")
+                    self._log_decision(_ts, _sym, _final_score, 'WATCHER_OI_OVERRIDE',
+                                      reason=f'{direction} overridden to {_oi_auth_dir} — OI={oi_signal} (operators positioned)',
+                                      direction=_oi_auth_dir)
+                    direction = _oi_auth_dir
+                    _watcher_oi_flipped = True
                 
                 # --- GATE G: ML flat veto — DISABLED for watcher (Mar-09) ---
                 # The ticker detected a real sustained price move. ML saying "flat"
@@ -1932,9 +2077,33 @@ class AutonomousTrader:
                               f'range={_pos_in_range:.0%}({_comp_c:.2f}) '
                               f'RSI={_rsi_ei:.0f}({_comp_d:.2f})]')
                 
-                _ei_threshold = BREAKOUT_WATCHER.get('exhaustion_index_block', 60)
+                _ei_threshold = BREAKOUT_WATCHER.get('exhaustion_index_block', 70)
+                # Regime-aware EI: on trending days where the move aligns with market
+                # direction, the intraday move IS the trend — not exhaustion.
+                # Relax threshold by +15 when breadth confirms trigger direction.
+                _breadth_confirms_ei = (
+                    (direction == 'SELL' and _breadth in ('BEARISH',))
+                    or (direction == 'BUY' and _breadth in ('BULLISH',))
+                )
+                if _breadth_confirms_ei:
+                    _ei_threshold += 15  # 70 → 85 on regime-aligned trending days
+                # Score-based EI boost: high score = many confirming signals.
+                # If the scorer rated this setup highly DESPITE the big move,
+                # the move is momentum-backed, not exhaustion.
+                if _final_score >= 65:
+                    _ei_threshold += 15  # Strong conviction → very permissive
+                elif _final_score >= 55:
+                    _ei_threshold += 10  # Solid conviction → moderately permissive
+                _ei_boost_note = []
+                if _breadth_confirms_ei:
+                    _ei_boost_note.append(f"regime+15")
+                if _final_score >= 65:
+                    _ei_boost_note.append(f"score({_final_score})+15")
+                elif _final_score >= 55:
+                    _ei_boost_note.append(f"score({_final_score})+10")
+                _ei_boost_str = f" (boosted to {_ei_threshold}: {','.join(_ei_boost_note)})" if _ei_boost_note else ""
                 if _ei > _ei_threshold:
-                    self._wlog(f"  BLOCKED(G2d-EXHAUST): {_stock_name} {_ei_detail}")
+                    self._wlog(f"  BLOCKED(G2d-EXHAUST): {_stock_name} {_ei_detail}{_ei_boost_str}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_EXHAUSTION',
                                       reason=f'Exhaustion Index {_ei} > {_ei_threshold}: {_ei_detail}',
@@ -1942,7 +2111,7 @@ class AutonomousTrader:
                     continue
                 elif _ei > 40:
                     # Log warning for borderline cases (visible but not blocking)
-                    self._wlog(f"  ⚠️ EXHAUST-WARN: {_stock_name} {_ei_detail} (below {_ei_threshold} threshold)")
+                    self._wlog(f"  ⚠️ EXHAUST-WARN: {_stock_name} {_ei_detail} (below {_ei_threshold} threshold{_ei_boost_str})")
                 
                 # --- GATE G3: XGB Move Probability Floor (watcher-specific) ---
                 # XGB must show minimum conviction that a move (up OR down) will happen.
@@ -2054,7 +2223,13 @@ class AutonomousTrader:
                     },
                     'scored_direction': direction,
                     'xgb_disagrees': False,
+                    'oi_signal': _oi_signal_from_result(_oi_results.get(_sym, {})),
+                    'oi_flipped': _watcher_oi_flipped,
                 } if _elite_ml else {}
+                if not _ml_data:
+                    _ml_data = {}
+                _ml_data.setdefault('oi_signal', _oi_signal_from_result(_oi_results.get(_sym, {})))
+                _ml_data.setdefault('oi_flipped', _watcher_oi_flipped)
                 
                 _setup_type = 'ORB_BREAKOUT' if 'DAY' in _trigger_type or 'SPIKE' in _trigger_type else 'WATCHER'
                 
@@ -2143,7 +2318,8 @@ class AutonomousTrader:
                                       f"Score {_final_score:.0f} P(move)={_cand['ml_move_prob']:.2f}, "
                                       f"ranked #{_candidates.index(_cand)+1}/{len(_candidates)} by P(move)"),
                             setup_type=_setup_type,
-                            ml_data=_ml_data
+                            ml_data=_ml_data,
+                            pre_fetched_market_data=market_data.get(_sym, {})
                         )
                     
                     if result and result.get('success'):
@@ -2495,6 +2671,35 @@ class AutonomousTrader:
                                 _confirmations += 1
                                 _signal_reasons.append('REV_ACCEL')
             
+            # ── Signal 5: OI REVERSAL (operators reversing position = move is done) ──
+            # Fetch OI periodically (every 60s, not every 5s check) and detect when
+            # operators flip: SHORT_COVERING after SELL trade, LONG_UNWINDING after BUY trade.
+            # Counts as 2 confirmations — this is the STRONGEST exit signal.
+            _oi_exit_cfg = _cfg.get('oi_reversal_exit_enabled', True)
+            _oi_check_iv = _cfg.get('oi_check_interval_seconds', 60)
+            _oi_min_hold = _cfg.get('oi_reversal_min_hold_seconds', 90)
+            if _oi_exit_cfg and self._oi_analyzer and (_now - _track['entry_time']) >= _oi_min_hold:
+                _last_oi_check = _track.get('_last_oi_check_ts', 0)
+                if (_now - _last_oi_check) >= _oi_check_iv:
+                    _track['_last_oi_check_ts'] = _now
+                    try:
+                        _oi_exit_data = self._oi_analyzer.analyze(_track['underlying'])
+                        if _oi_exit_data:
+                            _oi_exit_signal = _oi_signal_from_result(_oi_exit_data)
+                            _oi_exit_dir = _oi_direction(_oi_exit_signal)
+                            _track['_last_oi_signal'] = _oi_exit_signal
+                            _track['_last_oi_dir'] = _oi_exit_dir
+                    except Exception:
+                        pass
+                # Use cached OI signal for confirmation check
+                _cached_oi_dir = _track.get('_last_oi_dir', '')
+                _cached_oi_sig = _track.get('_last_oi_signal', '')
+                if _cached_oi_dir and _cached_oi_dir != _direction:
+                    # OI flipped AGAINST our trade direction — operators are reversing!
+                    # This counts as 2 confirmations (strongest signal)
+                    _confirmations += 2
+                    _signal_reasons.append(f'OI_REVERSAL({_cached_oi_sig})')
+            
             # ── Determine adaptive reversal threshold ──
             # Start with base thresholds
             if _confirmations >= 2:
@@ -2534,6 +2739,7 @@ class AutonomousTrader:
             
             # ── Check exit conditions ──
             _exit_reason = None
+            _oi_reversal_active = any('OI_REVERSAL' in s for s in _signal_reasons)
             
             # Check 1: Underlying reversal from peak/trough
             if _rev >= _effective_rev:
@@ -2544,10 +2750,24 @@ class AutonomousTrader:
             if not _exit_reason and _opt_rev >= _effective_prem_rev:
                 _exit_reason = 'PREMIUM_REVERSAL'
             
+            # Check 3: OI reversal alone can trigger exit (operators reversed = move is done)
+            # Even if price hasn't reversed enough yet, OI flip is a leading indicator.
+            if not _exit_reason and _oi_reversal_active and _rev > 0:
+                _exit_reason = 'OI_REVERSAL'
+            
             # ── TREND SHIELD Gate 3: Armed grace period (V-shape filter) ──
             # Instead of instant exit, enter ARMED state. Wait for grace period.
             # If price recovers → DISARM (it was just a healthy pullback).
             # If reversal deepens beyond threshold → exit immediately.
+            # Exception: OI reversal with immediate_exit config skips grace entirely.
+            _oi_immediate = _cfg.get('oi_reversal_immediate_exit', True)
+            if _exit_reason and _oi_reversal_active and _oi_immediate:
+                # OI reversal = operators reversed — skip grace, exit NOW
+                _exit_reason = _exit_reason + '_OI'
+                _exits_to_process.append((_opt_sym, _track, _ul_ltp, _opt_ltp, _rev * 100, _opt_rev * 100,
+                                          _opt_gain_pct, _confirmations, _signal_reasons,
+                                          _effective_rev * 100, _effective_prem_rev * 100, _exit_reason))
+                continue
             if _exit_reason:
                 _armed_at = _track.get('wme_armed_at', None)
                 if _armed_at is None:
@@ -2635,7 +2855,7 @@ class AutonomousTrader:
             
             print(f"\n🌊 WATCHER MOMENTUM EXIT: {_ul_short} ({_opt_type})")
             print(f"   Reason: {_exit_reason} | Direction: {_direction} | Trigger: {_trigger_label}")
-            print(f"   Signals: {_signals_str} ({_n_confirms}/4 confirmed)")
+            print(f"   Signals: {_signals_str} ({_n_confirms}/5 confirmed)")
             print(f"   UL: entry ₹{_track['entry_ul_price']:.2f} → {_extreme_label} ₹{_extreme_val:.2f} → now ₹{_ul_ltp:.2f} ({_rev_pct:.2f}% rev, thresh {_eff_rev:.2f}%)")
             print(f"   Premium: entry ₹{_entry_price:.2f} → peak ₹{_peak_opt:.2f} → now ₹{_opt_ltp:.2f} ({_prem_rev_pct:.1f}% drop, thresh {_eff_prem_rev:.1f}%)")
             print(f"   Peak gain: {_opt_gain_pct:.0f}% | P&L: ₹{_pnl:+,.0f}")
@@ -3327,6 +3547,16 @@ class AutonomousTrader:
                 _sniper_reject_counts['hold'] += 1
                 continue
             
+            # ── OI AUTHORITY — OI overrides direction unconditionally ──
+            _snp_oi_data = getattr(self, '_cycle_oi_results', {}).get(sym, {})
+            _snp_oi_signal = _oi_signal_from_result(_snp_oi_data)
+            _snp_oi_auth_dir = _oi_direction(_snp_oi_signal)
+            _sniper_was_oi_flipped = False
+            if _snp_oi_auth_dir and _snp_oi_auth_dir != direction:
+                print(f"      🎯 OI OVERRIDE: {sym.replace('NSE:', '')} {direction} → {_snp_oi_auth_dir} (OI={_snp_oi_signal})")
+                direction = _snp_oi_auth_dir
+                _sniper_was_oi_flipped = True
+            
             # ── DIRECTION CONFIDENCE GATE ──
             # Smart Direction Engine measures how many signals agree on direction.
             # Sniper requires minimum confidence to avoid trading on thin evidence.
@@ -3416,6 +3646,8 @@ class AutonomousTrader:
                     },
                     'scored_direction': direction,
                     'xgb_signal': _xgb_signal,
+                    'oi_signal': _snp_oi_signal,
+                    'oi_flipped': _sniper_was_oi_flipped,
                 },
             })
         
@@ -5189,7 +5421,14 @@ class AutonomousTrader:
                         for state in self.exit_manager.get_all_states():
                             self.exit_manager.increment_candles(state.symbol)
             except Exception as e:
-                print(f"⚠️ Monitor error: {e}")
+                # Throttle monitor error to once per 60 seconds
+                import time as _t_mod2
+                if not hasattr(self, '_last_monitor_error_ts'):
+                    self._last_monitor_error_ts = 0
+                _now_err = _t_mod2.time()
+                if _now_err - self._last_monitor_error_ts >= 60:
+                    self._last_monitor_error_ts = _now_err
+                    print(f"⚠️ Monitor error: {e}")
             
             time.sleep(self.monitor_interval)
     
@@ -6070,7 +6309,7 @@ class AutonomousTrader:
         else:
             quotes = {}
         
-        # Print position status every 30 seconds (every 10th check)
+        # Print position status every ~30 seconds (every 10th check)
         if not hasattr(self, '_monitor_count'):
             self._monitor_count = 0
         self._monitor_count += 1
@@ -6079,7 +6318,7 @@ class AutonomousTrader:
         if getattr(self, '_scanning', False):
             show_status = False
         else:
-            show_status = (self._monitor_count % 3 == 0)  # Every ~10 seconds
+            show_status = (self._monitor_count % 10 == 0)  # Every ~30 seconds
         
         # === CHECK OPTION EXITS (Greeks-based) ===
         # Only check naked option trades — credit spreads use exit_manager
@@ -6261,7 +6500,15 @@ class AutonomousTrader:
                                         _skip_parts.append(f'PATH_B: spread ₹{current_value:.2f} vs threshold ₹{_spread_profit_threshold:.2f} ({"OK" if current_value >= _spread_profit_threshold else "BELOW"})')
                                     else:
                                         _skip_parts.append('PATH_B: disabled or no net_debit')
-                                print(f"   ℹ️ UNWIND SKIP: {t['symbol']} — {' | '.join(_skip_parts)}")
+                                # Throttle: only log once per symbol every 5 minutes
+                                import time as _t_mod
+                                if not hasattr(self, '_unwind_skip_last_log'):
+                                    self._unwind_skip_last_log = {}
+                                _now_ts = _t_mod.time()
+                                _last_ts = self._unwind_skip_last_log.get(t['symbol'], 0)
+                                if _now_ts - _last_ts >= 300:
+                                    self._unwind_skip_last_log[t['symbol']] = _now_ts
+                                    print(f"   ℹ️ UNWIND SKIP: {t['symbol']} — {' | '.join(_skip_parts)}")
             else:
                 ltp_val = quotes.get(t['symbol'], {}).get('last_price', 0)
                 if ltp_val and ltp_val > 0:
@@ -7628,7 +7875,7 @@ class AutonomousTrader:
             # Compute market breadth early so scorer can use it for regime-aware ORB weighting
             _pre_up = sum(1 for s, d in sorted_data if isinstance(d, dict) and d.get('change_pct', 0) > 0.5)
             _pre_down = sum(1 for s, d in sorted_data if isinstance(d, dict) and d.get('change_pct', 0) < -0.5)
-            _pre_breadth = "BULLISH" if _pre_up > _pre_down * 1.5 else "BEARISH" if _pre_down > _pre_up * 1.5 else "MIXED"
+            _pre_breadth = "BULLISH" if _pre_up > _pre_down * 1.2 else "BEARISH" if _pre_down > _pre_up * 1.2 else "MIXED"
             self._last_market_breadth = _pre_breadth  # Cache for watcher focused scans
             
             try:
@@ -7636,9 +7883,6 @@ class AutonomousTrader:
                 _scorer = get_intraday_scorer()
                 for _sym, _d in sorted_data:
                     if not isinstance(_d, dict) or 'ltp' not in _d:
-                        continue
-                    # Skip symbols already traded by breakout watcher this cycle
-                    if _sym in self._watcher_fired_this_session:
                         continue
                     # Inject market breadth into market_data for regime-aware ORB scoring
                     _d['market_breadth'] = _pre_breadth
@@ -7967,38 +8211,33 @@ class AutonomousTrader:
                 except Exception:
                     pass
                 
-                # === OI CROSS-VALIDATION ON SCORES ===
-                # If OI says BEARISH but scored direction is BUY (or vice versa),
-                # penalize score. OI flow (PCR, IV skew, MaxPain, buildup) reflects
-                # institutional positioning — conflicting with it is risky.
-                # JINDALSTEL lesson: scored BUY 62, OI was BEARISH — stock reversed.
+                # === OI AUTHORITY ON SCORES ===
+                # OI = leading indicator. Operators build positions first, then move the stock.
+                # OI direction overrides scorer direction unconditionally.
                 _oi_score_adjusted = 0
                 for _oi_sym, _oi_data in _oi_results.items():
                     try:
-                        _oi_bias = _oi_data.get('flow_bias', 'NEUTRAL')
-                        _oi_conf = _oi_data.get('flow_confidence', 0.0)
-                        if _oi_bias == 'NEUTRAL' or _oi_conf < 0.55:
-                            continue
-                        # Get scored direction from cycle decision
+                        _oi_signal_s = _oi_signal_from_result(_oi_data)
+                        _oi_dir = _oi_direction(_oi_signal_s)
+                        if not _oi_dir:
+                            # Fall back to flow_bias with lowered threshold
+                            _oi_bias = _oi_data.get('flow_bias', 'NEUTRAL')
+                            _oi_conf = _oi_data.get('flow_confidence', 0.0)
+                            if _oi_bias == 'NEUTRAL' or _oi_conf < 0.40:
+                                continue
+                            _oi_dir = 'BUY' if _oi_bias == 'BULLISH' else 'SELL'
                         _cd = _cycle_decisions.get(_oi_sym)
                         if not _cd or not _cd.get('decision'):
                             continue
                         _scored_dir = _cd['decision'].recommended_direction
-                        if _scored_dir == 'HOLD':
-                            continue
-                        # Cross-validate: OI direction vs scored direction
-                        _oi_dir = 'BUY' if _oi_bias == 'BULLISH' else 'SELL'
+                        # OI overrides even HOLD — operators have positioned
                         if _scored_dir != _oi_dir:
-                            # OI conflicts with scored direction → penalize
-                            _oi_penalty = -5 if _oi_conf >= 0.70 else -3
-                            _pre_scores[_oi_sym] += _oi_penalty
-                            if _oi_sym in _cycle_decisions:
-                                _cycle_decisions[_oi_sym]['score'] = _pre_scores[_oi_sym]
+                            _cd['decision'].recommended_direction = _oi_dir
                             _oi_score_adjusted += 1
                     except Exception:
                         pass
                 if _oi_score_adjusted > 0:
-                    # print(f"   📊 OI CROSS-VAL: {_oi_score_adjusted} stocks penalized for direction conflict")
+                    print(f"   📊 OI AUTHORITY: {_oi_score_adjusted} stocks direction set by OI")
                     pass
 
                 # === SECTOR INDEX CROSS-VALIDATION ON SCORES ===
@@ -10344,130 +10583,13 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
             print(f"   ⚠️ Broker position sync failed: {e}")
 
     # ══════════════════════════════════════════════════════════════
-    #  SETTINGS HOT-RELOAD: Read titan_settings.json & apply overrides
+    #  SETTINGS HOT-RELOAD via settings_manager (single source of truth)
     # ══════════════════════════════════════════════════════════════
     def _apply_settings_overrides(self):
-        """Read titan_settings.json and apply overrides to config module.
-        Called at startup and every 30s from the main loop.
-        Only re-applies if file has been modified since last check."""
-        import config as _cfg
+        """Hot-reload settings from titan_settings.json → config module.
+        Delegated to settings_manager which handles ALL keys."""
         try:
-            if not os.path.exists(self._settings_file):
-                return
-            mtime = os.path.getmtime(self._settings_file)
-            if mtime == self._settings_mtime:
-                return  # No change since last read
-            self._settings_mtime = mtime
-
-            with open(self._settings_file, 'r') as f:
-                s = json.load(f)
-
-            applied = []
-
-            # --- Kill switch ---
-            if s.get('kill_switch', False):
-                print("🚨 KILL SWITCH ACTIVE — blocking all new trades")
-                _cfg.HARD_RULES['MAX_POSITIONS'] = 0  # Zero positions = no new trades
-                return  # Don't apply other overrides
-
-            # --- Capital & Risk ---
-            for key in ['CAPITAL', 'RISK_PER_TRADE', 'MAX_DAILY_LOSS', 'MAX_POSITIONS',
-                        'REENTRY_COOLDOWN_MINUTES', 'MIN_OPTION_PREMIUM', 'PORTFOLIO_PROFIT_TARGET']:
-                if key in s and s[key] != _cfg.HARD_RULES.get(key):
-                    _cfg.HARD_RULES[key] = s[key]
-                    applied.append(f"HARD_RULES.{key}={s[key]}")
-
-            # --- Strategy toggles ---
-            strat_map = {
-                'BREAKOUT_WATCHER': 'BREAKOUT_WATCHER',
-                'ELITE_AUTO_FIRE': 'ELITE_AUTO_FIRE',
-                'DOWN_RISK_GATING': 'DOWN_RISK_GATING',
-                'GMM_SNIPER': 'GMM_SNIPER',
-                'GMM_CONTRARIAN': 'GMM_CONTRARIAN',
-                'TEST_GMM': 'TEST_GMM',
-                'TEST_XGB': 'TEST_XGB',
-                'SNIPER_OI_UNWINDING': 'SNIPER_OI_UNWINDING',
-                'SNIPER_PCR_EXTREME': 'SNIPER_PCR_EXTREME',
-                'ARBTR_CONFIG': 'ARBTR_CONFIG',
-                'IRON_CONDOR_CONFIG': 'IRON_CONDOR_CONFIG',
-                'CREDIT_SPREAD_CONFIG': 'CREDIT_SPREAD_CONFIG',
-                'DEBIT_SPREAD_CONFIG': 'DEBIT_SPREAD_CONFIG',
-                'ML_DIRECTION_CONFLICT': 'ML_DIRECTION_CONFLICT',
-                'GCR_CONFIG': 'GCR_CONFIG',
-            }
-            for key, attr_name in strat_map.items():
-                skey = f'strategy_{key}'
-                if skey in s:
-                    cfg_dict = getattr(_cfg, attr_name, None)
-                    if isinstance(cfg_dict, dict) and 'enabled' in cfg_dict:
-                        new_val = bool(s[skey])
-                        if cfg_dict['enabled'] != new_val:
-                            cfg_dict['enabled'] = new_val
-                            applied.append(f"{attr_name}.enabled={new_val}")
-
-            # --- Watcher tunables ---
-            bw = getattr(_cfg, 'BREAKOUT_WATCHER', {})
-            for skey, cfgkey in [
-                ('watcher_min_score', 'min_score'),
-                ('watcher_max_trades_per_scan', 'max_trades_per_scan'),
-                ('watcher_max_triggers_per_batch', 'max_triggers_per_batch'),
-                ('watcher_sustain_seconds', 'sustain_seconds'),
-                ('watcher_vix_hard_block', 'vix_hard_block_above'),
-            ]:
-                if skey in s and bw.get(cfgkey) != s[skey]:
-                    bw[cfgkey] = s[skey]
-                    applied.append(f"BREAKOUT_WATCHER.{cfgkey}={s[skey]}")
-            if 'watcher_momentum_exit' in s:
-                me = bw.get('momentum_exit', {})
-                new_me = bool(s['watcher_momentum_exit'])
-                if me.get('enabled') != new_me:
-                    me['enabled'] = new_me
-                    applied.append(f"momentum_exit.enabled={new_me}")
-
-            # --- Lot multipliers ---
-            for skey_prefix, attr_name in [
-                ('lots_GMM_SNIPER', 'GMM_SNIPER'),
-                ('lots_ARBTR_CONFIG', 'ARBTR_CONFIG'),
-                ('lots_SNIPER_OI_UNWINDING', 'SNIPER_OI_UNWINDING'),
-                ('lots_SNIPER_PCR_EXTREME', 'SNIPER_PCR_EXTREME'),
-                ('lots_DOWN_RISK_GATING', 'DOWN_RISK_GATING'),
-                ('lots_GMM_CONTRARIAN', 'GMM_CONTRARIAN'),
-            ]:
-                if skey_prefix in s:
-                    cfg_dict = getattr(_cfg, attr_name, None)
-                    if isinstance(cfg_dict, dict):
-                        if attr_name == 'DOWN_RISK_GATING':
-                            new_v = float(s[skey_prefix])
-                            if cfg_dict.get('all_agree_lot_multiplier') != new_v:
-                                cfg_dict['all_agree_lot_multiplier'] = new_v
-                                applied.append(f"{attr_name}.all_agree_lot_multiplier={new_v}")
-                        else:
-                            new_v = float(s[skey_prefix])
-                            if cfg_dict.get('lot_multiplier') != new_v:
-                                cfg_dict['lot_multiplier'] = new_v
-                                applied.append(f"{attr_name}.lot_multiplier={new_v}")
-
-            # --- Global lot multiplier (applied to HARD_RULES for sizer) ---
-            if 'global_lot_multiplier' in s:
-                new_gl = float(s['global_lot_multiplier'])
-                if _cfg.HARD_RULES.get('GLOBAL_LOT_MULTIPLIER') != new_gl:
-                    _cfg.HARD_RULES['GLOBAL_LOT_MULTIPLIER'] = new_gl
-                    applied.append(f"GLOBAL_LOT_MULTIPLIER={new_gl}")
-
-            # --- Trading hours ---
-            th = getattr(_cfg, 'TRADING_HOURS', {})
-            for skey, cfgkey in [
-                ('hours_start', 'start'),
-                ('hours_end', 'end'),
-                ('hours_no_new_after', 'no_new_after'),
-            ]:
-                if skey in s and th.get(cfgkey) != s[skey]:
-                    th[cfgkey] = s[skey]
-                    applied.append(f"TRADING_HOURS.{cfgkey}={s[skey]}")
-
-            if applied:
-                print(f"⚙️  Settings reloaded ({len(applied)} overrides): {', '.join(applied[:5])}"
-                      f"{'...' if len(applied) > 5 else ''}")
+            self._settings_manager.reload()
         except Exception as e:
             print(f"⚠️ Settings reload failed: {e}")
 
