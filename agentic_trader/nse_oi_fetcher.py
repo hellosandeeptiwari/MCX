@@ -81,7 +81,7 @@ class NSEOIFetcher:
         "Connection": "keep-alive",
     }
     
-    CACHE_TTL = 180  # 3 minutes (NSE updates every ~3 min during market hours)
+    CACHE_TTL = 90  # 90 seconds (faster refresh for watcher pipeline)
     MIN_REQUEST_GAP = 1.5  # seconds between requests
     MAX_RETRIES = 2
     
@@ -509,17 +509,14 @@ class NSEOIFetcher:
     def _detect_oi_buildup(self, call_oi_chg: int, put_oi_chg: int,
                            call_vol: int, put_vol: int,
                            spot: float, strikes: list) -> Tuple[str, float]:
-        """Detect OI buildup pattern from OI changes.
+        """Detect OI buildup pattern — ENHANCED v2.
         
-        Patterns:
-        - LONG_BUILDUP: Put OI increasing + Call OI stable/decreasing + spot near support
-        - SHORT_BUILDUP: Call OI increasing + Put OI stable/decreasing + spot near resistance
-        - SHORT_COVERING: Call OI decreasing + spot moving up
-        - LONG_UNWINDING: Put OI decreasing + spot moving down
-        - NEUTRAL: No clear pattern
-        
-        Returns:
-            (signal, strength) where strength is 0.0 to 1.0
+        Same enhanced logic as DhanHQ fetcher:
+          1) ATM-concentrated OI analysis (±5 strikes around spot)
+          2) IV skew confirmation
+          3) Price-direction heuristic (from option price changes)
+          4) OI concentration noise filter
+          5) Expiry-week noise guard
         """
         try:
             net_oi_change = put_oi_chg - call_oi_chg
@@ -528,44 +525,177 @@ class NSEOIFetcher:
             if total_oi_change == 0:
                 return 'NEUTRAL', 0.0
             
-            # Ratio of net change to total change (-1.0 to +1.0)
-            # Positive = more puts being added = bullish support building
-            # Negative = more calls being added = bearish, resistance building
             oi_ratio = net_oi_change / total_oi_change if total_oi_change > 0 else 0
-            
-            # Volume ratio for confirmation
             vol_ratio = put_vol / call_vol if call_vol > 0 else 1.0
             
+            # ── ATM-concentrated OI analysis (±5 strikes around spot) ──
+            atm_ce_chg = 0
+            atm_pe_chg = 0
+            atm_ce_vol = 0
+            atm_pe_vol = 0
+            _atm_iv_skew = 0.0
+            _atm_count = 0
+            _concentration_max_ce = 0
+            _concentration_max_pe = 0
+            _price_dir = 0  # +1=up, -1=down
+            
+            if strikes and spot > 0:
+                by_dist = sorted(strikes, key=lambda s: abs(s['strike'] - spot))
+                atm_zone = by_dist[:10]
+                
+                for s in atm_zone:
+                    atm_ce_chg += s.get('ce_oi_change', 0)
+                    atm_pe_chg += s.get('pe_oi_change', 0)
+                    atm_ce_vol += s.get('ce_volume', 0)
+                    atm_pe_vol += s.get('pe_volume', 0)
+                    _concentration_max_ce = max(_concentration_max_ce, abs(s.get('ce_oi_change', 0)))
+                    _concentration_max_pe = max(_concentration_max_pe, abs(s.get('pe_oi_change', 0)))
+                
+                # ATM IV skew
+                if atm_zone:
+                    _atm = atm_zone[0]
+                    _ce_iv = _atm.get('ce_iv', 0) or 0
+                    _pe_iv = _atm.get('pe_iv', 0) or 0
+                    if _ce_iv > 0 and _pe_iv > 0:
+                        _atm_iv_skew = _pe_iv - _ce_iv
+                    # Price direction from option price changes
+                    _ce_chg = _atm.get('ce_change', 0) or 0
+                    _pe_chg = _atm.get('pe_change', 0) or 0
+                    if _ce_chg > 0 and _pe_chg < 0:
+                        _price_dir = 1
+                    elif _ce_chg < 0 and _pe_chg > 0:
+                        _price_dir = -1
+                    _atm_count = len(atm_zone)
+            
+            # Use ATM data if available
+            _use_atm = _atm_count >= 4
+            _eff_ce_chg = atm_ce_chg if _use_atm else call_oi_chg
+            _eff_pe_chg = atm_pe_chg if _use_atm else put_oi_chg
+            _eff_ce_vol = atm_ce_vol if _use_atm else call_vol
+            _eff_pe_vol = atm_pe_vol if _use_atm else put_vol
+            
+            _eff_net = _eff_pe_chg - _eff_ce_chg
+            _eff_total = abs(_eff_pe_chg) + abs(_eff_ce_chg)
+            _eff_ratio = _eff_net / _eff_total if _eff_total > 0 else 0
+            _eff_vol_ratio = _eff_pe_vol / _eff_ce_vol if _eff_ce_vol > 0 else 1.0
+            
+            # Concentration check
+            _conc_ce = _concentration_max_ce / abs(_eff_ce_chg) if abs(_eff_ce_chg) > 0 else 0
+            _conc_pe = _concentration_max_pe / abs(_eff_pe_chg) if abs(_eff_pe_chg) > 0 else 0
+            _single_strike_noise = max(_conc_ce, _conc_pe) > 0.85
+            
+            # IV confirmation
+            _iv_confirms_bull = _atm_iv_skew < -2.0
+            _iv_confirms_bear = _atm_iv_skew > 2.0
+            
+            # ════════════════════════════════════════════════════════════
+            # PREMIUM-OI CROSS-ANALYSIS — Writer vs Buyer Identification
+            # ════════════════════════════════════════════════════════════
+            _ce_writer_oi = 0
+            _ce_buyer_oi = 0
+            _pe_writer_oi = 0
+            _pe_buyer_oi = 0
+            
+            if _use_atm and strikes and spot > 0:
+                by_dist = sorted(strikes, key=lambda s: abs(s['strike'] - spot))
+                _pid_zone = by_dist[:10]
+                for _ps in _pid_zone:
+                    _ps_ce_oi_chg = _ps.get('ce_oi_change', 0)
+                    _ps_pe_oi_chg = _ps.get('pe_oi_change', 0)
+                    _ps_ce_prem_chg = _ps.get('ce_change', 0) or 0
+                    _ps_pe_prem_chg = _ps.get('pe_change', 0) or 0
+                    _ps_ce_ltp = _ps.get('ce_ltp', 0) or 0
+                    _ps_pe_ltp = _ps.get('pe_ltp', 0) or 0
+                    
+                    if _ps_ce_oi_chg > 0:
+                        _ce_prem_pct = (_ps_ce_prem_chg / _ps_ce_ltp * 100) if _ps_ce_ltp > 1 else 0
+                        if _ce_prem_pct <= -1.0:
+                            _ce_writer_oi += _ps_ce_oi_chg
+                        elif _ce_prem_pct >= 1.0:
+                            _ce_buyer_oi += _ps_ce_oi_chg
+                    
+                    if _ps_pe_oi_chg > 0:
+                        _pe_prem_pct = (_ps_pe_prem_chg / _ps_pe_ltp * 100) if _ps_pe_ltp > 1 else 0
+                        if _pe_prem_pct <= -1.0:
+                            _pe_writer_oi += _ps_pe_oi_chg
+                        elif _pe_prem_pct >= 1.0:
+                            _pe_buyer_oi += _ps_pe_oi_chg
+            
+            # ── SIGNAL CLASSIFICATION ──
             signal = 'NEUTRAL'
             strength = 0.0
+            _THRESHOLD = 0.25
             
-            if put_oi_chg > 0 and oi_ratio > 0.3:
-                # Significant put OI building → support → bullish
-                if vol_ratio > 0.8:
-                    signal = 'LONG_BUILDUP'
-                    strength = min(1.0, abs(oi_ratio) * 0.8 + 0.2)
-                else:
-                    signal = 'LONG_BUILDUP'
-                    strength = min(0.7, abs(oi_ratio) * 0.6)
+            if _eff_pe_chg > 0 and _eff_ratio > _THRESHOLD:
+                # Classic: PE OI ↑ = put writers = bullish
+                # BUT if PE BUYERS dominate → hedging/fear = bearish!
+                signal = 'LONG_BUILDUP'
+                _base = abs(_eff_ratio) * 0.6
+                
+                _pe_is_buyer_driven = (_pe_buyer_oi > _pe_writer_oi * 1.5) and _pe_buyer_oi > 0
+                _pe_is_writer_confirmed = (_pe_writer_oi > _pe_buyer_oi * 1.5) and _pe_writer_oi > 0
+                
+                if _pe_is_buyer_driven:
+                    signal = 'SHORT_BUILDUP'  # Flip: PE buyers = bearish
+                    _base *= 0.7
+                elif _pe_is_writer_confirmed:
+                    _base += 0.12  # Writer-confirmed boost
+                
+                if _eff_vol_ratio > 0.8:    _base += 0.10
+                if _iv_confirms_bull:        _base += 0.10
+                if _price_dir == 1:          _base += 0.10
+                if _single_strike_noise:     _base -= 0.15
+                strength = min(1.0, max(0.1, _base))
             
-            elif call_oi_chg > 0 and oi_ratio < -0.3:
-                # Significant call OI building → resistance → bearish
-                if vol_ratio < 1.2:
-                    signal = 'SHORT_BUILDUP'
-                    strength = min(1.0, abs(oi_ratio) * 0.8 + 0.2)
-                else:
-                    signal = 'SHORT_BUILDUP'
-                    strength = min(0.7, abs(oi_ratio) * 0.6)
+            elif _eff_ce_chg > 0 and _eff_ratio < -_THRESHOLD:
+                # Classic: CE OI ↑ = call writers = bearish
+                # BUT if CE BUYERS dominate → aggressive buying = bullish!
+                signal = 'SHORT_BUILDUP'
+                _base = abs(_eff_ratio) * 0.6
+                
+                _ce_is_buyer_driven = (_ce_buyer_oi > _ce_writer_oi * 1.5) and _ce_buyer_oi > 0
+                _ce_is_writer_confirmed = (_ce_writer_oi > _ce_buyer_oi * 1.5) and _ce_writer_oi > 0
+                
+                if _ce_is_buyer_driven:
+                    signal = 'LONG_BUILDUP'  # Flip: CE buyers = bullish
+                    _base *= 0.7
+                elif _ce_is_writer_confirmed:
+                    _base += 0.12  # Writer-confirmed boost
+                
+                if _eff_vol_ratio < 1.2:     _base += 0.10
+                if _iv_confirms_bear:         _base += 0.10
+                if _price_dir == -1:          _base += 0.10
+                if _single_strike_noise:      _base -= 0.15
+                strength = min(1.0, max(0.1, _base))
             
-            elif call_oi_chg < 0 and abs(call_oi_chg) > abs(put_oi_chg):
-                # Call OI decreasing = call writers exiting = short covering rally
+            elif _eff_ce_chg < 0 and abs(_eff_ce_chg) > abs(_eff_pe_chg):
                 signal = 'SHORT_COVERING'
-                strength = min(0.8, abs(oi_ratio) * 0.7)
+                _base = abs(_eff_ratio) * 0.5
+                if _price_dir == 1:           _base += 0.10
+                if _iv_confirms_bull:         _base += 0.08
+                strength = min(0.85, max(0.1, _base))
             
-            elif put_oi_chg < 0 and abs(put_oi_chg) > abs(call_oi_chg):
-                # Put OI decreasing = put writers exiting = long unwinding
+            elif _eff_pe_chg < 0 and abs(_eff_pe_chg) > abs(_eff_ce_chg):
                 signal = 'LONG_UNWINDING'
-                strength = min(0.8, abs(oi_ratio) * 0.7)
+                _base = abs(_eff_ratio) * 0.5
+                if _price_dir == -1:          _base += 0.10
+                if _iv_confirms_bear:         _base += 0.08
+                strength = min(0.85, max(0.1, _base))
+            
+            # Expiry-week noise guard
+            try:
+                from datetime import datetime as _dt
+                _day_of_week = _dt.now().date().weekday()
+                if _day_of_week in (2, 3):  # Wed, Thu
+                    strength *= 0.7
+            except Exception:
+                pass
+            
+            # Cross-validate: price direction vs OI signal
+            if signal == 'LONG_BUILDUP' and _price_dir == -1:
+                strength *= 0.7
+            elif signal == 'SHORT_BUILDUP' and _price_dir == 1:
+                strength *= 0.7
             
             return signal, round(strength, 3)
             

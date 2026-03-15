@@ -171,12 +171,15 @@ class DhanOIFetcher:
     EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
     PROFILE_URL = f"{BASE_URL}/profile"
     RENEW_URL = f"{BASE_URL}/RenewToken"
+    QUOTE_URL = f"{BASE_URL}/marketfeed/quote"
     
-    # Rate limit: 1 unique request per 3 seconds
+    # Rate limit: 1 unique request per 3 seconds (option chain)
     MIN_REQUEST_GAP = 3.2  # slightly over to be safe
+    # Market quote has separate rate limit: 1 req/sec, 1000 instruments
+    QUOTE_REQUEST_GAP = 1.1
     
-    # Cache TTL: 3 minutes (OI updates slowly)
-    CACHE_TTL = 180
+    # Cache TTL: 90 seconds (faster refresh for watcher pipeline)
+    CACHE_TTL = 90
     
     # Circuit breaker: disable after N consecutive failures
     MAX_CONSECUTIVE_FAILURES = 5
@@ -200,10 +203,21 @@ class DhanOIFetcher:
         
         # Rate limiting
         self._last_request_time = 0.0
+        self._last_quote_time = 0.0  # separate throttle for market quote
         self._lock = threading.Lock()
+        self._quote_lock = threading.Lock()
         
         # Cache: {key: (timestamp, data)}
         self._cache: Dict[str, Tuple[float, dict]] = {}
+        
+        # Market quote cache: {cache_key: (timestamp, data)}
+        self._quote_cache: Dict[str, Tuple[float, dict]] = {}
+        self._QUOTE_CACHE_TTL = 60  # 60s for real-time quote data
+        
+        # OI timeseries: {security_id: [(timestamp, oi), ...]}
+        # Stores OI snapshots for computing intraday rate-of-change
+        self._oi_timeseries: Dict[str, list] = {}
+        self._OI_TIMESERIES_MAX_AGE = 1800  # keep last 30 minutes
         
         # Circuit breaker
         self._consecutive_failures = 0
@@ -236,6 +250,15 @@ class DhanOIFetcher:
             if elapsed < self.MIN_REQUEST_GAP:
                 time.sleep(self.MIN_REQUEST_GAP - elapsed)
             self._last_request_time = time.time()
+    
+    def _throttle_quote(self):
+        """Enforce rate limit for market quote: 1 request per second."""
+        with self._quote_lock:
+            now = time.time()
+            elapsed = now - self._last_quote_time
+            if elapsed < self.QUOTE_REQUEST_GAP:
+                time.sleep(self.QUOTE_REQUEST_GAP - elapsed)
+            self._last_quote_time = time.time()
     
     def _check_circuit_breaker(self) -> bool:
         """Returns True if circuit is CLOSED (OK to proceed)."""
@@ -645,11 +668,101 @@ class DhanOIFetcher:
             # ATM Greeks summary
             atm_greeks = self._atm_greeks(strikes, spot_price)
             
+            # ═══ Market Quote Enrichment ═══
+            # Fetch oi_day_high/low, buy/sell qty, 5-level depth for ATM zone
+            # This is a SEPARATE API (1 req/sec, 1000 instruments) — not option chain
+            _quote_enrichment = {}
+            try:
+                if spot_price > 0:
+                    # Collect ATM zone security IDs (±5 strikes)
+                    _atm_sorted = sorted(strikes, key=lambda s: abs(s['strike'] - spot_price))
+                    _atm_zone = _atm_sorted[:10]
+                    _sec_ids = []
+                    _sid_to_strike = {}  # map security_id → (strike, 'ce'|'pe')
+                    for s in _atm_zone:
+                        ce_sid = s.get('ce_security_id', 0)
+                        pe_sid = s.get('pe_security_id', 0)
+                        if ce_sid:
+                            _sec_ids.append(ce_sid)
+                            _sid_to_strike[ce_sid] = (s['strike'], 'ce')
+                        if pe_sid:
+                            _sec_ids.append(pe_sid)
+                            _sid_to_strike[pe_sid] = (s['strike'], 'pe')
+                    
+                    if _sec_ids:
+                        _quotes = self.fetch_market_quotes(_sec_ids, segment='NSE_FNO')
+                        if _quotes:
+                            # Aggregate ATM zone metrics
+                            _total_buy_qty = 0
+                            _total_sell_qty = 0
+                            _ce_at_day_high = 0
+                            _pe_at_day_high = 0
+                            _atm_enriched = 0
+                            _ce_oi_velocities = []
+                            _pe_oi_velocities = []
+                            
+                            for sid, q in _quotes.items():
+                                if sid not in _sid_to_strike:
+                                    continue
+                                strike_val, opt_type = _sid_to_strike[sid]
+                                _total_buy_qty += q.get('buy_quantity', 0)
+                                _total_sell_qty += q.get('sell_quantity', 0)
+                                
+                                # Check if OI is at intraday high (fresh buildup)
+                                _oi = q.get('oi', 0)
+                                _oi_dh = q.get('oi_day_high', 0)
+                                if _oi > 0 and _oi_dh > 0 and _oi >= _oi_dh * 0.98:
+                                    if opt_type == 'ce':
+                                        _ce_at_day_high += 1
+                                    else:
+                                        _pe_at_day_high += 1
+                                
+                                # Enrich strike data with depth
+                                for s in strikes:
+                                    if s['strike'] == strike_val:
+                                        if opt_type == 'ce':
+                                            s['ce_buy_qty_total'] = q.get('buy_quantity', 0)
+                                            s['ce_sell_qty_total'] = q.get('sell_quantity', 0)
+                                            s['ce_oi_day_high'] = q.get('oi_day_high', 0)
+                                            s['ce_oi_day_low'] = q.get('oi_day_low', 0)
+                                            s['ce_depth'] = q.get('depth', {})
+                                        else:
+                                            s['pe_buy_qty_total'] = q.get('buy_quantity', 0)
+                                            s['pe_sell_qty_total'] = q.get('sell_quantity', 0)
+                                            s['pe_oi_day_high'] = q.get('oi_day_high', 0)
+                                            s['pe_oi_day_low'] = q.get('oi_day_low', 0)
+                                            s['pe_depth'] = q.get('depth', {})
+                                        break
+                                
+                                # OI velocity
+                                vel = self._compute_oi_velocity(str(sid))
+                                if vel is not None:
+                                    if opt_type == 'ce':
+                                        _ce_oi_velocities.append(vel)
+                                    else:
+                                        _pe_oi_velocities.append(vel)
+                                _atm_enriched += 1
+                            
+                            _quote_enrichment = {
+                                'atm_buy_qty': _total_buy_qty,
+                                'atm_sell_qty': _total_sell_qty,
+                                'ce_at_day_high_count': _ce_at_day_high,
+                                'pe_at_day_high_count': _pe_at_day_high,
+                                'atm_enriched_count': _atm_enriched,
+                                'ce_oi_velocity': sum(_ce_oi_velocities) / len(_ce_oi_velocities) if _ce_oi_velocities else None,
+                                'pe_oi_velocity': sum(_pe_oi_velocities) / len(_pe_oi_velocities) if _pe_oi_velocities else None,
+                            }
+                            logger.debug(f"DhanOI: Quote enrichment for {symbol}: "
+                                        f"buy/sell={_total_buy_qty}/{_total_sell_qty}, "
+                                        f"CE@DH={_ce_at_day_high}, PE@DH={_pe_at_day_high}")
+            except Exception as e:
+                logger.debug(f"DhanOI: Quote enrichment failed: {e}")
+            
             # OI buildup signal
             buildup_signal, buildup_strength = self._detect_oi_buildup(
                 total_call_oi_change, total_put_oi_change,
                 total_call_volume, total_put_volume,
-                spot_price, strikes
+                spot_price, strikes, _quote_enrichment
             )
             
             # Clean symbol
@@ -690,8 +803,15 @@ class DhanOIFetcher:
                 'oi_buildup_signal': buildup_signal,
                 'oi_buildup_strength': buildup_strength,
                 
+                # Participant identification (v4: writer vs buyer)
+                'oi_participant_id': getattr(self, '_last_participant_id', 'UNKNOWN'),
+                'oi_participant_detail': getattr(self, '_last_participant_detail', {}),
+                
                 # Greeks (ATM summary)
                 'atm_greeks': atm_greeks,
+                
+                # Market Quote enrichment (oi_day_high/low, buy/sell)
+                'quote_enrichment': _quote_enrichment,
                 
                 # Full strike data
                 'strikes': strikes,
@@ -725,6 +845,157 @@ class DhanOIFetcher:
         except Exception:
             return {}
     
+    @staticmethod
+    def find_optimal_strike(direction: str, strikes: list, spot_price: float) -> dict:
+        """OI Heatmap Strike Picker — find where institutional action is concentrated.
+
+        Scores each strike in ATM ± 2 zone on 5 factors:
+          1. Volume (30 pts)  — liquidity for quick entry/exit
+          2. Spread (25 pts)  — tighter bid-ask = less slippage
+          3. Delta  (20 pts)  — peak at ~0.50 (ATM sweet spot)
+          4. Support (15 pts) — contra-side OI writing = support/resistance building
+          5. Momentum (10 pts) — same-side buying activity vs writing (can be negative)
+
+        Args:
+            direction: 'BUY' (bullish → buy CE) or 'SELL' (bearish → buy PE)
+            strikes: Full per-strike data list from fetch()
+            spot_price: Current spot price
+
+        Returns:
+            {'selection': 'ATM'|'ITM_1'|'OTM_1'|..., 'strike': float,
+             'reason': str, 'score': float, 'atm_strike': float}
+        """
+        _default = {'selection': 'ATM', 'strike': 0, 'reason': 'no_data', 'score': 0,
+                     'atm_strike': 0, 'details': {}}
+        try:
+            if not strikes or spot_price <= 0:
+                return _default
+
+            # Sort by strike price
+            sorted_all = sorted(strikes, key=lambda s: s['strike'])
+            if len(sorted_all) < 3:
+                return _default
+
+            # Find ATM index
+            atm_idx = min(range(len(sorted_all)),
+                          key=lambda i: abs(sorted_all[i]['strike'] - spot_price))
+
+            # Zone: ATM ± 2
+            z_start = max(0, atm_idx - 2)
+            z_end = min(len(sorted_all), atm_idx + 3)
+            zone = sorted_all[z_start:z_end]
+            atm_in_zone = atm_idx - z_start  # ATM position within zone
+
+            is_ce = (direction == 'BUY')
+
+            # Collect zone values for normalisation
+            if is_ce:
+                volumes = [s.get('ce_volume', 0) for s in zone]
+            else:
+                volumes = [s.get('pe_volume', 0) for s in zone]
+            max_vol = max(volumes) if volumes else 1
+
+            # Contra-OI normalisation
+            if is_ce:
+                contra_ois = [abs(s.get('pe_oi_change', 0)) for s in zone]
+                same_ois = [abs(s.get('ce_oi_change', 0)) for s in zone]
+            else:
+                contra_ois = [abs(s.get('ce_oi_change', 0)) for s in zone]
+                same_ois = [abs(s.get('pe_oi_change', 0)) for s in zone]
+            max_contra = max(contra_ois) if contra_ois else 1
+            max_same = max(same_ois) if same_ois else 1
+
+            best_score = -999
+            best_idx = atm_in_zone
+            best_details = {}
+
+            for i, s in enumerate(zone):
+                if is_ce:
+                    vol = s.get('ce_volume', 0)
+                    bid = s.get('ce_bid', 0)
+                    ask = s.get('ce_ask', 0)
+                    delta = abs(s.get('ce_greeks', {}).get('delta', 0))
+                    oi_chg = s.get('ce_oi_change', 0)
+                    px_chg = s.get('ce_change', 0)
+                    contra_oi_chg = s.get('pe_oi_change', 0)
+                    contra_px_chg = s.get('pe_change', 0)
+                else:
+                    vol = s.get('pe_volume', 0)
+                    bid = s.get('pe_bid', 0)
+                    ask = s.get('pe_ask', 0)
+                    delta = abs(s.get('pe_greeks', {}).get('delta', 0))
+                    oi_chg = s.get('pe_oi_change', 0)
+                    px_chg = s.get('pe_change', 0)
+                    contra_oi_chg = s.get('ce_oi_change', 0)
+                    contra_px_chg = s.get('ce_change', 0)
+
+                # === 1. VOLUME (0-30) ===
+                vol_score = (vol / max_vol * 30) if max_vol > 0 else 15
+
+                # === 2. SPREAD (0-25) ===
+                mid = (bid + ask) / 2
+                if mid > 0:
+                    spread_pct = (ask - bid) / mid
+                    spread_score = max(0.0, 25 * (1 - spread_pct / 0.05))
+                else:
+                    spread_score = 0.0
+
+                # === 3. DELTA (0-20) — sweet spot at 0.45-0.55 ===
+                delta_score = max(0.0, 20 * (1 - abs(delta - 0.50) / 0.30))
+
+                # === 4. CONTRA-SIDE SUPPORT (0-15) ===
+                #   Contra OI up + contra price down = writing (support/resistance) → good
+                if contra_oi_chg > 0 and contra_px_chg <= 0:
+                    support_score = min(15.0, (contra_oi_chg / max_contra * 15) if max_contra > 0 else 0)
+                else:
+                    support_score = 0.0
+
+                # === 5. SAME-SIDE MOMENTUM (-10 to +10) ===
+                #   OI up + price up = buying activity (good)
+                #   OI up + price down = writing (resistance → bad)
+                if oi_chg > 0:
+                    norm = (oi_chg / max_same * 10) if max_same > 0 else 0
+                    momentum_score = min(10.0, norm) if px_chg >= 0 else -min(10.0, norm)
+                else:
+                    momentum_score = 0.0
+
+                total = vol_score + spread_score + delta_score + support_score + momentum_score
+
+                if total > best_score:
+                    best_score = total
+                    best_idx = i
+                    best_details = {
+                        'vol': round(vol_score, 1), 'spread': round(spread_score, 1),
+                        'delta': round(delta_score, 1), 'support': round(support_score, 1),
+                        'momentum': round(momentum_score, 1), 'total': round(total, 1),
+                    }
+
+            # ── Map zone-offset → StrikeSelection label ──
+            offset = best_idx - atm_in_zone  # positive = higher strike
+            if offset == 0:
+                selection = 'ATM'
+            elif is_ce:
+                # CE: lower strike = ITM, higher = OTM
+                sel_map = {-1: 'ITM_1', -2: 'ITM_2', 1: 'OTM_1', 2: 'OTM_2'}
+                selection = sel_map.get(offset, 'ITM_2' if offset < -2 else 'OTM_2')
+            else:
+                # PE: higher strike = ITM, lower = OTM
+                sel_map = {1: 'ITM_1', 2: 'ITM_2', -1: 'OTM_1', -2: 'OTM_2'}
+                selection = sel_map.get(offset, 'ITM_2' if offset > 2 else 'OTM_2')
+
+            return {
+                'selection': selection,
+                'strike': zone[best_idx]['strike'],
+                'reason': (f"V={best_details.get('vol', 0)} Sp={best_details.get('spread', 0)} "
+                           f"D={best_details.get('delta', 0)} Su={best_details.get('support', 0)} "
+                           f"M={best_details.get('momentum', 0)}"),
+                'score': round(best_score, 1),
+                'atm_strike': zone[atm_in_zone]['strike'],
+                'details': best_details,
+            }
+        except Exception:
+            return _default
+
     def _calc_max_pain(self, strikes: list) -> float:
         """Calculate max pain strike."""
         try:
@@ -770,15 +1041,25 @@ class DhanOIFetcher:
     
     def _detect_oi_buildup(self, call_oi_chg: int, put_oi_chg: int,
                            call_vol: int, put_vol: int,
-                           spot: float, strikes: list) -> Tuple[str, float]:
-        """Detect OI buildup pattern.
+                           spot: float, strikes: list,
+                           quote_enrichment: dict = None) -> Tuple[str, float]:
+        """Detect OI buildup pattern — ENHANCED v3.
         
-        Same logic as NSE fetcher for consistency:
-        - LONG_BUILDUP: Put OI increasing, support building → bullish
-        - SHORT_BUILDUP: Call OI increasing, resistance building → bearish
-        - SHORT_COVERING: Call OI decreasing → bullish
-        - LONG_UNWINDING: Put OI decreasing → bearish
+        Improvements over v2:
+          7) OI day-high detection (fresh intraday buildup via Market Quote API)
+          8) Exchange buy/sell queue imbalance (aggregate pending orders)
+          9) Intraday OI velocity (rate-of-change from timeseries cache)
+        
+        v2 features (retained):
+          1) Price-direction cross-reference (textbook OI interpretation)
+          2) ATM-concentrated OI analysis (5 strikes each side of ATM)
+          3) IV skew confirmation (put IV vs call IV supports direction)
+          4) OI-change concentration (single-strike dominance = noise filter)
+          5) Bid/ask imbalance (writing vs buying heuristic)
+          6) Expiry-week noise guard (lower strength near expiry)
         """
+        if quote_enrichment is None:
+            quote_enrichment = {}
         try:
             net_oi_change = put_oi_chg - call_oi_chg
             total_oi_change = abs(put_oi_chg) + abs(call_oi_chg)
@@ -789,38 +1070,517 @@ class DhanOIFetcher:
             oi_ratio = net_oi_change / total_oi_change if total_oi_change > 0 else 0
             vol_ratio = put_vol / call_vol if call_vol > 0 else 1.0
             
+            # ── ATM-concentrated OI analysis (±5 strikes around spot) ──
+            # OI changes far OTM are noise (hedging, straddles).
+            # Only ATM-zone OI represents directional conviction.
+            atm_ce_chg = 0
+            atm_pe_chg = 0
+            atm_ce_vol = 0
+            atm_pe_vol = 0
+            _atm_iv_skew = 0.0
+            _atm_count = 0
+            _atm_ce_bid_qty = 0
+            _atm_ce_ask_qty = 0
+            _atm_pe_bid_qty = 0
+            _atm_pe_ask_qty = 0
+            _concentration_max_ce = 0  # max single-strike CE OI change
+            _concentration_max_pe = 0  # max single-strike PE OI change
+            
+            if strikes and spot > 0:
+                # Sort by proximity to spot, take ±5 strikes
+                by_dist = sorted(strikes, key=lambda s: abs(s['strike'] - spot))
+                atm_zone = by_dist[:10]  # 5 ITM + 5 OTM effectively
+                
+                for s in atm_zone:
+                    atm_ce_chg += s.get('ce_oi_change', 0)
+                    atm_pe_chg += s.get('pe_oi_change', 0)
+                    atm_ce_vol += s.get('ce_volume', 0)
+                    atm_pe_vol += s.get('pe_volume', 0)
+                    _atm_ce_bid_qty += s.get('ce_bid_qty', 0)
+                    _atm_ce_ask_qty += s.get('ce_ask_qty', 0)
+                    _atm_pe_bid_qty += s.get('pe_bid_qty', 0)
+                    _atm_pe_ask_qty += s.get('pe_ask_qty', 0)
+                    _concentration_max_ce = max(_concentration_max_ce, abs(s.get('ce_oi_change', 0)))
+                    _concentration_max_pe = max(_concentration_max_pe, abs(s.get('pe_oi_change', 0)))
+                
+                # ATM IV skew (nearest strike)
+                if atm_zone:
+                    _atm = atm_zone[0]
+                    _ce_iv = _atm.get('ce_iv', 0) or 0
+                    _pe_iv = _atm.get('pe_iv', 0) or 0
+                    if _ce_iv > 0 and _pe_iv > 0:
+                        _atm_iv_skew = _pe_iv - _ce_iv  # positive = put IV > call IV = bearish
+                    _atm_count = len(atm_zone)
+            
+            # Use ATM data if available, else fall back to totals
+            _use_atm = _atm_count >= 4
+            _eff_ce_chg = atm_ce_chg if _use_atm else call_oi_chg
+            _eff_pe_chg = atm_pe_chg if _use_atm else put_oi_chg
+            _eff_ce_vol = atm_ce_vol if _use_atm else call_vol
+            _eff_pe_vol = atm_pe_vol if _use_atm else put_vol
+            
+            _eff_net = _eff_pe_chg - _eff_ce_chg
+            _eff_total = abs(_eff_pe_chg) + abs(_eff_ce_chg)
+            _eff_ratio = _eff_net / _eff_total if _eff_total > 0 else 0
+            _eff_vol_ratio = _eff_pe_vol / _eff_ce_vol if _eff_ce_vol > 0 else 1.0
+            
+            # ── OI concentration check (single-strike dominance = noise) ──
+            # If >80% of total OI change comes from one strike, it's likely
+            # a large institutional hedge, not broad market positioning.
+            _conc_ce = _concentration_max_ce / abs(_eff_ce_chg) if abs(_eff_ce_chg) > 0 else 0
+            _conc_pe = _concentration_max_pe / abs(_eff_pe_chg) if abs(_eff_pe_chg) > 0 else 0
+            _single_strike_noise = max(_conc_ce, _conc_pe) > 0.85
+            
+            # ── Price-direction heuristic from options ──
+            # We infer price direction from option price changes:
+            # CE prices rising + PE prices falling = underlying moving UP
+            # CE prices falling + PE prices rising = underlying moving DOWN
+            _price_dir = 0  # +1 = up, -1 = down, 0 = unclear
+            if strikes and spot > 0:
+                _atm_s = min(strikes, key=lambda s: abs(s['strike'] - spot))
+                _ce_price_chg = _atm_s.get('ce_change', 0) or 0
+                _pe_price_chg = _atm_s.get('pe_change', 0) or 0
+                if _ce_price_chg > 0 and _pe_price_chg < 0:
+                    _price_dir = 1   # underlying UP
+                elif _ce_price_chg < 0 and _pe_price_chg > 0:
+                    _price_dir = -1  # underlying DOWN
+            
+            # ════════════════════════════════════════════════════════════
+            # PREMIUM-OI CROSS-ANALYSIS — Writer vs Buyer Identification
+            # ════════════════════════════════════════════════════════════
+            # The golden rule: OI increase alone is ambiguous.
+            #   OI ↑ + Premium ↓/flat = WRITERS adding (supply ↑, selling)
+            #   OI ↑ + Premium ↑      = BUYERS adding (demand ↑, buying)
+            # This matters because:
+            #   PE OI ↑ by WRITERS = BULLISH (support being built)
+            #   PE OI ↑ by BUYERS  = BEARISH (protection/hedging)
+            #   CE OI ↑ by WRITERS = BEARISH (resistance being built)
+            #   CE OI ↑ by BUYERS  = BULLISH (aggressive call buying)
+            #
+            # v4.1: Uses RECENT-WINDOW deltas (last 10 min) when timeseries
+            # data is available, so premium changes reflect the same window
+            # as the OI changes.  Falls back to whole-day (LTP - prev_close)
+            # only on cold start (first ~10 min of tracking).
+            # ────────────────────────────────────────────────────────────
+            _ce_writer_oi = 0   # CE OI added by writers (premium ↓ while OI ↑)
+            _ce_buyer_oi = 0    # CE OI added by buyers (premium ↑ while OI ↑)
+            _pe_writer_oi = 0   # PE OI added by writers
+            _pe_buyer_oi = 0    # PE OI added by buyers
+            _participant_id = 'UNKNOWN'  # WRITER_DOMINANT | BUYER_DOMINANT | MIXED
+            _recent_window_used = 0      # How many strikes used recent delta
+            _daily_fallback_used = 0     # How many fell back to whole-day change
+            
+            if _use_atm and strikes and spot > 0:
+                by_dist = sorted(strikes, key=lambda s: abs(s['strike'] - spot))
+                _pid_zone = by_dist[:10]
+                for _ps in _pid_zone:
+                    _ps_ce_oi_chg = _ps.get('ce_oi_change', 0)
+                    _ps_pe_oi_chg = _ps.get('pe_oi_change', 0)
+                    _ps_ce_sid = str(_ps.get('ce_security_id', 0))
+                    _ps_pe_sid = str(_ps.get('pe_security_id', 0))
+                    
+                    # ── CE side: try recent-window delta first ──
+                    if _ps_ce_oi_chg > 0:
+                        _ce_recent = self._compute_recent_delta(_ps_ce_sid) if _ps_ce_sid != '0' else None
+                        if _ce_recent and _ce_recent['oi_delta'] > 0:
+                            # Recent window has OI increasing — use recent premium delta
+                            _ce_prem_pct = _ce_recent['premium_pct']
+                            _recent_window_used += 1
+                        else:
+                            # Fallback: whole-day change
+                            _ps_ce_prem_chg = _ps.get('ce_change', 0) or 0
+                            _ps_ce_ltp = _ps.get('ce_ltp', 0) or 0
+                            _ce_prem_pct = (_ps_ce_prem_chg / _ps_ce_ltp * 100) if _ps_ce_ltp > 1 else 0
+                            _daily_fallback_used += 1
+                        
+                        if _ce_prem_pct <= -1.0:
+                            _ce_writer_oi += _ps_ce_oi_chg
+                        elif _ce_prem_pct >= 1.0:
+                            _ce_buyer_oi += _ps_ce_oi_chg
+                    
+                    # ── PE side: try recent-window delta first ──
+                    if _ps_pe_oi_chg > 0:
+                        _pe_recent = self._compute_recent_delta(_ps_pe_sid) if _ps_pe_sid != '0' else None
+                        if _pe_recent and _pe_recent['oi_delta'] > 0:
+                            _pe_prem_pct = _pe_recent['premium_pct']
+                            _recent_window_used += 1
+                        else:
+                            _ps_pe_prem_chg = _ps.get('pe_change', 0) or 0
+                            _ps_pe_ltp = _ps.get('pe_ltp', 0) or 0
+                            _pe_prem_pct = (_ps_pe_prem_chg / _ps_pe_ltp * 100) if _ps_pe_ltp > 1 else 0
+                            _daily_fallback_used += 1
+                        
+                        if _pe_prem_pct <= -1.0:
+                            _pe_writer_oi += _ps_pe_oi_chg
+                        elif _pe_prem_pct >= 1.0:
+                            _pe_buyer_oi += _ps_pe_oi_chg
+                
+                # Determine dominant participant for the ACTIVE side
+                _total_writer = _ce_writer_oi + _pe_writer_oi
+                _total_buyer = _ce_buyer_oi + _pe_buyer_oi
+                _total_classified = _total_writer + _total_buyer
+                if _total_classified > 0:
+                    _writer_pct = _total_writer / _total_classified
+                    if _writer_pct >= 0.65:
+                        _participant_id = 'WRITER_DOMINANT'
+                    elif _writer_pct <= 0.35:
+                        _participant_id = 'BUYER_DOMINANT'
+                    else:
+                        _participant_id = 'MIXED'
+            
+            # Store for return in parent dict
+            self._last_participant_id = _participant_id
+            self._last_participant_detail = {
+                'ce_writer_oi': _ce_writer_oi, 'ce_buyer_oi': _ce_buyer_oi,
+                'pe_writer_oi': _pe_writer_oi, 'pe_buyer_oi': _pe_buyer_oi,
+                'participant_id': _participant_id,
+                'recent_window_used': _recent_window_used,
+                'daily_fallback_used': _daily_fallback_used,
+            }
+            
+            # ── Bid/Ask writing heuristic ──
+            # Large ask_qty on CEs = writers selling CEs = bearish positioning
+            # Large bid_qty on PEs = writers selling PEs = bullish support
+            _writer_bias = 0  # +1 = writers bullish, -1 = writers bearish
+            if _atm_ce_ask_qty > 0 and _atm_pe_ask_qty > 0:
+                _ce_ba_ratio = _atm_ce_ask_qty / max(_atm_ce_bid_qty, 1)
+                _pe_ba_ratio = _atm_pe_ask_qty / max(_atm_pe_bid_qty, 1)
+                # CE ask >> bid = heavy CE writing = bearish
+                if _ce_ba_ratio > 1.5 and _pe_ba_ratio < 1.2:
+                    _writer_bias = -1
+                # PE ask >> bid = heavy PE writing = bullish support
+                elif _pe_ba_ratio > 1.5 and _ce_ba_ratio < 1.2:
+                    _writer_bias = 1
+            
+            # ── IV skew confirmation ──
+            # Positive skew (put IV > call IV) = bearish fear = confirms SHORT_BUILDUP
+            # Negative skew (call IV > put IV) = bullish greed = confirms LONG_BUILDUP
+            _iv_confirms_bull = _atm_iv_skew < -2.0
+            _iv_confirms_bear = _atm_iv_skew > 2.0
+            
+            # ── Market Quote enrichment (v3) ──
+            # 7) OI at day high = fresh intraday buildup happening NOW
+            # 8) Exchange buy/sell queue imbalance
+            # 9) OI velocity (intraday rate-of-change)
+            _fresh_ce_buildup = False  # CE OI at intraday highs
+            _fresh_pe_buildup = False  # PE OI at intraday highs
+            _exchange_pressure = 0     # +1 = buy pressure, -1 = sell pressure
+            _oi_velocity_bull = False   # PE OI accelerating (bullish)
+            _oi_velocity_bear = False   # CE OI accelerating (bearish)
+            
+            if quote_enrichment:
+                _ce_dh = quote_enrichment.get('ce_at_day_high_count', 0)
+                _pe_dh = quote_enrichment.get('pe_at_day_high_count', 0)
+                # If 3+ ATM PE strikes have OI at day high → fresh put writing → bullish
+                _fresh_pe_buildup = _pe_dh >= 3
+                # If 3+ ATM CE strikes have OI at day high → fresh call writing → bearish
+                _fresh_ce_buildup = _ce_dh >= 3
+                
+                # Exchange aggregate buy vs sell queue
+                _buy_q = quote_enrichment.get('atm_buy_qty', 0)
+                _sell_q = quote_enrichment.get('atm_sell_qty', 0)
+                if _buy_q > 0 and _sell_q > 0:
+                    _bs_ratio = _buy_q / _sell_q
+                    if _bs_ratio > 1.5:
+                        _exchange_pressure = 1   # heavy buy queue = demand
+                    elif _bs_ratio < 0.67:
+                        _exchange_pressure = -1  # heavy sell queue = supply
+                
+                # OI velocity from timeseries
+                _ce_vel = quote_enrichment.get('ce_oi_velocity')
+                _pe_vel = quote_enrichment.get('pe_oi_velocity')
+                # PE OI accelerating faster than CE = put writing increasing = bullish
+                if _pe_vel is not None and _ce_vel is not None:
+                    if _pe_vel > 0.02 and _pe_vel > _ce_vel:
+                        _oi_velocity_bull = True
+                    elif _ce_vel > 0.02 and _ce_vel > _pe_vel:
+                        _oi_velocity_bear = True
+            
+            # ════════════════════════════════════════════════════════════
+            # SIGNAL CLASSIFICATION — using ATM-zone effective values
+            # ════════════════════════════════════════════════════════════
             signal = 'NEUTRAL'
             strength = 0.0
+            _THRESHOLD = 0.25  # lowered from 0.3 for ATM-only data (less noise)
             
-            if put_oi_chg > 0 and oi_ratio > 0.3:
-                if vol_ratio > 0.8:
-                    signal = 'LONG_BUILDUP'
-                    strength = min(1.0, abs(oi_ratio) * 0.8 + 0.2)
-                else:
-                    signal = 'LONG_BUILDUP'
-                    strength = min(0.7, abs(oi_ratio) * 0.6)
-            
-            elif call_oi_chg > 0 and oi_ratio < -0.3:
-                if vol_ratio < 1.2:
+            if _eff_pe_chg > 0 and _eff_ratio > _THRESHOLD:
+                # Put OI increasing more than call OI
+                # Classic assumption: put WRITERS adding → support → bullish
+                # BUT if PE BUYERS dominate → hedging/fear → actually bearish!
+                signal = 'LONG_BUILDUP'
+                _base = abs(_eff_ratio) * 0.6
+                
+                # Writer vs Buyer check on PE side
+                _pe_is_buyer_driven = (_pe_buyer_oi > _pe_writer_oi * 1.5) and _pe_buyer_oi > 0
+                _pe_is_writer_confirmed = (_pe_writer_oi > _pe_buyer_oi * 1.5) and _pe_writer_oi > 0
+                
+                if _pe_is_buyer_driven:
+                    # PE OI rising because BUYERS are buying puts = bearish hedge
+                    # Flip signal: this is NOT long buildup, it's put buying
                     signal = 'SHORT_BUILDUP'
-                    strength = min(1.0, abs(oi_ratio) * 0.8 + 0.2)
-                else:
-                    signal = 'SHORT_BUILDUP'
-                    strength = min(0.7, abs(oi_ratio) * 0.6)
+                    _base *= 0.7  # Lower base — buyer-driven OI is less sticky
+                elif _pe_is_writer_confirmed:
+                    # PE OI rising because WRITERS are selling puts = genuine support
+                    _base += 0.12  # Writer-confirmed boost
+                
+                # Confirmations boost strength
+                if _eff_vol_ratio > 0.8:    _base += 0.10  # volume confirms
+                if _iv_confirms_bull:        _base += 0.10  # IV skew confirms
+                if _price_dir == 1:          _base += 0.10  # price moving up confirms
+                if _writer_bias == 1:        _base += 0.08  # bid/ask shows writing
+                if _fresh_pe_buildup:        _base += 0.12  # PE OI at day high = fresh!
+                if _oi_velocity_bull:        _base += 0.08  # PE OI accelerating
+                if _exchange_pressure == 1:  _base += 0.06  # buy queue dominance
+                if _single_strike_noise:     _base -= 0.15  # concentrated = less reliable
+                strength = min(1.0, max(0.1, _base))
             
-            elif call_oi_chg < 0 and abs(call_oi_chg) > abs(put_oi_chg):
+            elif _eff_ce_chg > 0 and _eff_ratio < -_THRESHOLD:
+                # Call OI increasing more than put OI
+                # Classic assumption: call WRITERS adding → resistance → bearish
+                # BUT if CE BUYERS dominate → aggressive call buying → bullish!
+                signal = 'SHORT_BUILDUP'
+                _base = abs(_eff_ratio) * 0.6
+                
+                # Writer vs Buyer check on CE side
+                _ce_is_buyer_driven = (_ce_buyer_oi > _ce_writer_oi * 1.5) and _ce_buyer_oi > 0
+                _ce_is_writer_confirmed = (_ce_writer_oi > _ce_buyer_oi * 1.5) and _ce_writer_oi > 0
+                
+                if _ce_is_buyer_driven:
+                    # CE OI rising because BUYERS are buying calls = bullish
+                    signal = 'LONG_BUILDUP'
+                    _base *= 0.7  # Lower base — buyer-driven OI is less sticky
+                elif _ce_is_writer_confirmed:
+                    # CE OI rising because WRITERS selling calls = genuine resistance
+                    _base += 0.12  # Writer-confirmed boost
+                
+                if _eff_vol_ratio < 1.2:     _base += 0.10
+                if _iv_confirms_bear:         _base += 0.10
+                if _price_dir == -1:          _base += 0.10
+                if _writer_bias == -1:        _base += 0.08
+                if _fresh_ce_buildup:         _base += 0.12  # CE OI at day high = fresh!
+                if _oi_velocity_bear:         _base += 0.08  # CE OI accelerating
+                if _exchange_pressure == -1:  _base += 0.06  # sell queue dominance
+                if _single_strike_noise:      _base -= 0.15
+                strength = min(1.0, max(0.1, _base))
+            
+            elif _eff_ce_chg < 0 and abs(_eff_ce_chg) > abs(_eff_pe_chg):
+                # Call OI decreasing = call writers exiting = short covering
                 signal = 'SHORT_COVERING'
-                strength = min(0.8, abs(oi_ratio) * 0.7)
+                _base = abs(_eff_ratio) * 0.5
+                if _price_dir == 1:           _base += 0.10
+                if _iv_confirms_bull:         _base += 0.08
+                if _exchange_pressure == 1:   _base += 0.06
+                strength = min(0.85, max(0.1, _base))
             
-            elif put_oi_chg < 0 and abs(put_oi_chg) > abs(call_oi_chg):
+            elif _eff_pe_chg < 0 and abs(_eff_pe_chg) > abs(_eff_ce_chg):
+                # Put OI decreasing = put writers exiting = long unwinding
                 signal = 'LONG_UNWINDING'
-                strength = min(0.8, abs(oi_ratio) * 0.7)
+                _base = abs(_eff_ratio) * 0.5
+                if _price_dir == -1:          _base += 0.10
+                if _iv_confirms_bear:         _base += 0.08
+                if _exchange_pressure == -1:  _base += 0.06
+                strength = min(0.85, max(0.1, _base))
             
-            return signal, round(strength, 3)
+            # ── Expiry-week noise guard ──
+            # Near expiry, OI changes are dominated by rollover/decay.
+            # Reduce strength by 30% if within 2 days of expiry.
+            try:
+                from datetime import datetime as _dt
+                _today = _dt.now().date()
+                _day_of_week = _today.weekday()  # Thu=3
+                # Weekly expiry is Thursday. If today is Wed(2) or Thu(3), reduce
+                if _day_of_week in (2, 3):
+                    strength *= 0.7
+            except Exception:
+                pass
+            
+            # ── Cross-validate: price direction vs OI signal ──
+            # If price is clearly moving opposite to OI signal, downgrade
+            if signal == 'LONG_BUILDUP' and _price_dir == -1:
+                strength *= 0.7  # bullish OI but price falling — less reliable
+            elif signal == 'SHORT_BUILDUP' and _price_dir == 1:
+                strength *= 0.7  # bearish OI but price rising — less reliable
+            
+            # ── Participant confidence modifier (v4) ──
+            # If participant analysis is conclusive, adjust final strength
+            if _participant_id == 'WRITER_DOMINANT':
+                strength *= 1.10  # Writers = stickier positions, higher conviction
+            elif _participant_id == 'BUYER_DOMINANT':
+                strength *= 0.85  # Buyers = can exit quickly, lower conviction
+            # MIXED / UNKNOWN = no adjustment
+            
+            return signal, round(min(1.0, strength), 3)
             
         except Exception:
             return 'NEUTRAL', 0.0
     
+    # ═══════════════════════════════════════════════════════════════════
+    # MARKET QUOTE API — oi_day_high/low, buy/sell qty, 5-level depth
+    # Endpoint: POST /v2/marketfeed/quote
+    # Rate: 1 req/sec, up to 1000 instruments per request
+    # ═══════════════════════════════════════════════════════════════════
+    
+    def fetch_market_quotes(self, security_ids: List[int], segment: str = "NSE_FNO") -> Dict[int, dict]:
+        """Batch-fetch real-time market quotes for multiple security IDs.
+        
+        Returns OI day high/low, buy/sell quantities, 5-level depth, volume.
+        """
+        if not self.ready or not security_ids:
+            return {}
+        
+        try:
+            # Cache check
+            _ids_key = ','.join(str(s) for s in sorted(security_ids[:50]))
+            cache_key = f"quote:{segment}:{_ids_key}"
+            cached = self._quote_cache.get(cache_key)
+            if cached:
+                ts, data = cached
+                if time.time() - ts < self._QUOTE_CACHE_TTL:
+                    return data
+            
+            self._throttle_quote()
+            
+            payload = {segment: [int(sid) for sid in security_ids[:1000]]}
+            
+            r = requests.post(self.QUOTE_URL, headers=self._headers(),
+                            json=payload, timeout=10)
+            
+            if r.status_code != 200:
+                logger.debug(f"DhanOI: Market quote HTTP {r.status_code}: {r.text[:100]}")
+                return {}
+            
+            raw = r.json()
+            if raw.get('status') != 'success':
+                return {}
+            
+            seg_data = raw.get('data', {}).get(segment, {})
+            result = {}
+            
+            for sid_str, q in seg_data.items():
+                sid = int(sid_str)
+                oi = q.get('oi', 0) or 0
+                result[sid] = {
+                    'oi': oi,
+                    'oi_day_high': q.get('oi_day_high', 0) or 0,
+                    'oi_day_low': q.get('oi_day_low', 0) or 0,
+                    'buy_quantity': q.get('buy_quantity', 0) or 0,
+                    'sell_quantity': q.get('sell_quantity', 0) or 0,
+                    'volume': q.get('volume', 0) or 0,
+                    'last_price': q.get('last_price', 0) or 0,
+                    'net_change': q.get('net_change', 0) or 0,
+                    'depth': q.get('depth', {}),
+                    'ohlc': q.get('ohlc', {}),
+                }
+                
+                # Record OI + premium snapshot for timeseries
+                if oi > 0:
+                    _ltp = q.get('last_price', 0) or 0
+                    self._record_oi_snapshot(str(sid), oi, float(_ltp))
+            
+            if result:
+                self._quote_cache[cache_key] = (time.time(), result)
+            
+            return result
+            
+        except Exception as e:
+            logger.debug(f"DhanOI: Market quote error: {e}")
+            return {}
+    
+    def _record_oi_snapshot(self, security_id: str, oi: int, premium: float = 0.0):
+        """Store OI + premium value in timeseries for intraday analysis.
+        
+        Each entry is (timestamp, oi, premium).  Premium is used for
+        recent-window writer vs buyer identification — avoids relying
+        on whole-day change which can lag actual OI buildup moment.
+        """
+        now = time.time()
+        if security_id not in self._oi_timeseries:
+            self._oi_timeseries[security_id] = []
+        
+        series = self._oi_timeseries[security_id]
+        series.append((now, oi, premium))
+        
+        # Prune entries older than max age
+        cutoff = now - self._OI_TIMESERIES_MAX_AGE
+        self._oi_timeseries[security_id] = [e for e in series if e[0] >= cutoff]
+    
+    def _compute_oi_velocity(self, security_id: str, lookback_seconds: int = 900) -> Optional[float]:
+        """Compute OI rate-of-change over the lookback window.
+        
+        Returns:
+            Fractional change (e.g., 0.05 = 5% increase) or None if insufficient data.
+        """
+        series = self._oi_timeseries.get(str(security_id), [])
+        if len(series) < 2:
+            return None
+        
+        now = time.time()
+        cutoff = now - lookback_seconds
+        
+        old_entries = [e for e in series if e[0] >= cutoff]
+        if len(old_entries) < 2:
+            return None
+        
+        old_oi = old_entries[0][1]
+        new_oi = old_entries[-1][1]
+        
+        if old_oi == 0:
+            return None
+        
+        return (new_oi - old_oi) / old_oi
+    
+    def _compute_recent_delta(self, security_id: str, lookback_seconds: int = 600) -> Optional[dict]:
+        """Compute RECENT OI and premium deltas over a short lookback window.
+        
+        This solves the premium-lag problem: instead of using LTP - prev_close
+        (which reflects the ENTIRE day), we compare the last two snapshots
+        to see what happened IN THE SAME WINDOW as the OI change.
+        
+        Args:
+            security_id: DhanHQ security ID (string)
+            lookback_seconds: window size (default 600s = 10 min)
+            
+        Returns:
+            dict with {oi_delta, premium_delta, oi_pct, premium_pct,
+                       old_oi, new_oi, old_premium, new_premium}
+            or None if insufficient data (need >= 2 entries with premium > 0).
+        """
+        series = self._oi_timeseries.get(str(security_id), [])
+        if len(series) < 2:
+            return None
+        
+        now = time.time()
+        cutoff = now - lookback_seconds
+        
+        # Only entries in the recent window that have premium data
+        recent = [e for e in series if e[0] >= cutoff and len(e) >= 3 and e[2] > 0]
+        if len(recent) < 2:
+            return None
+        
+        old_ts, old_oi, old_prem = recent[0]
+        new_ts, new_oi, new_prem = recent[-1]
+        
+        # Need meaningful time gap (at least 60 seconds)
+        if (new_ts - old_ts) < 60:
+            return None
+        
+        oi_delta = new_oi - old_oi
+        prem_delta = new_prem - old_prem
+        oi_pct = (oi_delta / old_oi * 100) if old_oi > 0 else 0.0
+        prem_pct = (prem_delta / old_prem * 100) if old_prem > 0 else 0.0
+        
+        return {
+            'oi_delta': oi_delta,
+            'premium_delta': round(prem_delta, 2),
+            'oi_pct': round(oi_pct, 2),
+            'premium_pct': round(prem_pct, 2),
+            'old_oi': old_oi,
+            'new_oi': new_oi,
+            'old_premium': round(old_prem, 2),
+            'new_premium': round(new_prem, 2),
+            'window_secs': round(new_ts - old_ts),
+        }
+
     def fetch_batch(self, symbols: List[str], max_symbols: int = 15) -> Dict[str, dict]:
         """Fetch OI data for multiple symbols.
         
@@ -973,6 +1733,36 @@ class DhanOIFetcher:
             if ce_chg != 0 or pe_chg != 0:
                 gpt_line += f"|ΔOI:CE{ce_chg:+,}/PE{pe_chg:+,}"
             
+            # Market Quote enrichment indicators
+            _qe = data.get('quote_enrichment', {})
+            if _qe:
+                _tags = []
+                _ce_dh = _qe.get('ce_at_day_high_count', 0)
+                _pe_dh = _qe.get('pe_at_day_high_count', 0)
+                if _pe_dh >= 3:
+                    _tags.append(f"PE@DH:{_pe_dh}")
+                if _ce_dh >= 3:
+                    _tags.append(f"CE@DH:{_ce_dh}")
+                _buy_q = _qe.get('atm_buy_qty', 0)
+                _sell_q = _qe.get('atm_sell_qty', 0)
+                if _buy_q > 0 and _sell_q > 0:
+                    _tags.append(f"B/S:{_buy_q}/{_sell_q}")
+                if _tags:
+                    gpt_line += f"|MQ:{'|'.join(_tags)}"
+            
+            # Participant identification (v4.1: writer vs buyer with recent-window)
+            _pid = data.get('oi_participant_id', 'UNKNOWN')
+            _pid_detail = data.get('oi_participant_detail', {})
+            if _pid != 'UNKNOWN':
+                _cw = _pid_detail.get('ce_writer_oi', 0)
+                _cb = _pid_detail.get('ce_buyer_oi', 0)
+                _pw = _pid_detail.get('pe_writer_oi', 0)
+                _pb = _pid_detail.get('pe_buyer_oi', 0)
+                _rw = _pid_detail.get('recent_window_used', 0)
+                _df = _pid_detail.get('daily_fallback_used', 0)
+                _src_tag = f"R{_rw}" if _rw > 0 else f"D{_df}"
+                gpt_line += f"|PID:{_pid}(CW:{_cw:,}/CB:{_cb:,}/PW:{_pw:,}/PB:{_pb:,}|{_src_tag})"
+            
             return {
                 'flow_bias': bias,
                 'flow_confidence': round(confidence, 3),
@@ -993,6 +1783,8 @@ class DhanOIFetcher:
                 'nse_oi_buildup': buildup,
                 'nse_oi_buildup_strength': strength,
                 'nse_enriched': True,
+                'oi_participant_id': _pid,
+                'oi_participant_detail': _pid_detail,
             }
             
         except Exception:

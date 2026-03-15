@@ -14,7 +14,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, asdict
 from enum import Enum
 from state_db import get_state_db
@@ -95,7 +95,7 @@ class PositionReconciliation:
         
         # Callback for manual/Kite-app exits detected via reconciliation
         # Signature: callback(symbol, local_position_dict, reason_str)
-        self.on_manual_exit_callback = None
+        self.on_manual_exit_callback: Optional[Callable[[str, Dict[str, Any], str], None]] = None
         
         # Load any saved state
         self._load_state()

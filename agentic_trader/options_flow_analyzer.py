@@ -51,7 +51,7 @@ class OptionsFlowAnalyzer:
     """
     
     _CACHE: Dict[str, tuple] = {}
-    _CACHE_TTL = 120  # 2 minutes
+    _CACHE_TTL = 90  # 90 seconds (sync with DhanHQ/NSE fetcher TTL)
     
     def __init__(self, chain_fetcher=None):
         """
@@ -228,6 +228,9 @@ class OptionsFlowAnalyzer:
         FAIL-SAFE: Returns result unchanged on any error.
         DhanHQ adds: OI change, buildup signal, full Greeks, bid/ask.
         Takes priority over NSE (richer data, more reliable).
+        
+        Cross-source validation: when Kite PCR and DhanHQ buildup AGREE,
+        boost confidence. When they disagree, flag it.
         """
         try:
             if not self._dhan_ready or not self._dhan_fetcher:
@@ -249,28 +252,62 @@ class OptionsFlowAnalyzer:
             result['nse_enriched'] = True
             result['oi_source'] = 'DHAN'
             
+            # Pass through full strikes data + spot for OI heatmap strike picker
+            result['dhan_strikes'] = dhan_data.get('strikes', [])
+            result['dhan_spot_price'] = dhan_data.get('spot_price', 0)
+            
+            # Participant identification (v4: writer vs buyer)
+            result['oi_participant_id'] = dhan_data.get('oi_participant_id', 'UNKNOWN')
+            result['oi_participant_detail'] = dhan_data.get('oi_participant_detail', {})
+            
             # DhanHQ exclusive: ATM Greeks
             atm_g = dhan_data.get('atm_greeks', {})
             if atm_g:
                 result['atm_greeks'] = atm_g
             
-            # Upgrade bias if DhanHQ buildup is strong and Kite was NEUTRAL
             buildup = dhan_data.get('oi_buildup_signal', 'NEUTRAL')
             strength = dhan_data.get('oi_buildup_strength', 0.0)
             
-            if result['flow_bias'] == 'NEUTRAL' and buildup != 'NEUTRAL' and strength >= 0.4:
-                if buildup in ('LONG_BUILDUP', 'SHORT_COVERING'):
+            # ── Cross-source validation: Kite PCR vs DhanHQ buildup ──
+            _kite_bias = result.get('flow_bias', 'NEUTRAL')
+            _dhan_bullish = buildup in ('LONG_BUILDUP', 'SHORT_COVERING')
+            _dhan_bearish = buildup in ('SHORT_BUILDUP', 'LONG_UNWINDING')
+            _sources_agree = (
+                (_kite_bias == 'BULLISH' and _dhan_bullish) or
+                (_kite_bias == 'BEARISH' and _dhan_bearish)
+            )
+            _sources_conflict = (
+                (_kite_bias == 'BULLISH' and _dhan_bearish) or
+                (_kite_bias == 'BEARISH' and _dhan_bullish)
+            )
+            
+            if _sources_agree and buildup != 'NEUTRAL':
+                # Both sources agree → high confidence, boost strength
+                result['flow_confidence'] = min(0.90, result['flow_confidence'] + 0.15)
+                result['nse_oi_buildup_strength'] = min(1.0, strength + 0.10)
+                result['oi_cross_validated'] = True
+            elif _sources_conflict:
+                # Sources disagree → lower confidence, flag conflict
+                result['flow_confidence'] = max(0.3, result['flow_confidence'] - 0.10)
+                result['nse_oi_buildup_strength'] = max(0.1, strength - 0.10)
+                result['oi_cross_validated'] = False
+            
+            # Upgrade bias if DhanHQ buildup is directional and Kite was NEUTRAL
+            # Threshold lowered to 0.3 (v2 enhanced signals are higher quality)
+            if _kite_bias == 'NEUTRAL' and buildup != 'NEUTRAL' and strength >= 0.3:
+                if _dhan_bullish:
                     result['flow_bias'] = 'BULLISH'
-                    result['flow_confidence'] = max(result['flow_confidence'], 0.55 + strength * 0.15)
+                    result['flow_confidence'] = max(result['flow_confidence'], 0.50 + strength * 0.20)
                     result['flow_score_boost'] = max(result['flow_score_boost'], min(3, int(strength * 4)))
-                elif buildup in ('SHORT_BUILDUP', 'LONG_UNWINDING'):
+                elif _dhan_bearish:
                     result['flow_bias'] = 'BEARISH'
-                    result['flow_confidence'] = max(result['flow_confidence'], 0.55 + strength * 0.15)
+                    result['flow_confidence'] = max(result['flow_confidence'], 0.50 + strength * 0.20)
                     result['flow_score_boost'] = min(result['flow_score_boost'], max(-3, -int(strength * 4)))
             
             # Upgrade GPT line with DhanHQ data
             if buildup != 'NEUTRAL':
-                result['flow_gpt_line'] += f"|Dhan:{buildup}({strength:.0%})"
+                _xv = '✓' if result.get('oi_cross_validated') else ('✗' if _sources_conflict else '')
+                result['flow_gpt_line'] += f"|Dhan:{buildup}({strength:.0%}){_xv}"
             
             ce_chg = dhan_data.get('total_call_oi_change', 0)
             pe_chg = dhan_data.get('total_put_oi_change', 0)
@@ -316,14 +353,14 @@ class OptionsFlowAnalyzer:
             buildup = nse_data.get('oi_buildup_signal', 'NEUTRAL')
             strength = nse_data.get('oi_buildup_strength', 0.0)
             
-            if result['flow_bias'] == 'NEUTRAL' and buildup != 'NEUTRAL' and strength >= 0.4:
+            if result['flow_bias'] == 'NEUTRAL' and buildup != 'NEUTRAL' and strength >= 0.3:
                 if buildup in ('LONG_BUILDUP', 'SHORT_COVERING'):
                     result['flow_bias'] = 'BULLISH'
-                    result['flow_confidence'] = max(result['flow_confidence'], 0.55 + strength * 0.15)
+                    result['flow_confidence'] = max(result['flow_confidence'], 0.50 + strength * 0.20)
                     result['flow_score_boost'] = max(result['flow_score_boost'], min(3, int(strength * 4)))
                 elif buildup in ('SHORT_BUILDUP', 'LONG_UNWINDING'):
                     result['flow_bias'] = 'BEARISH'
-                    result['flow_confidence'] = max(result['flow_confidence'], 0.55 + strength * 0.15)
+                    result['flow_confidence'] = max(result['flow_confidence'], 0.50 + strength * 0.20)
                     result['flow_score_boost'] = min(result['flow_score_boost'], max(-3, -int(strength * 4)))
             
             # Upgrade GPT line with NSE buildup info

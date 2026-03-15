@@ -299,7 +299,7 @@ class TitanStateDB:
                 c.execute("ROLLBACK")
                 raise
 
-    def load_active_trades(self, date_str: str = None) -> Tuple[list, float, float]:
+    def load_active_trades(self, date_str: str | None = None) -> Tuple[list, float, float]:
         """Load active trades for today (or given date).
 
         Returns: (positions_list, realized_pnl, paper_capital)
@@ -350,7 +350,7 @@ class TitanStateDB:
                 c.execute("ROLLBACK")
                 raise
 
-    def load_live_pnl(self, date_str: str = None) -> dict:
+    def load_live_pnl(self, date_str: str | None = None) -> dict:
         """Load live P&L snapshots. Returns {symbol: {ltp, unrealized_pnl}, '_total': float}."""
         d = date_str or self._today()
         with self._lock:
@@ -423,7 +423,7 @@ class TitanStateDB:
             )
             self._conn.commit()
 
-    def load_exit_states(self, date_str: str = None) -> Dict[str, dict]:
+    def load_exit_states(self, date_str: str | None = None) -> Dict[str, dict]:
         """Load exit states for today. Returns {symbol: state_dict}."""
         d = date_str or self._today()
         with self._lock:
@@ -451,7 +451,7 @@ class TitanStateDB:
             )
             self._conn.commit()
 
-    def load_risk_state(self, date_str: str = None) -> Optional[dict]:
+    def load_risk_state(self, date_str: str | None = None) -> Optional[dict]:
         """Load risk state for today. Returns dict or None."""
         d = date_str or self._today()
         with self._lock:
@@ -488,7 +488,7 @@ class TitanStateDB:
             ).fetchone()
         return row is not None
 
-    def load_order_records(self, date_str: str = None) -> Tuple[Set[str], Dict[str, dict]]:
+    def load_order_records(self, date_str: str | None = None) -> Tuple[Set[str], Dict[str, dict]]:
         """Load all order records for today.
 
         Returns: (placed_order_ids_set, {order_id: record_dict})
@@ -506,7 +506,7 @@ class TitanStateDB:
             records[oid] = json.loads(r['record_json'])
         return ids, records
 
-    def clear_orders_for_day(self, date_str: str = None):
+    def clear_orders_for_day(self, date_str: str | None = None):
         """Clear all order records for a date (new-day reset)."""
         d = date_str or self._today()
         with self._lock:
@@ -539,7 +539,7 @@ class TitanStateDB:
             )
             self._conn.commit()
 
-    def load_data_health(self, date_str: str = None) -> Optional[dict]:
+    def load_data_health(self, date_str: str | None = None) -> Optional[dict]:
         """Load data health for today. Returns dict with keys or None."""
         d = date_str or self._today()
         with self._lock:
@@ -597,7 +597,7 @@ class TitanStateDB:
             )
             self._conn.commit()
 
-    def load_reconciliation_state(self, date_str: str = None) -> Optional[dict]:
+    def load_reconciliation_state(self, date_str: str | None = None) -> Optional[dict]:
         """Load reconciliation state for today."""
         d = date_str or self._today()
         with self._lock:
@@ -625,7 +625,7 @@ class TitanStateDB:
             )
             self._conn.commit()
 
-    def load_orb_trades(self, date_str: str = None) -> Optional[dict]:
+    def load_orb_trades(self, date_str: str | None = None) -> Optional[dict]:
         """Load ORB trade state for today. Returns trades dict or None."""
         d = date_str or self._today()
         with self._lock:
@@ -648,7 +648,7 @@ class TitanStateDB:
             )
             self._conn.commit()
 
-    def get_scan_decisions(self, date_str: str = None, symbol: str = None,
+    def get_scan_decisions(self, date_str: str | None = None, symbol: str | None = None,
                            limit: int = 5000) -> list:
         """Query scan decisions for today (optionally filtered by symbol)."""
         d = date_str or self._today()
@@ -669,7 +669,7 @@ class TitanStateDB:
     #  MIGRATION — JSON → SQLite (one-time import)
     # ==================================================================
 
-    def migrate_from_json(self, base_dir: str = None):
+    def migrate_from_json(self, base_dir: str | None = None):
         """
         Import all existing JSON state files into SQLite.
 
@@ -805,7 +805,7 @@ class TitanStateDB:
     #  UTILITIES
     # ==================================================================
 
-    def get_daily_realized_pnl(self, date_str: str = None) -> float:
+    def get_daily_realized_pnl(self, date_str: str | None = None) -> float:
         """Quick lookup of today's realized P&L."""
         d = date_str or self._today()
         with self._lock:
@@ -941,9 +941,9 @@ class TitanStateDB:
             self._conn.commit()
             return True
 
-    def query_trades(self, date_str: str = None, source: str = None,
-                     underlying: str = None, status: str = None,
-                     direction: str = None, limit: int = 500) -> list:
+    def query_trades(self, date_str: str | None = None, source: str | None = None,
+                     underlying: str | None = None, status: str | None = None,
+                     direction: str | None = None, limit: int = 500) -> list:
         """Query trades with optional filters. Returns list of dicts."""
         d = date_str or self._today()
         conditions = ["date = ?"]
@@ -972,7 +972,7 @@ class TitanStateDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def daily_pnl_summary(self, date_str: str = None) -> dict:
+    def daily_pnl_summary(self, date_str: str | None = None) -> dict:
         """Get daily P&L summary from trades table."""
         d = date_str or self._today()
         with self._lock:
@@ -997,7 +997,7 @@ class TitanStateDB:
 
         return dict(row)
 
-    def pnl_by_source(self, date_str: str = None) -> list:
+    def pnl_by_source(self, date_str: str | None = None) -> list:
         """P&L breakdown by strategy source."""
         d = date_str or self._today()
         with self._lock:
@@ -1012,7 +1012,7 @@ class TitanStateDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def pnl_by_exit_type(self, date_str: str = None) -> list:
+    def pnl_by_exit_type(self, date_str: str | None = None) -> list:
         """P&L breakdown by exit type."""
         d = date_str or self._today()
         with self._lock:

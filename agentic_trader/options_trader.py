@@ -294,10 +294,11 @@ class IntradayOptionScorer:
         self.fill_history: Dict[str, List[Dict]] = {}  # symbol -> list of fill records
     
     def score_intraday_signal(self, signal: IntradaySignal, 
-                              market_data: Dict = None,
-                              option_data: OptionMicrostructure = None,
-                              caller_direction: str = None,
-                              source: str = 'scanner') -> IntradayOptionDecision:
+                              market_data: Dict | None = None,
+                              option_data: OptionMicrostructure | None = None,
+                              caller_direction: str | None = None,
+                              source: str = 'scanner',
+                              trigger_type: str = '') -> IntradayOptionDecision:
         """
         Score intraday signals and recommend option parameters
         
@@ -558,7 +559,13 @@ class IntradayOptionScorer:
             # Fix 5: VWAP GRIND DETECTION — catch slow downtrends that never break ORB
             # HINDALCO-type: INSIDE_ORB but price grinding below VWAP with HIGH+ volume
             # These stocks are in a clear trend but the ORB range was too wide to break
+            #
+            # SLOW_GRIND FIX: When watcher detected a sustained slow grind (1% over 5min),
+            # relax the volume gate (NORMAL is fine — watcher already confirmed persistence)
+            # and lower the move threshold (grind is from VWAP, not necessarily from open).
+            # Symmetric for both UP and DOWN.
             vwap_grind_points = 0
+            _is_slow_grind = trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN')
             if market_data:
                 _grind_vwap_slope = signal.vwap_slope if hasattr(signal, 'vwap_slope') else market_data.get('vwap_slope', 'FLAT')
                 _grind_vol = signal.volume_regime if hasattr(signal, 'volume_regime') else market_data.get('volume_regime', 'NORMAL')
@@ -568,33 +575,182 @@ class IntradayOptionScorer:
                 _grind_open = market_data.get('open', _grind_ltp)
                 _grind_move_pct = abs((_grind_ltp - _grind_open) / _grind_open * 100) if _grind_open > 0 else 0
                 
-                # Bearish VWAP grind: below VWAP, high+ volume, stock actually moved down
+                # Slow grind relaxation: watcher already confirmed sustained directional move
+                _grind_vol_ok = _grind_vol in ('HIGH', 'EXPLOSIVE') or (_is_slow_grind and _grind_vol == 'NORMAL')
+                _grind_move_min = 0.4 if _is_slow_grind else 0.8
+                
+                # Bearish VWAP grind: below VWAP, vol confirmed, stock actually moved down
                 if (_grind_ltp < _grind_vwap and _grind_ltp < _grind_open 
-                    and _grind_vol in ('HIGH', 'EXPLOSIVE') and _grind_move_pct >= 0.8):
+                    and _grind_vol_ok and _grind_move_pct >= _grind_move_min):
                     vwap_grind_points = 8
                     if _grind_adx >= 25:
                         vwap_grind_points += 2  # ADX confirms trend
+                    if _is_slow_grind:
+                        vwap_grind_points += 2  # Watcher-confirmed persistence bonus
                     score += vwap_grind_points
                     bearish_points += vwap_grind_points
                     if direction == "HOLD":
                         direction = "SELL"
-                    reasons.append(f"📉 VWAP GRIND DOWN: Below VWAP, {_grind_vol} vol, {_grind_move_pct:.1f}% down (+{vwap_grind_points})")
-                # Bullish VWAP grind: above VWAP, high+ volume, stock moved up
+                    _grind_label = "SLOW " if _is_slow_grind else ""
+                    reasons.append(f"📉 {_grind_label}VWAP GRIND DOWN: Below VWAP, {_grind_vol} vol, {_grind_move_pct:.1f}% down (+{vwap_grind_points})")
+                # Bullish VWAP grind: above VWAP, vol confirmed, stock moved up
                 elif (_grind_ltp > _grind_vwap and _grind_ltp > _grind_open
-                      and _grind_vol in ('HIGH', 'EXPLOSIVE') and _grind_move_pct >= 0.8):
+                      and _grind_vol_ok and _grind_move_pct >= _grind_move_min):
                     vwap_grind_points = 8
                     if _grind_adx >= 25:
                         vwap_grind_points += 2
+                    if _is_slow_grind:
+                        vwap_grind_points += 2  # Watcher-confirmed persistence bonus
                     score += vwap_grind_points
                     bullish_points += vwap_grind_points
                     if direction == "HOLD":
                         direction = "BUY"
-                    reasons.append(f"📈 VWAP GRIND UP: Above VWAP, {_grind_vol} vol, {_grind_move_pct:.1f}% up (+{vwap_grind_points})")
+                    _grind_label = "SLOW " if _is_slow_grind else ""
+                    reasons.append(f"📈 {_grind_label}VWAP GRIND UP: Above VWAP, {_grind_vol} vol, {_grind_move_pct:.1f}% up (+{vwap_grind_points})")
                 else:
                     reasons.append("⏳ Inside ORB range (wait for breakout)")
             else:
                 reasons.append("⏳ Inside ORB range (wait for breakout)")
+            
+            # === SLOW GRIND CONVICTION BONUS (symmetric for UP and DOWN) ===
+            # The watcher detected a sustained, monotonic price grind.
+            # Award bonus points for confirming indicators:
+            # - VWAP slope alignment (the grind is pulling VWAP with it)
+            # - Macro trend alignment (market is moving the same way)
+            # - ADX strength (trend is measurable)
+            # - Monotonicity (price isn't oscillating, it's grinding)
+            # This closes the ~15-20 point gap vs ORB breakouts.
+            if _is_slow_grind and market_data:
+                _sg_bonus = 0
+                _sg_reasons = []
+                _sg_dir = 'BUY' if trigger_type == 'SLOW_GRIND_UP' else 'SELL'
+                _sg_macro = market_data.get('macro_alignment', 'NEUTRAL')
+                _sg_mono = market_data.get('macro_monotonicity', 0)
+                _sg_adx = market_data.get('adx', 0)
+                _sg_vwap_slope = signal.vwap_trend
+                _sg_vwap_pos = signal.vwap_position
+                
+                # 1. VWAP slope alignment: grind pulling VWAP in same direction (+4)
+                _sg_vwap_aligned = (
+                    (_sg_dir == 'BUY' and _sg_vwap_slope == 'RISING' and _sg_vwap_pos == 'ABOVE_VWAP')
+                    or (_sg_dir == 'SELL' and _sg_vwap_slope == 'FALLING' and _sg_vwap_pos == 'BELOW_VWAP')
+                )
+                if _sg_vwap_aligned:
+                    _sg_bonus += 4
+                    _sg_reasons.append(f"VWAP={_sg_vwap_slope}+{_sg_vwap_pos}")
+                
+                # 2. Macro trend alignment: market moving same way (+4)
+                _sg_macro_aligned = (
+                    (_sg_dir == 'BUY' and _sg_macro == 'BULLISH')
+                    or (_sg_dir == 'SELL' and _sg_macro == 'BEARISH')
+                )
+                if _sg_macro_aligned:
+                    _sg_bonus += 4
+                    _sg_reasons.append(f"macro={_sg_macro}")
+                
+                # 3. ADX strength: measurable trend (+2 to +3)
+                if _sg_adx >= 30:
+                    _sg_bonus += 3
+                    _sg_reasons.append(f"ADX={_sg_adx:.0f}")
+                elif _sg_adx >= 22:
+                    _sg_bonus += 2
+                    _sg_reasons.append(f"ADX={_sg_adx:.0f}")
+                
+                # 4. Monotonicity: price consistently moving one way (+3)
+                if _sg_mono >= 0.7:
+                    _sg_bonus += 3
+                    _sg_reasons.append(f"mono={_sg_mono:.2f}")
+                elif _sg_mono >= 0.5:
+                    _sg_bonus += 2
+                    _sg_reasons.append(f"mono={_sg_mono:.2f}")
+                
+                if _sg_bonus > 0:
+                    score += _sg_bonus
+                    if _sg_dir == 'BUY':
+                        bullish_points += _sg_bonus
+                        if direction == 'HOLD':
+                            direction = 'BUY'
+                    else:
+                        bearish_points += _sg_bonus
+                        if direction == 'HOLD':
+                            direction = 'SELL'
+                    reasons.append(f"🐌 SLOW GRIND {_sg_dir}: +{_sg_bonus} [{', '.join(_sg_reasons)}]")
         
+            # === VOLUME SURGE CONVICTION BONUS (up to +16) ===
+            # Volume surges don't exhibit ORB breakout characteristics (follow-through,
+            # range expansion, ORB hold) — the scorer structurally under-scores them.
+            # This bonus compensates by evaluating volume-specific signals:
+            # surge intensity, volume regime confirmation, directional alignment.
+            _is_volume_surge = trigger_type == 'VOLUME_SURGE'
+            if _is_volume_surge and market_data:
+                _vs_bonus = 0
+                _vs_reasons = []
+                # Infer direction from move_pct via macro alignment
+                _vs_macro = market_data.get('macro_alignment', 'NEUTRAL')
+                _vs_macro_move = market_data.get('macro_net_move_pct', 0)
+                _vs_dir = 'BUY' if _vs_macro_move >= 0 else 'SELL'
+                _vs_vol_regime = signal.volume_regime
+                _vs_recent_rate = market_data.get('recent_vol_rate', 1.0)
+                _vs_adx = market_data.get('adx', 0)
+                _vs_vwap_slope = signal.vwap_trend
+                _vs_vwap_pos = signal.vwap_position
+                _vs_surge_ratio = market_data.get('surge_ratio', 0)  # from trigger metadata
+                _vs_depth_imb = abs(market_data.get('depth_imbalance', 0))
+                
+                # 1. Volume regime confirmation (+3 to +5)
+                #    VOLUME_SURGE detection fires on tick-level data; REST candle data confirms
+                if _vs_vol_regime == 'EXPLOSIVE':
+                    _vs_bonus += 5
+                    _vs_reasons.append('EXPLOSIVE_VOL')
+                elif _vs_vol_regime == 'HIGH':
+                    _vs_bonus += 3
+                    _vs_reasons.append('HIGH_VOL')
+                elif _vs_vol_regime == 'NORMAL' and _vs_recent_rate >= 1.5:
+                    _vs_bonus += 2  # Volume accelerating RIGHT NOW even if daily avg looks normal
+                    _vs_reasons.append(f'vol_accel={_vs_recent_rate:.1f}x')
+                
+                # 2. Recent volume rate — is it intense NOW? (+2 to +3)
+                if _vs_recent_rate >= 2.5:
+                    _vs_bonus += 3
+                    _vs_reasons.append(f'rate={_vs_recent_rate:.1f}x')
+                elif _vs_recent_rate >= 1.8:
+                    _vs_bonus += 2
+                    _vs_reasons.append(f'rate={_vs_recent_rate:.1f}x')
+                
+                # 3. VWAP + price alignment (+3)
+                _vs_vwap_aligned = (
+                    (_vs_dir == 'BUY' and _vs_vwap_slope == 'RISING' and _vs_vwap_pos == 'ABOVE_VWAP')
+                    or (_vs_dir == 'SELL' and _vs_vwap_slope == 'FALLING' and _vs_vwap_pos == 'BELOW_VWAP')
+                )
+                if _vs_vwap_aligned:
+                    _vs_bonus += 3
+                    _vs_reasons.append('VWAP_aligned')
+                
+                # 4. ADX trend strength (+2)
+                if _vs_adx >= 25:
+                    _vs_bonus += 2
+                    _vs_reasons.append(f'ADX={_vs_adx:.0f}')
+                
+                # 5. Depth imbalance — order book skew confirms institutional intent (+3)
+                if _vs_depth_imb >= 0.4:
+                    _vs_bonus += 3
+                    _vs_reasons.append(f'depth={_vs_depth_imb:.2f}')
+                elif _vs_depth_imb >= 0.25:
+                    _vs_bonus += 1
+                    _vs_reasons.append(f'depth={_vs_depth_imb:.2f}')
+                
+                if _vs_bonus > 0:
+                    score += _vs_bonus
+                    if _vs_dir == 'BUY':
+                        bullish_points += _vs_bonus
+                        if direction == 'HOLD':
+                            direction = 'BUY'
+                    else:
+                        bearish_points += _vs_bonus
+                        if direction == 'HOLD':
+                            direction = 'SELL'
+                    reasons.append(f"📊 VOLUME SURGE {_vs_dir}: +{_vs_bonus} [{', '.join(_vs_reasons)}]")
+
         _audit_after_orb = score
         
         # === 3. VOLUME REGIME (7-15 points, CAPPED if window overlap) ===
@@ -3171,7 +3327,7 @@ class OptionChainFetcher:
         symbol = self._nfo_symbol(underlying)
         return FNO_LOT_SIZES.get(symbol, 1)
     
-    def fetch_option_chain(self, underlying: str, expiry: datetime = None) -> Optional[OptionChain]:
+    def fetch_option_chain(self, underlying: str, expiry: datetime | date | None = None) -> Optional[OptionChain]:
         """
         Fetch complete option chain for an underlying
         
@@ -3797,10 +3953,10 @@ class OptionsTrader:
         return ('PASS', 1.0)
 
     def create_option_order_with_intraday(self, underlying: str, direction: str,
-                                          market_data: Dict = None,
-                                          force_strike: StrikeSelection = None,
-                                          force_expiry: ExpirySelection = None,
-                                          cached_decision: dict = None) -> Optional[Tuple[OptionOrderPlan, IntradayOptionDecision]]:
+                                          market_data: Dict | None = None,
+                                          force_strike: StrikeSelection | None = None,
+                                          force_expiry: ExpirySelection | None = None,
+                                          cached_decision: dict | None = None) -> Optional[Tuple[OptionOrderPlan, IntradayOptionDecision]]:
         """
         Create option order using INTRADAY SIGNALS as HIGHEST PRECEDENCE
         
@@ -4164,11 +4320,11 @@ class OptionsTrader:
             return None
     
     def create_option_order(self, underlying: str, direction: str,
-                           option_type: OptionType = None,
-                           strike_selection: StrikeSelection = None,
-                           expiry_selection: ExpirySelection = None,
-                           market_data: Dict = None,
-                           cached_decision: dict = None,
+                           option_type: OptionType | None = None,
+                           strike_selection: StrikeSelection | None = None,
+                           expiry_selection: ExpirySelection | None = None,
+                           market_data: Dict | None = None,
+                           cached_decision: dict | None = None,
                            setup_type: str = "") -> Optional[OptionOrderPlan]:
         """
         Create an option order plan based on underlying signal
@@ -4271,9 +4427,9 @@ class OptionsTrader:
     # ================================================================
     
     def create_credit_spread(self, underlying: str, direction: str,
-                             market_data: Dict = None,
-                             spread_width_strikes: int = None,
-                             cached_decision: dict = None) -> Optional[CreditSpreadPlan]:
+                             market_data: Dict | None = None,
+                             spread_width_strikes: int | None = None,
+                             cached_decision: dict | None = None) -> Optional[CreditSpreadPlan]:
         """
         Create a credit spread order plan.
         
@@ -5578,9 +5734,9 @@ class OptionsTrader:
     # =================================================================
 
     def create_debit_spread(self, underlying: str, direction: str,
-                            market_data: Dict = None,
-                            spread_width_strikes: int = None,
-                            cached_decision: dict = None) -> Optional[DebitSpreadPlan]:
+                            market_data: Dict | None = None,
+                            spread_width_strikes: int | None = None,
+                            cached_decision: dict | None = None) -> Optional[DebitSpreadPlan]:
         """
         Create an intraday debit spread on a big mover.
         

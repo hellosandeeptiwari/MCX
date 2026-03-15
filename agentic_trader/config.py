@@ -265,6 +265,31 @@ BREAKOUT_WATCHER = {
         "oi_check_interval_seconds": 60,          # Fetch OI every 60s per symbol (not every 5s — too expensive)
         "oi_reversal_immediate_exit": True,        # If OI reverses, trigger exit without grace period
         "oi_reversal_min_hold_seconds": 90,        # Min hold before OI exit check (let trade develop)
+        # --- OI Confirmation Shield & Accelerator (smart exit adjustment for ALL WME trades) ---
+        # OI confirms trade → WIDEN thresholds (avoid premature exit on healthy pullback)
+        # OI opposes trade → TIGHTEN thresholds (exit faster when smart money reverses)
+        "oi_shield_enabled": True,                 # Enable OI-based threshold adjustment
+        "oi_shield_confirm_multiplier": 1.40,      # OI confirms direction → thresholds × 1.40 (40% more room)
+        "oi_shield_writer_confirm_bonus": 1.15,    # Writer-dominant confirming → extra 15% room on top
+        "oi_shield_oppose_multiplier": 0.70,       # OI opposes direction → thresholds × 0.70 (30% tighter)
+        "oi_shield_neutral_multiplier": 0.90,      # OI went neutral → slightly tighter (conviction fading)
+        "oi_shield_strength_collapse_mult": 0.80,  # OI strength < 50% of entry → 20% tighter
+        "oi_shield_strength_collapse_ratio": 0.50, # Threshold: current/entry strength ratio
+    },
+    # --- OI_WATCHER Exit Intelligence (thesis-based exit for pure OI trades) ---
+    # OI_WATCHER trades have NO model/score thesis — ONLY OI.
+    # When OI thesis breaks, exit immediately. No grace period, no V-shape filter.
+    "oi_watcher_exit": {
+        "enabled": True,
+        "min_hold_seconds": 60,                    # Shorter than regular WME (pure OI = fast thesis check)
+        "oi_check_interval_seconds": 45,            # More frequent OI checks (45s vs 60s for regular)
+        "direction_flip_exit": True,                # Exit if OI direction flips (LONG_BUILDUP → SHORT_BUILDUP)
+        "strength_collapse_exit": True,             # Exit if OI strength drops significantly
+        "strength_collapse_ratio": 0.40,            # Exit if strength < 40% of entry strength
+        "strength_collapse_only_losing": True,      # Only exit on strength collapse if position is losing
+        "participant_flip_exit": True,              # Exit if WRITER_DOMINANT → BUYER_DOMINANT
+        "signal_neutral_exit": True,                # Exit if OI signal becomes NEUTRAL (buildup dissolved)
+        "skip_if_trailing_active": False,           # Don't skip — OI thesis break overrides trailing
     },
 }
 

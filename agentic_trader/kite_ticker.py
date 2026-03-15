@@ -838,6 +838,18 @@ class BreakoutWatcher:
         self._LOG_SUSTAIN_MAX = 5  # show first N per window
         self._LOG_WINDOW_SECS = 300  # 5 min window
         
+        # OI Forward-Looking Confirmation — async prefetch during sustain
+        # When a trigger enters sustain pending, we launch a bg thread to fetch
+        # OI data.  By the time sustain completes (15-60s), the OI result is ready.
+        # OI confirmation adjusts sustain thresholds and enriches trigger metadata.
+        self._oi_analyzer_ref = None    # Set via attach_oi_analyzer()
+        self._oi_prefetch_results: Dict[str, dict] = {}  # sym → {result, ts, direction, signal, strength}
+        self._oi_prefetch_lock = threading.Lock()
+        # Config: how much OI confirmation / contradiction adjusts the sustain bar
+        self._oi_confirm_sustain_ease = config.get('oi_confirm_sustain_ease_pct', 0.15)   # lower recheck by 0.15% when OI confirms
+        self._oi_contradict_sustain_tighten = config.get('oi_contradict_sustain_tighten_pct', 0.20)  # raise recheck by 0.20% when OI contradicts
+        self._oi_min_strength_for_confirm = config.get('oi_min_strength_for_confirm', 0.35)  # minimum OI strength to count as confirmation
+
         # State persistence — survive mid-session restarts
         self._state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'watcher_state.json')
         self._last_save_ts = 0.0
@@ -848,6 +860,88 @@ class BreakoutWatcher:
         # Try to restore state from a previous session (same trading day)
         self._try_load_state()
     
+    # === OI FORWARD-LOOKING CONFIRMATION ===
+
+    def attach_oi_analyzer(self, oi_analyzer):
+        """Provide the OptionsFlowAnalyzer reference for OI confirmation.
+        Called from autonomous_trader after both ticker and OI analyzer are ready."""
+        self._oi_analyzer_ref = oi_analyzer
+        print(f"   🔬 Watcher: OI analyzer attached — sustain OI confirmation ACTIVE")
+
+    def _launch_oi_prefetch(self, symbol: str, move_direction: str):
+        """Launch a background thread to fetch OI data for a symbol entering sustain.
+        
+        Non-blocking: the OI fetch runs on a daemon thread, result is stored
+        in _oi_prefetch_results for the sustain check to read when ready.
+        
+        Args:
+            symbol: "NSE:SYMBOL" format
+            move_direction: 'UP' or 'DOWN' (price move direction)
+        """
+        if not self._oi_analyzer_ref:
+            return
+        # Don't re-fetch if we already have a recent result (< 30s old)
+        with self._oi_prefetch_lock:
+            existing = self._oi_prefetch_results.get(symbol)
+            if existing and (time.time() - existing.get('ts', 0)) < 30:
+                return
+
+        def _fetch_oi():
+            try:
+                result = self._oi_analyzer_ref.analyze(symbol)
+                if not result:
+                    return
+                sig = result.get('nse_oi_buildup', 'NEUTRAL')
+                strength = result.get('nse_oi_buildup_strength', 0.0)
+                bias = result.get('flow_bias', 'NEUTRAL')
+                # Determine if OI supports the price move direction
+                _oi_bullish = sig in ('LONG_BUILDUP', 'SHORT_COVERING')
+                _oi_bearish = sig in ('SHORT_BUILDUP', 'LONG_UNWINDING')
+                if move_direction == 'UP':
+                    confirms = _oi_bullish
+                    contradicts = _oi_bearish
+                else:
+                    confirms = _oi_bearish
+                    contradicts = _oi_bullish
+                with self._oi_prefetch_lock:
+                    self._oi_prefetch_results[symbol] = {
+                        'result': result,
+                        'ts': time.time(),
+                        'signal': sig,
+                        'strength': strength,
+                        'bias': bias,
+                        'confirms': confirms,
+                        'contradicts': contradicts,
+                        'move_direction': move_direction,
+                        'participant': result.get('oi_participant_id', ''),
+                    }
+            except Exception:
+                pass  # Fail silently — OI confirmation is optional
+
+        t = threading.Thread(target=_fetch_oi, daemon=True, name=f"oi-prefetch-{symbol[-8:]}")
+        t.start()
+
+    def _get_oi_confirmation(self, symbol: str) -> Optional[dict]:
+        """Get pre-fetched OI confirmation result for a symbol.
+        
+        Returns:
+            dict with {confirms, contradicts, signal, strength, bias, participant}
+            or None if not available / too old.
+        """
+        with self._oi_prefetch_lock:
+            result = self._oi_prefetch_results.get(symbol)
+            if not result:
+                return None
+            # Stale check: OI data older than 90s is not useful
+            if (time.time() - result.get('ts', 0)) > 90:
+                return None
+            return result
+
+    def _cleanup_oi_prefetch(self, symbol: str):
+        """Remove OI prefetch result after use (or on sustain failure)."""
+        with self._oi_prefetch_lock:
+            self._oi_prefetch_results.pop(symbol, None)
+
     # === STATE PERSISTENCE ===
     
     def save_state(self):
@@ -1180,31 +1274,73 @@ class BreakoutWatcher:
                 _retrace_max = self._config.get('sustain_retrace_max_pct', 50.0)
                 _retraced_pct = ((1 - move_pct / _peak_move) * 100) if _peak_move > 0 else 0
                 _retrace_fail = _peak_move > 0 and _retraced_pct > _retrace_max
+
+                # === OI FORWARD-LOOKING CONFIRMATION ===
+                # Check async OI prefetch result (launched when trigger entered sustain).
+                # OI buildup in the SAME direction as price move = forward confirmation
+                # that institutional money supports this move → ease the sustain bar.
+                # OI buildup AGAINST the price move = contradiction → tighten the bar.
+                _oi_confirm = self._get_oi_confirmation(symbol)
+                _oi_tag = ''
+                _oi_adjusted = False
+                if _oi_confirm and _oi_confirm.get('strength', 0) >= self._oi_min_strength_for_confirm:
+                    _oi_sig = _oi_confirm.get('signal', 'NEUTRAL')
+                    _oi_str = _oi_confirm.get('strength', 0)
+                    if _oi_confirm.get('confirms'):
+                        # OI confirms the price move — writers/buyers building in the
+                        # same direction.  This is forward-looking evidence that the
+                        # move will continue.  Ease the sustain recheck threshold.
+                        _recheck = max(0.1, _recheck - self._oi_confirm_sustain_ease)
+                        _oi_tag = f' OI✓{_oi_sig}({_oi_str:.2f})'
+                        _oi_adjusted = True
+                        pending['_oi_confirmed'] = True
+                        pending['_oi_signal'] = _oi_sig
+                        pending['_oi_strength'] = _oi_str
+                        pending['_oi_participant'] = _oi_confirm.get('participant', '')
+                    elif _oi_confirm.get('contradicts'):
+                        # OI contradicts the price move — institutional money is
+                        # positioned against this direction.  Raise the bar.
+                        _recheck = _recheck + self._oi_contradict_sustain_tighten
+                        _oi_tag = f' OI✗{_oi_sig}({_oi_str:.2f})'
+                        _oi_adjusted = True
+                        pending['_oi_contradicted'] = True
+                        pending['_oi_signal'] = _oi_sig
+                        pending['_oi_strength'] = _oi_str
+                elif _oi_confirm:
+                    # OI data available but strength too low to matter
+                    _oi_tag = f' OI~{_oi_confirm.get("signal", "?")}(weak)'
+
                 if move_pct >= _recheck and not _retrace_fail:
                     # SUSTAINED — push to queue
                     # Record the sustained move and peak for exhaustion analysis downstream
                     pending['_sustain_held_pct'] = move_pct
                     self._stats['sustain_passed'] += 1
+                    if _oi_adjusted and _oi_confirm and _oi_confirm.get('confirms'):
+                        self._stats['oi_confirm_sustain_passed'] = self._stats.get('oi_confirm_sustain_passed', 0) + 1
                     self._log_sustain_count += 1
                     if self._log_sustain_count <= self._LOG_SUSTAIN_MAX:
-                        print(f"   ✅ Watcher: {symbol} SUSTAINED {_ttype} ({move_pct:.1f}% held vs {_recheck}%, peak={_peak_move:.1f}%, retrace={_retraced_pct:.0f}%) — queuing")
+                        print(f"   ✅ Watcher: {symbol} SUSTAINED {_ttype} ({move_pct:.1f}% held vs {_recheck}%, peak={_peak_move:.1f}%, retrace={_retraced_pct:.0f}%{_oi_tag}) — queuing")
                     else:
                         self._log_sustain_suppressed.append(symbol.replace('NSE:', ''))
+                    self._cleanup_oi_prefetch(symbol)
                     self._fire_trigger(symbol, ltp, pending['trigger_type'], pending)
                 else:
                     # Failed sustain — retrace (batch-logged to reduce noise)
                     self._stats['sustain_failed'] += 1
+                    if _oi_adjusted and _oi_confirm and _oi_confirm.get('contradicts'):
+                        self._stats['oi_contradict_sustain_failed'] = self._stats.get('oi_contradict_sustain_failed', 0) + 1
                     _fail_reason = f'retrace {_retraced_pct:.0f}%>{_retrace_max:.0f}%' if _retrace_fail else f'{move_pct:.1f}%<{_recheck}%'
                     if 'VOLUME' not in _ttype:
                         _pf = self._stats.get('_price_sustain_fails', 0) + 1
                         self._stats['_price_sustain_fails'] = _pf
                         if _pf <= 3 or _pf % 25 == 0:
-                            print(f"   ❌ Watcher: {symbol} sustain FAILED {_ttype} ({_fail_reason}, peak={_peak_move:.1f}%) [#{_pf}]")
+                            print(f"   ❌ Watcher: {symbol} sustain FAILED {_ttype} ({_fail_reason}, peak={_peak_move:.1f}%{_oi_tag}) [#{_pf}]")
                     else:
                         _vf = self._stats.get('_vol_sustain_fails', 0) + 1
                         self._stats['_vol_sustain_fails'] = _vf
                         if _vf % 50 == 0:
-                            print(f"   📉 Watcher: {_vf} volume-surge sustain fails so far (latest: {symbol} {_fail_reason})")
+                            print(f"   📉 Watcher: {_vf} volume-surge sustain fails so far (latest: {symbol} {_fail_reason}{_oi_tag})")
+                    self._cleanup_oi_prefetch(symbol)
                 del self._pending[symbol]
             return  # While pending, don't check new triggers for this symbol
         
@@ -1348,6 +1484,11 @@ class BreakoutWatcher:
                 _trigger_meta['break_count'] = _day_ext_break_count
                 _trigger_meta['break_margin'] = _day_ext_break_margin
             self._pending[symbol] = _trigger_meta
+            # === OI FORWARD-LOOKING PREFETCH ===
+            # Launch async OI fetch NOW so it's ready by the time sustain completes.
+            # The 15-60s sustain window gives plenty of time for the OI HTTP call.
+            _move_dir = 'UP' if move_pct > 0 else 'DOWN'
+            self._launch_oi_prefetch(symbol, _move_dir)
     
     def _fire_trigger(self, symbol: str, ltp: float, trigger_type: str, pending: dict):
         """Push a confirmed trigger to the priority queue after passing gates.
@@ -1425,7 +1566,9 @@ class BreakoutWatcher:
                           'surge_ratio', 'depth_imbalance',
                           'spike_accel', 'spike_magnitude',
                           'break_count', 'break_margin',
-                          '_peak_move_pct', '_sustain_held_pct'):
+                          '_peak_move_pct', '_sustain_held_pct',
+                          '_oi_confirmed', '_oi_contradicted',
+                          '_oi_signal', '_oi_strength', '_oi_participant'):
             if _meta_key in pending:
                 trigger_data[_meta_key] = pending[_meta_key]
         
@@ -1434,6 +1577,10 @@ class BreakoutWatcher:
             trigger_data['post_restart'] = True
         
         priority = move_pct_abs
+        # OI confirmation boost: if OI confirms the move, give it priority uplift
+        # so OI-confirmed triggers are processed before unconfirmed ones.
+        if pending.get('_oi_confirmed') and pending.get('_oi_strength', 0) >= 0.50:
+            priority = priority * 1.25  # 25% priority boost for strong OI confirmation
         added, evicted = self._queue.put(trigger_data, priority)
         
         if added:
@@ -1489,6 +1636,8 @@ class BreakoutWatcher:
         self._recent_triggers.clear()
         self._queue.clear()
         self._post_restart = False
+        with self._oi_prefetch_lock:
+            self._oi_prefetch_results.clear()
         for k in self._stats:
             self._stats[k] = 0
         # Delete previous day's state file

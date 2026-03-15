@@ -64,7 +64,7 @@ for log_name in ["titan_bot.log", "titan-bot.log", "bot.log"]:
     if os.path.exists(log_path):
         print(f"\n=== RECENT WATCHER LOG LINES from {log_name} ===")
         import subprocess
-        result = subprocess.run(["grep", "-i", "watcher\|WME\|momentum.*exit\|GATE.*CHECK\|trigger.*bonus\|placed.*order\|ENTRY\|EXIT", log_path], capture_output=True, text=True)
+        result = subprocess.run(["grep", "-i", r"watcher\|WME\|momentum.*exit\|GATE.*CHECK\|trigger.*bonus\|placed.*order\|ENTRY\|EXIT", log_path], capture_output=True, text=True)
         lines = result.stdout.strip().split("\n")
         # Get only today's lines
         today_lines = [l for l in lines if TODAY in l]

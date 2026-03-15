@@ -969,6 +969,7 @@ def trade_summary():
             'stop_loss': p.get('stop_loss', 0),
             'target': p.get('target', 0),
             'setup': p.get('setup_type', p.get('strategy_type', '')),
+            'trigger_type': p.get('trigger_type', ''),
             'score': p.get('smart_score', p.get('entry_score', 0)),
             'hold_minutes': hold_mins,
             'entry_time': _entry_time_str,

@@ -177,7 +177,7 @@ class ZerodhaTools:
     TRADES_FILE = os.path.join(os.path.dirname(__file__), 'active_trades.json')
     # Trade logging is handled by centralized TradeLedger (trade_ledger.py)
     
-    def __init__(self, paper_mode: bool = True, paper_capital: float = None):
+    def __init__(self, paper_mode: bool = True, paper_capital: float | None = None):
         self.kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
         self.access_token = None
         self.start_of_day_equity = None
@@ -213,7 +213,7 @@ class ZerodhaTools:
                 print(f"   ⚠️ Broker margin fetch failed ({e}), using config capital: ₹{self.paper_capital:,.0f}")
         
         # === INITIALIZE KITE TICKER (WebSocket streaming) ===
-        self.ticker: TitanTicker = None
+        self.ticker: TitanTicker | None = None
         if self.access_token:
             try:
                 self.ticker = get_ticker(ZERODHA_API_KEY, self.access_token, self.kite)
@@ -744,7 +744,7 @@ class ZerodhaTools:
         except Exception as e:
             print(f"⚠️ TradeLedger entry log error: {e}")
 
-    def _save_to_history(self, trade: Dict, result: str, pnl: float, exit_detail: Dict = None):
+    def _save_to_history(self, trade: Dict, result: str, pnl: float, exit_detail: Dict | None = None):
         """Save completed trade to centralized Trade Ledger (single source of truth)"""
         try:
             from trade_ledger import get_trade_ledger
@@ -831,7 +831,7 @@ class ZerodhaTools:
                     return trade
         return None
     
-    def _execute_live_exit(self, trade: Dict, exit_qty: int = None):
+    def _execute_live_exit(self, trade: Dict, exit_qty: int | None = None):
         """Place real exit order(s) on Zerodha to close a live position.
         
         Handles single legs (options/equity) AND multi-leg spreads/condors.
@@ -915,7 +915,7 @@ class ZerodhaTools:
             except Exception:
                 pass
 
-    def _execute_live_spread_exit(self, trade: Dict, exit_qty: int = None):
+    def _execute_live_spread_exit(self, trade: Dict, exit_qty: int | None = None):
         """Close all legs of a credit spread or iron condor on Zerodha.
         
         Credit spread: BUY back sold option + SELL the hedge option.
@@ -990,7 +990,7 @@ class ZerodhaTools:
                 except Exception:
                     pass
 
-    def update_trade_status(self, symbol: str, status: str, exit_price: float = None, pnl: float = None, exit_detail: Dict = None):
+    def update_trade_status(self, symbol: str, status: str, exit_price: float | None = None, pnl: float | None = None, exit_detail: Dict | None = None):
         """Update trade status and move to history if closed.
         
         In LIVE mode, also places a real SELL order on Zerodha to close the position
@@ -1500,7 +1500,7 @@ class ZerodhaTools:
         except Exception as e:
             return {"error": str(e), "can_trade": False, "reason": f"API Error: {e}"}
     
-    def get_volume_analysis(self, symbols: List[str]) -> Dict[str, Dict]:
+    def get_volume_analysis(self, symbols: List[str]) -> Dict:
         """
         Tool: Analyze intraday momentum using FUTURES OI (not delivery volume)
         
@@ -1888,7 +1888,7 @@ class ZerodhaTools:
         except Exception as e:
             return {"error": str(e)}
 
-    def get_market_data(self, symbols: List[str], force_fresh: bool = False) -> Dict[str, Dict]:
+    def get_market_data(self, symbols: List[str], force_fresh: bool = False) -> Dict:
         """
         Tool: Get market data for symbols
         Returns OHLCV + technical indicators
@@ -2234,12 +2234,13 @@ class ZerodhaTools:
             sma_20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else close.mean()
             sma_50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else close.mean()
             
-            # RSI
+            # RSI (guard div-by-zero when loss==0 i.e. only up-moves)
             delta = close.diff()
             gain = delta.where(delta > 0, 0).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss
-            rsi = (100 - (100 / (1 + rs))).iloc[-1] if len(close) >= 14 else 50
+            rs = gain / loss.where(loss > 0, 1e-10)  # epsilon prevents inf when all gains
+            rsi_series = 100 - (100 / (1 + rs))
+            rsi = float(rsi_series.iloc[-1]) if (len(close) >= 14 and not pd.isna(rsi_series.iloc[-1])) else 50.0
             
             # ATR
             tr1 = high - low
@@ -2258,11 +2259,14 @@ class ZerodhaTools:
                 atr_smooth = tr.rolling(14).mean()
                 plus_di = 100 * (plus_dm.rolling(14).mean() / atr_smooth)
                 minus_di = 100 * (minus_dm.rolling(14).mean() / atr_smooth)
-                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+                _di_sum = plus_di + minus_di
+                dx = 100 * abs(plus_di - minus_di) / _di_sum.where(_di_sum > 0, 1e-10)
                 dx = dx.replace([float('inf'), float('-inf')], 0).fillna(0)
                 adx_series = dx.rolling(14).mean()
                 if len(adx_series.dropna()) > 0:
-                    adx = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 20.0
+                    _adx_val = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else None
+                    # If DX was all zeros (no directional movement), indicate weak trend
+                    adx = _adx_val if _adx_val is not None else 10.0
             
             # === INTRADAY ADX OVERRIDE ===
             # Daily ADX is blind to today's price action — a stock crashing 4% intraday
@@ -2303,8 +2307,7 @@ class ZerodhaTools:
                         adx = max(adx, 45.0)
                     elif _atr_multiple >= 1.5:
                         adx = max(adx, 35.0)
-                    elif _atr_multiple >= 1.0:
-                        adx = max(adx, 28.0)
+                    # Removed 1.0x tier — too loose, 1x ATR moves are noise on low-vol stocks
                     
                     if adx > _daily_adx:
                         _adx_overridden = True
@@ -2334,9 +2337,12 @@ class ZerodhaTools:
             _full_day_min = 375.0  # 9:15 to 15:30
             _elapsed_min = max((_now - _market_open).total_seconds() / 60.0, 1.0)
             if _elapsed_min < _full_day_min:
-                # Cap multiplier at 12.5x (= 30-min minimum extrapolation)
-                # Prevents absurd projections in first few minutes
-                _proj_mult = min(_full_day_min / _elapsed_min, 12.5)
+                # Don't extrapolate during first 10 minutes — volume is too thin
+                # After 10 min, cap at 8x (= ~47-min extrapolation floor)
+                if _elapsed_min < 10.0:
+                    _proj_mult = 1.0  # Use raw volume, no projection
+                else:
+                    _proj_mult = min(_full_day_min / _elapsed_min, 8.0)
                 current_volume = raw_today_volume * _proj_mult
             else:
                 current_volume = raw_today_volume  # After market close, no projection
@@ -2396,8 +2402,8 @@ class ZerodhaTools:
                 ivol = intraday_df['volume']
                 i_cum_tpv = (itp * ivol).cumsum()
                 i_cum_vol = ivol.cumsum()
-                vwap_series = i_cum_tpv / i_cum_vol
-                vwap_series = vwap_series.replace([float('inf'), float('-inf')], current_price).fillna(current_price)
+                vwap_series = i_cum_tpv / i_cum_vol.where(i_cum_vol > 0, float('nan'))
+                vwap_series = vwap_series.ffill().bfill().fillna(current_price)
                 vwap = vwap_series.iloc[-1]
                 
                 # VWAP slope over lookback window (30 min equivalent)
@@ -2530,8 +2536,9 @@ class ZerodhaTools:
                 chop_zone = True
                 chop_reason = "VWAP_FLAT+LOW_VOL"
             
-            # 2. Range too compressed (< 0.4x ATR over 5 candles) 
-            elif atr_range_ratio < 0.4:
+            # 2. Range too compressed AND no ORB hold candles (directional stocks pass)
+            # A stock can trend 2% on tight range — compressed range alone is NOT chop
+            elif atr_range_ratio < 0.3 and orb_hold_candles <= 1:
                 chop_zone = True
                 chop_reason = "COMPRESSED_RANGE"
             
@@ -3306,14 +3313,16 @@ class ZerodhaTools:
         # CHECK FOR DUPLICATE TRADE (active position check)
         if self.is_symbol_in_active_trades(symbol):
             existing = self.get_active_trade(symbol)
+            if existing is None:
+                existing = {}
             return {
                 "success": False,
                 "error": f"DUPLICATE TRADE BLOCKED: {symbol} already has an active position",
                 "existing_trade": {
-                    "symbol": existing['symbol'],
-                    "side": existing['side'],
-                    "entry": existing['avg_price'],
-                    "stop_loss": existing['stop_loss'],
+                    "symbol": existing.get('symbol', symbol),
+                    "side": existing.get('side', ''),
+                    "entry": existing.get('avg_price', 0),
+                    "stop_loss": existing.get('stop_loss', 0),
                     "target": existing.get('target'),
                     "opened_at": existing.get('timestamp')
                 }
@@ -3663,6 +3672,13 @@ class ZerodhaTools:
             # LIVE MODE: Place real order
             exchange, tradingsymbol = symbol.split(":")
             
+            # Get current LTP for fill price fallback
+            try:
+                _ltp_q = self.kite.ltp([symbol])
+                current_ltp = _ltp_q[symbol]['last_price']
+            except Exception:
+                current_ltp = order.get('entry_price', 0)
+            
             # Place main order (with autoslice for freeze qty protection)
             order_id = self._place_order_autoslice(
                 variety=self.kite.VARIETY_REGULAR,
@@ -3787,16 +3803,16 @@ class ZerodhaTools:
             }
     
     def place_option_order(self, underlying: str, direction: str, 
-                          option_type: str = None, 
+                          option_type: str | None = None, 
                           strike_selection: str = "ATM",
                           expiry_selection: str = "CURRENT_WEEK",
                           rationale: str = "",
                           use_intraday_scoring: bool = True,
                           lot_multiplier: float = 1.0,
                           setup_type: str = "",
-                          ml_data: dict = None,
+                          ml_data: dict | None = None,
                           sector: str = "",
-                          pre_fetched_market_data: dict = None) -> Dict:
+                          pre_fetched_market_data: dict | None = None) -> Dict:
         """
         Tool: Place an option order instead of equity order
         
@@ -4172,7 +4188,7 @@ class ZerodhaTools:
                                     idx_exp = options_trader.chain_fetcher.get_nearest_expiry(idx_sym, ExpirySelection[idx_mode.get('prefer_expiry', 'CURRENT_WEEK')])
                                     if idx_exp:
                                         from datetime import date as _date
-                                        exp_d = idx_exp if isinstance(idx_exp, _date) and not isinstance(idx_exp, datetime) else idx_exp.date() if hasattr(idx_exp, 'date') else idx_exp
+                                        exp_d = idx_exp.date() if isinstance(idx_exp, datetime) else idx_exp
                                         if (exp_d - today_date).days <= idx_mode.get('max_dte', 2):
                                             ic_dte_ok = True
                                 except Exception:
@@ -4182,7 +4198,7 @@ class ZerodhaTools:
                                     stk_exp = options_trader.chain_fetcher.get_nearest_expiry("NSE:RELIANCE", ExpirySelection[stk_mode.get('prefer_expiry', 'CURRENT_MONTH')])
                                     if stk_exp:
                                         from datetime import date as _date
-                                        exp_d = stk_exp if isinstance(stk_exp, _date) and not isinstance(stk_exp, datetime) else stk_exp.date() if hasattr(stk_exp, 'date') else stk_exp
+                                        exp_d = stk_exp.date() if isinstance(stk_exp, datetime) else stk_exp
                                         if (exp_d - today_date).days <= stk_mode.get('max_dte', 15):
                                             ic_dte_ok = True
                                 except Exception:
@@ -4366,7 +4382,7 @@ class ZerodhaTools:
                 _dte = -1
                 if _opt_expiry:
                     from datetime import date as _date_cls
-                    _exp_d = _opt_expiry.date() if hasattr(_opt_expiry, 'date') else _opt_expiry
+                    _exp_d = _opt_expiry.date() if isinstance(_opt_expiry, datetime) else _opt_expiry
                     _dte = (_exp_d - _date_cls.today()).days
                 
                 # Gate 1: Theta/premium ratio — block if theta eats >5% of premium per day
@@ -4560,6 +4576,7 @@ class ZerodhaTools:
                     'score_tier': getattr(plan, 'entry_metadata', {}).get('score_tier', 'unknown'),
                     'strategy_type': getattr(plan, 'entry_metadata', {}).get('strategy_type', 'NAKED_OPTION'),
                     'setup_type': setup_type or 'MANUAL',
+                    'trigger_type': (ml_data or {}).get('trigger_type', ''),
                     'is_sniper': setup_type == 'GMM_SNIPER',
                     'lot_multiplier': lot_multiplier if lot_multiplier != 1.0 else 1.0,
                     # === TOP-LEVEL ML SCORES (easy access) ===
@@ -4576,6 +4593,7 @@ class ZerodhaTools:
                     'sector': sector or '',
                     'oi_signal': (ml_data or {}).get('oi_signal', ''),
                     'oi_flipped': (ml_data or {}).get('oi_flipped', False),
+                    'arbtr_meta': (ml_data or {}).get('arbtr_meta', {}),
                 }
                 with self._positions_lock:
                     self.paper_positions.append(option_position)
@@ -4627,6 +4645,7 @@ class ZerodhaTools:
                     'score_tier': getattr(plan, 'entry_metadata', {}).get('score_tier', 'unknown'),
                     'strategy_type': getattr(plan, 'entry_metadata', {}).get('strategy_type', 'NAKED_OPTION'),
                     'setup_type': setup_type or 'MANUAL',
+                    'trigger_type': (ml_data or {}).get('trigger_type', ''),
                     'is_sniper': setup_type == 'GMM_SNIPER',
                     'lot_multiplier': lot_multiplier if lot_multiplier != 1.0 else 1.0,
                     # === TOP-LEVEL ML SCORES (easy access) ===
@@ -4643,6 +4662,7 @@ class ZerodhaTools:
                     'sector': sector or '',
                     'oi_signal': (ml_data or {}).get('oi_signal', ''),
                     'oi_flipped': (ml_data or {}).get('oi_flipped', False),
+                    'arbtr_meta': (ml_data or {}).get('arbtr_meta', {}),
                 }
                 
                 # Place SL-M order for the option
@@ -4692,10 +4712,10 @@ class ZerodhaTools:
         return result
     
     def place_credit_spread(self, underlying: str, direction: str,
-                            spread_width: int = None,
+                            spread_width: int | None = None,
                             rationale: str = "",
-                            pre_fetched_market_data: dict = None,
-                            cached_decision: dict = None) -> Dict:
+                            pre_fetched_market_data: dict | None = None,
+                            cached_decision: dict | None = None) -> Dict:
         """
         Tool: Place a credit spread (SELL option + BUY hedge) — theta-positive strategy
         
@@ -4977,10 +4997,10 @@ class ZerodhaTools:
         return result
     
     def place_debit_spread(self, underlying: str, direction: str,
-                           spread_width: int = None,
+                           spread_width: int | None = None,
                            rationale: str = "",
-                           pre_fetched_market_data: dict = None,
-                           cached_decision: dict = None) -> Dict:
+                           pre_fetched_market_data: dict | None = None,
+                           cached_decision: dict | None = None) -> Dict:
         """
         Tool: Place an intraday debit spread on a momentum mover.
         
@@ -5307,9 +5327,12 @@ class ZerodhaTools:
         # CRITICAL: Normalize to date object for Zerodha instrument matching
         # Zerodha instruments store expiry as datetime.date; datetime != date in Python 3
         from datetime import date as _date_type
-        expiry_date = expiry.date() if isinstance(expiry, datetime) and not isinstance(expiry, _date_type) else expiry
-        if hasattr(expiry_date, 'hour'):  # Still a datetime, force to date
-            expiry_date = expiry_date.date()
+        if isinstance(expiry, datetime):
+            expiry_date = expiry.date()
+        elif isinstance(expiry, _date_type):
+            expiry_date = expiry
+        else:
+            expiry_date = expiry
         
         # Check DTE — on 0DTE, hedging is still valuable to cap max loss
         # but warn that sell leg premium may be thin
@@ -5340,8 +5363,7 @@ class ZerodhaTools:
             c.strike for c in chain.contracts
             if c.option_type == opt_type and (
                 c.expiry == expiry_date or 
-                (hasattr(c.expiry, 'date') and c.expiry.date() == expiry_date) or
-                (hasattr(expiry_date, 'date') and c.expiry == expiry_date.date())
+                (hasattr(c.expiry, 'date') and callable(c.expiry.date) and c.expiry.date() == expiry_date)
             )
         ))
         if not strikes:
@@ -5689,7 +5711,7 @@ class ZerodhaTools:
     def place_iron_condor(self, underlying: str,
                           rationale: str = "",
                           directional_score: float = 0,
-                          pre_fetched_market_data: dict = None) -> Dict:
+                          pre_fetched_market_data: dict | None = None) -> Dict:
         """
         Tool: Place an Iron Condor on a choppy/range-bound stock to harvest theta.
         
@@ -5947,7 +5969,7 @@ class ZerodhaTools:
         self._subscribe_position_symbols()
         return result
 
-    def get_option_greeks_update(self, symbol: str = None) -> Dict:
+    def get_option_greeks_update(self, symbol: str | None = None) -> Dict:
         """
         Tool: Get current Greeks for option positions
         
@@ -6326,7 +6348,7 @@ class ZerodhaTools:
 # Create singleton instance
 _tools = None
 
-def get_tools(paper_mode: bool = True, paper_capital: float = None) -> ZerodhaTools:
+def get_tools(paper_mode: bool = True, paper_capital: float | None = None) -> ZerodhaTools:
     global _tools
     if _tools is None:
         _tools = ZerodhaTools(paper_mode=paper_mode, paper_capital=paper_capital)

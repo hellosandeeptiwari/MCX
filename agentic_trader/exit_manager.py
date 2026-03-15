@@ -145,11 +145,11 @@ class ExitManager:
         # Build zone (0 → 0.7R): No trailing, let trade establish
         # Run zone (0.7R → 2.0R): Moderate trail, balance room vs profit lock
         # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
-        self.trailing_start_r = 0.7    # Trail from 0.7R (was 1.0R — too late, giving back gains)
-        self.trailing_run_pct = 0.50   # Run zone: retain 50% of peak (give back 50%) — was 0.40 (too loose, giving back 60%)
+        self.trailing_start_r = 0.5    # Trail from 0.5R (was 0.7R — protect early gains sooner)
+        self.trailing_run_pct = 0.60   # Run zone: retain 60% of peak (give back 40%) — was 0.50
         self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
-        self.trailing_harvest_pct = 0.65  # Harvest zone: retain 65% of peak (give back 35%) — was 0.55 (too loose, giving back 45%)
-        self.trailing_pct = 0.50  # Default (used as fallback) — was 0.40
+        self.trailing_harvest_pct = 0.75  # Harvest zone: retain 75% of peak (give back 25%) — was 0.65
+        self.trailing_pct = 0.60  # Default (used as fallback) — was 0.50
         
         # Scaled profit booking (options only)
         self.partial_profit_pct = 30.0       # Book 50% at +30% premium gain (was 15% — too early!)

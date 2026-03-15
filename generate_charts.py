@@ -6,7 +6,7 @@ clear axis titles, bold legends, values on every data point.
 import openpyxl
 from openpyxl.chart import (
     BarChart, LineChart, AreaChart, PieChart, DoughnutChart,
-    ScatterChart, Reference, Series
+    ScatterChart, Reference
 )
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.text import RichText
@@ -17,6 +17,7 @@ wb = openpyxl.Workbook()
 
 # ── DATA SHEET ──────────────────────────────────────────────
 ws_data = wb.active
+assert ws_data is not None
 ws_data.title = "Data"
 
 # Simple quarterly sales data — easy numbers for Class 8
@@ -217,18 +218,7 @@ pie_vals = Reference(ws4, min_col=2, min_row=3, max_row=6)
 c4 = PieChart()
 c4.add_data(pie_vals, titles_from_data=True)
 c4.set_categories(pie_cats)
-c4.title = "Total Sales by Product (Pie Chart)"
-c4.width = 20
-c4.height = 15
-c4.legend.position = "b"
-# Large title
-title_font4 = CharacterProperties(sz=1600, b=True)
-title_font4.latin = DrawingFont(typeface="Arial")
-c4.title.txPr = RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=title_font4), endParaRPr=title_font4)])
-# Large legend
-leg_font4 = CharacterProperties(sz=1100, b=True)
-leg_font4.latin = DrawingFont(typeface="Arial")
-c4.legend.txPr = RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=leg_font4), endParaRPr=leg_font4)])
+style_chart(c4, "Total Sales by Product (Pie Chart)", width=20, height=15)
 # Data labels: show category name + value + percentage
 c4.dataLabels = DataLabelList()
 c4.dataLabels.showPercent = True
@@ -271,16 +261,7 @@ dn_vals = Reference(ws5, min_col=2, min_row=3, max_row=6)
 c5 = DoughnutChart()
 c5.add_data(dn_vals, titles_from_data=True)
 c5.set_categories(dn_cats)
-c5.title = "Total Sales by Product (Doughnut Chart)"
-c5.width = 20
-c5.height = 15
-c5.legend.position = "b"
-title_font5 = CharacterProperties(sz=1600, b=True)
-title_font5.latin = DrawingFont(typeface="Arial")
-c5.title.txPr = RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=title_font5), endParaRPr=title_font5)])
-leg_font5 = CharacterProperties(sz=1100, b=True)
-leg_font5.latin = DrawingFont(typeface="Arial")
-c5.legend.txPr = RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=leg_font5), endParaRPr=leg_font5)])
+style_chart(c5, "Total Sales by Product (Doughnut Chart)", width=20, height=15)
 c5.dataLabels = DataLabelList()
 c5.dataLabels.showPercent = True
 c5.dataLabels.showVal = True
@@ -333,16 +314,17 @@ for i, row in enumerate(data, start=4):
 c7 = ScatterChart()
 c7.style = 10
 x_vals = Reference(ws7, min_col=1, min_row=4, max_row=7)
-y_vals1 = Reference(ws7, min_col=2, min_row=4, max_row=7)
-s1 = Series(y_vals1, x_vals, title="Clothing vs Electronics")
-s1.marker.symbol = "circle"
-s1.marker.size = 12
-c7.series.append(s1)
-y_vals2 = Reference(ws7, min_col=3, min_row=4, max_row=7)
-s2 = Series(y_vals2, x_vals, title="Groceries vs Electronics")
-s2.marker.symbol = "diamond"
-s2.marker.size = 12
-c7.series.append(s2)
+y_vals1 = Reference(ws7, min_col=2, min_row=3, max_row=7)
+y_vals2 = Reference(ws7, min_col=3, min_row=3, max_row=7)
+c7.add_data(y_vals1, titles_from_data=True)
+c7.add_data(y_vals2, titles_from_data=True)
+# Set x-values and markers for each scatter series
+c7.series[0].title = "Clothing vs Electronics"
+c7.series[0].marker.symbol = "circle"
+c7.series[0].marker.size = 12
+c7.series[1].title = "Groceries vs Electronics"
+c7.series[1].marker.symbol = "diamond"
+c7.series[1].marker.size = 12
 style_chart(c7, "Product Correlation (XY Scatter Chart)",
             x_title="Electronics Sales (₹ Lakhs)", y_title="Other Product Sales (₹ Lakhs)")
 # Add value labels to scatter points
