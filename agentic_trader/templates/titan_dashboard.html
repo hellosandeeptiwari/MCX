@@ -1381,7 +1381,13 @@ async function loadPositions() {
           ? '<strong>' + entryTime + '</strong>' + (holdStr ? '<br><span style="font-size:.6rem;color:var(--txt3)">' + holdStr + ' ago</span>' : '')
           : DASH;
 
-        return '<tr>' +
+        const rowStyle = isTrailing
+          ? 'background:rgba(5,150,105,0.15);border-left:4px solid #059669'
+          : isBE
+          ? 'background:rgba(37,99,235,0.10);border-left:4px solid #2563eb'
+          : '';
+
+        return '<tr style="' + rowStyle + '">' +
           '<td>' + timeHtml + '</td>' +
           '<td><strong>' + sym + '</strong>' + (p.option_type ? ' <span class="badge" style="font-size:.65rem">' + p.strike + ' ' + p.option_type + '</span>' : '') + '</td>' +
           '<td>' + typeTag + '</td>' +
@@ -1400,11 +1406,17 @@ async function loadPositions() {
             const oiLabels = {'LONG_BUILDUP':'LB','SHORT_BUILDUP':'SB','LONG_UNWINDING':'LU','SHORT_COVERING':'SC'};
             const c = oiColors[oi] || '#8b929e';
             const l = oiLabels[oi] || oi;
+            // Check if OI actually agrees with trade direction
+            const bullishOI = (oi === 'LONG_BUILDUP' || oi === 'SHORT_COVERING');
+            const isBuy = (dir === 'BUY' || dir === 'LONG');
+            const oiAgrees = (isBuy && bullishOI) || (!isBuy && !bullishOI);
             let tag = '';
             if(p.oi_flipped) {
               tag = ' <span style="font-size:.6rem;background:#f59e0b;color:#000;padding:1px 3px;border-radius:3px;font-weight:700" title="Direction was flipped by OI">FLIP</span>';
-            } else {
+            } else if(oiAgrees) {
               tag = ' <span style="font-size:.6rem;background:#059669;color:#fff;padding:1px 3px;border-radius:3px;font-weight:700" title="OI aligned with trade direction">ALIGNED</span>';
+            } else {
+              tag = ' <span style="font-size:.6rem;background:#dc2626;color:#fff;padding:1px 3px;border-radius:3px;font-weight:700" title="OI conflicts with trade direction">CONFLICT</span>';
             }
             return '<span style="font-size:.72rem;font-weight:600;color:'+c+'" title="'+oi+'">'+l+'</span>'+tag;
           })() + '</td>' +

@@ -40,7 +40,7 @@ class RiskLimits:
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
     cooldown_minutes: int = 0             # No cooldown after loss (disabled per user request)
     max_position_pct: float = 25.0        # Max 25% of capital in one position
-    max_total_exposure_pct: float = 85.0  # 85% cap — leave 15% cash reserve for proven setups
+    max_total_exposure_pct: float = 100.0  # 100% — full capital utilization
 
 
 @dataclass

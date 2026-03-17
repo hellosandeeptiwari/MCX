@@ -195,8 +195,8 @@ class DhanRiskTools:
         
         body = {
             'dhanClientId': self.client_id,
-            'profitValue': str(abs(profit)),
-            'lossValue': str(-abs(loss)),
+            'profitValue': abs(profit),
+            'lossValue': abs(loss),
             'productType': product_types,
             'enableKillSwitch': enable_kill_switch,
         }

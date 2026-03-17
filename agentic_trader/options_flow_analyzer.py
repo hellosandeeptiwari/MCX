@@ -117,8 +117,19 @@ class OptionsFlowAnalyzer:
             
             # Fetch chain (uses chain_fetcher's own 60s cache)
             chain = self.chain_fetcher.fetch_option_chain(underlying)
-            if not chain or not chain.contracts:
-                return self._neutral()
+            _kite_chain_ok = chain and hasattr(chain, 'contracts') and chain.contracts
+            if not _kite_chain_ok:
+                # Kite chain failed — DON'T abort. Build minimal result and still
+                # try DhanHQ/NSE enrichment. Those sources are independent.
+                result = self._neutral()
+                result = self._enrich_with_dhan(underlying, result)
+                if not result.get('nse_enriched'):
+                    result = self._enrich_with_nse(underlying, result)
+                # If enrichment succeeded, cache and return the enriched result
+                if result.get('nse_enriched'):
+                    self._CACHE[cache_key] = (datetime.now(), result)
+                    return result
+                return result  # Truly no data from any source
             
             # === Compute PCR by OI ===
             total_call_oi = sum(c.oi for c in chain.contracts if c.option_type.value == 'CE')
@@ -219,7 +230,9 @@ class OptionsFlowAnalyzer:
             self._CACHE[cache_key] = (datetime.now(), result)
             return result
             
-        except Exception:
+        except Exception as _e:
+            import logging as _ofa_log
+            _ofa_log.getLogger('OFA').warning(f"analyze({underlying}): {_e}")
             return self._neutral()
     
     def _enrich_with_dhan(self, underlying: str, result: dict) -> dict:

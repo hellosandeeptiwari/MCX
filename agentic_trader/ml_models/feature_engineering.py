@@ -800,7 +800,7 @@ STOCK_SECTOR_MAP = {
     'HINDCOPPER': 'METAL', 'COALINDIA': 'METAL',
     # IT
     'INFY': 'IT', 'TCS': 'IT', 'WIPRO': 'IT', 'HCLTECH': 'IT',
-    'TECHM': 'IT', 'LTIM': 'IT', 'KPITTECH': 'IT', 'COFORGE': 'IT',
+    'TECHM': 'IT', 'LTM': 'IT', 'KPITTECH': 'IT', 'COFORGE': 'IT',
     'MPHASIS': 'IT', 'PERSISTENT': 'IT',
     # BANKS
     'SBIN': 'BANK', 'HDFCBANK': 'BANK', 'ICICIBANK': 'BANK',

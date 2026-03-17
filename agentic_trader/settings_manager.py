@@ -47,7 +47,8 @@ _WATCHER_KEYS = [
     'sustain_seconds_volume', 'sustain_seconds_grind',
     'sustain_recheck_pct', 'sustain_recheck_pct_volume',
     'sustain_retrace_max_pct', 'volume_surge_min_move_pct',
-    'price_spike_pct', 'day_extreme_trigger', 'day_extreme_min_move_pct',
+    'price_spike_pct', 'price_spike_pct_open', 'price_spike_open_until',
+    'day_extreme_trigger', 'day_extreme_min_move_pct',
     'volume_surge_multiplier', 'slow_grind_pct',
     'cooldown_seconds', 'max_triggers_per_minute',
     'queue_size', 'priority_bypass_pct',
@@ -85,6 +86,16 @@ _LOT_STRATEGIES = {
     'DOWN_RISK_GATING': 'all_agree_lot_multiplier',
     'GMM_CONTRARIAN': 'lot_multiplier',
 }
+
+
+def _values_differ(json_val, config_val):
+    """Compare values tolerantly (handles int vs float, small rounding)."""
+    if json_val == config_val:
+        return False
+    try:
+        return abs(float(json_val) - float(config_val)) > 1e-9
+    except (TypeError, ValueError):
+        return str(json_val) != str(config_val)
 
 
 class SettingsManager:
@@ -203,11 +214,14 @@ class SettingsManager:
 
     def sync_defaults(self):
         """Populate titan_settings.json with config.py defaults for any MISSING keys.
-        Called once at startup. Never overwrites existing values."""
+        Called once at startup. Never overwrites existing values.
+        Also audits and WARNS about any keys where titan_settings.json
+        overrides config.py with a DIFFERENT value."""
         import config as _cfg
         bw = getattr(_cfg, 'BREAKOUT_WATCHER', {})
         hr = getattr(_cfg, 'HARD_RULES', {})
         added = []
+        overrides = []  # (json_key, json_value, config_value)
 
         with self._lock:
             # Watcher keys
@@ -216,6 +230,11 @@ class SettingsManager:
                 if json_key not in self._data and key in bw:
                     self._data[json_key] = bw[key]
                     added.append(json_key)
+                elif json_key in self._data and key in bw:
+                    jv = self._data[json_key]
+                    cv = bw[key]
+                    if _values_differ(jv, cv):
+                        overrides.append((json_key, jv, cv))
 
             # momentum_exit.enabled
             if 'watcher_momentum_exit' not in self._data:
@@ -227,6 +246,11 @@ class SettingsManager:
                 if key not in self._data and key in hr:
                     self._data[key] = hr[key]
                     added.append(key)
+                elif key in self._data and key in hr:
+                    jv = self._data[key]
+                    cv = hr[key]
+                    if _values_differ(jv, cv):
+                        overrides.append((key, jv, cv))
 
             # Strategy toggles
             for name in _STRATEGY_NAMES:
@@ -251,6 +275,21 @@ class SettingsManager:
 
         if added:
             print(f"📋 settings_manager: synced {len(added)} defaults → titan_settings.json")
+
+        # ── Override audit (LOUD) ────────────────────────────────────
+        if overrides:
+            print(f"\n{'='*70}")
+            print(f"⚠️  SETTINGS OVERRIDE AUDIT — {len(overrides)} key(s) differ!")
+            print(f"    titan_settings.json overrides config.py for these keys:")
+            print(f"{'='*70}")
+            for jk, jv, cv in overrides:
+                print(f"  🔶  {jk}: json={jv}  ←  config.py={cv}")
+            print(f"{'='*70}")
+            print(f"    To use config.py values, update titan_settings.json via dashboard")
+            print(f"    or run: settings.set('{overrides[0][0]}', {overrides[0][2]})")
+            print(f"{'='*70}\n")
+        else:
+            print("✅ settings_manager: titan_settings.json and config.py are in sync")
 
         return added
 

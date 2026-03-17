@@ -808,6 +808,8 @@ class BreakoutWatcher:
         self._prev_reported_low: Dict[str, float] = {}   # sym → last seen ohlc.low
         self._day_high_break_count: Dict[str, int] = {}   # sym → how many times new day high fired
         self._day_low_break_count: Dict[str, int] = {}    # sym → how many times new day low fired
+        self._last_day_high_break_ts: Dict[str, float] = {}  # sym → epoch of last NEW_DAY_HIGH fire
+        self._last_day_low_break_ts: Dict[str, float] = {}   # sym → epoch of last NEW_DAY_LOW fire
         
         # Price history for spike acceleration detection: last few LTPs per symbol
         self._recent_prices: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
@@ -965,6 +967,9 @@ class BreakoutWatcher:
             # Break counts: essential — prevents 5th break looking like 1st
             'day_high_breaks': dict(self._day_high_break_count),
             'day_low_breaks': dict(self._day_low_break_count),
+            # Break timestamps: for consolidation lookback (quiet time before break)
+            'last_high_break_ts': dict(self._last_day_high_break_ts),
+            'last_low_break_ts': dict(self._last_day_low_break_ts),
             # Day extremes: so we don't re-trigger on the same high/low
             'prev_high': dict(self._prev_reported_high),
             'prev_low': dict(self._prev_reported_low),
@@ -1022,6 +1027,9 @@ class BreakoutWatcher:
             # Restore break counts
             self._day_high_break_count.update(state.get('day_high_breaks', {}))
             self._day_low_break_count.update(state.get('day_low_breaks', {}))
+            # Restore break timestamps (consolidation lookback)
+            self._last_day_high_break_ts.update(state.get('last_high_break_ts', {}))
+            self._last_day_low_break_ts.update(state.get('last_low_break_ts', {}))
             
             # Restore day extremes
             self._prev_reported_high.update(state.get('prev_high', {}))
@@ -1098,6 +1106,25 @@ class BreakoutWatcher:
         """Return True if symbol is past its cooldown period"""
         last = self._cooldowns.get(symbol, 0)
         return (time.time() - last) >= self._cooldown_secs
+
+    def mark_grind_traded(self, symbol: str):
+        """Reset the grind trend-origin baseline after a trade is actually placed.
+        Called by autonomous_trader when a SLOW_GRIND trade successfully enters.
+        This ensures the baseline accumulates through blocked triggers but resets
+        once the system has acted on the trend."""
+        now = time.time()
+        ltp = None
+        # Get latest price from pending or baseline
+        bl = self._baselines_long.get(symbol)
+        if bl:
+            ltp = bl.get('price', 0)
+        # Reset to current state
+        if symbol in self._baselines_long:
+            self._baselines_long[symbol] = {'price': ltp or 0, 'ts': now, 'peak_move': 0.0}
+        _cum_vol = self._cum_volume.get(symbol, 0)
+        self._grind_start_vol[symbol] = _cum_vol
+        _hist = self._vol_delta_history.get(symbol)
+        self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
     
     def process_tick(self, symbol: str, tick: dict, token_to_symbol: Dict[int, str]):
         """
@@ -1160,17 +1187,23 @@ class BreakoutWatcher:
         
         # Long baseline (rolling) — detects slow grinds that the 60s window misses.
         # ROLLING design: baseline only resets when (a) grind fires, (b) price REVERSES
-        # back to within 0.25% of the baseline, or (c) max age 10min (stale protection).
+        # significantly (>50% retrace from peak), or (c) max age (10min or 30min if trending).
         # This way a steady 0.2%/min grind accumulates to 1% over 5 min and fires.
         bl_long = self._baselines_long.get(symbol)
         if bl_long is None:
-            self._baselines_long[symbol] = {'price': ltp, 'ts': now}
+            self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0}
             self._grind_start_vol[symbol] = _cum_vol
             _hist = self._vol_delta_history.get(symbol)
             self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
         else:
             _long_move = (ltp - bl_long['price']) / bl_long['price'] * 100 if bl_long['price'] > 0 else 0
             _age = now - bl_long['ts']
+
+            # Track peak move from baseline (absolute, for retrace detection)
+            _peak_move = bl_long.get('peak_move', 0.0)
+            if abs(_long_move) > abs(_peak_move):
+                bl_long['peak_move'] = _long_move
+                _peak_move = _long_move
             
             # Volume confirmation: compare vol rate during grind vs before grind
             _grind_vol_confirmed = False
@@ -1182,16 +1215,26 @@ class BreakoutWatcher:
                 _grind_vol_rate = _grind_vol_total / _age  # vol/sec during grind
                 _baseline_vol_rate = _grind_start_ad  # avg delta/tick before grind
                 _grind_vol_ratio = _grind_vol_rate / _baseline_vol_rate if _baseline_vol_rate > 0 else 1.0
-                _grind_vol_confirmed = _grind_vol_ratio >= 1.2  # 20%+ more volume = real interest
+                _grind_vol_confirmed = _grind_vol_ratio >= 1.15  # 15%+ more volume = real interest (was 1.2)
             
             # Velocity: how fast the grind is moving (pct per minute)
             _velocity = abs(_long_move) / (_age / 60) if _age > 10 else 0
             
+            # Track peak velocity on every tick (not just at detection)
+            _prev_peak_vel = bl_long.get('peak_velocity', 0)
+            if _velocity > _prev_peak_vel:
+                bl_long['peak_velocity'] = _velocity
+            
             # Adaptive grind threshold: lower when volume confirms the move
-            _effective_grind_pct = self._slow_grind_pct * 0.7 if _grind_vol_confirmed else self._slow_grind_pct
+            _effective_grind_pct = self._slow_grind_pct * 0.65 if _grind_vol_confirmed else self._slow_grind_pct
             
             # Check if slow grind threshold crossed
-            if abs(_long_move) >= _effective_grind_pct and symbol not in self._pending:
+            # TREND-ORIGIN MEMORY: Don't reset baseline on grind fire.
+            # Keep the trend origin so re-triggers after cooldown see the
+            # FULL cumulative move (e.g. 2.5% not 0.6%). The cooldown
+            # check here prevents useless churn during the cooldown window.
+            _grind_cooled = self._is_cooled_down(symbol)
+            if abs(_long_move) >= _effective_grind_pct and symbol not in self._pending and _grind_cooled:
                 _sg_type = 'SLOW_GRIND_UP' if _long_move > 0 else 'SLOW_GRIND_DOWN'
                 self._stats['slow_grinds_detected'] = self._stats.get('slow_grinds_detected', 0) + 1
                 self._pending[symbol] = {
@@ -1205,6 +1248,24 @@ class BreakoutWatcher:
                     'vol_ratio': round(_grind_vol_ratio, 2),
                     'grind_age_s': round(_age, 0),
                 }
+                # Slope quality signals for end-of-slope detection downstream
+                _grind_open = ohlc.get('open', 0) if ohlc else 0
+                if _grind_open > 0:
+                    self._pending[symbol]['intraday_pct'] = round((ltp - _grind_open) / _grind_open * 100, 2)
+                if _tick_day_high > _tick_day_low:
+                    self._pending[symbol]['day_range_position'] = round(
+                        max(0, min(1, (ltp - _tick_day_low) / (_tick_day_high - _tick_day_low))), 3)
+                # Peak velocity: track highest velocity seen for this grind baseline
+                _prev_peak_vel = bl_long.get('peak_velocity', 0)
+                if _velocity > _prev_peak_vel:
+                    bl_long['peak_velocity'] = _velocity
+                self._pending[symbol]['peak_velocity'] = round(bl_long.get('peak_velocity', _velocity), 3)
+                # SB move: how much did price move in the LAST 60s?
+                # If SB << LB the grind has stalled (slope flattening)
+                _sb = self._baselines.get(symbol)
+                if _sb and _sb['price'] > 0:
+                    _sb_move = abs((ltp - _sb['price']) / _sb['price'] * 100)
+                    self._pending[symbol]['sb_move_pct'] = round(_sb_move, 3)
                 _mins = _age / 60
                 _vc_tag = " VOL✓" if _grind_vol_confirmed else ""
                 self._log_grind_count += 1
@@ -1212,24 +1273,30 @@ class BreakoutWatcher:
                     print(f"   🐢 Watcher: {symbol} SLOW GRIND detected ({_long_move:+.1f}% over {_mins:.1f}min, vel={_velocity:.2f}%/min{_vc_tag}) → sustain check")
                 else:
                     self._log_grind_suppressed.append(symbol.replace('NSE:', ''))
-                # Reset baseline after firing
-                self._baselines_long[symbol] = {'price': ltp, 'ts': now}
-                self._grind_start_vol[symbol] = _cum_vol
-                _hist = self._vol_delta_history.get(symbol)
-                self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
-            elif abs(_long_move) < 0.25:
-                # Price reverted back to baseline — reset (move died)
-                # Raised from 0.15% to 0.25% to avoid resetting on tiny pullbacks during legitimate grinds
-                self._baselines_long[symbol] = {'price': ltp, 'ts': now}
+                # TREND-ORIGIN: Do NOT reset baseline here. The origin is
+                # preserved so the next trigger (after cooldown) sees the full
+                # cumulative grind. Baseline only resets on reversion/staleness
+                # or when the trade is actually placed (via mark_grind_traded).
+            elif abs(_long_move) < 0.15 or (abs(_peak_move) >= 0.3 and abs(_long_move) < abs(_peak_move) * 0.5):
+                # Baseline reversion — the grind has died. Two conditions:
+                # (a) Price drifted back to within 0.15% of baseline (flat/reversed), OR
+                # (b) Price retraced >50% of its peak move from baseline (momentum fading).
+                # Old logic: reset at 0.25% flat — killed legitimate grinds with normal noise.
+                self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0}
                 self._grind_start_vol[symbol] = _cum_vol
                 _hist = self._vol_delta_history.get(symbol)
                 self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
             elif _age > 600:
-                # Stale protection: max 10 min baseline age
-                self._baselines_long[symbol] = {'price': ltp, 'ts': now}
-                self._grind_start_vol[symbol] = _cum_vol
-                _hist = self._vol_delta_history.get(symbol)
-                self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
+                # Stale protection: max 10 min baseline age.
+                # But if the stock is actively trending (move > threshold),
+                # extend to 30 min — this IS the trend we want to track.
+                _still_trending = abs(_long_move) >= self._slow_grind_pct
+                _stale_limit = 1800 if _still_trending else 600
+                if _age > _stale_limit:
+                    self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0}
+                    self._grind_start_vol[symbol] = _cum_vol
+                    _hist = self._vol_delta_history.get(symbol)
+                    self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
         
         # If short baseline was just reset, skip trigger detection this tick
         if bl is None or (now - self._baselines[symbol]['ts']) < 0.01:
@@ -1351,6 +1418,8 @@ class BreakoutWatcher:
         
         move_pct = (ltp - baseline_price) / baseline_price * 100
         trigger_type = None
+        _spike_plus_surge = False
+        _spike_surge_ratio = 0.0
         
         # Track recent prices for acceleration detection
         self._recent_prices[symbol].append((now, ltp))
@@ -1358,7 +1427,13 @@ class BreakoutWatcher:
         # 1) PRICE SPIKE: moved ≥ spike_pct from baseline
         #    [FIX Mar 10] Add volume confirmation — reject spikes on dry volume.
         #    Add acceleration tracking and spike magnitude to trigger metadata.
-        if abs(move_pct) >= self._spike_pct:
+        #    [FIX Mar 16] Time-aware threshold: higher bar before 09:45 (opening noise)
+        _open_spike_pct = self._config.get('price_spike_pct_open', 1.0)
+        _open_cutoff = self._config.get('price_spike_open_until', '09:45')
+        _h, _m = int(_open_cutoff.split(':')[0]), int(_open_cutoff.split(':')[1])
+        _now_t = datetime.now()
+        _effective_spike_pct = _open_spike_pct if (_now_t.hour < _h or (_now_t.hour == _h and _now_t.minute < _m)) else self._spike_pct
+        if abs(move_pct) >= _effective_spike_pct:
             # Volume confirmation: require current vol delta ≥ 50% of rolling avg
             # Prevents fake spikes from illiquid ticks or stale-price jumps
             _spike_vol_ok = True
@@ -1382,57 +1457,33 @@ class BreakoutWatcher:
                         _o_speed = abs(_older_half[-1][1] - _older_half[0][1]) / max(0.1, _older_half[-1][0] - _older_half[0][0])
                         if _o_speed > 0:
                             _spike_accel = round(_r_speed / _o_speed, 2)  # >1 = accelerating
+                
+                # === SPIKE + SURGE CO-FIRE: check if VOLUME_SURGE also met ===
+                # When both conditions fire simultaneously, trade gets double lot.
+                # PRICE_SPIKE preempts VOLUME_SURGE by priority, but if volume is
+                # ALSO surging, it signals massive institutional conviction → 2x sizing.
+                _spike_plus_surge = False
+                _spike_surge_ratio = 0.0
+                if _vol_delta > 0 and len(self._vol_delta_history[symbol]) >= 5:
+                    _sps_hist = self._vol_delta_history[symbol]
+                    _sps_avg = sum(_sps_hist) / len(_sps_hist)
+                    _sps_warmup = (now - self._init_ts) < 600
+                    _sps_mult = max(1.8, self._vol_surge_x * 0.6) if _sps_warmup else self._vol_surge_x
+                    if _sps_avg > 0 and _vol_delta >= _sps_avg * _sps_mult:
+                        _sps_recent_3 = list(_sps_hist)[-3:] if len(_sps_hist) >= 3 else list(_sps_hist)
+                        _sps_elev = sum(1 for d in _sps_recent_3 if d >= _sps_avg * 2.0)
+                        if _sps_elev >= 2:
+                            _spike_plus_surge = True
+                            _spike_surge_ratio = round(_vol_delta / _sps_avg, 1)
         
-        # 2) DAY EXTREME: exchange-reported ohlc.high/low INCREASED since last tick
-        #    [FIX Mar 10] Track break count — 1st/2nd break = strong, 5th+ = noise.
-        #    Require margin above old extreme (not just ₹0.01). Check volume on break.
-        if self._day_extreme and not trigger_type and _tick_day_high > 0 and _tick_day_low > 0:
-            _prev_h = self._prev_reported_high.get(symbol, 0)
-            _prev_l = self._prev_reported_low.get(symbol, 0)
-            
-            if _prev_h > 0 and _tick_day_high > _prev_h and abs(move_pct) >= self._day_ext_min_move:
-                # Check break margin: new high must be ≥ 0.05% above old high (filters ₹0.05 noise)
-                _break_margin = (_tick_day_high - _prev_h) / _prev_h * 100 if _prev_h > 0 else 0
-                _hbc = self._day_high_break_count.get(symbol, 0) + 1
-                self._day_high_break_count[symbol] = _hbc
-                # First 3 breaks are meaningful; after that require larger margin
-                _margin_ok = _break_margin >= 0.05 if _hbc <= 3 else _break_margin >= 0.15
-                # Volume check: at least average volume on the break
-                _ext_vol_ok = True
-                if len(self._vol_delta_history[symbol]) >= 3:
-                    _e_avg = sum(self._vol_delta_history[symbol]) / len(self._vol_delta_history[symbol])
-                    if _e_avg > 0 and _vol_delta < _e_avg * 0.4:
-                        _ext_vol_ok = False  # New high on dying volume — weak
-                if _margin_ok and _ext_vol_ok:
-                    trigger_type = 'NEW_DAY_HIGH'
-                    self._stats['extremes_detected'] += 1
-                    _day_ext_break_count = _hbc
-                    _day_ext_break_margin = round(_break_margin, 3)
-            elif _prev_l > 0 and _tick_day_low < _prev_l and abs(move_pct) >= self._day_ext_min_move:
-                _break_margin = (_prev_l - _tick_day_low) / _prev_l * 100 if _prev_l > 0 else 0
-                _lbc = self._day_low_break_count.get(symbol, 0) + 1
-                self._day_low_break_count[symbol] = _lbc
-                _margin_ok = _break_margin >= 0.05 if _lbc <= 3 else _break_margin >= 0.15
-                _ext_vol_ok = True
-                if len(self._vol_delta_history[symbol]) >= 3:
-                    _e_avg = sum(self._vol_delta_history[symbol]) / len(self._vol_delta_history[symbol])
-                    if _e_avg > 0 and _vol_delta < _e_avg * 0.4:
-                        _ext_vol_ok = False
-                if _margin_ok and _ext_vol_ok:
-                    trigger_type = 'NEW_DAY_LOW'
-                    self._stats['extremes_detected'] += 1
-                    _day_ext_break_count = _lbc
-                    _day_ext_break_margin = round(_break_margin, 3)
-            # Always update the tracked values
-            self._prev_reported_high[symbol] = _tick_day_high
-            self._prev_reported_low[symbol] = _tick_day_low
-        
-        # 3) VOLUME SURGE: current tick's volume DELTA ≥ N× rolling average delta
+        # 2) VOLUME SURGE: current tick's volume DELTA ≥ N× rolling average delta
         #    [FIX Mar 6] Also require minimum price move — explosive volume with
         #    only 0.1% move = absorption, not breakout. BDL had EXPLOSIVE vol but
         #    tiny move, reversed in 4 min.
         #    [FIX Mar 10] Require 2+ consecutive elevated ticks to filter single-tick anomalies.
         #    Add surge_ratio and depth_imbalance to trigger data for pipeline scoring.
+        #    [FIX Mar 17] Promoted to #2 priority (was #3 behind DAY_EXT). Volume surge
+        #    signals institutional conviction — should not be preempted by day extremes.
         if not trigger_type and _vol_delta > 0 and len(self._vol_delta_history[symbol]) >= 5:
             _hist = self._vol_delta_history[symbol]
             _avg_delta = sum(_hist) / len(_hist)
@@ -1457,6 +1508,76 @@ class BreakoutWatcher:
                             _depth_imbalance = round((_buy_qty - _sell_qty) / (_buy_qty + _sell_qty), 3)
                 # else: volume spike but price hasn't moved enough — absorption, skip
         
+        # 3) DAY EXTREME: exchange-reported ohlc.high/low INCREASED since last tick
+        #    [FIX Mar 10] Track break count — 1st/2nd break = strong, 5th+ = noise.
+        #    Require margin above old extreme (not just ₹0.01). Check volume on break.
+        #    [FIX Mar 17] Demoted to #3 priority (was #2). Volume surge takes precedence.
+        #    Always update tracked high/low values even if another trigger already fired.
+        #    [FIX Mar 17b] Hardened: raised break margin, require vol ≥1.2x avg,
+        #    wick-body check (LTP must still be above old extreme), late-day margin 2x.
+        #    [FIX Mar 17c] Consolidation lookback: track quiet time since last break.
+        _day_ext_quiet_min = 60.0  # default if not computed
+        if self._day_extreme and _tick_day_high > 0 and _tick_day_low > 0:
+            _prev_h = self._prev_reported_high.get(symbol, 0)
+            _prev_l = self._prev_reported_low.get(symbol, 0)
+            _now_ext = datetime.now()
+            _late_day = _now_ext.hour >= 14  # after 14:00 — require higher margin
+            
+            if not trigger_type and _prev_h > 0 and _tick_day_high > _prev_h and abs(move_pct) >= self._day_ext_min_move:
+                _break_margin = (_tick_day_high - _prev_h) / _prev_h * 100 if _prev_h > 0 else 0
+                _hbc = self._day_high_break_count.get(symbol, 0) + 1
+                self._day_high_break_count[symbol] = _hbc
+                # Break margin gate: 0.12% for fresh breaks, 0.20% for repeated
+                # Late-day (after 14:00): double the margin — thin-volume extensions are traps
+                _base_margin = 0.12 if _hbc <= 3 else 0.20
+                _margin_ok = _break_margin >= (_base_margin * 2 if _late_day else _base_margin)
+                # Volume gate: require vol ≥ 1.2× average (not just "not dead")
+                _ext_vol_ok = True
+                if len(self._vol_delta_history[symbol]) >= 3:
+                    _e_avg = sum(self._vol_delta_history[symbol]) / len(self._vol_delta_history[symbol])
+                    if _e_avg > 0 and _vol_delta < _e_avg * 1.2:
+                        _ext_vol_ok = False  # Breakout on below-average volume — skip
+                # Wick-body check: LTP must still be AT or ABOVE the OLD high
+                # If ohlc.high made a new high but LTP already retraced below prev high,
+                # the break was a wick (intra-tick spike that reversed) — not a real breakout
+                _wick_ok = ltp >= _prev_h
+                if _margin_ok and _ext_vol_ok and _wick_ok:
+                    trigger_type = 'NEW_DAY_HIGH'
+                    self._stats['extremes_detected'] += 1
+                    _day_ext_break_count = _hbc
+                    _day_ext_break_margin = round(_break_margin, 3)
+                    # Consolidation lookback: how long since the last day-high break?
+                    # Market opens 09:15 IST — use that as reference for first break
+                    _mkt_open_ts = datetime.now().replace(hour=9, minute=15, second=0).timestamp()
+                    _last_h_ts = self._last_day_high_break_ts.get(symbol, _mkt_open_ts)
+                    _day_ext_quiet_min = round((now - _last_h_ts) / 60, 1)
+                    self._last_day_high_break_ts[symbol] = now
+            elif not trigger_type and _prev_l > 0 and _tick_day_low < _prev_l and abs(move_pct) >= self._day_ext_min_move:
+                _break_margin = (_prev_l - _tick_day_low) / _prev_l * 100 if _prev_l > 0 else 0
+                _lbc = self._day_low_break_count.get(symbol, 0) + 1
+                self._day_low_break_count[symbol] = _lbc
+                _base_margin = 0.12 if _lbc <= 3 else 0.20
+                _margin_ok = _break_margin >= (_base_margin * 2 if _late_day else _base_margin)
+                _ext_vol_ok = True
+                if len(self._vol_delta_history[symbol]) >= 3:
+                    _e_avg = sum(self._vol_delta_history[symbol]) / len(self._vol_delta_history[symbol])
+                    if _e_avg > 0 and _vol_delta < _e_avg * 1.2:
+                        _ext_vol_ok = False
+                # Wick-body check: LTP must still be AT or BELOW the OLD low
+                _wick_ok = ltp <= _prev_l
+                if _margin_ok and _ext_vol_ok and _wick_ok:
+                    trigger_type = 'NEW_DAY_LOW'
+                    self._stats['extremes_detected'] += 1
+                    _day_ext_break_count = _lbc
+                    _day_ext_break_margin = round(_break_margin, 3)
+                    _mkt_open_ts = datetime.now().replace(hour=9, minute=15, second=0).timestamp()
+                    _last_l_ts = self._last_day_low_break_ts.get(symbol, _mkt_open_ts)
+                    _day_ext_quiet_min = round((now - _last_l_ts) / 60, 1)
+                    self._last_day_low_break_ts[symbol] = now
+            # Always update the tracked values
+            self._prev_reported_high[symbol] = _tick_day_high
+            self._prev_reported_low[symbol] = _tick_day_low
+        
         # === ENTER SUSTAIN PHASE ===
         if trigger_type:
             # Build trigger metadata — enriched for pipeline scoring
@@ -1476,13 +1597,18 @@ class BreakoutWatcher:
             if 'SPIKE' in trigger_type:
                 _trigger_meta['spike_accel'] = _spike_accel
                 _trigger_meta['spike_magnitude'] = round(abs(move_pct), 2)
+                # Co-fire: PRICE_SPIKE + VOLUME_SURGE both met → double lot signal
+                if _spike_plus_surge:
+                    _trigger_meta['spike_plus_surge'] = True
+                    _trigger_meta['surge_ratio'] = _spike_surge_ratio
             # VOLUME_SURGE: add surge ratio
             elif trigger_type == 'VOLUME_SURGE':
                 _trigger_meta['surge_ratio'] = _surge_ratio
-            # NEW_DAY_HIGH/LOW: add break count and margin
+            # NEW_DAY_HIGH/LOW: add break count, margin, and consolidation quiet time
             elif 'DAY' in trigger_type:
                 _trigger_meta['break_count'] = _day_ext_break_count
                 _trigger_meta['break_margin'] = _day_ext_break_margin
+                _trigger_meta['quiet_minutes'] = _day_ext_quiet_min
             self._pending[symbol] = _trigger_meta
             # === OI FORWARD-LOOKING PREFETCH ===
             # Launch async OI fetch NOW so it's ready by the time sustain completes.
@@ -1506,12 +1632,13 @@ class BreakoutWatcher:
         
         # Gate: cooldown (per-symbol) — with priority escalation
         # Higher-priority trigger types can bypass cooldown set by weaker triggers.
-        # Priority order: PRICE_SPIKE / SLOW_GRIND > NEW_DAY_LOW/HIGH > VOLUME_SURGE
+        # Priority order: PRICE_SPIKE > VOLUME_SURGE > SLOW_GRIND > NEW_DAY_LOW/HIGH
+        # [FIX Mar 17] Volume surge promoted above grind and day-ext (institutional signal)
         _TRIGGER_PRIORITY = {
-            'VOLUME_SURGE': 1,
-            'NEW_DAY_HIGH': 2, 'NEW_DAY_LOW': 2,
-            'PRICE_SPIKE_UP': 3, 'PRICE_SPIKE_DOWN': 3,
-            'SLOW_GRIND_UP': 3, 'SLOW_GRIND_DOWN': 3,
+            'NEW_DAY_HIGH': 1, 'NEW_DAY_LOW': 1,
+            'SLOW_GRIND_UP': 2, 'SLOW_GRIND_DOWN': 2,
+            'VOLUME_SURGE': 3,
+            'PRICE_SPIKE_UP': 4, 'PRICE_SPIKE_DOWN': 4,
         }
         if not self._is_cooled_down(symbol):
             # Check if this trigger outranks the one that set the cooldown
@@ -1563,8 +1690,10 @@ class BreakoutWatcher:
         }
         # Pass through enriched metadata from process_tick
         for _meta_key in ('velocity', 'vol_confirmed', 'vol_ratio', 'grind_age_s',
+                          'intraday_pct', 'day_range_position',
+                          'peak_velocity', 'sb_move_pct',
                           'surge_ratio', 'depth_imbalance',
-                          'spike_accel', 'spike_magnitude',
+                          'spike_accel', 'spike_magnitude', 'spike_plus_surge',
                           'break_count', 'break_margin',
                           '_peak_move_pct', '_sustain_held_pct',
                           '_oi_confirmed', '_oi_contradicted',

@@ -158,10 +158,13 @@ class ExitManager:
         # VIX regime trailing adjustment (set by autonomous_trader each cycle)
         self.vix_trail_retain_reduce = 0.0   # Reduce retention by this amount in high VIX
         
-        # Early speed gate (options only) — RELAXED: was killing 91% of trades
-        self.option_speed_gate_candles = 12  # Check after 12 candles (60 min) — was 6
-        self.option_speed_gate_pct = 3.0     # Need +3% premium gain — was 5%
-        self.option_speed_gate_max_r = 0.10  # OR need +0.10R — was 0.15
+        # Early speed gate (options only) — TIGHTENED: free capital faster for swaps
+        self.option_speed_gate_candles = 6   # Check after 6 candles (30 min) — was 12
+        self.option_speed_gate_pct = 3.0     # Need +3% premium gain
+        self.option_speed_gate_max_r = 0.10  # OR need +0.10R
+        
+        # Debit spread stale position cap (minutes)
+        self.debit_spread_stale_cap_minutes = 120  # Force exit debit spreads stagnant > 120 min
         
         # Track trades
         self.trade_states: Dict[str, TradeState] = {}
@@ -626,7 +629,7 @@ class ExitManager:
         DTE-AWARE TIGHTENING (Feb 24 fix):
           DTE ≤ 2: 4 candles (20 min), need +8% premium (theta is extreme)
           DTE 3-7: 8 candles (40 min), need +5% premium (theta is steep)
-          DTE 8+:  12 candles (60 min), need +3% premium (theta is mild)
+          DTE 8+:  6 candles (30 min), need +3% premium (theta is mild)
         
         Uses OR-pass logic: survives if EITHER premium% OR R-multiple is good enough.
         Only applies to option positions (is_option=True).
@@ -641,7 +644,7 @@ class ExitManager:
             return None
         
         # DTE-aware speed gate parameters
-        _sg_candles = self.option_speed_gate_candles  # default 12
+        _sg_candles = self.option_speed_gate_candles  # default 6
         _sg_pct = self.option_speed_gate_pct          # default 3.0%
         _sg_max_r = self.option_speed_gate_max_r      # default 0.10
         
@@ -658,7 +661,7 @@ class ExitManager:
                 _sg_candles = 8    # 40 min
                 _sg_pct = 5.0      # Need +5% gain
                 _sg_max_r = 0.15   # Or +0.15R
-            # else: DTE 8+ or unknown → use defaults (12 candles, 3%, 0.10R)
+            # else: DTE 8+ or unknown → use defaults (6 candles, 3%, 0.10R)
         except Exception:
             pass  # Use defaults if DTE unavailable
         
@@ -828,6 +831,18 @@ class ExitManager:
         
         # Track highest spread value for trailing
         state.highest_price = max(state.highest_price, current_value)
+        
+        # 0. STALE CAP — force exit debit spreads held > 120 min with no profit
+        _hold_minutes = (datetime.now() - state.entry_time).total_seconds() / 60
+        if _hold_minutes >= self.debit_spread_stale_cap_minutes and profit_pct <= 0:
+            return ExitSignal(
+                symbol=state.symbol,
+                should_exit=True,
+                exit_type="DEBIT_SPREAD_STALE_CAP",
+                exit_price=current_value,
+                reason=f"Debit spread stale cap: held {_hold_minutes:.0f}min > {self.debit_spread_stale_cap_minutes}min with P&L {profit_pct:+.1f}% — freeing capital",
+                urgency="NORMAL"
+            )
         
         # 1. TIME CUTOFF — debit spreads exit 10 min earlier than credit spreads
         now = datetime.now().time()

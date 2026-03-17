@@ -1610,23 +1610,21 @@ class IntradayOptionScorer:
             _dv_votes['TREND'] = (trend_direction, _dv_tw)
         
         # Vote 2: ORB breakout direction (weight from ORB contribution)
-        # Time-of-day decay: ORB/VWAP unreliable in first 15 min (9:15-9:30)
-        _dv_early_market = datetime.now().hour == 9 and datetime.now().minute < 30
-        _dv_early_mult = 0.5 if _dv_early_market else 1.0
-        
+        # [FIX Mar 17] Removed 0.5x early_mult — the A2 gate itself handles early risk.
+        # Double-penalizing ORB/VWAP votes made dir_conf mathematically impossible to pass.
         _dv_orb_contrib = max(0, _audit_after_orb - _audit_after_micro)
         if signal.orb_signal == "BREAKOUT_UP" and _dv_orb_contrib > 0:
-            _dv_votes['ORB'] = ('BUY', max(1, int(min(15, max(3, _dv_orb_contrib)) * _dv_early_mult)))
+            _dv_votes['ORB'] = ('BUY', max(1, int(min(15, max(3, _dv_orb_contrib)))))
         elif signal.orb_signal == "BREAKOUT_DOWN" and _dv_orb_contrib > 0:
-            _dv_votes['ORB'] = ('SELL', max(1, int(min(15, max(3, _dv_orb_contrib)) * _dv_early_mult)))
+            _dv_votes['ORB'] = ('SELL', max(1, int(min(15, max(3, _dv_orb_contrib)))))
         
         # Vote 3: VWAP position (direction-independent)
         if signal.vwap_position == "ABOVE_VWAP":
             _dv_vw = 8 if signal.vwap_trend == "RISING" else (5 if signal.vwap_trend == "FLAT" else 3)
-            _dv_votes['VWAP'] = ('BUY', max(1, int(_dv_vw * _dv_early_mult)))
+            _dv_votes['VWAP'] = ('BUY', _dv_vw)
         elif signal.vwap_position == "BELOW_VWAP":
             _dv_vw = 8 if signal.vwap_trend == "FALLING" else (5 if signal.vwap_trend == "FLAT" else 3)
-            _dv_votes['VWAP'] = ('SELL', max(1, int(_dv_vw * _dv_early_mult)))
+            _dv_votes['VWAP'] = ('SELL', _dv_vw)
         
         # Vote 4: Price action (above/below open)
         if market_data:
@@ -1670,12 +1668,11 @@ class IntradayOptionScorer:
         _dv_buy_src = [f"{k}({w})" for k, (d, w) in sorted(_dv_votes.items()) if d == 'BUY']
         _dv_sell_src = [f"{k}({w})" for k, (d, w) in sorted(_dv_votes.items()) if d == 'SELL']
         
-        # Direction confidence formula:
-        # = (agreement_ratio * 50) + (margin_ratio * 50)
-        # agreement_ratio = how many of 7 possible signals agree (breadth)
-        # margin_ratio = weighted margin strength (depth)
-        # This naturally penalizes directions with few sources OR weak margins.
-        _DVR_MAX_SOURCES = 7  # 7 possible vote sources
+        # Direction confidence formula (v2 — Mar 17 fix):
+        # OLD: agreement = winner_n / 7 → broken early market (only 2-3 signals exist)
+        # NEW: agreement = winner_n / available_sources (% of ACTIVE signals that agree)
+        #      + source_quality scaling: fewer sources = slight discount (2 of 2 < 5 of 5)
+        #      This makes confidence achievable when only 2-3 signals are available.
         _dir_conf = 0.0
         _dir_sources_str = ""
         
@@ -1683,11 +1680,15 @@ class IntradayOptionScorer:
             _dv_winner_w = _dv_buy_w if direction == 'BUY' else _dv_sell_w
             _dv_winner_n = _dv_buy_n if direction == 'BUY' else _dv_sell_n
             _dv_loser_w = _dv_sell_w if direction == 'BUY' else _dv_buy_w
+            _dv_total_n = _dv_buy_n + _dv_sell_n  # signals that actually voted
             _dv_margin = _dv_winner_w - _dv_loser_w
             
-            _dv_agreement = _dv_winner_n / _DVR_MAX_SOURCES
+            _dv_agreement = _dv_winner_n / max(1, _dv_total_n)  # % of active voters
             _dv_margin_ratio = max(0, _dv_margin) / (max(0, _dv_margin) + 10)
-            _dir_conf = (_dv_agreement * 50) + (_dv_margin_ratio * 50)
+            _dv_raw_conf = (_dv_agreement * 50) + (_dv_margin_ratio * 50)
+            # Source quality: scale down when few sources voted (full credit at 4+)
+            _dv_source_quality = min(1.0, _dv_total_n / 4.0)
+            _dir_conf = _dv_raw_conf * (0.6 + 0.4 * _dv_source_quality)
             _dir_conf = min(100, max(0, _dir_conf))
         
         _dir_sources_str = f"BUY={_dv_buy_w}[{','.join(_dv_buy_src)}] SELL={_dv_sell_w}[{','.join(_dv_sell_src)}]"
@@ -6512,23 +6513,37 @@ class OptionsTrader:
         from datetime import datetime, date
         exits = []
         
+        # --- Batch LTP fetch: one API call instead of N ---
+        _open_positions = []
+        _ltp_symbols = []
         for pos in self.positions:
             if pos['status'] != 'OPEN':
                 continue
-            
-            # Skip credit spreads — they use exit_manager, not Greeks-based exits
             if pos.get('is_credit_spread') or pos.get('is_debit_spread') or '|' in pos.get('symbol', ''):
                 continue
-            
+            _open_positions.append(pos)
+            _ltp_symbols.append(pos['symbol'])
+        
+        _ltp_cache = {}
+        if self.kite and _ltp_symbols:
+            try:
+                # Kite ltp() supports up to 200 instruments per call
+                for i in range(0, len(_ltp_symbols), 200):
+                    _batch = _ltp_symbols[i:i+200]
+                    _quotes = self.kite.ltp(_batch)
+                    for sym, data in _quotes.items():
+                        _ltp_cache[sym] = data.get('last_price', 0)
+            except Exception as e:
+                print(f"⚠️ Batch LTP fetch error: {e}")
+        
+        for pos in _open_positions:
             symbol = pos['symbol']
             
             try:
-                # Get current price
-                if self.kite:
-                    quote = self.kite.ltp([symbol])
-                    current_premium = quote[symbol]['last_price']
-                else:
-                    current_premium = pos['entry_premium']  # Can't check in paper without kite
+                # Get current price from batch cache
+                current_premium = _ltp_cache.get(symbol, 0)
+                if not current_premium:
+                    current_premium = pos['entry_premium']  # Fallback if LTP unavailable
                 
                 entry = pos['entry_premium']
                 target = pos['target_premium']

@@ -112,7 +112,7 @@ DHAN_SCRIP_MAP = {
     'JSWSTEEL':    {'scrip_id': 11723, 'segment': 'NSE_FNO'},
     'KOTAKBANK':   {'scrip_id': 1922,  'segment': 'NSE_FNO'},
     'LT':          {'scrip_id': 11483, 'segment': 'NSE_FNO'},
-    'LTIM':        {'scrip_id': 17818, 'segment': 'NSE_FNO'},
+    'LTM':         {'scrip_id': 17818, 'segment': 'NSE_FNO'},
     'M&M':         {'scrip_id': 2031,  'segment': 'NSE_FNO'},
     'MARUTI':      {'scrip_id': 10999, 'segment': 'NSE_FNO'},
     'NESTLEIND':   {'scrip_id': 17963, 'segment': 'NSE_FNO'},
@@ -489,7 +489,18 @@ class DhanOIFetcher:
                     logger.warning("DhanOI: Data APIs not subscribed (Error 806)")
                     self.data_plan_active = False
                 elif '807' in str(err) or '809' in str(err) or 'expired' in str(err).lower():
-                    logger.warning("DhanOI: Token expired/invalid")
+                    logger.warning("DhanOI: Token expired/invalid — attempting renewal")
+                    # Try renewing token immediately before giving up
+                    if self.renew_token():
+                        logger.info("DhanOI: Token renewed after 401 — retrying fetch")
+                        return self.fetch(symbol, expiry)  # Retry once with fresh token
+                    # Renewal failed — check env for externally-refreshed token
+                    import os as _dhan_os
+                    _env_token = _dhan_os.environ.get('DHAN_ACCESS_TOKEN', '')
+                    if _env_token and _env_token != self.access_token:
+                        self.access_token = _env_token
+                        logger.info("DhanOI: Picked up refreshed token from env — retrying")
+                        return self.fetch(symbol, expiry)
                 else:
                     logger.warning(f"DhanOI: Auth error: {r.text[:200]}")
                 self._record_failure(f"{r.status_code}: {r.text[:100]}")
@@ -1131,19 +1142,23 @@ class DhanOIFetcher:
             _conc_pe = _concentration_max_pe / abs(_eff_pe_chg) if abs(_eff_pe_chg) > 0 else 0
             _single_strike_noise = max(_conc_ce, _conc_pe) > 0.85
             
-            # ── Price-direction heuristic from options ──
-            # We infer price direction from option price changes:
-            # CE prices rising + PE prices falling = underlying moving UP
-            # CE prices falling + PE prices rising = underlying moving DOWN
+            # ── Price-direction from real-time spot vs ATM strike ──
+            # Old logic inferred from daily premium changes — stale and misleading.
+            # New: spot above ATM strike = UP, below = DOWN. Cross-check via CE/PE LTP.
             _price_dir = 0  # +1 = up, -1 = down, 0 = unclear
             if strikes and spot > 0:
                 _atm_s = min(strikes, key=lambda s: abs(s['strike'] - spot))
-                _ce_price_chg = _atm_s.get('ce_change', 0) or 0
-                _pe_price_chg = _atm_s.get('pe_change', 0) or 0
-                if _ce_price_chg > 0 and _pe_price_chg < 0:
-                    _price_dir = 1   # underlying UP
-                elif _ce_price_chg < 0 and _pe_price_chg > 0:
-                    _price_dir = -1  # underlying DOWN
+                _atm_strike = _atm_s.get('strike', 0)
+                _ce_ltp = _atm_s.get('ce_ltp', 0) or 0
+                _pe_ltp = _atm_s.get('pe_ltp', 0) or 0
+                if _atm_strike > 0:
+                    _spot_vs_strike = spot - _atm_strike
+                    # Primary: direct spot vs strike
+                    if abs(_spot_vs_strike) > _atm_strike * 0.002:  # >0.2% away
+                        _price_dir = 1 if _spot_vs_strike > 0 else -1
+                    # Tiebreaker: CE vs PE LTP at ATM (put-call parity)
+                    elif _ce_ltp > 0 and _pe_ltp > 0:
+                        _price_dir = 1 if _ce_ltp > _pe_ltp else (-1 if _pe_ltp > _ce_ltp else 0)
             
             # ════════════════════════════════════════════════════════════
             # PREMIUM-OI CROSS-ANALYSIS — Writer vs Buyer Identification
@@ -1318,7 +1333,7 @@ class DhanOIFetcher:
                     # PE OI rising because BUYERS are buying puts = bearish hedge
                     # Flip signal: this is NOT long buildup, it's put buying
                     signal = 'SHORT_BUILDUP'
-                    _base *= 0.7  # Lower base — buyer-driven OI is less sticky
+                    _base *= 0.80  # Lower base — buyer-driven OI is less sticky
                 elif _pe_is_writer_confirmed:
                     # PE OI rising because WRITERS are selling puts = genuine support
                     _base += 0.12  # Writer-confirmed boost
@@ -1348,7 +1363,7 @@ class DhanOIFetcher:
                 if _ce_is_buyer_driven:
                     # CE OI rising because BUYERS are buying calls = bullish
                     signal = 'LONG_BUILDUP'
-                    _base *= 0.7  # Lower base — buyer-driven OI is less sticky
+                    _base *= 0.80  # Lower base — buyer-driven OI is less sticky
                 elif _ce_is_writer_confirmed:
                     # CE OI rising because WRITERS selling calls = genuine resistance
                     _base += 0.12  # Writer-confirmed boost

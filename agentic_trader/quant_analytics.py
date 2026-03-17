@@ -42,7 +42,7 @@ SECTOR_MAP = {
     "PFC": "NBFC", "RECLTD": "NBFC",
     # IT
     "INFY": "IT", "TCS": "IT", "WIPRO": "IT", "HCLTECH": "IT", "TECHM": "IT",
-    "LTIM": "IT", "MPHASIS": "IT", "COFORGE": "IT", "PERSISTENT": "IT",
+    "LTM": "IT", "MPHASIS": "IT", "COFORGE": "IT", "PERSISTENT": "IT",
     # Metals
     "TATASTEEL": "METALS", "JSWSTEEL": "METALS", "JINDALSTEL": "METALS", "HINDALCO": "METALS",
     "VEDL": "METALS", "NATIONALUM": "METALS", "NMDC": "METALS", "SAIL": "METALS",

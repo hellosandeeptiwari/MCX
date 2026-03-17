@@ -106,6 +106,30 @@ def calc_brokerage(entry_price, exit_price, quantity):
     total = brokerage + stt + exchange_charges + gst + sebi + stamp
     return round(total, 2)
 
+# ========== CAPITAL SWAP / EVICTION ENGINE ==========
+# When exposure >= threshold and a high-priority trade arrives,
+# evict the worst-performing stale position to free capital.
+CAPITAL_SWAP = {
+    "enabled": True,
+    "exposure_threshold_pct": 85.0,      # Only attempt swap when exposure >= 85%
+    "min_hold_minutes": 30,              # Don't evict positions held < 30 min
+    "min_stale_minutes": 45,             # Position must be stale >= 45 min to be evict-eligible
+    "max_evict_loss_pct": 15.0,          # Don't evict if unrealized loss > 15% (let SL handle it)
+    # Priority tier for INCOMING trades (higher = more deserving of capital)
+    # Incoming trade must have higher priority than the BEST open position to evict
+    "priority_tiers": {
+        "OI_WATCHER": 9,
+        "WATCHER_SPIKE_UP": 8, "WATCHER_SPIKE_DOWN": 8,
+        "WATCHER_SLOW_GRIND_UP": 7, "WATCHER_SLOW_GRIND_DOWN": 7,
+        "WATCHER_VOLUME_SURGE": 6,
+        "WATCHER_NEW_DAY_HIGH": 5, "WATCHER_NEW_DAY_LOW": 5,
+        "GMM_SNIPER": 4,
+        "ELITE": 3,
+        "GMM": 2,
+    },
+    "default_priority": 1,               # Anything not listed gets priority 1
+}
+
 # ========== HARD RULES (NEVER VIOLATE) ==========
 HARD_RULES = {
     "RISK_PER_TRADE": 0.07,         # 7% base risk per trade (tiered: 7% premium, 5% std, 4% base)
@@ -151,7 +175,9 @@ BREAKOUT_WATCHER = {
     "enabled": True,
     "watcher_start": "09:20",            # Watcher ignores triggers before this time (let ORB settle)
     # --- Trigger Thresholds (tightened Mar-10: catch sustainable moves, not opening spikes) ---
-    "price_spike_pct": 1.0,           # Trigger if price moves ≥1.0% within 60s baseline (was 0.7 — too sensitive at open)
+    "price_spike_pct": 0.6,           # Trigger if price moves ≥0.6% within 60s baseline (after 09:45)
+    "price_spike_pct_open": 1.0,      # Opening 30min spike threshold (09:15-09:45) — higher bar to avoid noise
+    "price_spike_open_until": "09:45", # Time cutoff for opening spike threshold
     "day_extreme_trigger": True,      # Trigger on new day high / day low break
     "day_extreme_min_move_pct": 0.35, # Day extreme must also show ≥0.35% move from baseline (was 0.25)
     "volume_surge_multiplier": 3.0,   # Trigger if tick volume ≥ 3.0x rolling average
@@ -161,13 +187,13 @@ BREAKOUT_WATCHER = {
     "sustain_seconds": 15,            # PRICE_SPIKE: 15s quick sanity check (OI fetched inline at drain provides real conviction)
     "sustain_seconds_extreme": 20,    # DAY_HIGH/LOW break — 20s proof
     "sustain_seconds_volume": 20,     # VOLUME_SURGE with confirmed ticks — 20s proof
-    "sustain_seconds_grind": 14,      # SLOW_GRIND already proved over 5min — quick sanity
-    "sustain_recheck_pct": 0.6,       # Spike/extreme: price must still be ≥0.6% from baseline (was 0.5)
+    "sustain_seconds_grind": 10,      # SLOW_GRIND already proved over 5min — 10s quick sanity (was 14)
+    "sustain_recheck_pct": 0.4,       # Spike/extreme: price must still be ≥0.4% from baseline (33% retrace room at 0.6 spike)
     "sustain_recheck_pct_volume": 0.5,# Volume surge: price must still be ≥0.5% from baseline (was 0.4 — 0.3% moves too weak)
     "sustain_retrace_max_pct": 50.0,  # Fail sustain if price retraces >50% from peak move during window
     "volume_surge_min_move_pct": 0.5, # VOLUME_SURGE must show ≥0.5% price move to enter sustain (was 0.3 — too noisy)
     # --- Slow Grind Detection ---
-    "slow_grind_pct": 1.0,              # 1%+ move over 5-minute window triggers SLOW_GRIND
+    "slow_grind_pct": 0.75,             # 0.75%+ move triggers SLOW_GRIND (was 0.85 — catching slower steady drifters)
     # --- Cooldown (anti-spam) ---
     "cooldown_seconds": 120,          # Don't re-trigger same stock within 2 minutes (was 3 — too slow)
     "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days
@@ -178,15 +204,15 @@ BREAKOUT_WATCHER = {
     "active_after": "09:35",          # Don't trigger before 09:35 (was 09:30 — ORB needs 20 min to form, VWAP unreliable before this)
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
     # --- Score Gate (LOWERED Mar-12: macro trend filter now handles quality, let more setups through) ---
-    "min_score": 35,                  # Minimum score to trade (was 40 — macro trend now filters counter-trend traps)
+    "min_score": 30,                  # Minimum score to trade (was 35 — lowered to let more watcher setups through)
     "orb_min_score": 40,              # ORB_BREAKOUT floor (was 25)
     "orb_min_move_prob": 0.55,        # ORB trades need P(move)≥55% (was 0.50)
     "watcher_min_move_prob": 0.40,    # WATCHER P(move) floor (was 0.30 — too permissive)
     "watcher_min_adx": 15,            # ADX floor — watcher trigger IS trend evidence
     # --- Scorer Conflict (NEW Mar-10: trust scorer when score is low) ---
-    "scorer_conflict_max_score": 50,  # If scorer disagrees and score < this, block trade
+    "scorer_conflict_max_score": 40,          # G2b: block scorer-trigger conflict only if score < 40 (was 50)  # If scorer disagrees and score < this, block trade
     # --- RSI Extreme Guard (NEW Mar-10: don't buy into exhausted moves) ---
-    "rsi_extreme_pe_max": 25,         # Block PE (SELL) if RSI < 25 — oversold bounce imminent
+    "rsi_extreme_pe_max": 24,         # Block PE (SELL) if RSI < 24 — oversold bounce imminent
     "rsi_extreme_ce_min": 75,         # Block CE (BUY) if RSI > 75 — overbought pullback imminent
     # --- Exhaustion Index (NEW Mar-10: statistical move exhaustion detection) ---
     # Combines: intraday move from open + recent trigger move + position in day range + RSI
@@ -197,12 +223,12 @@ BREAKOUT_WATCHER = {
     "max_trades_before_1000": 2,      # Max watcher trades before 10:00 IST (was 3)
     # --- Early Market Hardening (9:35-9:55 is still dicey) ---
     "early_market_end": "09:55",       # Early market protection window end
-    "early_market_min_score": 50,      # Higher score bar during early market (normal=40)
+    "early_market_min_score": 40,      # Lowered from 50 — review after tomorrow's session
     "early_market_min_dir_conf": 45,   # Min direction confidence during early market
     "early_market_min_sustain_pct": 1.0, # Min sustained move % for spikes in early market (normal=0.6)
     # --- Dynamic Batch ---
     "max_triggers_per_batch": 6,      # Max triggers fed to pipeline per drain
-    "max_trades_per_scan": 2,         # Max trades PLACED per scan (was 3 — quality over quantity)
+    "max_trades_per_scan": 5,         # Max trades PLACED per scan (raised from 2 → 5 to catch all strong triggers)
     # --- VIX-based score penalty for elevated options pricing ---
     "vix_penalty_above": 22.0,        # If India VIX > 22, apply -2 score penalty per VIX point above 22
     "vix_penalty_per_point": 2,       # Penalty per VIX point (VIX=25 → -6 penalty, VIX=28 → -12 penalty)
@@ -405,7 +431,7 @@ DOWN_RISK_GATING = {
     # Flag=True guarantees score > model threshold (UP≈0.19, DOWN≈0.23).
     # Floor must be BELOW these thresholds so flagged stocks aren't double-filtered.
     "min_confirm_score": 0.0,          # Flag gate is sufficient — smart_score safety weight handles quality ranking
-    "min_smart_score": 55,             # Raised from 50 — require real conviction (Mar 2: VEDL tech=35 slipped through at 54)
+    "min_smart_score": 55,             # Minimum smart score for model tracker trades
     # === ALL_AGREE AMPLIFIED BET ===
     # All 3 models agree (Titan + GMM + XGB) = strongest conviction → amplified lot sizing
     "all_agree_lot_multiplier": 1.5,   # 1.5x lots for ALL_AGREE (strongest conviction)
@@ -437,11 +463,11 @@ ML_DIRECTION_CONFLICT = {
 #   gmm_confirms_direction = True means NO anomaly = clean pattern = safe
 #   → ML_OVERRIDE fires when XGB opposes AND gmm_confirms_direction=True
 ML_OVERRIDE_GATES = {
-    "min_move_prob": 0.55,            # XGB gate P(MOVE) floor — 0.56 blocked edge cases due to float rounding
+    "min_move_prob": 0.55,            # XGB P(MOVE) — must see real movement signal
     "min_dr_score": 0.15,             # GMM must show clean signal (low dr = confirmed direction, high dr = anomaly)
     "min_directional_prob": 0.30,     # XGB prob_up/prob_down — relaxed from 0.40 (Mar 2 fix: LT blocked at 0.29)
     "max_concurrent_open": 3,         # Max simultaneously open ML_OVERRIDE_WGMM positions
-    "min_smart_score": 55,            # Smart score floor (was 58)
+    "min_smart_score": 55,            # Minimum smart score for ML_OVERRIDE trades
 }
 
 # === GMM CONTRARIAN (DR_FLIP) — Feb 24 fix ===
@@ -450,8 +476,8 @@ ML_OVERRIDE_GATES = {
 # Safety: requires high Gate P(MOVE) + XGB must not strongly disagree with flipped dir.
 GMM_CONTRARIAN = {
     "enabled": True,
-    "min_dr_score": 0.27,              # Anomaly floor — stronger signal required (top ~15-20% anomalies only)
-    "min_gate_prob": 0.65,             # P(MOVE) floor — contrarian needs strong gate conviction to override direction
+    "min_dr_score": 0.27,              # Require top ~15% anomalies
+    "min_gate_prob": 0.65,             # Contrarian needs strong gate conviction
     "max_concurrent_open": 3,          # Max simultaneously open DR_FLIP positions
     "max_trades_per_day": 4,           # Conservative daily limit — these are contrarian
     "lot_multiplier": 1.0,             # Standard lots (not boosted — contrarian = careful)
@@ -477,22 +503,27 @@ GMM_CONTRARIAN = {
 TEST_GMM = {
     "enabled": True,
     # DOWN model signal: down_flag confirms → BUY PUT
-    "down_min_score": 0.27,              # Tightened: require stronger DOWN signal (was 0.25)
+    # Data: winners DN range 0.245-0.343. Floor catches signal, cap blocks exhaustion.
+    "down_min_score": 0.28,              # Data Mar16-17: DR<0.25 = 0% WR -₹19k. Raised floor to 0.28
+    "down_max_score": 0.35,              # Winner max DN=0.343. DN>0.35 = 0W/3L (exhaustion trap)
     "down_max_opposite": 0.10,           # Clean side must be genuinely clean
     # UP model signal: up_flag confirms → BUY CALL
-    "up_min_score": 0.24,                # Tightened: UP model AUROC=0.56, need stronger signal (was 0.22)
+    "up_min_score": 0.28,                # Aligned with DOWN floor raise
+    "up_max_score": 0.35,                # Cap over-confidence on CALL side too
     "up_max_opposite": 0.10,             # Clean side must be genuinely clean
-    # Divergence quality
-    "min_divergence_gap": 0.20,          # Require strong gap between regimes (was 0.12)
+    # Divergence quality — data-driven from 43 trades Mar 4-17
+    # gap<=0.21: 11W/11L +Rs33k | gap>=0.24: 3W/6L -Rs31k | gap>=0.29: 0W/3L -Rs12k
+    "min_divergence_gap": 0.13,          # Winner min gap=0.139 — catch all valid signals
+    "max_divergence_gap": 0.23,          # Data: gap>=0.24 = 33%WR -Rs31k. Sweet spot <=0.23
     # FLAG-based conviction gates (model-calibrated thresholds)
     "require_signaling_flag": True,      # Signaling regime must FIRE its own anomaly flag
-    "require_clean_no_flag": True,       # Tightened: clean side must NOT be flagging (reduces noise)
+    "require_clean_no_flag": True,       # Clean side must NOT be flagging (reduces noise)
     # Pure GMM play — NO XGB involvement
     "require_xgb_agree": False,          # No XGB gating — pure regime divergence signal
     "min_gate_prob": 0.0,                # No P(MOVE) requirement — bypass XGB entirely
     "max_gate_prob": 1.0,                # No cap needed
     "max_ml_confidence": 1.0,            # No cap needed
-    "min_smart_score": 0,                # No smart score — divergence IS the signal
+    "min_smart_score": 45,               # Data Mar16-17: score≥45 = 50% WR +₹5k vs score<45 = heavy losses
     "max_trades_per_day": 50,            # Uncapped for paper tracking — conviction thresholds do the filtering
     "lot_multiplier": 1.0,               # Standard lots — paper tracking, not sizing up
     "score_tier": "standard",
@@ -537,10 +568,10 @@ GMM_SNIPER = {
     "enabled": True,
     "max_sniper_trades_per_day": 4,    # ⚠️ Tightened: sniper = SELECTIVE, 4 max (was 8)
     "lot_multiplier": 3.0,             # Reduced from 5x → 3x. Earn bigger size with proven P&L
-    "min_smart_score": 53,             # Strict: need solid conviction (was 50)
-    "max_updr_score": 0.10,            # Strict: GMM must show cleaner signal (was 0.11)
-    "max_downdr_score": 0.13,          # Strict: cleaner downside (was 0.14)
-    "min_gate_prob": 0.52,             # Strict: XGB must see real movement (was 0.50)
+    "min_smart_score": 53,             # Minimum smart score for sniper trades
+    "max_updr_score": 0.10,            # Cleanest UP regime only
+    "max_downdr_score": 0.13,          # Cleanest DOWN regime only
+    "min_gate_prob": 0.52,             # XGB movement signal threshold
     "min_direction_confidence": 55,    # Smart Direction Engine: multi-signal consensus required
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
     "separate_capital": 200000,        # ₹2 Lakh — sniper capital reduced, must prove ROI
@@ -692,7 +723,7 @@ ARBTR_SECTOR_MAP = {
     },
     'IT': {
         'index': 'NSE:NIFTY IT',
-        'stocks': ['INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM',
+        'stocks': ['INFY', 'TCS', 'WIPRO', 'HCLTECH', 'TECHM', 'LTM',
                    'COFORGE', 'MPHASIS', 'PERSISTENT'],
     },
     'BANKS': {

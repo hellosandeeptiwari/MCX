@@ -1020,8 +1020,9 @@ class ZerodhaTools:
                         'IC_TARGET_HIT', 'IC_SL_HIT', 'IC_TIME_EXIT', 'IC_BREAKOUT_EXIT', 'IC_EOD_EXIT',
                         'SPREAD_TRAIL_SL', 'THETA_DECAY_WARNING',
                         'DEBIT_SPREAD_SL', 'DEBIT_SPREAD_TARGET', 'DEBIT_SPREAD_TIME_EXIT',
-                        'DEBIT_SPREAD_TRAIL_SL', 'DEBIT_SPREAD_MAX_PROFIT',
+                        'DEBIT_SPREAD_TRAIL_SL', 'DEBIT_SPREAD_MAX_PROFIT', 'DEBIT_SPREAD_STALE_CAP',
                         'SNIPE_TRAILING_SL', 'SNIPE_TIME_GUARD', 'CONVICTION_REVERSAL',
+                        'CAPITAL_SWAP_EVICT',
                         # Thesis Invalidation Engine (TIE) exit types
                         'THESIS_INVALID_R_COLLAPSE', 'THESIS_INVALID_NEVER_SHOWED_LIFE',
                         'THESIS_INVALID_IV_CRUSH', 'THESIS_INVALID_UNDERLYING_BOS',
@@ -2268,49 +2269,65 @@ class ZerodhaTools:
                     # If DX was all zeros (no directional movement), indicate weak trend
                     adx = _adx_val if _adx_val is not None else 10.0
             
-            # === INTRADAY ADX OVERRIDE ===
-            # Daily ADX is blind to today's price action — a stock crashing 4% intraday
-            # still shows daily ADX=20 because it looks at past 14+ daily bars.
-            # Fix: if today's move from prev_close exceeds N× daily ATR, override ADX
-            # to reflect the real intraday trend strength.
-            #
-            # Tiers (conservative — only boosts, never reduces):
-            #   Move ≥ 2.0× ATR → ADX = max(daily, 45)  "Very strong intraday trend"
-            #   Move ≥ 1.5× ATR → ADX = max(daily, 35)  "Strong intraday trend"
-            #   Move ≥ 1.0× ATR → ADX = max(daily, 28)  "Moderate intraday trend"
-            #
-            # Also checks intraday candle consistency: if 70%+ candles move in same
-            # direction, it confirms directional conviction (not just a gap).
+            # === INTRADAY ADX (from 5-min candles) ===
+            # Daily ADX reflects multi-week trend strength — missed today's momentum.
+            # Compute a proper ADX from intraday candles when available, and use
+            # the HIGHER of daily vs intraday ADX (best of both timeframes).
             _daily_adx = adx  # preserve original for logging
             _adx_overridden = False
-            _prev_close_for_adx = close.iloc[-2] if len(close) > 1 else close.iloc[-1]
-            _current_price_for_adx = close.iloc[-1]
-            if atr > 0 and _prev_close_for_adx > 0:
-                _todays_move = abs(_current_price_for_adx - _prev_close_for_adx)
-                _atr_multiple = _todays_move / atr
-                
-                # Check intraday directional consistency (anti-whipsaw)
-                _directional_pct = 0.0
-                if intraday_df is not None and len(intraday_df) >= 3:
-                    _bodies = intraday_df['close'] - intraday_df['open']
-                    _bullish_count = (_bodies > 0).sum()
-                    _bearish_count = (_bodies < 0).sum()
-                    _total = len(_bodies)
-                    _directional_pct = max(_bullish_count, _bearish_count) / _total if _total > 0 else 0
-                
-                # Only override if move is significant AND directionally consistent
-                # OR if move is very large (gap + continuation, direction inherently clear)
-                _direction_confirmed = _directional_pct >= 0.6 or _atr_multiple >= 2.0
-                
-                if _direction_confirmed:
-                    if _atr_multiple >= 2.0:
-                        adx = max(adx, 45.0)
-                    elif _atr_multiple >= 1.5:
-                        adx = max(adx, 35.0)
-                    # Removed 1.0x tier — too loose, 1x ATR moves are noise on low-vol stocks
-                    
-                    if adx > _daily_adx:
-                        _adx_overridden = True
+            
+            if intraday_df is not None and len(intraday_df) >= 28:
+                try:
+                    _ih = intraday_df['high']
+                    _il = intraday_df['low']
+                    _ic = intraday_df['close']
+                    _itr1 = _ih - _il
+                    _itr2 = abs(_ih - _ic.shift(1))
+                    _itr3 = abs(_il - _ic.shift(1))
+                    _itr = pd.concat([_itr1, _itr2, _itr3], axis=1).max(axis=1)
+                    _iatr_smooth = _itr.rolling(14).mean()
+                    _iplus_dm = _ih.diff()
+                    _iminus_dm = -_il.diff()
+                    _iplus_dm = _iplus_dm.where((_iplus_dm > _iminus_dm) & (_iplus_dm > 0), 0.0)
+                    _iminus_dm = _iminus_dm.where((_iminus_dm > _iplus_dm) & (_iminus_dm > 0), 0.0)
+                    _iplus_di = 100 * (_iplus_dm.rolling(14).mean() / _iatr_smooth)
+                    _iminus_di = 100 * (_iminus_dm.rolling(14).mean() / _iatr_smooth)
+                    _idi_sum = _iplus_di + _iminus_di
+                    _idx = 100 * abs(_iplus_di - _iminus_di) / _idi_sum.where(_idi_sum > 0, 1e-10)
+                    _idx = _idx.replace([float('inf'), float('-inf')], 0).fillna(0)
+                    _iadx_series = _idx.rolling(14).mean()
+                    _iadx_last = _iadx_series.iloc[-1]
+                    if not pd.isna(_iadx_last):
+                        _intraday_adx = float(_iadx_last)
+                        # Use higher of daily vs intraday — captures trend on both timeframes
+                        if _intraday_adx > adx:
+                            adx = _intraday_adx
+                            _adx_overridden = True
+                except Exception:
+                    pass  # Fall through to ATR-multiple fallback below
+            
+            # Fallback: ATR-multiple heuristic when intraday candles < 28 (early session)
+            if not _adx_overridden:
+                _prev_close_for_adx = close.iloc[-2] if len(close) > 1 else close.iloc[-1]
+                _current_price_for_adx = close.iloc[-1]
+                if atr > 0 and _prev_close_for_adx > 0:
+                    _todays_move = abs(_current_price_for_adx - _prev_close_for_adx)
+                    _atr_multiple = _todays_move / atr
+                    _directional_pct = 0.0
+                    if intraday_df is not None and len(intraday_df) >= 3:
+                        _bodies = intraday_df['close'] - intraday_df['open']
+                        _bullish_count = (_bodies > 0).sum()
+                        _bearish_count = (_bodies < 0).sum()
+                        _total = len(_bodies)
+                        _directional_pct = max(_bullish_count, _bearish_count) / _total if _total > 0 else 0
+                    _direction_confirmed = _directional_pct >= 0.6 or _atr_multiple >= 2.0
+                    if _direction_confirmed:
+                        if _atr_multiple >= 2.0:
+                            adx = max(adx, 45.0)
+                        elif _atr_multiple >= 1.5:
+                            adx = max(adx, 35.0)
+                        if adx > _daily_adx:
+                            _adx_overridden = True
             
             # Additional context for informed decisions
             high_20d = high.tail(20).max()
@@ -2510,22 +2527,47 @@ class ZerodhaTools:
             chop_zone = False
             chop_reason = ""
             
-            # Calculate ATR/Range ratio for last 5 candles
-            if len(df) >= 5:
+            # Calculate ATR/Range ratio from INTRADAY candles (not daily)
+            # Old logic used 5-day daily range — meaningless for intraday chop.
+            # Now uses last 12 intraday candles (~1hr on 5-min) vs intraday ATR.
+            atr_range_ratio = 1.0
+            if intraday_df is not None and len(intraday_df) >= 12:
+                _chop_window = intraday_df.iloc[-12:]
+                _chop_high = _chop_window['high'].max()
+                _chop_low = _chop_window['low'].min()
+                _chop_range = _chop_high - _chop_low
+                # Intraday ATR from 5-min candles
+                _itr1 = intraday_df['high'] - intraday_df['low']
+                _itr2 = abs(intraday_df['high'] - intraday_df['close'].shift(1))
+                _itr3 = abs(intraday_df['low'] - intraday_df['close'].shift(1))
+                _itr = pd.concat([_itr1, _itr2, _itr3], axis=1).max(axis=1)
+                _intra_atr = _itr.rolling(14).mean().iloc[-1] if len(_itr) >= 14 else _itr.mean()
+                atr_range_ratio = _chop_range / _intra_atr if _intra_atr > 0 else 1.0
+            elif len(df) >= 5:
+                # Fallback to daily if no intraday data
                 recent_high = high.iloc[-5:].max()
                 recent_low = low.iloc[-5:].min()
                 recent_range = recent_high - recent_low
                 atr_range_ratio = recent_range / atr if atr > 0 else 1.0
-            else:
-                atr_range_ratio = 1.0
             
-            # Count ORB re-entries (price crossing back into ORB multiple times)
+            # Count ORB re-entries from INTRADAY candles (not daily)
+            # Old logic used last 10 daily closes — completely wrong for
+            # intraday whipsaw detection. Now checks intraday candle closes.
             orb_reentries = 0
-            if len(df) >= 10:
+            if intraday_df is not None and len(intraday_df) >= 4:
+                _orb_closes = intraday_df['close'].values
+                for i in range(max(1, len(_orb_closes) - 20), len(_orb_closes)):
+                    _pc = _orb_closes[i]
+                    _pp = _orb_closes[i - 1]
+                    # Check if crossed back into ORB from outside
+                    if orb_low <= _pc <= orb_high:
+                        if _pp > orb_high or _pp < orb_low:
+                            orb_reentries += 1
+            elif len(df) >= 10:
+                # Fallback to daily if no intraday data
                 for i in range(-10, 0):
                     price_i = close.iloc[i]
                     price_prev = close.iloc[i-1] if i > -10 else close.iloc[i]
-                    # Check if crossed back into ORB from outside
                     if orb_low <= price_i <= orb_high:
                         if price_prev > orb_high or price_prev < orb_low:
                             orb_reentries += 1
@@ -2724,6 +2766,22 @@ class ZerodhaTools:
                 close_back = float(intraday_df['close'].iloc[-(_momentum_lookback + 1)])  # lookback candles back
                 if close_back > 0:
                     momentum_15m = ((close_now - close_back) / close_back) * 100
+            
+            # === INTRADAY RSI (5-min candles) ===
+            # Daily RSI reflects multi-week trend — useless for intraday gates.
+            # Intraday RSI shows actual session momentum: a stock rallying +3%
+            # today will have intraday RSI ~65-70 even if daily RSI is 23.
+            rsi_intraday = 50.0  # neutral default
+            if intraday_df is not None and len(intraday_df) >= 16:
+                _iclose = intraday_df['close']
+                _idelta = _iclose.diff()
+                _igain = _idelta.where(_idelta > 0, 0).rolling(14).mean()
+                _iloss = (-_idelta.where(_idelta < 0, 0)).rolling(14).mean()
+                _irs = _igain / _iloss.where(_iloss > 0, 1e-10)
+                _irsi_series = 100 - (100 / (1 + _irs))
+                _irsi_last = _irsi_series.iloc[-1]
+                if not pd.isna(_irsi_last):
+                    rsi_intraday = float(_irsi_last)
             
             # === BOS / SWEEP (STRUCTURE) DETECTION ===
             # BOS: Did price break AND close beyond the last swing high/low?
@@ -2927,6 +2985,7 @@ class ZerodhaTools:
                 'pullback_candles': pullback_candles,
                 # === MOMENTUM ===
                 'momentum_15m': round(momentum_15m, 4),
+                'rsi_intraday': round(rsi_intraday, 1),
                 # === BOS / SWEEP (STRUCTURE) ===
                 'bos_signal': bos_signal,
                 'sweep_signal': sweep_signal,

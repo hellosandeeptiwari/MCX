@@ -140,7 +140,15 @@ class NSEOIFetcher:
         Returns None on failure.
         """
         if self._consecutive_failures >= self._max_consecutive_failures:
-            return None  # Circuit breaker
+            # Auto-reset after 5 minutes (prevents permanent lockout)
+            import time as _nse_t
+            if not hasattr(self, '_circuit_open_until'):
+                self._circuit_open_until = _nse_t.time() + 300
+            if _nse_t.time() > self._circuit_open_until:
+                self._consecutive_failures = 0  # Half-open: try one request
+                self._circuit_open_until = 0
+            else:
+                return None  # Circuit breaker still active
             
         # Determine endpoint
         clean_symbol = symbol.replace("NSE:", "").replace("NFO:", "").strip()
@@ -558,13 +566,20 @@ class NSEOIFetcher:
                     _pe_iv = _atm.get('pe_iv', 0) or 0
                     if _ce_iv > 0 and _pe_iv > 0:
                         _atm_iv_skew = _pe_iv - _ce_iv
-                    # Price direction from option price changes
-                    _ce_chg = _atm.get('ce_change', 0) or 0
-                    _pe_chg = _atm.get('pe_change', 0) or 0
-                    if _ce_chg > 0 and _pe_chg < 0:
-                        _price_dir = 1
-                    elif _ce_chg < 0 and _pe_chg > 0:
-                        _price_dir = -1
+                    # Price direction from real-time spot vs ATM strike
+                    # If spot > ATM strike → underlying UP, else DOWN
+                    # Cross-check with CE/PE LTP: CE > PE at ATM → spot above strike
+                    _atm_strike = _atm.get('strike', 0)
+                    _ce_ltp = _atm.get('ce_ltp', 0) or 0
+                    _pe_ltp = _atm.get('pe_ltp', 0) or 0
+                    if _atm_strike > 0 and spot > 0:
+                        _spot_vs_strike = spot - _atm_strike
+                        # Primary: direct spot vs strike
+                        if abs(_spot_vs_strike) > _atm_strike * 0.002:  # >0.2% away
+                            _price_dir = 1 if _spot_vs_strike > 0 else -1
+                        # Tiebreaker: CE vs PE LTP at ATM (put-call parity)
+                        elif _ce_ltp > 0 and _pe_ltp > 0:
+                            _price_dir = 1 if _ce_ltp > _pe_ltp else (-1 if _pe_ltp > _ce_ltp else 0)
                     _atm_count = len(atm_zone)
             
             # Use ATM data if available
@@ -637,7 +652,7 @@ class NSEOIFetcher:
                 
                 if _pe_is_buyer_driven:
                     signal = 'SHORT_BUILDUP'  # Flip: PE buyers = bearish
-                    _base *= 0.7
+                    _base *= 0.80
                 elif _pe_is_writer_confirmed:
                     _base += 0.12  # Writer-confirmed boost
                 
@@ -658,7 +673,7 @@ class NSEOIFetcher:
                 
                 if _ce_is_buyer_driven:
                     signal = 'LONG_BUILDUP'  # Flip: CE buyers = bullish
-                    _base *= 0.7
+                    _base *= 0.80
                 elif _ce_is_writer_confirmed:
                     _base += 0.12  # Writer-confirmed boost
                 
