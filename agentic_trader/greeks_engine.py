@@ -99,6 +99,7 @@ def _load_greeks_config():
     try:
         from config import GREEKS_EXIT_CONFIG as _cfg
     except ImportError:
+        print("⚠️ FALLBACK [greeks/config_load]: GREEKS_EXIT_CONFIG import failed — using defaults")
         _cfg = {}
     return {
         'delta_collapse': _cfg.get('delta_collapse_threshold', 0.08),
@@ -158,6 +159,7 @@ def compute_live_greeks(
     try:
         from options_trader import BlackScholes, OptionType
     except ImportError:
+        print("⚠️ FALLBACK [greeks/compute_live]: BlackScholes import failed")
         return None
     
     if spot_price <= 0 or strike <= 0 or option_ltp <= 0:

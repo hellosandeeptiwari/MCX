@@ -161,8 +161,8 @@ def update_env_token(new_token: str, env_path: str = None) -> bool:
             # Clean up temp file on failure
             try:
                 os.unlink(tmp_path)
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [dhan_token/cleanup_tmp]: {e}")
             raise e
     
     except Exception as e:

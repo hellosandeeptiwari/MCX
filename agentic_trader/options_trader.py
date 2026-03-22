@@ -577,7 +577,7 @@ class IntradayOptionScorer:
                 
                 # Slow grind relaxation: watcher already confirmed sustained directional move
                 _grind_vol_ok = _grind_vol in ('HIGH', 'EXPLOSIVE') or (_is_slow_grind and _grind_vol == 'NORMAL')
-                _grind_move_min = 0.4 if _is_slow_grind else 0.8
+                _grind_move_min = 0.7 if _is_slow_grind else 0.8  # was 0.4 — too lenient, small grinds reversing
                 
                 # Bearish VWAP grind: below VWAP, vol confirmed, stock actually moved down
                 if (_grind_ltp < _grind_vwap and _grind_ltp < _grind_open 
@@ -1191,6 +1191,24 @@ class IntradayOptionScorer:
                     reasons.append(f"OI FLIP: SHORT_COVERING overrides {_old_dir} → BUY (OI-{oi_change:.1f}%) (+{oi_score})")
                 
                 score += oi_score
+        
+        # === 8a2. TRAPPED VOLUME (Participant Quality) ===
+        # Writer-dominant OI = smart money conviction → bonus
+        # Buyer-dominant OI = retail chase → discount when OI already scored
+        if market_data and oi_score != 0:
+            _oi_part = market_data.get('oi_participant_id', 'UNKNOWN')
+            if _oi_part == 'WRITER_DOMINANT':
+                _part_bonus = 2
+                score += _part_bonus
+                if direction in ('BUY', 'HOLD'):
+                    bullish_points += _part_bonus
+                else:
+                    bearish_points += _part_bonus
+                reasons.append(f"WRITER_DOMINANT OI = smart money (+{_part_bonus})")
+            elif _oi_part == 'BUYER_DOMINANT' and abs(oi_score) >= 3:
+                _part_pen = -1
+                score += _part_pen
+                reasons.append(f"BUYER_DOMINANT OI = retail chase ({_part_pen})")
         
         _audit_after_oi = score
         
@@ -2483,13 +2501,7 @@ class IntradayOptionScorer:
                 print(f"   🛡️ MONTHLY EXPIRY: Forcing NEXT_MONTH expiry (0DTE monthly gamma too dangerous)")
                 return "NEXT_MONTH"
         except ImportError:
-            pass
-        
-        current_hour = datetime.now().hour
-        
-        # After 2 PM IST - prefer next week to avoid theta decay
-        if current_hour >= 14:
-            return "NEXT_WEEK"
+            print("⚠️ FALLBACK [options/expiry_shield_config]: EXPIRY_SHIELD_CONFIG import failed")
         
         # Early morning with ORB breakout - current week is fine
         if current_hour < 11 and signal.orb_signal in ["BREAKOUT_UP", "BREAKOUT_DOWN"]:
@@ -3879,8 +3891,8 @@ class OptionsTrader:
                 import config as _cfg_mod
                 _setup_cfg = getattr(_cfg_mod, setup_type, {})
                 _setup_overrides = _setup_cfg.get('iv_crush_overrides', {}) if isinstance(_setup_cfg, dict) else {}
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [options/setup_iv_overrides]: {e}")
         
         # 1. Compute ATM IV from chain (average of ATM CE + PE)
         atm_iv_pct = 0.0
@@ -3897,7 +3909,8 @@ class OptionsTrader:
                 atm_iv_pct = pe.iv * 100
             else:
                 atm_iv_pct = contract.iv * 100  # Fallback: selected contract
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ FALLBACK [options/atm_iv_calc]: {e}")
             atm_iv_pct = contract.iv * 100 if contract.iv > 0 else 0
         
         if atm_iv_pct <= 0:
@@ -4019,8 +4032,8 @@ class OptionsTrader:
                                 q = self.chain_fetcher.kite.quote([atm_contract.symbol])
                                 if atm_contract.symbol in q:
                                     depth_data = q[atm_contract.symbol].get('depth', {})
-                        except Exception:
-                            pass  # Use contract data without depth
+                        except Exception as e:
+                            print(f"⚠️ FALLBACK [options/depth_fetch]: {e}")  # Use contract data without depth
                         
                         # Build microstructure from contract + depth
                         contract_dict = {
@@ -4133,8 +4146,8 @@ class OptionsTrader:
                     print(f"   🧠 ML OVERRIDE: {underlying} tech=BUY → ML=BEARISH (flipping to SELL/PE)")
                     final_direction = 'SELL'
                     opt_type = OptionType.PE
-        except Exception:
-            pass  # ML unavailable — keep original direction
+        except Exception as e:
+            print(f"⚠️ FALLBACK [options/ml_direction_override]: {e}")  # ML unavailable — keep original direction
         
         print(f"   Strike: {strike_sel.value} | Expiry: {expiry_sel.value} | Type: {opt_type.value}")
         
@@ -4194,7 +4207,8 @@ class OptionsTrader:
                 if cached_decision and cached_decision.get('ml_prediction'):
                     _ml_sizing = cached_decision['ml_prediction'].get('ml_sizing_factor', 1.0)
                     _ml_sizing = max(0.5, min(2.0, _ml_sizing))  # Safety clamp (2.0x max for elite ML signals)
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ FALLBACK [options/ml_sizing]: {e}")
                 _ml_sizing = 1.0  # Any error → neutral (no sizing change)
             
             adjusted_lots = max(1, round(sizing['lots'] * decision.position_size_multiplier * _ml_sizing * iv_lot_mult))

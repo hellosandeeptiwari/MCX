@@ -40,12 +40,14 @@ def _load_expiry_config():
     try:
         from config import EXPIRY_SHIELD_CONFIG as _cfg
     except ImportError:
+        print("⚠️ FALLBACK [expiry/config_load]: EXPIRY_SHIELD_CONFIG import failed — using defaults")
         _cfg = {}
     def _parse_time(s, default):
         try:
             parts = s.split(':')
             return time(int(parts[0]), int(parts[1]))
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ FALLBACK [expiry/parse_time]: '{s}' — {e}")
             return default
     return {
         'no_new_naked_after': _parse_time(_cfg.get('no_new_naked_after', '12:00'), time(12, 0)),

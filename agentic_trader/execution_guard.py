@@ -113,7 +113,8 @@ class ExecutionGuard:
                 with open(self.slippage_log_file, 'r') as f:
                     data = json.load(f)
                     self.slippage_log = [SlippageRecord(**r) for r in data]
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ FALLBACK [exec_guard/slippage_json_load]: {e}")
                 self.slippage_log = []
 
     def _save_slippage_log(self):

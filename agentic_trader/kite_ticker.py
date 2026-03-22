@@ -112,8 +112,8 @@ class TitanTicker:
                     if inst.get('segment') == 'INDICES':
                         key = f"NSE:{inst['tradingsymbol']}"
                         self._instrument_map[key] = inst['instrument_token']
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/index_instruments]: {e}")
             
             self._instruments_loaded = True
             # print(f"🔌 Ticker: Loaded {len(self._instrument_map)} instrument tokens")
@@ -178,13 +178,13 @@ class TitanTicker:
             try:
                 self._breakout_watcher.save_state()
                 print("   💾 Watcher: state saved on shutdown")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/save_state_shutdown]: {e}")
         if self._ws:
             try:
                 self._ws.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/ws_close]: {e}")
         self._connected = False
     
     def subscribe_symbols(self, symbols: List[str], mode: str = 'quote'):
@@ -231,8 +231,8 @@ class TitanTicker:
         if tokens and self._connected and self._ws:
             try:
                 self._ws.unsubscribe(tokens)
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/unsubscribe]: {e}")
     
     # ===========================================================
     # DATA ACCESS — Zero API calls, reads from in-memory cache
@@ -263,7 +263,8 @@ class TitanTicker:
                         self._ltp_cache[token] = ltp
                         self._last_update[token] = time.time()
                 return ltp
-            except:
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/get_ltp_REST]: {symbol} — {e}")
                 return None
         return None
     
@@ -303,8 +304,8 @@ class TitanTicker:
                                 with self._lock:
                                     self._ltp_cache[token] = ltp
                                     self._last_update[token] = time.time()
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/get_ltp_batch_REST]: {len(cache_misses)} misses — {e}")
         
         return result
     
@@ -327,7 +328,8 @@ class TitanTicker:
                 self._stats['fallback_calls'] += 1
                 data = self.kite.quote([symbol])
                 return data.get(symbol)
-            except:
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/get_quote_REST]: {symbol} — {e}")
                 return None
         return None
     
@@ -354,8 +356,8 @@ class TitanTicker:
                 for sym in cache_misses:
                     if sym in data:
                         result[sym] = data[sym]
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/get_quote_batch_REST]: {len(cache_misses)} misses — {e}")
         
         return result
     
@@ -470,8 +472,22 @@ class TitanTicker:
                 # === BREAKOUT WATCHER: feed every equity tick ===
                 if self._breakout_watcher:
                     sym = self._token_to_symbol.get(token)
-                    if sym and sym.startswith('NSE:') and ':NIFTY' not in sym:
-                        self._breakout_watcher.process_tick(sym, tick, self._token_to_symbol)
+                    if sym and sym.startswith('NSE:'):
+                        if ':NIFTY' not in sym:
+                            self._breakout_watcher.process_tick(sym, tick, self._token_to_symbol)
+                        elif sym == 'NSE:NIFTY 50':
+                            # Feed NIFTY 50 data for Earlybird market-context gating
+                            _n_ltp = tick.get('last_price', 0)
+                            if _n_ltp > 0:
+                                self._breakout_watcher._nifty_ltp = _n_ltp
+                            _n_ohlc = tick.get('ohlc', {})
+                            if _n_ohlc:
+                                _n_close = _n_ohlc.get('close', 0)
+                                _n_open = _n_ohlc.get('open', 0)
+                                if _n_close > 0 and self._breakout_watcher._nifty_prev_close == 0:
+                                    self._breakout_watcher._nifty_prev_close = _n_close
+                                if _n_open > 0 and self._breakout_watcher._nifty_day_open == 0:
+                                    self._breakout_watcher._nifty_day_open = _n_open
     
     def _on_connect(self, ws, response):
         """Called on WebSocket connect"""
@@ -623,6 +639,8 @@ class TitanTicker:
                     'oi_day_low': quote.get('oi_day_low', 0),
                     'volume': quote.get('volume', 0),
                     'ltp': quote.get('last_price', 0),
+                    'buy_quantity': quote.get('buy_quantity', 0),
+                    'sell_quantity': quote.get('sell_quantity', 0),
                 }
 
         return None  # Not in cache — caller should REST fallback
@@ -650,6 +668,8 @@ class TitanTicker:
                             'oi_day_low': quote.get('oi_day_low', 0),
                             'volume': quote.get('volume', 0),
                             'ltp': quote.get('last_price', 0),
+                            'buy_quantity': quote.get('buy_quantity', 0),
+                            'sell_quantity': quote.get('sell_quantity', 0),
                         }
                         self._stats['cache_hits'] += 1
         return result
@@ -771,7 +791,7 @@ class BreakoutWatcher:
         
         # Priority queue settings
         self._queue_size = config.get('queue_size', 100)
-        self._priority_bypass_pct = config.get('priority_bypass_pct', 2.0)
+        self._priority_bypass_pct = config.get('priority_bypass_pct', 1.5)
         
         # Active window
         self._active_after = config.get('active_after', '09:20')
@@ -852,6 +872,22 @@ class BreakoutWatcher:
         self._oi_contradict_sustain_tighten = config.get('oi_contradict_sustain_tighten_pct', 0.20)  # raise recheck by 0.20% when OI contradicts
         self._oi_min_strength_for_confirm = config.get('oi_min_strength_for_confirm', 0.35)  # minimum OI strength to count as confirmation
 
+        # === EARLYBIRD STATE (Opening Volatility 09:15-09:45) ===
+        from config import EARLYBIRD_COMMON, EARLYBIRD_A, EARLYBIRD_B, EARLYBIRD_C
+        self._eb_common = EARLYBIRD_COMMON
+        self._eb_a = EARLYBIRD_A
+        self._eb_b = EARLYBIRD_B
+        self._eb_c = EARLYBIRD_C
+        self._earlybird_enabled = EARLYBIRD_COMMON.get('enabled', False)
+        self._earlybird_trades_fired = 0  # Count of earlybird triggers queued today
+        self._prev_close: Dict[str, float] = {}  # sym → previous day close price (from OHLC)
+        self._day_open: Dict[str, float] = {}     # sym → today's open price (from OHLC)
+        self._earlybird_fired: Dict[str, set] = {'A': set(), 'B': set(), 'C': set()}  # Per-mode fired symbols
+        # NIFTY 50 tracking for market-context gating
+        self._nifty_prev_close: float = 0.0    # NIFTY 50 previous day close
+        self._nifty_day_open: float = 0.0       # NIFTY 50 today's open
+        self._nifty_ltp: float = 0.0            # NIFTY 50 latest tick price
+
         # State persistence — survive mid-session restarts
         self._state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'watcher_state.json')
         self._last_save_ts = 0.0
@@ -917,8 +953,8 @@ class BreakoutWatcher:
                         'move_direction': move_direction,
                         'participant': result.get('oi_participant_id', ''),
                     }
-            except Exception:
-                pass  # Fail silently — OI confirmation is optional
+            except Exception as e:
+                print(f"⚠️ FALLBACK [ticker/oi_prefetch]: {symbol[-8:] if len(symbol) > 8 else symbol} — {e}")
 
         t = threading.Thread(target=_fetch_oi, daemon=True, name=f"oi-prefetch-{symbol[-8:]}")
         t.start()
@@ -1081,15 +1117,15 @@ class BreakoutWatcher:
         """Return True if we're under per-symbol AND global per-minute limits.
         
         Per-symbol: max 3 triggers/min per stock (prevents one noisy stock flooding)
-        Global: max 20 triggers/min total (safety net for crash days)
+        Global: max 30 triggers/min total (safety net for crash days)
         Individual stocks should NOT be dropped because other stocks ate the quota.
         """
         now = time.time()
         # Prune old timestamps (older than 60s)
         self._recent_triggers = [t for t in self._recent_triggers if now - t < 60]
         
-        # Global safety cap (generous — 20/min, not the old 10)
-        if len(self._recent_triggers) >= 20:
+        # Global safety cap (generous — 30/min, not the old 20)
+        if len(self._recent_triggers) >= 30:
             return False
         
         # Per-symbol cap: 3/min per stock
@@ -1120,8 +1156,8 @@ class BreakoutWatcher:
             ltp = bl.get('price', 0)
         # Reset to current state
         if symbol in self._baselines_long:
-            self._baselines_long[symbol] = {'price': ltp or 0, 'ts': now, 'peak_move': 0.0}
-        _cum_vol = self._cum_volume.get(symbol, 0)
+            self._baselines_long[symbol] = {'price': ltp or 0, 'ts': now, 'peak_move': 0.0, 'min_price': ltp or 0, 'max_price': ltp or 0}
+        _cum_vol = self._prev_cumulative_vol.get(symbol, 0)
         self._grind_start_vol[symbol] = _cum_vol
         _hist = self._vol_delta_history.get(symbol)
         self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
@@ -1168,6 +1204,15 @@ class BreakoutWatcher:
         _tick_day_high = ohlc.get('high', 0) if ohlc else 0
         _tick_day_low = ohlc.get('low', 0) if ohlc else 0
         
+        # === TRACK PREV CLOSE & DAY OPEN (for Earlybird gap detection) ===
+        if ohlc:
+            _ohlc_close = ohlc.get('close', 0)  # Previous day's close
+            _ohlc_open = ohlc.get('open', 0)     # Today's open
+            if _ohlc_close > 0 and symbol not in self._prev_close:
+                self._prev_close[symbol] = _ohlc_close
+            if _ohlc_open > 0 and symbol not in self._day_open:
+                self._day_open[symbol] = _ohlc_open
+        
         # === COMPUTE VOLUME DELTA (convert cumulative → per-tick delta) ===
         _cum_vol = tick.get('volume_traded', tick.get('volume', 0))
         _vol_delta = 0
@@ -1191,7 +1236,7 @@ class BreakoutWatcher:
         # This way a steady 0.2%/min grind accumulates to 1% over 5 min and fires.
         bl_long = self._baselines_long.get(symbol)
         if bl_long is None:
-            self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0}
+            self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0, 'min_price': ltp, 'max_price': ltp}
             self._grind_start_vol[symbol] = _cum_vol
             _hist = self._vol_delta_history.get(symbol)
             self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
@@ -1204,6 +1249,12 @@ class BreakoutWatcher:
             if abs(_long_move) > abs(_peak_move):
                 bl_long['peak_move'] = _long_move
                 _peak_move = _long_move
+
+            # Track min/max prices for spike-vs-grind move efficiency
+            if ltp < bl_long.get('min_price', ltp):
+                bl_long['min_price'] = ltp
+            if ltp > bl_long.get('max_price', ltp):
+                bl_long['max_price'] = ltp
             
             # Volume confirmation: compare vol rate during grind vs before grind
             _grind_vol_confirmed = False
@@ -1233,8 +1284,46 @@ class BreakoutWatcher:
             # Keep the trend origin so re-triggers after cooldown see the
             # FULL cumulative move (e.g. 2.5% not 0.6%). The cooldown
             # check here prevents useless churn during the cooldown window.
+            # [FIX Mar 19] Grind ≠ spike. After 09:45 require 5-min buildup
+            # at ≤0.4%/min. Before 09:45 keep 3-min/0.8 for opening grinds.
+            from datetime import time as _dtime
+            _now_t = datetime.now().time()
+            _post_open = _now_t >= _dtime(9, 45)
+            _grind_min_age = 300 if _post_open else 180   # 5 min after 09:45, 3 min before
+            _grind_max_vel = 0.40 if _post_open else 0.80  # tighter slope after open settles
             _grind_cooled = self._is_cooled_down(symbol)
-            if abs(_long_move) >= _effective_grind_pct and symbol not in self._pending and _grind_cooled:
+            _grind_age_ok = _age >= _grind_min_age
+            _grind_vel_ok = _velocity <= _grind_max_vel
+
+            # === SPIKE-vs-GRIND SMART FILTER ===
+            # A real grind is STEADY and LINEAR. Spikes/craters are bursts.
+            #
+            # 1. MOVE EFFICIENCY: net_move / (high - low) price range.
+            #    Grind A→B steadily: eff ~0.85-1.0
+            #    Spike+retrace A→C→B: eff <0.60
+            #    V-shape crater: eff <0.50
+            #
+            # 2. CONCENTRATION: fraction of total move in last 60s.
+            #    Grind: ~20% per minute over 5 min.
+            #    Late spike from flat base: 80-100% in last 60s. Cap at 50%.
+            _bl_min = bl_long.get('min_price', bl_long['price'])
+            _bl_max = bl_long.get('max_price', ltp)
+            _bl_range = _bl_max - _bl_min
+            _net_abs = abs(ltp - bl_long['price'])
+            _move_efficiency = (_net_abs / _bl_range) if _bl_range > 0.01 else 1.0
+            _efficiency_ok = _move_efficiency >= 0.60
+
+            _concentration_ok = True
+            _concentration = 0.0
+            if abs(_long_move) > 0.3:
+                _sb_conc = self._baselines.get(symbol)
+                if _sb_conc and _sb_conc['price'] > 0 and (now - _sb_conc['ts']) >= 15:
+                    _sb_move_abs = abs((ltp - _sb_conc['price']) / _sb_conc['price'] * 100)
+                    if abs(_long_move) > 0.01:
+                        _concentration = _sb_move_abs / abs(_long_move)
+                        _concentration_ok = _concentration <= 0.50
+
+            if abs(_long_move) >= _effective_grind_pct and symbol not in self._pending and _grind_cooled and _grind_age_ok and _grind_vel_ok and _efficiency_ok and _concentration_ok:
                 _sg_type = 'SLOW_GRIND_UP' if _long_move > 0 else 'SLOW_GRIND_DOWN'
                 self._stats['slow_grinds_detected'] = self._stats.get('slow_grinds_detected', 0) + 1
                 self._pending[symbol] = {
@@ -1247,6 +1336,8 @@ class BreakoutWatcher:
                     'vol_confirmed': _grind_vol_confirmed,
                     'vol_ratio': round(_grind_vol_ratio, 2),
                     'grind_age_s': round(_age, 0),
+                    'move_efficiency': round(_move_efficiency, 3),
+                    'concentration': round(_concentration, 3),
                 }
                 # Slope quality signals for end-of-slope detection downstream
                 _grind_open = ohlc.get('open', 0) if ohlc else 0
@@ -1270,7 +1361,7 @@ class BreakoutWatcher:
                 _vc_tag = " VOL✓" if _grind_vol_confirmed else ""
                 self._log_grind_count += 1
                 if self._log_grind_count <= self._LOG_GRIND_MAX:
-                    print(f"   🐢 Watcher: {symbol} SLOW GRIND detected ({_long_move:+.1f}% over {_mins:.1f}min, vel={_velocity:.2f}%/min{_vc_tag}) → sustain check")
+                    print(f"   🐢 Watcher: {symbol} SLOW GRIND detected ({_long_move:+.1f}% over {_mins:.1f}min, vel={_velocity:.2f}%/min{_vc_tag}, eff={_move_efficiency:.0%}, conc={_concentration:.0%}) → sustain check")
                 else:
                     self._log_grind_suppressed.append(symbol.replace('NSE:', ''))
                 # TREND-ORIGIN: Do NOT reset baseline here. The origin is
@@ -1282,7 +1373,7 @@ class BreakoutWatcher:
                 # (a) Price drifted back to within 0.15% of baseline (flat/reversed), OR
                 # (b) Price retraced >50% of its peak move from baseline (momentum fading).
                 # Old logic: reset at 0.25% flat — killed legitimate grinds with normal noise.
-                self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0}
+                self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0, 'min_price': ltp, 'max_price': ltp}
                 self._grind_start_vol[symbol] = _cum_vol
                 _hist = self._vol_delta_history.get(symbol)
                 self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
@@ -1293,7 +1384,7 @@ class BreakoutWatcher:
                 _still_trending = abs(_long_move) >= self._slow_grind_pct
                 _stale_limit = 1800 if _still_trending else 600
                 if _age > _stale_limit:
-                    self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0}
+                    self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0, 'min_price': ltp, 'max_price': ltp}
                     self._grind_start_vol[symbol] = _cum_vol
                     _hist = self._vol_delta_history.get(symbol)
                     self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
@@ -1315,7 +1406,9 @@ class BreakoutWatcher:
                     pending['_peak_move_pct'] = _cur_move
             # Signal-aware sustain time: stronger signals need less proof
             _ttype_s = pending.get('trigger_type', '')
-            if 'GRIND' in _ttype_s:
+            if 'EARLYBIRD' in _ttype_s:
+                _effective_sustain = pending.get('_earlybird_sustain', 10)
+            elif 'GRIND' in _ttype_s:
                 _effective_sustain = self._sustain_secs_grind
             elif 'DAY' in _ttype_s:
                 _effective_sustain = self._sustain_secs_extreme
@@ -1328,14 +1421,28 @@ class BreakoutWatcher:
                 move_pct = round(abs(ltp - baseline_price) / baseline_price * 100, 1)
                 # Volume surges use a lower sustain bar (they just need price not to crash)
                 _ttype = pending.get('trigger_type', '')
-                _recheck = self._sustain_recheck_pct_volume if 'VOLUME' in _ttype else self._sustain_recheck_pct
+                # Earlybird uses per-mode sustain hold threshold
+                if 'EARLYBIRD' in _ttype:
+                    _eb_mode = pending.get('earlybird_mode', 'B')
+                    if _eb_mode == 'A':
+                        _recheck = self._eb_a.get('sustain_min_hold_pct', 0.4)
+                    elif _eb_mode == 'C':
+                        _recheck = self._eb_c.get('sustain_min_hold_pct', 0.7)
+                    else:
+                        _recheck = self._eb_b.get('sustain_min_hold_pct', 0.5)
+                elif 'VOLUME' in _ttype:
+                    _recheck = self._sustain_recheck_pct_volume
+                else:
+                    _recheck = self._sustain_recheck_pct
                 # Early market hardening: require larger sustained move before 09:55
-                _em_end = self._config.get('early_market_end', '09:55')
-                _em_h, _em_m = int(_em_end.split(':')[0]), int(_em_end.split(':')[1])
-                _now_dt = datetime.now()
-                if _now_dt.hour < _em_h or (_now_dt.hour == _em_h and _now_dt.minute < _em_m):
-                    _em_min_sustain = self._config.get('early_market_min_sustain_pct', 1.0)
-                    _recheck = max(_recheck, _em_min_sustain)
+                # NOTE: Earlybird triggers SKIP early market hardening (they ARE early market)
+                if 'EARLYBIRD' not in _ttype:
+                    _em_end = self._config.get('early_market_end', '09:55')
+                    _em_h, _em_m = int(_em_end.split(':')[0]), int(_em_end.split(':')[1])
+                    _now_dt = datetime.now()
+                    if _now_dt.hour < _em_h or (_now_dt.hour == _em_h and _now_dt.minute < _em_m):
+                        _em_min_sustain = self._config.get('early_market_min_sustain_pct', 1.0)
+                        _recheck = max(_recheck, _em_min_sustain)
                 _peak_move = pending.get('_peak_move_pct', move_pct)
                 # Anti-retrace: if price retraced >50% of its peak move, the move is fading
                 _retrace_max = self._config.get('sustain_retrace_max_pct', 50.0)
@@ -1410,6 +1517,157 @@ class BreakoutWatcher:
                     self._cleanup_oi_prefetch(symbol)
                 del self._pending[symbol]
             return  # While pending, don't check new triggers for this symbol
+        
+        # === EARLYBIRD DETECTION (09:16-09:45 opening volatility) ===
+        # Three modes tracked separately:
+        #   A = Gap continuation (highest quality, larger sizing)
+        #   B = Strong opening directional move (medium quality)
+        #   C = Opening spike (lowest quality, stricter sustain)
+        # Market-context: compare stock move vs NIFTY 50 to detect beta vs idiosyncratic.
+        _earlybird_triggered = False
+        if self._earlybird_enabled:
+            from datetime import time as _eb_time
+            _eb_com = self._eb_common
+            _eb_now_t = datetime.now().time()
+            _eb_start_parts = _eb_com.get('start_time', '09:16').split(':')
+            _eb_end_parts = _eb_com.get('end_time', '09:45').split(':')
+            _eb_start = _eb_time(int(_eb_start_parts[0]), int(_eb_start_parts[1]))
+            _eb_end = _eb_time(int(_eb_end_parts[0]), int(_eb_end_parts[1]))
+            
+            if _eb_start <= _eb_now_t <= _eb_end:
+                _eb_prev_close = self._prev_close.get(symbol, 0)
+                _eb_day_open = self._day_open.get(symbol, 0)
+                _eb_baseline = bl['price'] if bl else 0
+                
+                if _eb_prev_close > 0 and _eb_day_open > 0 and _eb_baseline > 0:
+                    # Core price metrics
+                    _gap_pct = (ltp - _eb_prev_close) / _eb_prev_close * 100
+                    _open_move_pct = (ltp - _eb_day_open) / _eb_day_open * 100
+                    _eb_move_from_bl = (ltp - _eb_baseline) / _eb_baseline * 100
+                    
+                    # --- Market Context: NIFTY 50 change from open ---
+                    _nifty_change = 0.0
+                    _is_idiosyncratic = False
+                    _is_beta_driven = False
+                    if self._nifty_day_open > 0 and self._nifty_ltp > 0:
+                        _nifty_change = (self._nifty_ltp - self._nifty_day_open) / self._nifty_day_open * 100
+                        _idx_thresh = _eb_com.get('index_same_dir_threshold', 0.3)
+                        # Stock and index moving same direction both ≥ threshold = beta-driven
+                        if abs(_nifty_change) >= _idx_thresh and abs(_open_move_pct) >= 0.3:
+                            if (_nifty_change > 0 and _open_move_pct > 0) or (_nifty_change < 0 and _open_move_pct < 0):
+                                _is_beta_driven = True
+                        # Stock moving but index flat/opposite = idiosyncratic
+                        if abs(_open_move_pct) >= 0.5 and (abs(_nifty_change) < _idx_thresh or
+                            (_nifty_change > 0 and _open_move_pct < 0) or (_nifty_change < 0 and _open_move_pct > 0)):
+                            _is_idiosyncratic = True
+                    
+                    # Volume check (shared baseline — modes can override)
+                    _eb_base_vol_ratio = _eb_com.get('min_vol_ratio', 1.5)
+                    _eb_vol_ok = True  # Assume OK if not enough history
+                    _eb_vol_ratio_actual = 0.0
+                    if len(self._vol_delta_history[symbol]) >= 3:
+                        _eb_avg_vol = sum(self._vol_delta_history[symbol]) / len(self._vol_delta_history[symbol])
+                        if _eb_avg_vol > 0:
+                            _eb_vol_ratio_actual = _vol_delta / _eb_avg_vol
+                    
+                    _has_gap = abs(_gap_pct) >= self._eb_a.get('gap_open_pct', 0.8)
+                    _strong_gap = abs(_gap_pct) >= self._eb_a.get('gap_strong_pct', 1.5)
+                    
+                    # --- MODE A: Gap Continuation ---
+                    _eb_a_cfg = self._eb_a
+                    if symbol not in self._earlybird_fired['A'] and _has_gap:
+                        _gap_cont_min = _eb_a_cfg.get('gap_continuation_min', 0.35)
+                        # Gap direction must match current move direction AND price continues
+                        if ((_gap_pct > 0 and _open_move_pct >= _gap_cont_min) or
+                            (_gap_pct < 0 and _open_move_pct <= -_gap_cont_min)):
+                            # Volume check for mode A (uses common threshold)
+                            if _eb_vol_ratio_actual >= _eb_base_vol_ratio or len(self._vol_delta_history[symbol]) < 3:
+                                _eb_dir_move = _open_move_pct
+                                _eb_ttype = 'EARLYBIRD_A_UP' if _eb_dir_move > 0 else 'EARLYBIRD_A_DOWN'
+                                _eb_sustain = _eb_a_cfg.get('sustain_seconds', 8)
+                                _eb_reason = f'GAP({_gap_pct:+.1f}%)+CONT({_open_move_pct:+.1f}%)'
+                                self._pending[symbol] = {
+                                    'trigger_price': ltp, 'trigger_ts': now,
+                                    'trigger_type': _eb_ttype, 'baseline_price': _eb_baseline,
+                                    'move_pct': _eb_dir_move,
+                                    'gap_pct': round(_gap_pct, 2), 'open_move_pct': round(_open_move_pct, 2),
+                                    'has_gap': True, 'strong_gap': _strong_gap,
+                                    'earlybird_mode': 'A', 'earlybird_reason': _eb_reason,
+                                    '_earlybird_sustain': _eb_sustain,
+                                    'nifty_change_pct': round(_nifty_change, 2),
+                                    'is_idiosyncratic': _is_idiosyncratic,
+                                    'is_beta_driven': _is_beta_driven,
+                                }
+                                _earlybird_triggered = True
+                                self._earlybird_fired['A'].add(symbol)
+                                self._earlybird_trades_fired += 1
+                                self._stats['earlybird_a_detected'] = self._stats.get('earlybird_a_detected', 0) + 1
+                                _ctx_tag = '★IDIO' if _is_idiosyncratic else ('βETA' if _is_beta_driven else 'NEUTRAL')
+                                print(f"   🐦A Watcher: {symbol} {_eb_ttype} ({_eb_reason}) nifty={_nifty_change:+.1f}% [{_ctx_tag}] → sustain {_eb_sustain}s")
+                    
+                    # --- MODE B: Strong Opening Move (only if A didn't fire) ---
+                    _eb_b_cfg = self._eb_b
+                    if not _earlybird_triggered and symbol not in self._earlybird_fired['B']:
+                        _eb_open_move_thresh = _eb_b_cfg.get('opening_move_pct', 0.7)
+                        if abs(_open_move_pct) >= _eb_open_move_thresh:
+                            # Volume check for mode B
+                            if _eb_vol_ratio_actual >= _eb_base_vol_ratio or len(self._vol_delta_history[symbol]) < 3:
+                                _eb_dir_move = _open_move_pct
+                                _eb_ttype = 'EARLYBIRD_B_UP' if _eb_dir_move > 0 else 'EARLYBIRD_B_DOWN'
+                                _eb_sustain = _eb_b_cfg.get('sustain_seconds', 10)
+                                _eb_reason = f'OPEN_MOVE({_open_move_pct:+.1f}%)'
+                                self._pending[symbol] = {
+                                    'trigger_price': ltp, 'trigger_ts': now,
+                                    'trigger_type': _eb_ttype, 'baseline_price': _eb_baseline,
+                                    'move_pct': _eb_dir_move,
+                                    'gap_pct': round(_gap_pct, 2), 'open_move_pct': round(_open_move_pct, 2),
+                                    'has_gap': _has_gap, 'strong_gap': _strong_gap,
+                                    'earlybird_mode': 'B', 'earlybird_reason': _eb_reason,
+                                    '_earlybird_sustain': _eb_sustain,
+                                    'nifty_change_pct': round(_nifty_change, 2),
+                                    'is_idiosyncratic': _is_idiosyncratic,
+                                    'is_beta_driven': _is_beta_driven,
+                                }
+                                _earlybird_triggered = True
+                                self._earlybird_fired['B'].add(symbol)
+                                self._earlybird_trades_fired += 1
+                                self._stats['earlybird_b_detected'] = self._stats.get('earlybird_b_detected', 0) + 1
+                                _ctx_tag = '★IDIO' if _is_idiosyncratic else ('βETA' if _is_beta_driven else 'NEUTRAL')
+                                print(f"   🐦B Watcher: {symbol} {_eb_ttype} ({_eb_reason}) nifty={_nifty_change:+.1f}% [{_ctx_tag}] → sustain {_eb_sustain}s")
+                    
+                    # --- MODE C: Opening Spike (only if A and B didn't fire) ---
+                    _eb_c_cfg = self._eb_c
+                    if not _earlybird_triggered and symbol not in self._earlybird_fired['C']:
+                        _eb_spike_thresh = _eb_c_cfg.get('opening_spike_pct', 1.2)
+                        if abs(_eb_move_from_bl) >= _eb_spike_thresh:
+                            # Mode C requires stricter volume
+                            _eb_c_vol_ratio = _eb_c_cfg.get('min_vol_ratio', 2.0)
+                            if _eb_vol_ratio_actual >= _eb_c_vol_ratio or len(self._vol_delta_history[symbol]) < 3:
+                                _eb_dir_move = _eb_move_from_bl
+                                _eb_ttype = 'EARLYBIRD_C_UP' if _eb_dir_move > 0 else 'EARLYBIRD_C_DOWN'
+                                _eb_sustain = _eb_c_cfg.get('sustain_seconds', 15)
+                                _eb_reason = f'OPEN_SPIKE({_eb_move_from_bl:+.1f}%)'
+                                self._pending[symbol] = {
+                                    'trigger_price': ltp, 'trigger_ts': now,
+                                    'trigger_type': _eb_ttype, 'baseline_price': _eb_baseline,
+                                    'move_pct': _eb_dir_move,
+                                    'gap_pct': round(_gap_pct, 2), 'open_move_pct': round(_open_move_pct, 2),
+                                    'has_gap': _has_gap, 'strong_gap': _strong_gap,
+                                    'earlybird_mode': 'C', 'earlybird_reason': _eb_reason,
+                                    '_earlybird_sustain': _eb_sustain,
+                                    'nifty_change_pct': round(_nifty_change, 2),
+                                    'is_idiosyncratic': _is_idiosyncratic,
+                                    'is_beta_driven': _is_beta_driven,
+                                }
+                                _earlybird_triggered = True
+                                self._earlybird_fired['C'].add(symbol)
+                                self._earlybird_trades_fired += 1
+                                self._stats['earlybird_c_detected'] = self._stats.get('earlybird_c_detected', 0) + 1
+                                _ctx_tag = '★IDIO' if _is_idiosyncratic else ('βETA' if _is_beta_driven else 'NEUTRAL')
+                                print(f"   🐦C Watcher: {symbol} {_eb_ttype} ({_eb_reason}) nifty={_nifty_change:+.1f}% [{_ctx_tag}] → sustain {_eb_sustain}s")
+        
+        if _earlybird_triggered:
+            return  # Earlybird entered sustain — skip normal trigger detection this tick
         
         # === DETECT TRIGGERS ===
         baseline_price = bl['price']
@@ -1639,6 +1897,10 @@ class BreakoutWatcher:
             'SLOW_GRIND_UP': 2, 'SLOW_GRIND_DOWN': 2,
             'VOLUME_SURGE': 3,
             'PRICE_SPIKE_UP': 4, 'PRICE_SPIKE_DOWN': 4,
+            'EARLYBIRD_UP': 5, 'EARLYBIRD_DOWN': 5,
+            'EARLYBIRD_C_UP': 5, 'EARLYBIRD_C_DOWN': 5,
+            'EARLYBIRD_B_UP': 6, 'EARLYBIRD_B_DOWN': 6,
+            'EARLYBIRD_A_UP': 7, 'EARLYBIRD_A_DOWN': 7,
         }
         if not self._is_cooled_down(symbol):
             # Check if this trigger outranks the one that set the cooldown
@@ -1661,8 +1923,6 @@ class BreakoutWatcher:
         if not self._check_rate_limit(symbol):
             if move_pct_abs < self._priority_bypass_pct:
                 self._stats['rate_limited'] += 1
-                print(f"   ⏳ Watcher: {symbol} rate-limited (per-sym 3/min or global 20/min, "
-                      f"move={move_pct_abs:.1f}% < {self._priority_bypass_pct}% bypass) — skipping")
                 return
             # Big move → bypass rate limit
             print(f"   🔥 Watcher: {symbol} BYPASSING rate limit "
@@ -1697,7 +1957,9 @@ class BreakoutWatcher:
                           'break_count', 'break_margin',
                           '_peak_move_pct', '_sustain_held_pct',
                           '_oi_confirmed', '_oi_contradicted',
-                          '_oi_signal', '_oi_strength', '_oi_participant'):
+                          '_oi_signal', '_oi_strength', '_oi_participant',
+                          'gap_pct', 'open_move_pct', 'has_gap', 'strong_gap',
+                          'earlybird_reason'):
             if _meta_key in pending:
                 trigger_data[_meta_key] = pending[_meta_key]
         
@@ -1769,6 +2031,14 @@ class BreakoutWatcher:
             self._oi_prefetch_results.clear()
         for k in self._stats:
             self._stats[k] = 0
+        # Reset Earlybird state
+        self._earlybird_trades_fired = 0
+        self._prev_close.clear()
+        self._day_open.clear()
+        self._earlybird_fired = {'A': set(), 'B': set(), 'C': set()}
+        self._nifty_prev_close = 0.0
+        self._nifty_day_open = 0.0
+        self._nifty_ltp = 0.0
         # Delete previous day's state file
         if os.path.exists(self._state_file):
             try:

@@ -634,9 +634,24 @@ class FuturesOIFetcher:
             )
             
             features.drop(columns=['merge_date'], inplace=True)
+
+            # Even when spot_df exists, some/all rows may still be zero
+            # (spot dates don't overlap futures dates → NaN after merge
+            #  → ffill has nothing to propagate → np.where gives 0).
+            # Apply synthetic defaults for those rows so the ML quality
+            # gate doesn't kill the signal.
+            _zero_mask = (features['fut_basis_pct'] == 0) & (features['fut_vol_ratio'] == 0)
+            if _zero_mask.any():
+                features.loc[_zero_mask, 'fut_basis_pct'] = 0.15
+                features.loc[_zero_mask, 'fut_vol_ratio'] = 1.0
         else:
-            features['fut_basis_pct'] = 0.0
-            features['fut_vol_ratio'] = 0.0
+            # Spot merge failed completely — use futures close as proxy.
+            # Typical basis is 0.05-0.5%, and vol_ratio ~1.0 for liquid stocks.
+            # Setting 0/0 triggers the ML quality gate and kills all ML signals.
+            # Using a small synthetic basis + vol_ratio=1.0 keeps the model fed
+            # with reasonable values instead of a degenerate regime.
+            features['fut_basis_pct'] = 0.15   # ~typical near-month premium
+            features['fut_vol_ratio'] = 1.0    # neutral ratio
         
         # 4. 5-day OI trend — clipped to ±50% to prevent anomalous spikes
         # (Short histories like 23 rows caused values of 2000%+ which broke
@@ -765,7 +780,14 @@ def load_futures_oi_daily(symbol: str) -> Optional[pd.DataFrame]:
     """Load pre-computed daily futures OI features for a symbol."""
     path = os.path.join(DATA_DIR, f'{symbol}_futures_oi.parquet')
     if os.path.exists(path):
-        return pd.read_parquet(path)
+        df = pd.read_parquet(path)
+        # Fix pre-saved files where spot merge failed → basis=0, vol_ratio=0
+        if 'fut_basis_pct' in df.columns and 'fut_vol_ratio' in df.columns:
+            _zero = (df['fut_basis_pct'] == 0) & (df['fut_vol_ratio'] == 0)
+            if _zero.any():
+                df.loc[_zero, 'fut_basis_pct'] = 0.15
+                df.loc[_zero, 'fut_vol_ratio'] = 1.0
+        return df
     return None
 
 

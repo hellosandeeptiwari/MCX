@@ -93,7 +93,7 @@ class DataHealthGate:
                     self.halted_symbols = [s for s in self.halted_symbols if s in APPROVED_UNIVERSE]
                     self.stale_counters = {k: v for k, v in self.stale_counters.items() if k in APPROVED_UNIVERSE}
                 except ImportError:
-                    pass
+                    print("⚠️ FALLBACK [health/approved_universe]: APPROVED_UNIVERSE import failed")
                 return
         except Exception as e:
             print(f"⚠️ Error loading health state from SQLite: {e}")
@@ -110,7 +110,7 @@ class DataHealthGate:
                             self.halted_symbols = [s for s in self.halted_symbols if s in APPROVED_UNIVERSE]
                             self.stale_counters = {k: v for k, v in self.stale_counters.items() if k in APPROVED_UNIVERSE}
                         except ImportError:
-                            pass
+                            print("⚠️ FALLBACK [health/approved_universe_json]: APPROVED_UNIVERSE import failed")
         except Exception as e:
             print(f"⚠️ Error loading health state from JSON: {e}")
     
@@ -215,12 +215,12 @@ class DataHealthGate:
                         from trend_following import get_trend_engine
                         get_trend_engine().reset_hysteresis(symbol, "DATA_HALT")
                     except ImportError:
-                        pass
+                        print("⚠️ FALLBACK [health/trend_reset]: trend_following not available")
                     try:
                         from regime_score import get_regime_scorer
                         get_regime_scorer().reset_hysteresis(symbol, "DATA_HALT")
                     except ImportError:
-                        pass
+                        print("⚠️ FALLBACK [health/regime_reset]: regime_score not available")
         
         stale_counter = self.stale_counters.get(symbol, 0)
         can_trade = all_passed and symbol not in self.halted_symbols
@@ -259,15 +259,15 @@ class DataHealthGate:
                 if isinstance(last_trade_time, str):
                     last_trade_time = datetime.fromisoformat(last_trade_time.replace('Z', '+00:00'))
                 age_seconds = (datetime.now() - last_trade_time).total_seconds()
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [health/parse_trade_time]: {e}")
         
         if timestamp_str and age_seconds is None:
             try:
                 ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00').replace('+00:00', ''))
                 age_seconds = (datetime.now() - ts).total_seconds()
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ FALLBACK [health/parse_timestamp]: {e}")
         
         if age_seconds is None:
             age_seconds = 0  # Assume fresh if can't determine
@@ -303,7 +303,8 @@ class DataHealthGate:
                 'threshold': self.STALE_CANDLE_MINUTES,
                 'issue': f"STALE_CANDLE: {age_minutes:.1f}min old (limit: {self.STALE_CANDLE_MINUTES}min)" if not passed else None
             }
-        except:
+        except Exception as e:
+            print(f"⚠️ FALLBACK [health/parse_candle_time]: {e}")
             return {'passed': True, 'note': 'Could not parse candle timestamp'}
     
     def _check_candle_gaps(self, symbol: str, market_data: Dict) -> Dict:

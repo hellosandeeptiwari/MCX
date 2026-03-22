@@ -101,8 +101,8 @@ def check_setup():
         try:
             __import__(dep)
             print(f"✅ {dep}: Installed")
-        except:
-            print(f"❌ {dep}: NOT INSTALLED")
+        except Exception as e:
+            print(f"❌ {dep}: NOT INSTALLED ({e})")
             issues.append(f"pip install {dep}")
     
     print("\n" + "=" * 50)

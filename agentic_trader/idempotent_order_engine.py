@@ -219,7 +219,8 @@ class IdempotentOrderEngine:
             else:
                 order_date = datetime.fromisoformat(order_time_str.replace('Z', '')).date()
             return order_date == date.today()
-        except:
+        except Exception as e:
+            print(f"⚠️ FALLBACK [idempotent/is_same_session]: {e}")
             return False
     
     def record_order(

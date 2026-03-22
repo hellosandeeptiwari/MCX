@@ -142,14 +142,14 @@ class ExitManager:
         self.breakeven_trigger_r = 1.0  # Move SL to entry at 1.0R (was 0.8R — too early)
         
         # === PHASED TRAILING: Build → Run → Harvest ===
-        # Build zone (0 → 0.7R): No trailing, let trade establish
-        # Run zone (0.7R → 2.0R): Moderate trail, balance room vs profit lock
+        # Build zone (0 → 0.65R): No trailing, let trade establish
+        # Run zone (0.65R → 2.0R): Moderate trail, balance room vs profit lock
         # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
-        self.trailing_start_r = 0.5    # Trail from 0.5R (was 0.7R — protect early gains sooner)
-        self.trailing_run_pct = 0.60   # Run zone: retain 60% of peak (give back 40%) — was 0.50
+        self.trailing_start_r = 0.65   # Trail from 0.65R (was 0.6R)
+        self.trailing_run_pct = 0.65   # Run zone: retain 65% of peak (give back 35%) — was 0.60
         self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
-        self.trailing_harvest_pct = 0.75  # Harvest zone: retain 75% of peak (give back 25%) — was 0.65
-        self.trailing_pct = 0.60  # Default (used as fallback) — was 0.50
+        self.trailing_harvest_pct = 0.80  # Harvest zone: retain 80% of peak (give back 20%) — was 0.75
+        self.trailing_pct = 0.65  # Default (used as fallback) — was 0.60
         
         # Scaled profit booking (options only)
         self.partial_profit_pct = 30.0       # Book 50% at +30% premium gain (was 15% — too early!)
@@ -616,7 +616,7 @@ class ExitManager:
                 if clean.startswith(name):
                     return size
         except ImportError:
-            pass
+            print("⚠️ FALLBACK [exit/fno_lot_size]: FNO_LOT_SIZES import failed — using lot=1")
         return 1  # Fallback
     
     def _check_option_speed_gate(self, state: TradeState, r_multiple: float) -> Optional[ExitSignal]:
@@ -662,8 +662,8 @@ class ExitManager:
                 _sg_pct = 5.0      # Need +5% gain
                 _sg_max_r = 0.15   # Or +0.15R
             # else: DTE 8+ or unknown → use defaults (6 candles, 3%, 0.10R)
-        except Exception:
-            pass  # Use defaults if DTE unavailable
+        except Exception as e:
+            print(f"⚠️ FALLBACK [exit/speed_gate_dte]: {e} — using default speed gate params")
         
         if state.candles_since_entry >= _sg_candles:
             t_minutes = state.candles_since_entry * 5
@@ -1131,7 +1131,7 @@ class ExitManager:
                         state.target = greeks_target
                         
         except Exception as e:
-            pass  # Silent fail — don't block exits due to Greeks computation errors
+            print(f"⚠️ FALLBACK [exit/greeks_computation]: {state.symbol} — {e}")  # Don't block exits due to Greeks errors
     
     def _check_expiry_force_exit(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
         """
@@ -1154,8 +1154,8 @@ class ExitManager:
                     reason=reason,
                     urgency="IMMEDIATE",
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ FALLBACK [exit/expiry_force_exit]: {state.symbol} — {e}")
         return None
     
     def _check_greeks_exit(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
@@ -1208,8 +1208,8 @@ class ExitManager:
                     reason=reason,
                     urgency="NORMAL",
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ FALLBACK [exit/greeks_exit]: {state.symbol} — {e}")
         return None
     
     def _apply_breakeven(self, state: TradeState, r_multiple: float):
@@ -1314,7 +1314,7 @@ class ExitManager:
                     from trend_following import get_trend_engine
                     get_trend_engine().reset_hysteresis(symbol, "POSITION_CLOSED")
                 except ImportError:
-                    pass
+                    print("⚠️ FALLBACK [exit/hysteresis_reset]: neither regime_score nor trend_following available")
     
     def get_trade_state(self, symbol: str) -> Optional[TradeState]:
         """Get current state of a trade"""
