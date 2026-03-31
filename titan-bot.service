@@ -1,0 +1,22 @@
+[Unit]
+Description=Titan v5 Autonomous Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+EnvironmentFile=/home/ubuntu/titan/agentic_trader/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/bash -c "find /home/ubuntu/titan -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true"
+ExecStart=/home/ubuntu/titan/venv/bin/python autonomous_trader.py
+Restart=on-failure
+RestartSec=30
+MemoryMax=1G
+StandardOutput=append:/home/ubuntu/titan/logs/titan.log
+StandardError=append:/home/ubuntu/titan/logs/titan-error.log
+
+[Install]
+WantedBy=multi-user.target

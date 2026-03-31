@@ -433,22 +433,56 @@ class ZerodhaTools:
     
     def _place_order_autoslice(self, **kwargs):
         """
-        Place order with autoslice=true to auto-split orders exceeding exchange freeze limits.
-        Without autoslice, orders >1800 qty NIFTY (or similar) get REJECTED.
+        Place order with autoslice, market protection, rate limiting, and 429 retry.
         
-        Uses route monkey-patching since the kiteconnect Python SDK doesn't expose
-        autoslice as a keyword argument (it's a URL query parameter).
+        - autoslice=true: auto-splits orders exceeding exchange freeze limits
+        - market_protection=5: enforces 5% default for MARKET/SL-M (Kite April 2026 mandate)
+        - Rate limiting: 350ms min gap between orders (Kite 10/sec cap)
+        - 429 retry: exponential backoff on rate limit errors
         """
-        if not AUTOSLICE_ENABLED or not hasattr(self.kite, '_routes'):
-            return self.kite.place_order(**kwargs)
+        import time as _time
         
-        orig_route = self.kite._routes.get("orders.place", "/orders/{variety}")
-        try:
+        # === MARKET PROTECTION (Kite mandate effective April 1 2026) ===
+        # market_protection=0 or missing is REJECTED for MARKET and SL-M orders
+        ot = str(kwargs.get('order_type', '')).upper()
+        if 'MARKET' in ot or 'SLM' in ot or 'SL-M' in ot:
+            mp = kwargs.get('market_protection')
+            if mp is None or (isinstance(mp, (int, float)) and mp <= 0):
+                kwargs['market_protection'] = 5
+        
+        # === RATE LIMIT THROTTLE (350ms min gap between orders) ===
+        if not hasattr(self, '_last_order_ts'):
+            self._last_order_ts = 0.0
+        elapsed = _time.time() - self._last_order_ts
+        if elapsed < 0.35:
+            _time.sleep(0.35 - elapsed)
+        
+        # === AUTOSLICE ROUTE PATCH ===
+        use_autoslice = AUTOSLICE_ENABLED and hasattr(self.kite, '_routes')
+        orig_route = None
+        if use_autoslice:
+            orig_route = self.kite._routes.get("orders.place", "/orders/{variety}")
             if "autoslice" not in orig_route:
                 self.kite._routes["orders.place"] = "/orders/{variety}?autoslice=true"
-            return self.kite.place_order(**kwargs)
+        
+        try:
+            for attempt in range(3):
+                try:
+                    result = self.kite.place_order(**kwargs)
+                    self._last_order_ts = _time.time()
+                    return result
+                except Exception as e:
+                    err_str = str(e)
+                    if ('429' in err_str or 'Too Many Requests' in err_str
+                            or 'rate' in err_str.lower()) and attempt < 2:
+                        delay = 1.0 * (2 ** attempt)
+                        print(f"   ⚠️ Rate limit (429), retry in {delay}s (attempt {attempt+1}/3)")
+                        _time.sleep(delay)
+                        continue
+                    raise
         finally:
-            self.kite._routes["orders.place"] = orig_route
+            if use_autoslice and orig_route is not None:
+                self.kite._routes["orders.place"] = orig_route
     
     # =================================================================
     # GTT SAFETY NET — Server-Side SL + Target (survives crashes)
@@ -4169,6 +4203,29 @@ class ZerodhaTools:
         # Pass market_data for IV crush gate even when not using intraday scoring
         # (e.g., TEST_XGB needs ATR for RV computation in IV/RV ratio check)
         _md_for_order = market_data if (use_intraday_scoring or pre_fetched_market_data) else None
+        
+        # === SNIPER THRESHOLD OVERRIDE: GMM Sniper has its own ML gates, lower score floor ===
+        _sniper_threshold_override = None
+        if setup_type in ('GMM_SNIPER', 'ML_OVERRIDE_WGMM'):
+            from options_trader import get_intraday_scorer as _get_scorer_snp
+            _scorer_inst = _get_scorer_snp()
+            _sniper_threshold_override = _scorer_inst.BLOCK_THRESHOLD
+            _scorer_inst.BLOCK_THRESHOLD = 58  # ML-backed trades need lower floor
+            print(f"   🎯 SNIPER THRESHOLD: {_sniper_threshold_override} → 58 (ML-backed)")
+        
+        # === EARLYBIRD THRESHOLD OVERRIDE: Watcher gates already validated the trade ===
+        # At 9:15-9:25, indicators (ORB, volume, follow-through) are barely formed.
+        # Intraday scorer naturally gives low scores early. EB watcher gates are the
+        # real validation — scorer should only block extreme garbage.
+        _eb_threshold_override = None
+        if 'EARLYBIRD' in (setup_type or ''):
+            from options_trader import get_intraday_scorer as _get_scorer_eb
+            _scorer_inst_eb = _get_scorer_eb()
+            _eb_threshold_override = _scorer_inst_eb.BLOCK_THRESHOLD
+            _scorer_inst_eb.BLOCK_THRESHOLD = 35  # EB watcher gates ≫ scorer at 9:15
+            _scorer_inst_eb._eb_micro_override = True  # Skip microstructure hard-block (spreads wide at 9:15)
+            print(f"   🐦 EARLYBIRD THRESHOLD: {_eb_threshold_override} → 35 + micro-bypass (watcher-validated)")
+        
         plan = options_trader.create_option_order(
             underlying=underlying,
             direction=direction,
@@ -4179,6 +4236,16 @@ class ZerodhaTools:
             cached_decision=_cached,
             setup_type=setup_type
         )
+        
+        # Restore original threshold
+        if _sniper_threshold_override is not None:
+            from options_trader import get_intraday_scorer as _get_scorer_snp2
+            _get_scorer_snp2().BLOCK_THRESHOLD = _sniper_threshold_override
+        if _eb_threshold_override is not None:
+            from options_trader import get_intraday_scorer as _get_scorer_eb2
+            _scorer_eb2 = _get_scorer_eb2()
+            _scorer_eb2.BLOCK_THRESHOLD = _eb_threshold_override
+            _scorer_eb2._eb_micro_override = False  # Restore microstructure hard-block
         
         if plan is None:
             # Track rejection so autonomous_trader won't retry this symbol
@@ -4301,18 +4368,9 @@ class ZerodhaTools:
                 "action": "SKIP - look for other opportunities"
             }
         
-        # === PENNY PREMIUM GATE (Feb 24 fix) ===
-        # Block options with LTP below minimum — prevents position-size bombs
-        # e.g. ₹0.94 option × 64,500 units: ₹0.10 move = ₹6,450 loss
-        from config import HARD_RULES as _hr
-        _min_premium = _hr.get('MIN_OPTION_PREMIUM', 3.0)
-        if plan.contract.ltp < _min_premium:
-            print(f"   🚫 PENNY PREMIUM BLOCKED: {plan.contract.symbol} LTP=₹{plan.contract.ltp:.2f} < min ₹{_min_premium}")
-            return {
-                "success": False,
-                "error": f"Option premium ₹{plan.contract.ltp:.2f} below minimum ₹{_min_premium} — penny options create position-size bombs",
-                "action": "Skip — premium too cheap, excessive unit exposure risk"
-            }
+        # === PENNY PREMIUM GATE — DISABLED (Mar 30: user OK with penny premiums) ===
+        # Previously blocked options < ₹3 to prevent position-size bombs.
+        # Disabled per user request — penny premiums are accepted.
         
         # === IV CRUSH GUARD (Feb 25 fix — IOC 22.8% IV trap) ===
         # Prevents buying low-IV options that are vulnerable to IV compression,
@@ -4416,6 +4474,7 @@ class ZerodhaTools:
         
         # === MAX UNITS GATE (Feb 24 fix) ===
         # Hard cap on total units (lots × lot_size) to prevent outsized notional exposure
+        from config import HARD_RULES as _hr
         _max_units = _hr.get('MAX_UNITS_PER_TRADE', 30000)
         _total_units = plan.quantity * plan.contract.lot_size
         if _total_units > _max_units:
@@ -4445,9 +4504,16 @@ class ZerodhaTools:
                     _dte = (_exp_d - _date_cls.today()).days
                 
                 # Gate 1: Theta/premium ratio — block if theta eats >5% of premium per day
+                # EARLYBIRD: relax to 12% — theta is always high at 9:15, gap edge compensates
+                # 0DTE: relax further — theta IS the premium on expiry day (Mar 30 fix)
                 if _opt_theta and _opt_ltp and _opt_ltp > 0:
                     _theta_pct = abs(_opt_theta) / _opt_ltp * 100
                     _max_theta_pct = _theta_cfg.get('max_theta_pct_of_premium', 5.0)
+                    if 'EARLYBIRD' in (setup_type or ''):
+                        _max_theta_pct = max(_max_theta_pct, 12.0)  # EB gap-open edge > theta drag
+                    # On 0DTE (expiry day), theta/premium is inherently extreme — relax cap
+                    if _dte == 0:
+                        _max_theta_pct = max(_max_theta_pct, 50.0)  # 0DTE: allow up to 50%
                     if _theta_pct > _max_theta_pct:
                         # print(f"   🕐 THETA GATE BLOCKED: {plan.contract.symbol} — daily θ=₹{_opt_theta:.2f} "
                         #       f"= {_theta_pct:.1f}% of LTP ₹{_opt_ltp:.2f} (max {_max_theta_pct}%)")

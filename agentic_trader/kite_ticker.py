@@ -1607,7 +1607,7 @@ class BreakoutWatcher:
                     
                     # --- MODE B: Strong Opening Move (only if A didn't fire) ---
                     _eb_b_cfg = self._eb_b
-                    if not _earlybird_triggered and symbol not in self._earlybird_fired['B']:
+                    if not _earlybird_triggered and _eb_b_cfg.get('enabled', True) and symbol not in self._earlybird_fired['B']:
                         _eb_open_move_thresh = _eb_b_cfg.get('opening_move_pct', 0.7)
                         if abs(_open_move_pct) >= _eb_open_move_thresh:
                             # Volume check for mode B
@@ -1637,7 +1637,7 @@ class BreakoutWatcher:
                     
                     # --- MODE C: Opening Spike (only if A and B didn't fire) ---
                     _eb_c_cfg = self._eb_c
-                    if not _earlybird_triggered and symbol not in self._earlybird_fired['C']:
+                    if not _earlybird_triggered and _eb_c_cfg.get('enabled', True) and symbol not in self._earlybird_fired['C']:
                         _eb_spike_thresh = _eb_c_cfg.get('opening_spike_pct', 1.2)
                         if abs(_eb_move_from_bl) >= _eb_spike_thresh:
                             # Mode C requires stricter volume
@@ -1959,7 +1959,7 @@ class BreakoutWatcher:
                           '_oi_confirmed', '_oi_contradicted',
                           '_oi_signal', '_oi_strength', '_oi_participant',
                           'gap_pct', 'open_move_pct', 'has_gap', 'strong_gap',
-                          'earlybird_reason'):
+                          'earlybird_mode', 'earlybird_reason'):
             if _meta_key in pending:
                 trigger_data[_meta_key] = pending[_meta_key]
         

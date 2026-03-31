@@ -136,7 +136,7 @@ class OIWatcherEngine:
                 # OI says BUY + stock is falling = divergence (could still work, but less confident)
                 _oc_C_confirmed = False
                 _oc_C_price_chg = 0.0
-                _oc_C_min_delta = getattr(t, '_oi_watcher_min_price_delta', 0.20)
+                _oc_C_min_delta = getattr(t, '_oi_watcher_min_price_delta', 0.15)
                 if _ticker:
                     try:
                         _oc_clean = _oc_sym.replace('NSE:', '')
@@ -406,7 +406,8 @@ class OIWatcherEngine:
                 _oc_vol_surge_ratio = 0.0
                 if _ticker:
                     try:
-                        _oc_vdh_store = getattr(_ticker, '_vol_delta_history', None)
+                        _oc_bw = getattr(_ticker, '_breakout_watcher', None)
+                        _oc_vdh_store = getattr(_oc_bw, '_vol_delta_history', None) if _oc_bw else None
                         _oc_vdh = _oc_vdh_store.get(_oc_sym) if _oc_vdh_store is not None else None
                         if _oc_vdh and len(_oc_vdh) >= 5:
                             _oc_vavg = sum(_oc_vdh) / len(_oc_vdh)
@@ -489,12 +490,64 @@ class OIWatcherEngine:
                 _oc_res['_mf_K'] = _oc_K_confirmed
                 _oc_res['_mf_M'] = _oc_vol_surge_aligned
 
+                # (B2) Momentum Confluence — 4 signals, ≥2/4 to confirm (anchor factor)
+                # Computed natively from OI watcher data. Joins F,H,K in anchor pool.
+                _oc_B2_signals = 0
+                _oc_B2_tags = []
+                # B2-1: Fresh price move (≥0.25% from prev close in either direction)
+                if abs(_oc_C_price_chg) >= 0.25:
+                    _oc_B2_signals += 1
+                    _oc_B2_tags.append('FreshPx')
+                # B2-2: Strong OI signal (base strength ≥ 0.45)
+                if _oc_str >= 0.45:
+                    _oc_B2_signals += 1
+                    _oc_B2_tags.append('OIStr')
+                # B2-3: Volume surge aligned (Factor M)
+                if _oc_vol_surge_aligned:
+                    _oc_B2_signals += 1
+                    _oc_B2_tags.append('VolSrg')
+                # B2-4: Price above open (BUY) / below open (SELL) — VWAP proxy
+                _oc_B2_px_vs_open = False
+                if _ticker:
+                    try:
+                        with _ticker._lock:
+                            _oc_b2_tok = None
+                            for _tk_b2, _tsym_b2 in _ticker._token_to_symbol.items():
+                                if _tsym_b2 == _oc_sym:
+                                    _oc_b2_tok = _tk_b2
+                                    break
+                            if _oc_b2_tok:
+                                _oc_b2_q = _ticker._quote_cache.get(_oc_b2_tok, {})
+                                _oc_b2_ltp = _oc_b2_q.get('last_price', 0)
+                                _oc_b2_open = ((_oc_b2_q.get('ohlc', {}) or {}).get('open', 0))
+                                if _oc_b2_ltp > 0 and _oc_b2_open > 0:
+                                    _oc_B2_px_vs_open = (
+                                        (_oc_dir == 'BUY' and _oc_b2_ltp > _oc_b2_open) or
+                                        (_oc_dir == 'SELL' and _oc_b2_ltp < _oc_b2_open)
+                                    )
+                    except Exception:
+                        pass
+                if _oc_B2_px_vs_open:
+                    _oc_B2_signals += 1
+                    _oc_B2_tags.append('PxVsOpen')
+                _oc_B2_confirmed = _oc_B2_signals >= 2
+                _oc_res['_mf_B2'] = _oc_B2_confirmed
+                _oc_res['_mf_B2_signals'] = _oc_B2_signals
+                _oc_res['_mf_B2_tags'] = ','.join(_oc_B2_tags)
+                if _oc_B2_confirmed:
+                    _oc_boosts.append(f'B2✓{_oc_B2_signals}/4[{",".join(_oc_B2_tags)}]')
+                else:
+                    _oc_boosts.append(f'B2✗{_oc_B2_signals}/4')
+
                 # [FIX Mar 24 v2] Cap multiplicative inflation — multiplier product capped at 2.0x base
                 _oc_max_boosted = _oc_str * 2.0  # base strength * 2.0 = max allowed
                 _oc_eff_str = min(1.0, min(_oc_max_boosted, _oc_eff_str))
                 # [FIX Mar 24 v2] SHORT_COVERING / LONG_UNWINDING need ≥0.65 effective to fire
                 if _oc_sig in ('SHORT_COVERING', 'LONG_UNWINDING') and _oc_eff_str < 0.65:
                     _oc_eff_str = 0.0  # Will be filtered by min_strength check downstream
+                # [FIX Mar 29] LONG_BUILDUP / SHORT_BUILDUP need ≥0.50 effective — prevent weak noise
+                if _oc_sig in ('LONG_BUILDUP', 'SHORT_BUILDUP') and _oc_eff_str < 0.50:
+                    _oc_eff_str = 0.0
                 _oi_candidates[_oci] = (_oc_sym, _oc_dir, _oc_sig, _oc_eff_str, _oc_res)
                 # Store boost tags + confirm count for logging
                 _oc_res['_quality_boosts'] = ' '.join(_oc_boosts) if _oc_boosts else ''
@@ -562,53 +615,45 @@ class OIWatcherEngine:
                                f"[{_oi_res.get('_quality_boosts', '')}] — need more confluence")
                     continue
 
-                # ── MANDATORY FACTOR GATE ──
-                # C (Price confirmation) is ABSOLUTELY mandatory — price must move ≥0.20% in OI direction.
-                # M (Vol surge) is ABSOLUTELY mandatory — no trade without volume confirmation.
-                # Of the remaining 3 (F, H, K), require at least 2 to confirm.
+                # ── CONVICTION FACTOR GATE ──
+                # Anchor pool: F (Futures OI), H (OI concentration), K (Futures conviction)
+                #   → at least 1 of 3 must confirm (strict futures-only validation)
+                # Rest pool: A, B2, C, D, E, G, I, J, L, M (10 factors)
+                #   → at least 4 of 10 must confirm (breadth confirmation)
                 _oi_mf_C = _oi_res.get('_mf_C', False)
                 _oi_mf_C_chg = _oi_res.get('_mf_C_price_chg', 0.0)
                 _oi_mf_F = _oi_res.get('_mf_F', False)
                 _oi_mf_H = _oi_res.get('_mf_H', False)
                 _oi_mf_K = _oi_res.get('_mf_K', False)
                 _oi_mf_M = _oi_res.get('_mf_M', False)
-                _oi_mf_count = sum([_oi_mf_C, _oi_mf_F, _oi_mf_H, _oi_mf_K, _oi_mf_M])
+                _oi_mf_B2 = _oi_res.get('_mf_B2', False)
                 _oi_mf_labels = []
                 if _oi_mf_C: _oi_mf_labels.append('C')
                 if _oi_mf_F: _oi_mf_labels.append('F')
                 if _oi_mf_H: _oi_mf_labels.append('H')
                 if _oi_mf_K: _oi_mf_labels.append('K')
                 if _oi_mf_M: _oi_mf_labels.append('M')
-                _oi_mf_fhk_count = sum([_oi_mf_F, _oi_mf_H, _oi_mf_K])
-                # Gate 0: Price confirmation (C) is absolutely mandatory
-                _oi_C_min = getattr(t, '_oi_watcher_min_price_delta', 0.20)
-                if not _oi_mf_C:
-                    t._wlog(f"  ⛔ OI_WATCHER PRICE CONFIRM MANDATORY: {_oi_sym.replace('NSE:', '')} "
+                if _oi_mf_B2: _oi_mf_labels.append('B2')
+                _oi_anchor_count = sum([_oi_mf_F, _oi_mf_H, _oi_mf_K])
+                _oi_rest_count = _oi_confirms - _oi_anchor_count
+                # B2 confirmed counts toward rest pool (breadth), not anchor
+                if _oi_mf_B2 and not any([_oi_mf_F, _oi_mf_H, _oi_mf_K]):
+                    pass  # B2 alone cannot satisfy anchor — must have futures validation
+                # Gate 1: At least 1 of {F, H, K} must confirm (anchor — futures only)
+                if _oi_anchor_count < 1:
+                    t._wlog(f"  ⛔ OI_WATCHER ANCHOR GATE: {_oi_sym.replace('NSE:', '')} "
                                f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                               f"price {_oi_mf_C_chg:+.2f}% not confirming (need ≥{_oi_C_min}% in {_oi_dir} dir) "
-                               f"— C is mandatory, no trade without price confirmation "
+                               f"0/3 of F,H,K confirmed (need ≥1 futures anchor) "
                                f"[confirmed={','.join(_oi_mf_labels)}] "
                                f"[{_oi_res.get('_quality_boosts', '')}]")
                     continue
-                # Gate 1: Vol surge (M) is absolutely mandatory
-                if not _oi_mf_M:
-                    t._wlog(f"  ⛔ OI_WATCHER VOL SURGE MANDATORY: {_oi_sym.replace('NSE:', '')} "
+                # Gate 2: At least 4 from the remaining 10 factors incl B2 (breadth)
+                if _oi_rest_count < 4:
+                    t._wlog(f"  ⛔ OI_WATCHER BREADTH GATE: {_oi_sym.replace('NSE:', '')} "
                                f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                               f"volume not surging — M is mandatory, no trade without vol confirmation "
+                               f"only {_oi_rest_count}/10 rest-pool factors confirm (need ≥4) "
+                               f"anchor={_oi_anchor_count}/3 "
                                f"[confirmed={','.join(_oi_mf_labels)}] "
-                               f"[{_oi_res.get('_quality_boosts', '')}]")
-                    continue
-                # Gate 2: Of F, H, K — require at least 2 of 3
-                if _oi_mf_fhk_count < 2:
-                    _oi_mf_missing = []
-                    if not _oi_mf_F: _oi_mf_missing.append('F:FutOI')
-                    if not _oi_mf_H: _oi_mf_missing.append('H:OIconc')
-                    if not _oi_mf_K: _oi_mf_missing.append('K:FutBook')
-                    t._wlog(f"  ⛔ OI_WATCHER MANDATORY FACTORS: {_oi_sym.replace('NSE:', '')} "
-                               f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                               f"only {_oi_mf_fhk_count}/3 of F,H,K confirmed (need ≥2) "
-                               f"[confirmed={','.join(_oi_mf_labels)}] "
-                               f"[missing={','.join(_oi_mf_missing)}] "
                                f"[{_oi_res.get('_quality_boosts', '')}]")
                     continue
 
@@ -873,9 +918,10 @@ class OIWatcherEngine:
             # (C) Price confirmation (we already have change% from _syms_with_change)
             _ag_chg = next((_c for _s, _, _c in _syms_with_change if _s == _sym), None)
             if _ag_chg is not None:
+                _ag_C_min = getattr(t, '_oi_aggr_min_price_delta', 0.05)
                 _ag_price_agrees = (
-                    (_dir == 'BUY' and _ag_chg > 0.3) or
-                    (_dir == 'SELL' and _ag_chg < -0.3)
+                    (_dir == 'BUY' and _ag_chg >= _ag_C_min) or
+                    (_dir == 'SELL' and _ag_chg <= -_ag_C_min)
                 )
                 _ag_price_diverges = (
                     (_dir == 'BUY' and _ag_chg < -0.5) or
@@ -1061,7 +1107,8 @@ class OIWatcherEngine:
             # (M) Volume Surge Alignment for AGGR path — same logic as Path 1
             if _ticker:
                 try:
-                    _ag_vdh_store = getattr(_ticker, '_vol_delta_history', None)
+                    _ag_bw = getattr(_ticker, '_breakout_watcher', None)
+                    _ag_vdh_store = getattr(_ag_bw, '_vol_delta_history', None) if _ag_bw else None
                     _ag_vdh = _ag_vdh_store.get(_sym) if _ag_vdh_store is not None else None
                     if _ag_vdh and len(_ag_vdh) >= 5:
                         _ag_vavg = sum(_ag_vdh) / len(_ag_vdh)
@@ -1133,6 +1180,9 @@ class OIWatcherEngine:
             _eff_str = min(1.0, min(_ag_max_boosted, _eff_str))
             # [FIX Mar 24 v2] SHORT_COVERING / LONG_UNWINDING need ≥0.65 effective to fire
             if _sig in ('SHORT_COVERING', 'LONG_UNWINDING') and _eff_str < 0.65:
+                continue
+            # [FIX Mar 29] LONG_BUILDUP / SHORT_BUILDUP need ≥0.50 effective — prevent weak noise
+            if _sig in ('LONG_BUILDUP', 'SHORT_BUILDUP') and _eff_str < 0.50:
                 continue
             # [FIX Mar 24 v2] Store mandatory factor results for AGGR gate
             _res['_ag_mf_C'] = _ag_mf_C
@@ -1214,8 +1264,8 @@ class OIWatcherEngine:
             _bias = _res.get('flow_bias', 'NEUTRAL')
             _part_id = _res.get('oi_participant_id', 'UNKNOWN')
 
-            # [FIX Mar 24 v2] MANDATORY FACTOR GATE for AGGR path
-            # Require price confirmation (C) + at least 1 of F/H/K
+            # [FIX Mar 25] MANDATORY FACTOR GATE for AGGR path
+            # Price (C) is now optional boost/penalty — vol surge (M) + conviction (F/H/K) mandatory
             _ag_mf_C = _res.get('_ag_mf_C', False)
             _ag_mf_F = _res.get('_ag_mf_F', False)
             _ag_mf_H = _res.get('_ag_mf_H', False)
@@ -1223,20 +1273,24 @@ class OIWatcherEngine:
             _ag_mf_fhk = sum([_ag_mf_F, _ag_mf_H, _ag_mf_K])
             _ag_mf_M = _res.get('_ag_mf_M', False)
             if not _ag_mf_C:
-                t._wlog(f"  ⛔ OI_AGGR PRICE MANDATORY: {_sym.replace('NSE:', '')} "
+                # Price not confirming — penalise strength but don't block
+                _str *= 0.85
+                t._wlog(f"  ⚠️ OI_AGGR PRICE WARN: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} dir={_dir} — "
-                           f"price not confirming — skipping")
-                continue
+                           f"price not confirming — strength penalised 15%")
             if not _ag_mf_M:
-                t._wlog(f"  ⛔ OI_AGGR VOL SURGE MANDATORY: {_sym.replace('NSE:', '')} "
+                # Vol surge not confirming — penalise strength but don't block
+                _str *= 0.85
+                t._wlog(f"  ⚠️ OI_AGGR VOL WARN: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} dir={_dir} — "
-                           f"volume not surging — skipping")
-                continue
+                           f"volume not surging — strength penalised 15%")
             if _ag_mf_fhk < 1:
-                t._wlog(f"  ⛔ OI_AGGR LOW CONVICTION: {_sym.replace('NSE:', '')} "
+                # [FIX Mar 25] Soft penalty instead of hard block — contrarian signals
+                # on trend days never get cross-validation from F/H/K
+                _str *= 0.80
+                t._wlog(f"  ⚠️ OI_AGGR CONVICTION WARN: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} dir={_dir} — "
-                           f"0/{3} of F/H/K confirmed — need ≥1")
-                continue
+                           f"0/{3} of F/H/K confirmed — strength penalised 20%")
 
             # Heatmap strike picker
             _strike_sel = 'ATM'

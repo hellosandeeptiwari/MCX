@@ -134,7 +134,7 @@ CAPITAL_SWAP = {
 HARD_RULES = {
     "RISK_PER_TRADE": 0.07,         # 7% base risk per trade (tiered: 7% premium, 5% std, 4% base)
     "MAX_DAILY_LOSS": 0.20,         # 20% max daily loss
-    "PORTFOLIO_PROFIT_TARGET": 0.12,  # 12% unrealized-only profit → KILL ALL & book profit
+    "PORTFOLIO_PROFIT_TARGET": 0.15,  # 15% realized+unrealized profit → KILL ALL & book profit
     "MAX_POSITIONS": 80,            # Max simultaneous positions (spreads count as 1)
     "MAX_POSITIONS_MIXED": 80,       # Max positions in MIXED regime
     "MAX_POSITIONS_TRENDING": 80,    # Max positions in BULLISH/BEARISH regime
@@ -205,9 +205,9 @@ BREAKOUT_WATCHER = {
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
     # --- Score Gate (LOWERED Mar-12: macro trend filter now handles quality, let more setups through) ---
     "min_score": 30,                  # Minimum score to trade (was 35 — lowered to let more watcher setups through)
-    "orb_min_score": 40,              # ORB_BREAKOUT floor (was 25)
-    "orb_min_move_prob": 0.55,        # ORB trades need P(move)≥55% (was 0.50)
-    "watcher_min_move_prob": 0.40,    # WATCHER P(move) floor (was 0.30 — too permissive)
+    "orb_min_score": 35,              # ORB_BREAKOUT floor (was 40 — lowered Mar 30)
+    "orb_min_move_prob": 0.55,        # ORB/SPIKE/DAY trades need P(move)≥55% (breadth relaxation → 0.45)
+    "watcher_min_move_prob": 0.50,    # WATCHER P(move) floor (was 0.40 — raised to 0.50, Mar-28)
     "watcher_min_adx": 15,            # ADX floor — watcher trigger IS trend evidence
     # --- Scorer Conflict (NEW Mar-10: trust scorer when score is low) ---
     "scorer_conflict_max_score": 40,          # G2b: block scorer-trigger conflict only if score < 40 (was 50)  # If scorer disagrees and score < this, block trade
@@ -224,7 +224,7 @@ BREAKOUT_WATCHER = {
     # --- Early Market Hardening (9:35-9:55 is still dicey) ---
     "early_market_end": "09:55",       # Early market protection window end
     "early_market_min_score": 40,      # Lowered from 50 — review after tomorrow's session
-    "early_market_min_dir_conf": 35,   # Min direction confidence during early market (lowered from 45 — was blocking valid trades)
+    "early_market_min_dir_conf": 45,   # Min direction confidence during early market
     "early_market_min_sustain_pct": 1.0, # Min sustained move % for spikes in early market (normal=0.6)
     # --- Dynamic Batch ---
     "max_triggers_per_batch": 6,      # Max triggers fed to pipeline per drain
@@ -307,8 +307,8 @@ BREAKOUT_WATCHER = {
     # When OI thesis breaks, exit immediately. No grace period, no V-shape filter.
     "oi_watcher_exit": {
         "enabled": True,
-        "min_hold_seconds": 120,                   # [FIX Mar 22] 2 min grace — enough for first OI cycle to settle. SL protects fast moves.
-        "oi_check_interval_seconds": 30,            # [FIX Mar 22] Was 90s — too slow, -10% losses before first check. 30s catches thesis breaks early
+        "min_hold_seconds": 600,                   # [FIX Mar 20] 10 min grace — winners need 10-60 min to develop. SL protects downside.
+        "oi_check_interval_seconds": 90,            # [FIX Mar 19] Was 45s — OI data is noisy, 90s smooths noise
         "direction_flip_exit": True,                # Exit if OI direction flips (LONG_BUILDUP → SHORT_BUILDUP)
         "strength_collapse_exit": True,             # Exit if OI strength drops significantly
         "strength_collapse_ratio": 0.25,            # [FIX Mar 19] Was 0.40 — too trigger-happy. Now 25% of entry (only extreme collapse)
@@ -316,25 +316,91 @@ BREAKOUT_WATCHER = {
         "participant_flip_exit": True,              # Exit if WRITER_DOMINANT → BUYER_DOMINANT
         "signal_neutral_exit": True,                # Exit if OI signal becomes NEUTRAL (buildup dissolved)
         "skip_if_trailing_active": False,           # Don't skip — OI thesis break overrides trailing
-        "consecutive_confirms_required": 2,         # [FIX Mar 22] 2 consecutive bad readings (60s total). Was 3 = 4.5min, too slow for thesis break
-        "premium_bypass_pct": -2.0,                 # [FIX Mar 22] Was 0.0 — even +0.01% bypassed exit! Now only bypass if premium UP 2%+
-        # === TRAIL TIGHTENING ON OI THESIS WEAKENING ===
-        # When OI strength drops >40% from entry but hasn't collapsed (25%), tighten trailing stop.
-        # Don't exit — just reduce giveback room so a dying trade gets cut faster.
-        "thesis_weakening_enabled": True,
-        "thesis_weakening_ratio": 0.60,             # Tighten when strength < 60% of entry
-        "thesis_weakened_trail_retain": 0.85,        # 85% retention (only 15% giveback) — vs normal 40-65%
-        "thesis_weakening_confirms": 2,              # Need 2 consecutive weak readings before tightening
-        # === THESIS WEAKENING TRAIL MINIMUM R ===
-        # Don't tighten trail on thesis weakening unless trade has at least 0.3R profit.
-        # At 0.02R with 85% retention = ₹0.03 room → tick noise kills the trade instantly.
-        "thesis_weakening_min_r": 0.30,              # Min R-multiple before tight trail activates
-        # === PROFIT GATE ===
-        # When trade is in profit ≥ this %, OI exit engine is completely skipped.
-        # Let trailing stop manage winners. OI thesis exit only kicks in for losers/small gains.
-        "profit_skip_pct": 1.0,                      # [FIX Mar 24] Skip OI exit when premium profit ≥1%
+        "consecutive_confirms_required": 3,         # [FIX Mar 20] 3 consecutive bad readings — OI must be against you for 4.5min straight
+        "premium_bypass_pct": 2.0,                  # [FIX Mar 25] If premium ≥ 2%, skip OI exit — let trailing manage
     },
 }
+
+# === EARLYBIRD STRATEGY (Opening Volatility 09:15-09:45) ===
+# Three distinct modes — tracked separately for performance analysis:
+#   A = Gap continuation (highest quality)
+#   B = Strong opening directional move (medium quality)
+#   C = Opening spike (lowest quality — needs volume + hold confirmation)
+#
+# Market-context gating: Is the stock move idiosyncratic or just market beta?
+# If NIFTY is moving the same way and the stock is HIGH_BETA, it's likely just
+# index-driven — lower conviction. Idiosyncratic moves (stock moves, index doesn't,
+# or stock moves AGAINST index) are highest quality.
+#
+# Shared settings applied to all three modes:
+EARLYBIRD_COMMON = {
+    "enabled": True,
+    "start_time": "09:15",               # Start detecting from market open (first tick)
+    "end_time": "09:30",                  # 15-minute earlybird window — normal watcher takes over at 09:30
+    "max_trades": 999,                    # No cap during paper trading (set to 6 for live)
+    "skip_dir_conf_gate": True,           # Skip direction confidence gate (unreliable at open)
+    "min_vol_ratio": 1.5,                 # Current vol delta must be ≥ 1.5× rolling avg
+    # --- Market Context Gating ---
+    "market_context_enabled": True,       # Enable index/sector alignment checks
+    "index_same_dir_threshold": 0.3,      # NIFTY move ≥0.3% in same direction = index-driven signal
+    "idiosyncratic_bonus": 4,             # Bonus when stock moves but index doesn't (or opposite)
+    "beta_penalty": 5,                    # Penalty when HIGH_BETA stock mirrors index move
+    "sector_aligned_penalty": 3,          # Penalty when sector index also moves same direction
+}
+
+# --- MODE A: Gap Continuation (Highest Quality) ---
+# Gap ≥ 0.8% from prev close AND price continuing in gap direction.
+# Highest conviction — real institutional positioning from overnight flow.
+# Allow larger sizing. Generous sustain.
+EARLYBIRD_A = {
+    "gap_open_pct": 0.9,                  # Min gap from prev close (0.9%)
+    "gap_strong_pct": 1.5,                # Strong gap threshold (1.5%+)
+    "gap_continuation_min": 0.35,         # Price must continue ≥ 0.35% in gap direction from open
+    "sustain_seconds": 8,                 # Shortest sustain — gap continuations are high-conviction
+    "sustain_min_hold_pct": 0.4,          # Relaxed hold — gap moves are sticky
+    "min_score": 20,                      # Very relaxed — gap itself is the thesis
+    "min_move_prob": 0.30,                # Very relaxed XGB floor
+    "trigger_bonus": 15,                  # Highest base bonus (gap = strongest opening signal)
+    "gap_bonus": 5,                       # Extra for gap confirmation
+    "strong_gap_bonus": 3,                # Extra for strong gap (≥1.5%)
+    "lot_multiplier": 1.5,               # Larger sizing — highest quality signals
+    "gap_strong_lot_multiplier": 2.0,     # 2x for strong gaps
+}
+
+# --- MODE B: Strong Opening Directional Move (Medium Quality) ---
+# Price moved ≥ 0.7% from today's open (with or without gap).
+# Medium conviction — can be real discovery or just noise.
+# Normal sizing. Standard sustain.
+EARLYBIRD_B = {
+    "enabled": False,                     # DISABLED — medium conviction, too noisy at open
+    "opening_move_pct": 0.7,              # Min move from day open (0.7%)
+    "sustain_seconds": 10,                # Standard sustain
+    "sustain_min_hold_pct": 0.5,          # Must hold 0.5% from baseline
+    "min_score": 25,                      # Standard early-market floor
+    "min_move_prob": 0.35,                # Standard XGB floor
+    "trigger_bonus": 10,                  # Medium bonus
+    "lot_multiplier": 1.0,               # Normal lot size
+}
+
+# --- MODE C: Opening Spike (Lowest Quality) ---
+# Price spiked ≥ 1.2% from 60s baseline — pure volatility burst.
+# Lowest conviction unless paired with strong volume + sustain hold.
+# Smaller sizing or stricter sustain required.
+EARLYBIRD_C = {
+    "enabled": False,                     # DISABLED — lowest conviction, spike noise
+    "opening_spike_pct": 1.2,             # Min spike from 60s baseline
+    "sustain_seconds": 15,                # Longest sustain — must PROVE the spike holds
+    "sustain_min_hold_pct": 0.7,          # Stricter hold — spike must not fade
+    "min_score": 30,                      # Tighter score floor
+    "min_move_prob": 0.40,                # Tighter XGB floor (spike could be noise)
+    "min_vol_ratio": 2.0,                 # Require 2x volume (higher than A/B)
+    "trigger_bonus": 7,                   # Lowest bonus
+    "lot_multiplier": 0.5,               # Half lot — lowest quality
+}
+
+# Backward-compat alias: modules that import 'EARLYBIRD' get the common config
+# with mode-specific overrides merged in at runtime
+EARLYBIRD = {**EARLYBIRD_COMMON}
 
 # === WATCHER IV CRUSH OVERRIDES (more lenient — breakouts naturally have elevated IV) ===
 # These override the global IV_CRUSH_GATE when setup_type='WATCHER'.
@@ -344,8 +410,8 @@ WATCHER = {
     "iv_crush_overrides": {
         "iv_rv_ratio_hard_block": 2.2,     # Global=1.8 → watcher=2.2 (lenient: breakouts have elevated IV)
         "iv_rv_ratio_reduce_lots": 1.5,    # Global=1.3 → watcher=1.5 (tolerate higher ratio)
-        "max_atm_iv_pct": 55,              # Global=50 → watcher=55 (allow slightly higher absolute IV)
-        "reduce_atm_iv_pct": 42,           # Global=38 → watcher=42 (halve lots less aggressively)
+        "max_atm_iv_pct": 70,              # Global=65 → watcher=70 (raised Mar 30, was 55)
+        "reduce_atm_iv_pct": 52,           # Global=45 → watcher=52 (raised Mar 30, was 42)
     },
 }
 
@@ -353,27 +419,10 @@ ORB_BREAKOUT = {
     "iv_crush_overrides": {
         "iv_rv_ratio_hard_block": 2.0,     # Slightly more lenient than global, but tighter than WATCHER
         "iv_rv_ratio_reduce_lots": 1.4,
-        "max_atm_iv_pct": 52,
-        "reduce_atm_iv_pct": 40,
+        "max_atm_iv_pct": 65,              # Global=65 → ORB=65 (raised Mar 30, was 52)
+        "reduce_atm_iv_pct": 50,           # Global=45 → ORB=50 (raised Mar 30, was 40)
     },
 }
-
-# === OI_WATCHER IV CRUSH OVERRIDES (most lenient — OI buildups happen during vol spikes) ===
-# OI-based entries fire when institutional activity is detected, which correlates with
-# elevated IV (55-65% is normal for active stocks). The global 50% cap blocks everything.
-OI_WATCHER = {
-    "iv_crush_overrides": {
-        "iv_rv_ratio_hard_block": 2.5,     # Very lenient — OI buildup = institutional activity = high IV is expected
-        "iv_rv_ratio_reduce_lots": 1.8,
-        "max_atm_iv_pct": 65,              # Global=50 → OI_WATCHER=65 (stocks with OI buildup often have 55-62% IV)
-        "reduce_atm_iv_pct": 50,           # Global=38 → OI_WATCHER=50
-    },
-}
-
-# Alias watcher sub-types to the WATCHER IV config (they were falling through to global=50%)
-WATCHER_SLOW_GRIND_UP = {"iv_crush_overrides": WATCHER["iv_crush_overrides"]}
-WATCHER_SLOW_GRIND_DOWN = {"iv_crush_overrides": WATCHER["iv_crush_overrides"]}
-WATCHER_VOLUME_SURGE = {"iv_crush_overrides": WATCHER["iv_crush_overrides"]}
 
 # === GTT SAFETY NET (Server-Side SL + Target) ===
 # After placing live orders, a GTT TWO-LEG (OCO) is placed on Zerodha's servers.
@@ -589,8 +638,8 @@ TEST_XGB = {
     "iv_crush_overrides": {
         "iv_rv_ratio_hard_block": 1.4,    # Block if IV/RV > 1.4x (global: 2.0x)
         "iv_rv_ratio_reduce_lots": 1.2,   # Halve lots if IV/RV > 1.2x (global: 1.5x)
-        "max_atm_iv_pct": 45,             # Absolute IV cap (global: 60%)
-        "reduce_atm_iv_pct": 35,          # Reduce lots above this (global: 45%)
+        "max_atm_iv_pct": 55,             # Absolute IV cap — raised Mar 30, was 45% (global: 65%)
+        "reduce_atm_iv_pct": 42,          # Reduce lots above this — raised Mar 30, was 35% (global: 45%)
     },
 }
 
@@ -604,7 +653,7 @@ GMM_SNIPER = {
     "lot_multiplier": 3.0,             # Reduced from 5x → 3x. Earn bigger size with proven P&L
     "min_smart_score": 53,             # Minimum smart score for sniper trades
     "max_updr_score": 0.12,            # UP regime clean (tiny relaxation from 0.10 — near misses at 0.07-0.12)
-    "max_downdr_score": 0.15,          # DOWN regime clean (tiny relaxation from 0.13 — DN clusters at 0.13-0.15)
+    "max_downdr_score": 0.189,         # DOWN regime clean (relaxed from 0.15 — DN near misses at 0.15-0.18)
     "min_gate_prob": 0.52,             # XGB movement signal threshold
     "min_direction_confidence": 55,    # Smart Direction Engine: multi-signal consensus required
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
@@ -630,13 +679,13 @@ SNIPER_OI_UNWINDING = {
     "lot_multiplier": 1.5,              # 1.5x lots (conviction but conservative)
     # --- OI Unwinding Detection ---
     "required_buildups": ["LONG_UNWINDING", "SHORT_COVERING"],
-    "min_buildup_strength": 0.35,      # [FIX Mar 23] was 0.565 — rescaled for new strength formula (base 0.35x)
+    "min_buildup_strength": 0.60,       # OI buildup signal strength >= 0.60 (lowered from 0.80 — 60s confirmation gate now filters noise)
     "min_oi_change_pct": 6.0,           # Dominant OI side must have changed >= 6% (relaxed from 8%)
     # --- Price Reversal at S/R ---
     "max_distance_from_sr_pct": 2.5,    # Spot must be within 2.5% of OI support/resistance (relaxed from 1.5%)
     # --- GMM Quality Gate ---
     "max_updr_score": 0.18,              # GMM clean — UP regime (relaxed from 0.15, aligned with PCR extreme)
-    "max_downdr_score": 0.15,            # GMM clean — DOWN regime (relaxed from 0.12)
+    "max_downdr_score": 0.189,           # GMM clean — DOWN regime (relaxed from 0.15)
     "min_gate_prob": 0.40,              # XGB gate P(move) floor (relaxed from 0.45)
     "min_smart_score": 50,              # Minimum smart_score — restored quality floor (45 was too loose)
     # --- Timing ---
@@ -661,7 +710,7 @@ SNIPER_PCR_EXTREME = {
     # --- PCR Extreme Detection (momentum thresholds) ---
     "pcr_oversold_threshold": 1.35,     # PCR >= 1.35 → crowd bearish → SELL with momentum
     "pcr_overbought_threshold": 0.60,   # PCR <= 0.60 → crowd bullish → BUY with momentum
-    "min_pcr_edge": 0.02,               # Relaxed from 0.05 — was blocking too many valid PCR extremes (NMDC 0.025, GMRAIRPORT 0.026)
+    "min_pcr_edge": 0.05,               # Min distance beyond threshold — blocks hair-trigger entries (ABCAPITAL edge=0.01 lesson)
     # --- Index PCR (Macro Confirmation) ---
     "use_index_pcr": True,              # Also check NIFTY PCR for macro regime
     "index_symbol": "NIFTY",            # Index to check
@@ -1052,7 +1101,7 @@ PROACTIVE_HEDGE_CONFIG = {
 # Options can swing 200-500% in minutes on expiry day due to extreme gamma.
 # ⚠️ MONTHLY EXPIRY MODE: Tighter settings — gamma risk is 2-3× higher than weekly expiry
 EXPIRY_SHIELD_CONFIG = {
-    "enabled": True,                    # Auto-managed by expiry detection (Feb 24 fix)
+    "enabled": False,                   # DISABLED Mar 30 — user accepts 0DTE risk
     "is_monthly_expiry": False,        # 🟢 NOW AUTO-DETECTED — no manual toggle needed
     # --- Entry Restrictions (TIGHTENED for monthly expiry) ---
     "no_new_naked_after": "10:30",     # No new naked options after 10:30 AM (was 11:00 — monthly gamma is extreme)
@@ -1086,7 +1135,7 @@ IV_CRUSH_GUARD = {
     # When breadth is extreme (most stocks same direction), uncertainty is LOW → IV compresses.
     # Raise the IV floor dynamically based on how skewed the breadth is.
     "breadth_extreme_threshold": 0.85,    # If >85% stocks in same direction → "extreme breadth"
-    "breadth_extreme_iv_floor": 0.25,     # Raise IV floor to 25% during extreme breadth (was 32%, blocked 90% of market)
+    "breadth_extreme_iv_floor": 0.22,     # Raise IV floor to 22% during extreme breadth (was 25%, blocked SBIN at 24.1%)
     # --- Sub-Gate 3: Minimum Premium (OTM penny filter upgrade) ---
     # Cheap options (<₹8) are disproportionately affected by IV changes:
     #   ₹1 IV drop on ₹5.49 option = -18.2% vs ₹1 drop on ₹20 = -5%
@@ -1106,7 +1155,7 @@ THETA_ENTRY_GATE = {
     "enabled": True,
     # --- Theta/Premium Ratio Gate (blocks trades where decay > expected gain) ---
     # Daily |theta| as % of premium. If theta eats >5% per day, stock needs >5% move just to break even.
-    "max_theta_pct_of_premium": 5.0,    # Block if |daily theta| > 5% of option LTP
+    "max_theta_pct_of_premium": 25.0,   # Block if |daily theta| > 25% of option LTP (raised Mar 30 — 10% blocks all 0DTE)
     # --- DTE Floor for Naked Buys (non-expiry days) ---
     # On non-expiry days, avoid buying options with <3 DTE — theta curve steepens quadratically.
     # On expiry day, expiry_shield handles 0DTE separately.
@@ -1165,8 +1214,8 @@ IV_CRUSH_GATE = {
     "iv_rv_ratio_reduce_lots": 1.3,    # Halve lots if IV > 1.3× realized vol (was 1.5x)
     # --- Absolute IV Caps ---
     # 60% was never triggered. Real IV crush happens at 35-50% on liquid stocks.
-    "max_atm_iv_pct": 50,              # Hard block: ATM IV > 50% (was 60% — too high)
-    "reduce_atm_iv_pct": 38,           # Halve lots: ATM IV > 38% (was 45%)
+    "max_atm_iv_pct": 65,              # Hard block: ATM IV > 65% (raised Mar 30 — 50% too tight on VIX>25 days)
+    "reduce_atm_iv_pct": 45,           # Halve lots: ATM IV > 45% (was 38% — too aggressive on high-VIX days)
     # --- Morning IV Adjustment ---
     "morning_iv_premium_until": "10:30",  # Before 10:30 morning IV is structurally inflated (was 11:00)
     "morning_ratio_penalty": 0.15,        # Add 0.15 to ratio thresholds (was 0.2 — tighter morning too)

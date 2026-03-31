@@ -115,6 +115,14 @@ def expiry_entry_gate(trade_type: str, is_spread: bool, expiry_str: str = '') ->
     Returns:
         (allowed: bool, reason: str)
     """
+    # Check if expiry shield is enabled in config
+    try:
+        from config import EXPIRY_SHIELD_CONFIG
+        if not EXPIRY_SHIELD_CONFIG.get('enabled', False):
+            return True, ""
+    except ImportError:
+        pass
+
     # If we can't determine expiry, allow (fail-open)
     if not expiry_str:
         return True, ""

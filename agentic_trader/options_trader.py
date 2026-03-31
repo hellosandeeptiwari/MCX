@@ -1868,9 +1868,14 @@ class IntradayOptionScorer:
             warnings.append("🚫 BLOCKED: No clear direction")
         
         # Gate 4: Microstructure block
-        if microstructure_block:
+        # EARLYBIRD: downgrade hard-block to warning (9:15 spreads are always wide,
+        # watcher gates already validated the setup — let scorer decide on score alone)
+        _eb_micro_bypass = getattr(self, '_eb_micro_override', False)
+        if microstructure_block and not _eb_micro_bypass:
             should_trade = False
             warnings.append(f"🚫 BLOCKED by microstructure: {microstructure_block_reason}")
+        elif microstructure_block and _eb_micro_bypass:
+            warnings.append(f"⚠️ EARLYBIRD micro-bypass: {microstructure_block_reason} (downgraded to warning)")
         
         # Gate 5: VWAP HARD GATE — direction MUST align with VWAP position
         # BUY direction requires price ABOVE or AT VWAP (not below)
@@ -2497,12 +2502,13 @@ class IntradayOptionScorer:
         # Force NEXT_MONTH to avoid blowing up on gamma swings.
         try:
             from config import EXPIRY_SHIELD_CONFIG
-            if EXPIRY_SHIELD_CONFIG.get('is_monthly_expiry', False):
+            if EXPIRY_SHIELD_CONFIG.get('enabled', False) and EXPIRY_SHIELD_CONFIG.get('is_monthly_expiry', False):
                 print(f"   🛡️ MONTHLY EXPIRY: Forcing NEXT_MONTH expiry (0DTE monthly gamma too dangerous)")
                 return "NEXT_MONTH"
         except ImportError:
             print("⚠️ FALLBACK [options/expiry_shield_config]: EXPIRY_SHIELD_CONFIG import failed")
         
+        current_hour = datetime.now().hour
         # Early morning with ORB breakout - current week is fine
         if current_hour < 11 and signal.orb_signal in ["BREAKOUT_UP", "BREAKOUT_DOWN"]:
             return "CURRENT_WEEK"
@@ -3714,19 +3720,56 @@ class OptionsTrader:
     
     def _place_order_autoslice(self, **kwargs):
         """
-        Place order with autoslice=true to auto-split orders exceeding exchange freeze limits.
-        Without autoslice, orders >1800 qty NIFTY (or similar) get REJECTED.
-        """
-        if not AUTOSLICE_ENABLED or not self.kite or not hasattr(self.kite, '_routes'):
-            return self.kite.place_order(**kwargs)
+        Place order with autoslice, market protection, rate limiting, and 429 retry.
         
-        orig_route = self.kite._routes.get("orders.place", "/orders/{variety}")
-        try:
+        - autoslice=true: auto-splits orders exceeding exchange freeze limits
+        - market_protection=5: enforces 5% default for MARKET/SL-M (Kite April 2026 mandate)
+        - Rate limiting: 350ms min gap between orders (Kite 10/sec cap)
+        - 429 retry: exponential backoff on rate limit errors
+        """
+        import time as _time
+        
+        # === MARKET PROTECTION (Kite mandate effective April 1 2026) ===
+        # market_protection=0 or missing is REJECTED for MARKET and SL-M orders
+        ot = str(kwargs.get('order_type', '')).upper()
+        if 'MARKET' in ot or 'SLM' in ot or 'SL-M' in ot:
+            mp = kwargs.get('market_protection')
+            if mp is None or (isinstance(mp, (int, float)) and mp <= 0):
+                kwargs['market_protection'] = 5
+        
+        # === RATE LIMIT THROTTLE (350ms min gap between orders) ===
+        if not hasattr(self, '_last_order_ts'):
+            self._last_order_ts = 0.0
+        elapsed = _time.time() - self._last_order_ts
+        if elapsed < 0.35:
+            _time.sleep(0.35 - elapsed)
+        
+        # === AUTOSLICE ROUTE PATCH ===
+        use_autoslice = AUTOSLICE_ENABLED and self.kite and hasattr(self.kite, '_routes')
+        orig_route = None
+        if use_autoslice:
+            orig_route = self.kite._routes.get("orders.place", "/orders/{variety}")
             if "autoslice" not in orig_route:
                 self.kite._routes["orders.place"] = "/orders/{variety}?autoslice=true"
-            return self.kite.place_order(**kwargs)
+        
+        try:
+            for attempt in range(3):
+                try:
+                    result = self.kite.place_order(**kwargs)
+                    self._last_order_ts = _time.time()
+                    return result
+                except Exception as e:
+                    err_str = str(e)
+                    if ('429' in err_str or 'Too Many Requests' in err_str
+                            or 'rate' in err_str.lower()) and attempt < 2:
+                        delay = 1.0 * (2 ** attempt)
+                        print(f"   ⚠️ Rate limit (429), retry in {delay}s (attempt {attempt+1}/3)")
+                        _time.sleep(delay)
+                        continue
+                    raise
         finally:
-            self.kite._routes["orders.place"] = orig_route
+            if use_autoslice and orig_route is not None:
+                self.kite._routes["orders.place"] = orig_route
     
     def _load_option_positions(self):
         """Load option positions from SQLite (falls back to active_trades.json)"""
@@ -4361,7 +4404,9 @@ class OptionsTrader:
         """
         # === IF MARKET DATA PROVIDED, USE INTRADAY SCORING ===
         # When setup_type is set (e.g., TEST_XGB), market_data is for IV gate only — skip intraday scoring
-        if market_data and not setup_type:
+        # EARLYBIRD trades go through intraday scoring (with relaxed threshold set upstream)
+        _eb_use_scoring = 'EARLYBIRD' in (setup_type or '')
+        if market_data and (not setup_type or _eb_use_scoring):
             result = self.create_option_order_with_intraday(
                 underlying=underlying,
                 direction=direction,
@@ -4547,7 +4592,7 @@ class OptionsTrader:
             # === MONTHLY EXPIRY OVERRIDE ===
             try:
                 from config import EXPIRY_SHIELD_CONFIG as _esc
-                if _esc.get('is_monthly_expiry', False):
+                if _esc.get('enabled', False) and _esc.get('is_monthly_expiry', False):
                     expiry_sel_str = "NEXT_MONTH"
                     print(f"   🛡️ MONTHLY EXPIRY: Credit spread using NEXT_MONTH expiry")
             except ImportError:
@@ -5164,7 +5209,7 @@ class OptionsTrader:
             if not is_index:
                 try:
                     from config import EXPIRY_SHIELD_CONFIG as _esc_ic
-                    if _esc_ic.get('is_monthly_expiry', False):
+                    if _esc_ic.get('enabled', False) and _esc_ic.get('is_monthly_expiry', False):
                         print(f"   🛡️ MONTHLY EXPIRY: Blocking stock iron condor — 0DTE monthly gamma too dangerous")
                         return None
                 except ImportError:
@@ -5961,7 +6006,7 @@ class OptionsTrader:
             # === MONTHLY EXPIRY OVERRIDE ===
             try:
                 from config import EXPIRY_SHIELD_CONFIG as _esc_ds
-                if _esc_ds.get('is_monthly_expiry', False):
+                if _esc_ds.get('enabled', False) and _esc_ds.get('is_monthly_expiry', False):
                     expiry_sel_str = "NEXT_MONTH"
                     print(f"   🛡️ MONTHLY EXPIRY: Debit spread using NEXT_MONTH expiry")
             except ImportError:
