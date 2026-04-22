@@ -153,6 +153,9 @@ class SniperStrategies:
         self._index_pcr_ts = None
 
         # Rolling PCR history for regime-adaptive thresholds
+
+        # VIX-adaptive DR scaling (Apr 9, 2026)
+        self._vix_regime = 'NORMAL'  # Set externally by AutonomousTrader
         # Key: symbol → deque of recent PCR readings (capped at window size)
         self._pcr_history: Dict[str, deque] = {}
         self._pcr_history_window = self._pcr_cfg.get('pcr_history_window', 20)
@@ -290,6 +293,12 @@ class SniperStrategies:
         
         return is_exhausted, round(exhaustion_score, 3), reason
 
+    def _get_vix_dr_multiplier(self, cfg: dict) -> float:
+        """Return VIX-adaptive DR score multiplier from strategy config.
+        Uses self._vix_regime set by AutonomousTrader each cycle."""
+        regime = self._vix_regime.lower()
+        return cfg.get(f'vix_dr_multiplier_{regime}', 1.0)
+
     # ------------------------------------------------------------------
     # STRATEGY 1: OI UNWINDING REVERSAL
     # ------------------------------------------------------------------
@@ -337,6 +346,11 @@ class SniperStrategies:
         max_sr_dist = cfg.get('max_distance_from_sr_pct', 1.5)
         max_dr_up = cfg.get('max_updr_score', 0.15)
         max_dr_down = cfg.get('max_downdr_score', 0.12)
+        # VIX-adaptive DR scaling (Apr 9, 2026)
+        _vix_mult = self._get_vix_dr_multiplier(cfg)
+        if _vix_mult != 1.0:
+            max_dr_up = round(max_dr_up * _vix_mult, 4)
+            max_dr_down = round(max_dr_down * _vix_mult, 4)
         min_gate = cfg.get('min_gate_prob', 0.45)
         min_smart = cfg.get('min_smart_score', 50)
         min_price_chg = cfg.get('min_price_change_pct', 0.3)
@@ -427,27 +441,18 @@ class SniperStrategies:
             if dr_score > max_dr or dr_flag:
                 continue
 
-            # --- XGB gate ---
-            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-            if ml_move_prob < min_gate:
-                continue
+            # --- XGB gates REMOVED (Apr 15, 2026) — XGB has no say in sniper trades ---
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))  # Keep for logging only
+            xgb_signal = ml.get('ml_signal', 'UNKNOWN')  # Keep for logging only
 
-            # --- XGB direction check — if XGB actively confirms CURRENT trend, skip reversal ---
-            xgb_signal = ml.get('ml_signal', 'UNKNOWN')
-            if direction == 'BUY' and xgb_signal == 'DOWN' and ml_move_prob >= 0.55:
-                continue  # XGB strongly confirms downtrend — don't fade it
-            if direction == 'SELL' and xgb_signal == 'UP' and ml_move_prob >= 0.55:
-                continue  # XGB strongly confirms uptrend — don't fade it
-
-            # --- Smart score (includes exhaustion quality) ---
+            # --- Smart score (XGB-free, includes exhaustion quality) ---
             p_score = pre_scores.get(sym, 0)
-            conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 30.0
+            conviction = min(p_score / 100.0, 1.0) * 30.0
             safety = (1.0 - min(dr_score, 1.0)) * 18.0 + 5.0
             oi_boost = strength * 12.0                    # OI signal strength bonus
             exhaustion_boost = exhaustion_score * 15.0    # Exhaustion quality bonus
             technical = min(p_score, 100) * 0.12
-            move_bonus = ml_move_prob * 8.0
-            smart_score = conviction + safety + oi_boost + exhaustion_boost + technical + move_bonus
+            smart_score = conviction + safety + oi_boost + exhaustion_boost + technical
 
             if smart_score < min_smart:
                 continue
@@ -676,6 +681,11 @@ class SniperStrategies:
         base_overbought = cfg.get('pcr_overbought_threshold', 0.65)
         max_dr_up = cfg.get('max_updr_score', 0.18)
         max_dr_down = cfg.get('max_downdr_score', 0.14)
+        # VIX-adaptive DR scaling (Apr 9, 2026)
+        _vix_mult = self._get_vix_dr_multiplier(cfg)
+        if _vix_mult != 1.0:
+            max_dr_up = round(max_dr_up * _vix_mult, 4)
+            max_dr_down = round(max_dr_down * _vix_mult, 4)
         min_gate = cfg.get('min_gate_prob', 0.40)
         min_smart = cfg.get('min_smart_score', 45)
         adaptive = cfg.get('adaptive_pcr', True)
@@ -795,22 +805,13 @@ class SniperStrategies:
             if dr_score > max_dr or dr_flag:
                 continue
 
-            # --- XGB gate ---
-            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-            if ml_move_prob < min_gate:
-                continue
+            # --- XGB gates REMOVED (Apr 15, 2026) — XGB has no say in sniper trades ---
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))  # Keep for logging only
+            xgb_signal = ml.get('ml_signal', 'UNKNOWN')  # Keep for logging only
 
-            # --- XGB direction alignment (momentum should agree with ML) ---
-            xgb_signal = ml.get('ml_signal', 'UNKNOWN')
-            xgb_penalty = 0
-            if direction == 'BUY' and xgb_signal == 'DOWN' and ml_move_prob >= 0.55:
-                xgb_penalty = 10  # ML disagrees with bullish momentum
-            elif direction == 'SELL' and xgb_signal == 'UP' and ml_move_prob >= 0.55:
-                xgb_penalty = 10  # ML disagrees with bearish momentum
-
-            # --- Smart score (PCR-weighted, regime-aware) ---
+            # --- Smart score (XGB-free, PCR-weighted, regime-aware) ---
             p_score = pre_scores.get(sym, 0)
-            conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 30.0
+            conviction = min(p_score / 100.0, 1.0) * 30.0
             safety = (1.0 - min(dr_score, 1.0)) * 18.0 + 5.0
             pcr_boost = min(pcr_edge, 0.5) * 30.0  # PCR extremity bonus (max 15 pts)
             # Bonus if BOTH stock and index PCR agree on momentum direction
@@ -821,9 +822,8 @@ class SniperStrategies:
                 elif direction == 'SELL' and index_pcr >= base_oversold * 0.9:
                     index_agree_bonus = 5.0  # Index also bearish flow
             technical = min(p_score, 100) * 0.12
-            move_bonus = ml_move_prob * 10.0
             smart_score = (conviction + safety + pcr_boost + index_agree_bonus
-                          + technical + move_bonus - xgb_penalty)
+                          + technical)
 
             if smart_score < min_smart:
                 continue

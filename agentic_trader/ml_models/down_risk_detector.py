@@ -50,7 +50,7 @@ import pickle
 import hashlib
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -107,12 +107,12 @@ class DetectorConfig:
     
     # GMM
     gmm_n_components: int = 6    # v5: 12→6 — fewer components to reduce memorization
-    gmm_covariance_type: str = "tied"  # v5: full→tied — shared covariance, far fewer params
+    gmm_covariance_type: Literal['full', 'tied', 'diag', 'spherical'] = "tied"  # v5: full→tied — shared covariance, far fewer params
     gmm_max_iter: int = 300
     
-    # Calibrator (v5: reduced capacity to fight overfitting)
-    calibrator_n_estimators: int = 100  # v5: 200→100 — fewer trees
-    calibrator_max_depth: int = 2       # v5: 3→2 — shallower
+    # Calibrator (v5: tuned Apr 9 — depth 3 for richer feature interactions)
+    calibrator_n_estimators: int = 120  # v5→v5.1: 100→120 — modest bump with depth increase
+    calibrator_max_depth: int = 3       # v5.1: 2→3 — allows 3-way interactions (GMM NLL × recon × latent)
     calibrator_lr: float = 0.05
     calibrator_val_split: float = 0.6  # fraction of val for GBM training (rest for threshold)
     
@@ -230,14 +230,14 @@ def _create_down_label(df: pd.DataFrame, lookahead: int = 8,
     """
     n = len(df)
     y_down = np.zeros(n, dtype=np.int32)
-    close = df['close'].values
-    low = df['low'].values if 'low' in df.columns else close
+    close = df['close'].to_numpy(dtype=np.float64)
+    low = df['low'].to_numpy(dtype=np.float64) if 'low' in df.columns else close
     
     # ATR-based threshold (per-candle, adaptive)
     has_atr = 'atr_pct' in df.columns
     if has_atr:
-        atr_pct = df['atr_pct'].values
-        threshold_pct = atr_factor * atr_pct  # array
+        atr_pct = df['atr_pct'].to_numpy(dtype=np.float64)
+        threshold_pct = np.float64(atr_factor) * atr_pct  # array
         threshold_pct = np.where(np.isnan(threshold_pct), fixed_pct, threshold_pct)
         threshold_pct = np.maximum(threshold_pct, 0.10)  # floor at 0.1%
     else:
@@ -267,14 +267,14 @@ def _create_up_label(df: pd.DataFrame, lookahead: int = 8,
     """
     n = len(df)
     y_up = np.zeros(n, dtype=np.int32)
-    close = df['close'].values
-    high = df['high'].values if 'high' in df.columns else close
+    close = df['close'].to_numpy(dtype=np.float64)
+    high = df['high'].to_numpy(dtype=np.float64) if 'high' in df.columns else close
     
     # ATR-based threshold (per-candle, adaptive)
     has_atr = 'atr_pct' in df.columns
     if has_atr:
-        atr_pct = df['atr_pct'].values
-        threshold_pct = atr_factor * atr_pct  # array
+        atr_pct = df['atr_pct'].to_numpy(dtype=np.float64)
+        threshold_pct = np.float64(atr_factor) * atr_pct  # array
         threshold_pct = np.where(np.isnan(threshold_pct), fixed_pct, threshold_pct)
         threshold_pct = np.maximum(threshold_pct, 0.10)  # floor at 0.1%
     else:
@@ -450,11 +450,11 @@ def load_detector_dataset(
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Gate labels: MOVE(1) vs FLAT(0)
-    y_gate = (combined['label_idx'] != 1).astype(int).values  # label_idx=1 is FLAT
+    y_gate = (combined['label_idx'] != 1).astype(np.int32).to_numpy()  # label_idx=1 is FLAT
     # Direction labels: UP(1) vs DOWN(0)
-    y_dir = (combined['label_idx'] == 2).astype(int).values  # label_idx=2 is UP
+    y_dir = (combined['label_idx'] == 2).astype(np.int32).to_numpy()  # label_idx=2 is UP
     
-    dates = combined['date'].values
+    dates = combined['date'].to_numpy()
     
     xgb_regime = _generate_xgb_cross_predictions(
         X, y_gate, y_dir, dates, feature_names, n_folds=5
@@ -611,6 +611,10 @@ class RegimeDetector:
     def _train_vae(self, X_train: np.ndarray, X_val: np.ndarray,
                    config: DetectorConfig) -> dict:
         """Train the VAE with early stopping."""
+        vae = self.vae
+        if vae is None:
+            raise RuntimeError("VAE model is not initialized")
+
         X_tr_t = torch.tensor(X_train, dtype=torch.float32)
         X_va_t = torch.tensor(X_val, dtype=torch.float32)
         
@@ -618,7 +622,7 @@ class RegimeDetector:
         train_loader = DataLoader(train_ds, batch_size=config.vae_batch_size,
                                   shuffle=True, drop_last=False)
         
-        optimizer = optim.AdamW(self.vae.parameters(), lr=config.vae_lr,
+        optimizer = optim.AdamW(vae.parameters(), lr=config.vae_lr,
                                 weight_decay=1e-5)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
@@ -645,17 +649,17 @@ class RegimeDetector:
                 kl_w = config.vae_kl_weight
             
             # ── Train ──
-            self.vae.train()
+            vae.train()
             epoch_loss = 0.0
             n_batches = 0
             for (batch,) in train_loader:
                 batch = batch.to(self.device)
-                x_hat, mu, logvar = self.vae(batch)
+                x_hat, mu, logvar = vae(batch)
                 loss, recon, kl = vae_loss(batch, x_hat, mu, logvar, kl_w)
                 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.vae.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
                 optimizer.step()
                 
                 epoch_loss += loss.item()
@@ -664,10 +668,10 @@ class RegimeDetector:
             avg_train = epoch_loss / max(n_batches, 1)
             
             # ── Validate ──
-            self.vae.eval()
+            vae.eval()
             with torch.no_grad():
                 X_va_dev = X_va_t.to(self.device)
-                x_hat_v, mu_v, lv_v = self.vae(X_va_dev)
+                x_hat_v, mu_v, lv_v = vae(X_va_dev)
                 val_loss, _, _ = vae_loss(X_va_dev, x_hat_v, mu_v, lv_v, kl_w)
                 avg_val = val_loss.item()
             
@@ -688,14 +692,14 @@ class RegimeDetector:
             elif epoch == warmup_epochs:
                 # First post-warmup epoch: initialize tracking with full-β loss
                 best_val_loss = avg_val
-                best_state = {k: v.cpu().clone() for k, v in self.vae.state_dict().items()}
+                best_state = {k: v.cpu().clone() for k, v in vae.state_dict().items()}
                 patience_counter = 0
                 logger.info(f"    Post-warmup baseline: val={avg_val:.4f} at β={kl_w:.3f}")
             else:
                 if avg_val < best_val_loss - 1e-5:
                     best_val_loss = avg_val
                     patience_counter = 0
-                    best_state = {k: v.cpu().clone() for k, v in self.vae.state_dict().items()}
+                    best_state = {k: v.cpu().clone() for k, v in vae.state_dict().items()}
                 else:
                     patience_counter += 1
                     if patience_counter >= config.vae_patience:
@@ -704,14 +708,28 @@ class RegimeDetector:
         
         # Restore best weights
         if best_state is not None:
-            self.vae.load_state_dict(best_state)
-            self.vae.to(self.device)
+            vae.load_state_dict(best_state)
+            vae.to(self.device)
         
         return {
             'best_val_loss': best_val_loss,
             'final_epoch': epoch,
             'train_loss_final': history['train_loss'][-1],
         }
+    
+    def _align_features(self, X: np.ndarray) -> np.ndarray:
+        """Pad or trim X columns to match scaler's expected feature count.
+        Handles predictor feature changes without requiring DR retrain."""
+        if self.scaler is None:
+            return X
+        expected = self.scaler.n_features_in_
+        actual = X.shape[1]
+        if actual == expected:
+            return X
+        if actual < expected:
+            pad = np.zeros((X.shape[0], expected - actual))
+            return np.hstack([X, pad])
+        return X[:, :expected]
     
     def _raw_anomaly_features(self, X: np.ndarray) -> np.ndarray:
         """Compute raw anomaly feature matrix (3 columns) for hybrid scoring.
@@ -721,15 +739,22 @@ class RegimeDetector:
           [1] VAE per-sample reconstruction MSE
           [2] VAE per-sample KL divergence
         """
+        if self.scaler is None or self.vae is None or self.gmm is None:
+            raise RuntimeError("Detector components are not initialized")
+        scaler = self.scaler
+        vae = self.vae
+        gmm = self.gmm
+
         X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        X_scaled = self.scaler.transform(X_clean)
+        X_clean = self._align_features(X_clean)
+        X_scaled = scaler.transform(X_clean)
         X_t = torch.tensor(X_scaled, dtype=torch.float32).to(self.device)
         
-        self.vae.eval()
+        vae.eval()
         with torch.no_grad():
-            mu, logvar = self.vae.encode(X_t)
+            mu, logvar = vae.encode(X_t)
             z = mu  # deterministic for scoring
-            x_hat = self.vae.decode(z)
+            x_hat = vae.decode(z)
             
             # Per-sample reconstruction error (MSE)
             recon_mse = ((X_t - x_hat) ** 2).mean(dim=1).cpu().numpy()
@@ -740,7 +765,7 @@ class RegimeDetector:
         latent = mu.cpu().numpy()
         
         # GMM negative log-likelihood
-        gmm_nll = -self.gmm.score_samples(latent)
+        gmm_nll = -gmm.score_samples(latent)
         
         # Stack into feature matrix [n_samples, 3]
         return np.column_stack([gmm_nll, recon_mse, kl_per_sample])
@@ -759,18 +784,23 @@ class RegimeDetector:
           - Latent L2 norm (1) — distance from origin in latent space
           - Latent max abs (1) — most extreme latent dimension
           - Distance to nearest GMM centroid (1) — cluster edge detection
-        
-        Much richer than v2's 3-feature [GMM NLL, recon MSE, KL div].
         """
+        if self.scaler is None or self.vae is None or self.gmm is None:
+            raise RuntimeError("Detector components are not initialized")
+        scaler = self.scaler
+        vae = self.vae
+        gmm = self.gmm
+
         X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        X_scaled = self.scaler.transform(X_clean)
+        X_clean = self._align_features(X_clean)
+        X_scaled = scaler.transform(X_clean)
         X_t = torch.tensor(X_scaled, dtype=torch.float32).to(self.device)
         
-        self.vae.eval()
+        vae.eval()
         with torch.no_grad():
-            mu, logvar = self.vae.encode(X_t)
+            mu, logvar = vae.encode(X_t)
             z = mu  # deterministic for scoring
-            x_hat = self.vae.decode(z)
+            x_hat = vae.decode(z)
             
             # Per-sample per-feature reconstruction errors
             recon_errors = ((X_t - x_hat) ** 2).cpu().numpy()  # [n, input_dim]
@@ -784,19 +814,18 @@ class RegimeDetector:
         latent = mu.cpu().numpy()  # [n, latent_dim]
         
         # GMM features
-        gmm_nll = -self.gmm.score_samples(latent)                # [n]
-        gmm_resp = self.gmm.predict_proba(latent)                # [n, n_components]
+        gmm_nll = -gmm.score_samples(latent)                     # [n]
+        gmm_resp = gmm.predict_proba(latent)                     # [n, n_components]
         
         # Latent space statistics
         latent_norm = np.linalg.norm(latent, axis=1)             # [n]
         latent_max_abs = np.abs(latent).max(axis=1)              # [n]
         
         # Distance to nearest GMM centroid
-        centroids = self.gmm.means_                              # [n_components, latent_dim]
-        nearest_dist = np.min(
-            np.stack([np.linalg.norm(latent - c, axis=1) for c in centroids], axis=1),
-            axis=1
-        )  # [n]
+        centroids = np.asarray(gmm.means_, dtype=np.float32)     # [n_components, latent_dim]
+        nearest_dist = np.linalg.norm(
+            latent[:, None, :] - centroids[None, :, :], axis=2
+        ).min(axis=1)  # [n]
         
         # Stack all features
         features = np.column_stack([
@@ -810,7 +839,7 @@ class RegimeDetector:
             latent_norm.reshape(-1, 1),          # 1
             latent_max_abs.reshape(-1, 1),       # 1
             nearest_dist.reshape(-1, 1),         # 1
-        ])  # Total: latent_dim + 1 + n_components + 7 = 16 + 1 + 6 + 7 = 30
+        ])  # Total: latent_dim + 1 + n_components + 7 = 30
         
         return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     
@@ -828,6 +857,13 @@ class RegimeDetector:
         if self.gbm_calibrator is not None:
             # v3: GBM on rich features
             rich_feats = self._rich_anomaly_features(X)
+            # Align to GBM expected feature count (pad/trim)
+            expected = self.gbm_calibrator.n_features_in_
+            if rich_feats.shape[1] < expected:
+                pad = np.zeros((rich_feats.shape[0], expected - rich_feats.shape[1]))
+                rich_feats = np.hstack([rich_feats, pad])
+            elif rich_feats.shape[1] > expected:
+                rich_feats = rich_feats[:, :expected]
             return self.gbm_calibrator.predict_proba(rich_feats)[:, 1]
         elif self.lr_calibrator is not None:
             # v2 fallback: LR on 3 basic features
@@ -951,18 +987,21 @@ class RegimeDetector:
         """Save all artifacts (scaler, VAE weights, GMM, LR calibrator, threshold)."""
         path.mkdir(parents=True, exist_ok=True)
         prefix = f"down_risk_{self.regime.lower()}"
+        if self.scaler is None or self.vae is None or self.gmm is None:
+            raise RuntimeError("Cannot save uninitialized detector components")
+        vae = self.vae
         
         # Scaler
         with open(path / f"{prefix}_scaler.pkl", 'wb') as f:
             pickle.dump(self.scaler, f)
         
         # VAE weights
-        torch.save(self.vae.state_dict(), path / f"{prefix}_vae.pt")
+        torch.save(vae.state_dict(), path / f"{prefix}_vae.pt")
         
         # VAE config (for reconstruction)
         vae_config = {
-            'input_dim': self.vae.input_dim,
-            'latent_dim': self.vae.latent_dim,
+            'input_dim': vae.input_dim,
+            'latent_dim': vae.latent_dim,
             'hidden_dims': self.config.hidden_dims,
             'dropout': self.config.dropout,
         }
@@ -1067,13 +1106,13 @@ class DownRiskDetector:
         self.config = config or DetectorConfig()
         self.up_detector = RegimeDetector('UP', self.config)
         self.down_detector = RegimeDetector('DOWN', self.config)
-        self._feature_names: list = []
+        self._feature_names: List[str] = []
     
     def train(self, symbols: Optional[list] = None) -> dict:
         """Full training pipeline: load data, train both regime detectors."""
         _set_seed()
         t0 = time.time()
-        all_metrics = {'config': self.config.to_dict()}
+        all_metrics: Dict[str, Any] = {'config': self.config.to_dict()}
         
         # ── Load dataset with cross-predicted XGB regimes ──
         combined, feature_names = load_detector_dataset(self.config, symbols)
@@ -1188,7 +1227,7 @@ class DownRiskDetector:
     def _evaluate_test(self, X_test: np.ndarray, y_test_down: np.ndarray,
                        y_test_up: np.ndarray, regime_test: np.ndarray) -> dict:
         """Evaluate all regime detectors on the test set."""
-        results = {}
+        results: Dict[str, Any] = {}
         
         # UP regime: evaluate against y_down8
         up_mask = regime_test == 'UP'
@@ -1237,7 +1276,7 @@ class DownRiskDetector:
         
         return results
     
-    def predict_single(self, X: np.ndarray, regime: str) -> Dict[str, any]:
+    def predict_single(self, X: np.ndarray, regime: str) -> Dict[str, Any]:
         """Predict for a single row (or batch) with known regime.
         
         Args:
@@ -1302,6 +1341,7 @@ def evaluate_detector(symbols: Optional[list] = None, config: Optional[DetectorC
         return
     
     combined, feature_names = load_detector_dataset(config, symbols)
+    feature_names = cast(List[str], feature_names)
     
     # Test split
     combined['_date'] = combined['date'].dt.date
@@ -1309,11 +1349,15 @@ def evaluate_detector(symbols: Optional[list] = None, config: Optional[DetectorC
     test_cutoff = all_dates[-config.test_days]
     test_mask = combined['_date'] >= test_cutoff
     
-    X_test = np.nan_to_num(combined.loc[test_mask, feature_names].values.astype(np.float32),
-                           nan=0.0, posinf=0.0, neginf=0.0)
-    y_test_down = combined.loc[test_mask, 'y_down8'].values
-    y_test_up = combined.loc[test_mask, 'y_up8'].values
-    regimes = combined.loc[test_mask, 'xgb_regime'].values
+    X_test = np.nan_to_num(
+        combined.loc[test_mask, feature_names].to_numpy(dtype=np.float32, copy=True),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    y_test_down = combined.loc[test_mask, ['y_down8']].to_numpy(dtype=np.int32, copy=True).ravel()
+    y_test_up = combined.loc[test_mask, ['y_up8']].to_numpy(dtype=np.int32, copy=True).ravel()
+    regimes = combined.loc[test_mask, ['xgb_regime']].to_numpy(dtype=object, copy=True).ravel()
     
     results = detector._evaluate_test(X_test, y_test_down, y_test_up, regimes)
     
@@ -1331,7 +1375,7 @@ def evaluate_detector(symbols: Optional[list] = None, config: Optional[DetectorC
 # ══════════════════════════════════════════════════════════════════════
 
 def infer_from_features(X: np.ndarray, regime: str,
-                        detector: Optional[DownRiskDetector] = None) -> Dict[str, any]:
+                        detector: Optional[DownRiskDetector] = None) -> Dict[str, Any]:
     """One-shot inference from a feature array.
     
     Args:
@@ -1475,12 +1519,16 @@ def main():
             print(f"ERROR: Feature computation failed for {args.symbol}")
             return
         
-        feature_names = get_feature_names()
+        feature_names = cast(List[str], get_feature_names())
         
         # Take last N rows
         df_tail = df.tail(args.tail).copy()
-        X = np.nan_to_num(df_tail[feature_names].values.astype(np.float32),
-                          nan=0.0, posinf=0.0, neginf=0.0)
+        X = np.nan_to_num(
+            df_tail.loc[:, feature_names].to_numpy(dtype=np.float32, copy=True),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         
         # Score for all regimes
         print(f"\n{'='*70}")

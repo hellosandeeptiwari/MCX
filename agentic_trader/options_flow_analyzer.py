@@ -234,7 +234,41 @@ class OptionsFlowAnalyzer:
             import logging as _ofa_log
             _ofa_log.getLogger('OFA').warning(f"analyze({underlying}): {_e}")
             return self._neutral()
-    
+
+    def analyze_dhan_only(self, underlying: str) -> dict:
+        """Dhan-first OI analysis — SKIPS Kite chain fetch entirely.
+
+        Used by OI_AGGR to horizontally shard the universe across two API
+        buckets: Kite handles top-N movers via analyze(), Dhan handles the
+        next tier via this method. DhanHQ has its own 3s global throttle
+        that is independent of Kite's ~10 req/s shared limit, so the two
+        paths can run concurrently without contention.
+
+        Falls back to NSE enrichment if Dhan returns nothing.
+        FAIL-SAFE: Returns NEUTRAL on any error. Uses the same cache as analyze().
+        Result shape is identical to analyze() so downstream scoring is
+        source-agnostic.
+        """
+        try:
+            if not self.ready:
+                return self._neutral()
+            cache_key = underlying
+            if cache_key in self._CACHE:
+                cached_time, cached_result = self._CACHE[cache_key]
+                if (datetime.now() - cached_time).total_seconds() < self._CACHE_TTL:
+                    return cached_result
+            result = self._neutral()
+            result = self._enrich_with_dhan(underlying, result)
+            if not result.get('nse_enriched'):
+                result = self._enrich_with_nse(underlying, result)
+            if result.get('nse_enriched'):
+                self._CACHE[cache_key] = (datetime.now(), result)
+            return result
+        except Exception as _e:
+            import logging as _ofa_log
+            _ofa_log.getLogger('OFA').warning(f"analyze_dhan_only({underlying}): {_e}")
+            return self._neutral()
+
     def _enrich_with_dhan(self, underlying: str, result: dict) -> dict:
         """Enrich Kite-based result with DhanHQ OI + Greeks data.
         

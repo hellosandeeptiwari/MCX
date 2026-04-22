@@ -187,15 +187,20 @@ BREAKOUT_WATCHER = {
     "sustain_seconds": 15,            # PRICE_SPIKE: 15s quick sanity check (OI fetched inline at drain provides real conviction)
     "sustain_seconds_extreme": 20,    # DAY_HIGH/LOW break — 20s proof
     "sustain_seconds_volume": 20,     # VOLUME_SURGE with confirmed ticks — 20s proof
-    "sustain_seconds_grind": 30,      # SLOW_GRIND: 30s sustain proof (was 10 — too short, small grinds slipping through)
+    "sustain_seconds_grind": 45,      # SLOW_GRIND: 45s sustain proof (was 30 — tighten to filter weak grinds)
     "sustain_recheck_pct": 0.4,       # Spike/extreme: price must still be ≥0.4% from baseline (33% retrace room at 0.6 spike)
+    "sustain_recheck_pct_spike_down": 0.25, # Spike DOWN: relaxed — panics hold direction better (was shared 0.4)
+    "sustain_recheck_pct_spike_up": 0.35,   # Spike UP: slightly relaxed (was shared 0.4)
+    "sustain_recheck_pct_spike_down": 0.25, # Spike DOWN: relaxed — panics hold direction better (was shared 0.4)
+    "sustain_recheck_pct_spike_up": 0.35,   # Spike UP: slightly relaxed (was shared 0.4)
     "sustain_recheck_pct_volume": 0.5,# Volume surge: price must still be ≥0.5% from baseline (was 0.4 — 0.3% moves too weak)
     "sustain_retrace_max_pct": 50.0,  # Fail sustain if price retraces >50% from peak move during window
     "volume_surge_min_move_pct": 0.5, # VOLUME_SURGE must show ≥0.5% price move to enter sustain (was 0.3 — too noisy)
     # --- Slow Grind Detection ---
-    "slow_grind_pct": 1.0,              # 1.0%+ move triggers SLOW_GRIND (was 0.75 — too many small grinds reversing)
+    "slow_grind_pct": 0.94,             # 0.94%+ move triggers SLOW_GRIND_DOWN (was 1.0 — tightened for earlier detection)
+    "slow_grind_up_pct": 1.2,            # 1.2%+ move triggers SLOW_GRIND_UP (tighter than down — up grinds need stronger conviction)
     # --- Cooldown (anti-spam) ---
-    "cooldown_seconds": 120,          # Don't re-trigger same stock within 2 minutes (was 3 — too slow)
+    "cooldown_seconds": 90,           # Don't re-trigger same stock within 90s (was 120 — too strict)
     "max_triggers_per_minute": 10,    # Max triggers per minute — relaxed for crash days
     # --- Priority Queue ---
     "queue_size": 100,                # Max queued triggers — evicts weakest when full
@@ -205,6 +210,7 @@ BREAKOUT_WATCHER = {
     "active_until": "15:10",          # Don't trigger after 15:10 (too close to close)
     # --- Score Gate (LOWERED Mar-12: macro trend filter now handles quality, let more setups through) ---
     "min_score": 30,                  # Minimum score to trade (was 35 — lowered to let more watcher setups through)
+    "grind_min_score": 48,            # [Apr 17] GRIND floor raised 40→48 — too many low-quality grinds at 40
     "orb_min_score": 35,              # ORB_BREAKOUT floor (was 40 — lowered Mar 30)
     "orb_min_move_prob": 0.55,        # ORB/SPIKE/DAY trades need P(move)≥55% (breadth relaxation → 0.45)
     "watcher_min_move_prob": 0.50,    # WATCHER P(move) floor (was 0.40 — raised to 0.50, Mar-28)
@@ -223,7 +229,7 @@ BREAKOUT_WATCHER = {
     "max_trades_before_1000": 2,      # Max watcher trades before 10:00 IST (was 3)
     # --- Early Market Hardening (9:35-9:55 is still dicey) ---
     "early_market_end": "09:55",       # Early market protection window end
-    "early_market_min_score": 40,      # Lowered from 50 — review after tomorrow's session
+    "early_market_min_score": 35,      # Lowered from 50→40→35
     "early_market_min_dir_conf": 45,   # Min direction confidence during early market
     "early_market_min_sustain_pct": 1.0, # Min sustained move % for spikes in early market (normal=0.6)
     # --- Dynamic Batch ---
@@ -337,7 +343,7 @@ EARLYBIRD_COMMON = {
     "enabled": True,
     "start_time": "09:15",               # Start detecting from market open (first tick)
     "end_time": "09:30",                  # 15-minute earlybird window — normal watcher takes over at 09:30
-    "max_trades": 999,                    # No cap during paper trading (set to 6 for live)
+    "max_trades": 3,                    # Apr 2: Cap at 3 earlybird trades per morning (9:15-9:30)
     "skip_dir_conf_gate": True,           # Skip direction confidence gate (unreliable at open)
     "min_vol_ratio": 1.5,                 # Current vol delta must be ≥ 1.5× rolling avg
     # --- Market Context Gating ---
@@ -396,6 +402,32 @@ EARLYBIRD_C = {
     "min_vol_ratio": 2.0,                 # Require 2x volume (higher than A/B)
     "trigger_bonus": 7,                   # Lowest bonus
     "lot_multiplier": 0.5,               # Half lot — lowest quality
+}
+
+# --- MODE D: News-Based Early Bird (Pre-market News Sentiment) ---
+# Scans financial news RSS feeds pre-market, uses GPT to identify directly
+# impacted F&O stocks, then fires trades at 9:15 in the news sentiment direction.
+# Highest conviction when news is stock-specific (earnings, upgrades, contracts).
+# Direction is SET by news sentiment — just needs price confirmation at open.
+EARLYBIRD_D = {
+    "enabled": True,
+    "scan_time": "08:50",                 # When to run the pre-market news scan
+    "min_open_move_pct": 0.3,             # Min move from open in news direction to confirm
+    "sustain_seconds": 5,                 # Shortest sustain — news = pre-validated catalyst
+    "sustain_min_hold_pct": 0.3,          # Relaxed hold — news sentiment is sticky
+    "min_score": 15,                      # Very relaxed — news itself is the thesis
+    "min_move_prob": 0.25,                # Very relaxed XGB floor (news overrides model)
+    "trigger_bonus": 18,                  # Highest bonus — pre-validated directional catalyst
+    "news_confidence_bonus": 5,           # Extra for hybrid score ≥ 65
+    "lot_multiplier": 1.5,               # Standard news lot size
+    "high_conf_lot_multiplier": 2.0,      # 2x for hybrid score ≥ 70
+    "min_news_confidence": 45,            # Min hybrid confidence to include as target
+    "max_news_targets": 10,               # Max stocks GPT identifies (scan universe)
+    "trade_targets": 5,                   # Top N by confidence to actually TRADE
+    # LLM config
+    "llm_model": "gpt-4o-mini",           # Fast, cheap model for headline analysis
+    "lookback_hours": 18,                 # 18h weekdays, auto 48h on Monday (weekend news)
+    "feed_timeout_sec": 10,               # RSS fetch timeout per feed
 }
 
 # Backward-compat alias: modules that import 'EARLYBIRD' get the common config
@@ -649,16 +681,37 @@ TEST_XGB = {
 # Separate budget from model-tracker trades.
 GMM_SNIPER = {
     "enabled": True,
-    "max_sniper_trades_per_day": 4,    # ⚠️ Tightened: sniper = SELECTIVE, 4 max (was 8)
-    "lot_multiplier": 3.0,             # Reduced from 5x → 3x. Earn bigger size with proven P&L
-    "min_smart_score": 53,             # Minimum smart score for sniper trades
-    "max_updr_score": 0.12,            # UP regime clean (tiny relaxation from 0.10 — near misses at 0.07-0.12)
-    "max_downdr_score": 0.189,         # DOWN regime clean (relaxed from 0.15 — DN near misses at 0.15-0.18)
-    "min_gate_prob": 0.52,             # XGB movement signal threshold
-    "min_direction_confidence": 55,    # Smart Direction Engine: multi-signal consensus required
+    "max_sniper_trades_per_day": 999,   # Unlimited — no daily cap on sniper trades
+    "lot_multiplier": 2.0,             # Reduced from 3x → 2x. Smaller size until WR proven
+    "min_smart_score": 50,             # Tightened from 45→50: keep quality bar higher
+    "max_updr_score": 0.0855,         # UP regime DR cap — tightened -5% (0.09→0.0855) Apr 21
+    "max_downdr_score": 0.153,         # DOWN regime DR cap — tightened -10% (0.17→0.153) Apr 21
+    "min_gate_prob": 0.58,             # XGB movement probability floor — RAISED from 0.55→0.58: tighter quality filter
+    "min_direction_confidence": 71,    # Direction confidence — raised from 67→71: tighter quality bar
+    "require_elite_ok": True,          # NEW: ml_elite_ok must be True (calibration: 53% vs 10.3% without)
+    "reject_chop_hint": True,          # NEW: ml_chop_hint=True = hard reject (calibration: chop=True = 10.3% WR)
+    "require_xgb_directional": True,   # NEW: xgb_signal must be UP or DOWN, not FLAT (calibration: FLAT=33.4% vs UP/DOWN=51-57%)
     "score_tier": "premium",           # Use premium tier sizing (5% risk, +80% target)
-    "separate_capital": 200000,        # ₹2 Lakh — sniper capital reduced, must prove ROI
+    "separate_capital": 400000,        # ₹4 Lakh — doubled sniper capital for more coverage
     "max_exposure_pct": 85,            # Max % of sniper capital usable
+    # --- VIX-Adaptive DR Thresholds (Apr 15, 2026) ---
+    # Multiplier applied to max_updr_score and max_downdr_score based on VIX regime.
+    # Base: UPDR=0.0855, DOWNDR=0.153
+    "vix_dr_multiplier_low": 0.85,     # VIX <13: tighten (UPDR→0.0727, DOWNDR→0.130)
+    "vix_dr_multiplier_normal": 1.0,   # VIX 13-18: base unchanged (UPDR=0.0855, DOWNDR=0.153)
+    "vix_dr_multiplier_high": 1.20,    # VIX 18-25: relax (UPDR→0.1026, DOWNDR→0.1836)
+    "vix_dr_multiplier_extreme": 1.35, # VIX >25: relax (UPDR→0.1154, DOWNDR→0.2066)
+    # --- Confluent Weakness Filter (Apr 9, 2026) ---
+    # Rejects candidates that pass every individual gate but only by the smallest margins.
+    # When 3+ weakness signals fire simultaneously, the setup is collectively too weak.
+    # Each threshold defines the "weak" zone just above the hard gate floor.
+    "confluent_weakness_enabled": True,
+    "cw_min_prob_dir": 0.55,           # prob_up (BUY) or prob_down (SELL) below this = 1 weakness point
+    "cw_min_smart": 60,                # smart_score below this = 1 weakness point
+    "cw_min_ml_conf": 50,              # ml_confidence below this = 1 weakness point
+    "cw_max_counter_trend_pct": 1.0,   # stock moving >1% AGAINST direction = 1 weakness point
+    "cw_min_gate_prob": 0.65,          # P(move) below this = 1 weakness point
+    "cw_max_weakness_points": 2,       # reject if weakness points > this (3+ = too weak)
 }
 
 # === SECTOR BREADTH PENALTY ===
@@ -679,13 +732,13 @@ SNIPER_OI_UNWINDING = {
     "lot_multiplier": 1.5,              # 1.5x lots (conviction but conservative)
     # --- OI Unwinding Detection ---
     "required_buildups": ["LONG_UNWINDING", "SHORT_COVERING"],
-    "min_buildup_strength": 0.60,       # OI buildup signal strength >= 0.60 (lowered from 0.80 — 60s confirmation gate now filters noise)
+    "min_buildup_strength": 0.50,       # OI buildup signal strength >= 0.50 (lowered from 0.60 Apr 16)
     "min_oi_change_pct": 6.0,           # Dominant OI side must have changed >= 6% (relaxed from 8%)
     # --- Price Reversal at S/R ---
     "max_distance_from_sr_pct": 2.5,    # Spot must be within 2.5% of OI support/resistance (relaxed from 1.5%)
     # --- GMM Quality Gate ---
-    "max_updr_score": 0.18,              # GMM clean — UP regime (relaxed from 0.15, aligned with PCR extreme)
-    "max_downdr_score": 0.189,           # GMM clean — DOWN regime (relaxed from 0.15)
+    "max_updr_score": 0.171,             # GMM clean — UP regime — tightened -5% (0.18→0.171) Apr 21
+    "max_downdr_score": 0.1701,          # GMM clean — DOWN regime — tightened -10% (0.189→0.1701) Apr 21
     "min_gate_prob": 0.40,              # XGB gate P(move) floor (relaxed from 0.45)
     "min_smart_score": 50,              # Minimum smart_score — restored quality floor (45 was too loose)
     # --- Timing ---
@@ -694,6 +747,11 @@ SNIPER_OI_UNWINDING = {
     # --- Risk ---
     "score_tier": "premium",
     "separate_capital": 200000,         # ₹2L reserved for OI unwinding sniper
+    # --- VIX-Adaptive DR (same as GMM_SNIPER) ---
+    "vix_dr_multiplier_low": 0.85,
+    "vix_dr_multiplier_normal": 1.0,
+    "vix_dr_multiplier_high": 1.20,
+    "vix_dr_multiplier_extreme": 1.35,
 }
 
 # === SNIPER: PCR EXTREME MOMENTUM (Sniper-PCRExtreme) ===
@@ -723,8 +781,8 @@ SNIPER_PCR_EXTREME = {
     # --- Price Alignment ---
     "min_price_alignment_pct": 0.3,     # Price must move ≥ 0.3% WITH direction (no counter-trend entries)
     # --- GMM Quality Gate ---
-    "max_updr_score": 0.18,              # Slightly relaxed — PCR is strong standalone signal (UP regime, threshold 0.25)
-    "max_downdr_score": 0.14,            # PCR strong standalone — DOWN regime (threshold 0.25)
+    "max_updr_score": 0.171,             # PCR standalone — UP regime — tightened -5% (0.18→0.171) Apr 21
+    "max_downdr_score": 0.126,           # PCR standalone — DOWN regime — tightened -10% (0.14→0.126) Apr 21
     "min_gate_prob": 0.40,              # XGB gate P(move) floor
     "min_smart_score": 45,              # Lower floor — PCR extreme itself is high-edge
     # --- Timing ---
@@ -733,6 +791,11 @@ SNIPER_PCR_EXTREME = {
     # --- Risk ---
     "score_tier": "premium",
     "separate_capital": 150000,         # ₹1.5L reserved for PCR extreme sniper
+    # --- VIX-Adaptive DR (same as GMM_SNIPER) ---
+    "vix_dr_multiplier_low": 0.85,
+    "vix_dr_multiplier_normal": 1.0,
+    "vix_dr_multiplier_high": 1.20,
+    "vix_dr_multiplier_extreme": 1.35,
 }
 
 # === DECISION LOG (Full Scan Audit Trail) ===
@@ -757,13 +820,13 @@ ARBTR_CONFIG = {
     "lot_multiplier": 1.0,                # Standard lots — ARBTR needs to prove itself profitable first
 
     # --- Sector Move Detection ---
-    "min_sector_move_pct": 0.6,           # Sector index must move ≥0.6% from prev close
-    "min_sector_stocks_aligned": 0.70,    # Strict: ≥70% of sector must align for conviction
+    "min_sector_move_pct": 1.0,           # Apr 7: Tightened 0.6→1.0%. Need real sector conviction
+    "min_sector_stocks_aligned": 0.75,    # Apr 7: Tightened 0.70→0.75. Broader alignment required
 
     # --- Laggard Detection ---
-    "max_laggard_move_pct": 1.2,          # Relaxed: stock must lag (<1.2%) — on crash days even laggards move 0.5-1%
-    "min_divergence_pct": 0.7,            # Strict: require meaningful divergence gap from sector
-    "max_divergence_pct": 5.0,            # If gap >5% the stock is decoupled (skip)
+    "max_laggard_move_pct": 0.8,          # Apr 7: Tightened 1.2→0.8%. True laggard = barely moved
+    "min_divergence_pct": 1.0,            # Apr 7: Tightened 0.7→1.0%. Need meaningful gap
+    "max_divergence_pct": 4.0,            # Apr 7: Tightened 5.0→4.0%. Lower decoupling threshold
 
     # --- Confirmation Gates (reduce failure trades) ---
     "require_volume_confirmation": True,  # Laggard must have ≥0.8x normal volume (not halted/illiquid)
@@ -774,16 +837,16 @@ ARBTR_CONFIG = {
     "max_ml_flat_prob": 0.55,             # (unused when require_ml=False)
     "require_no_chop_zone": True,         # Laggard must NOT be in chop zone
     "require_htf_not_opposed": True,      # HTF must not oppose sector direction
-    "min_smart_score": 40,                # Moderate floor — need decent score to confirm divergence
+    "min_smart_score": 50,                # Apr 7: Tightened 40→50. Need solid score
 
     # --- GMM Safety Net ---
     "use_gmm_veto": True,                 # GMM anomaly model can veto if opposing
-    "max_dr_score": 0.25,                 # GMM down-risk score must be <0.25 (clean)
+    "max_dr_score": 0.20,                 # Apr 7: Tightened 0.25→0.20. Stricter GMM filter
 
     # --- Timing ---
     "earliest_entry": "09:45",            # First 30 min: too noisy, let the divergence establish
-    "no_entry_after": "15:00",            # Extended to 3 PM — give more window on broad move days
-    "cooldown_per_sector_minutes": 15,    # After entering one ARBTR in a sector, wait 15 min
+    "no_entry_after": "14:30",            # Apr 7: Tightened 15:00→14:30. No late-day ARBTR
+    "cooldown_per_sector_minutes": 20,    # Apr 7: Tightened 15→20 min. More patience between sector entries
 
     # --- Risk / Sizing ---
     "score_tier": "standard",             # Standard sizing (3% risk)
@@ -793,8 +856,9 @@ ARBTR_CONFIG = {
     "separate_capital": 200000,           # ₹2L — ARBTR hasn't earned more capital yet
 
     # --- Speed Gate (Mar 10 fix) ---
-    "speed_gate_minutes": 15,             # If no convergence in 15 min, thesis is dead
-    "speed_gate_min_gain_pct": 3.0,       # Need ≥3% premium gain to prove thesis is working
+    "speed_gate_enabled": True,           # Apr 7: RE-ENABLED. Kill dead thesis fast
+    "speed_gate_minutes": 20,             # Apr 7: 15→20 min. If no convergence in 20 min, thesis is dead
+    "speed_gate_min_gain_pct": 2.0,       # Apr 7: 3→2%. Need ≥2% premium gain to prove thesis working
 }
 
 # Sector definitions for ARBTR — must match _sector_stock_map in scan_and_trade
@@ -881,6 +945,8 @@ TRADING_HOURS = {
     "no_new_after": "15:10"  # No new trades after this (12 min buffer before EOD exit)
 }
 
+
+
 # Early Session: Use 4-min candles for faster indicator maturation
 # Between 9:15 and EARLY_SESSION_END, fetch 4-minute candles instead of 5-minute
 # This gives 4+ candles by 9:31 instead of just 3, so ORB/FT/VWAP mature sooner
@@ -923,20 +989,54 @@ TIER_2_OPTIONS = [
     "NSE:ITC",         # FMCG - tightest spreads in FMCG, high OI
     # Automotive
     "NSE:TATAMOTORS",  # Auto - high beta, deep OI, global exposure
+    # Retail / Consumer
+    "NSE:TRENT",       # Retail - Tata group, high beta, deep OI, trending stock
     # Pharma
     "NSE:CIPLA",       # Pharma - liquid options, consistent trending
     # "NSE:IDEA",      # REMOVED Mar 6 — not F&O eligible, watcher keeps failing on it
 ]
 
-TIER_2_MIN_TREND_SCORE = 60  # Tier-2 stocks need BULLISH/BEARISH trend to trade
+# Tier-3: Broad liquid F&O stocks — scanned by OI watchers, same trend_score gate as Tier-2.
+# Adds sector diversity: PSU banks, auto ancillary, chemicals, insurance, cement, power, media.
+TIER_3_OPTIONS = [
+    # PSU Banks (high OI, trend on policy/credit growth news)
+    "NSE:BANKBARODA", "NSE:PNB", "NSE:CANBK",
+    # Private Banks / NBFCs (deep OI, institutional favorites)
+    "NSE:INDUSINDBK", "NSE:BANDHANBNK", "NSE:SBICARD",
+    # IT — mid-cap liquid (earnings-driven moves, tight chains)
+    "NSE:WIPRO", "NSE:HCLTECH", "NSE:TECHM", "NSE:LTIM",
+    # Auto / Auto Ancillary (budget/demand plays)
+    "NSE:M&M", "NSE:BAJAJ-AUTO", "NSE:HEROMOTOCO", "NSE:EICHERMOT",
+    # Cement / Infrastructure (capex cycle plays)
+    "NSE:ULTRACEMCO", "NSE:SHREECEM", "NSE:GRASIM",
+    # Metals / Mining (commodity-linked, high beta)
+    "NSE:COALINDIA", "NSE:VEDL", "NSE:NMDC",
+    # Oil & Gas / Energy (macro + crude plays)
+    "NSE:BPCL", "NSE:IOC", "NSE:GAIL", "NSE:POWERGRID", "NSE:TATAPOWER",
+    # Pharma / Healthcare (defensive + event-driven)
+    "NSE:DRREDDY", "NSE:APOLLOHOSP", "NSE:DIVISLAB",
+    # Insurance / Financial Services
+    "NSE:SBILIFE", "NSE:HDFCLIFE",
+    # FMCG / Consumer (low-vol but deep OI, good for spreads)
+    "NSE:HINDUNILVR", "NSE:NESTLEIND", "NSE:BRITANNIA",
+    # Telecom / Media
+    "NSE:IDEA",  # Re-added — now F&O eligible again since Oct 2025 series
+    # Diversified / Conglomerate
+    "NSE:ADANIENT", "NSE:ADANIPORTS",
+    # Auto Ancillary — Precision Forgings (liquid F&O, strong intraday momentum)
+    "NSE:SONACOMS",
+]
 
-# Combined universe for scanning (Tier-1 + Tier-2 only, no cash-only/ETFs)
-APPROVED_UNIVERSE = TIER_1_OPTIONS + TIER_2_OPTIONS
+TIER_2_MIN_TREND_SCORE = 55  # Tier-2 stocks need BULLISH/BEARISH trend to trade
+TIER_3_MIN_TREND_SCORE = 60  # Tier-3 stocks need slightly stronger trend confirmation
+
+# Combined universe for scanning (Tier-1 + Tier-2 + Tier-3)
+APPROVED_UNIVERSE = TIER_1_OPTIONS + TIER_2_OPTIONS + TIER_3_OPTIONS
 
 # F&O Configuration
 FNO_CONFIG = {
     "enabled": True,
-    "prefer_options_for": TIER_1_OPTIONS + TIER_2_OPTIONS,  # All stocks are options-eligible
+    "prefer_options_for": TIER_1_OPTIONS + TIER_2_OPTIONS + TIER_3_OPTIONS,  # All stocks are options-eligible
     "option_type_on_bullish": "CE",  # Buy Call on bullish signal
     "option_type_on_bearish": "PE",  # Buy Put on bearish signal
     "strike_selection": "ATM",       # ATM, ITM, OTM

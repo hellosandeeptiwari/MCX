@@ -1,5 +1,5 @@
-"""
-TITAN v5 — Monitoring Dashboard
+﻿"""
+TITAN v5 â€” Monitoring Dashboard
 ================================
 Real-time log viewer, P&L dashboard, trade history, system health.
 Runs as a separate Flask/SSE service alongside the trading bot.
@@ -20,44 +20,87 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (
     HARD_RULES, APPROVED_UNIVERSE, PAPER_MODE,
-    TRADING_HOURS, TIER_1_OPTIONS, TIER_2_OPTIONS,
+    TRADING_HOURS, TIER_1_OPTIONS, TIER_2_OPTIONS, TIER_3_OPTIONS,
     ZERODHA_API_KEY,
 )
 import config as _config_module
 from state_db import get_state_db
 from trade_ledger import get_trade_ledger
 
-# ── Lightweight Kite instance for LIVE exit orders ────────────
+# â”€â”€ Lightweight Kite instance for LIVE exit orders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _dashboard_kite = None
 
 def _get_dashboard_kite():
     """Lazy-init a KiteConnect instance for placing exit orders.
-    Reuses the same access token as the bot (from .env)."""
+    Reuses the same access token as the bot (from .env).
+    Auto-renews via kite_token_manager if token expired."""
     global _dashboard_kite
-    if _dashboard_kite is not None:
-        return _dashboard_kite
-    try:
-        from kiteconnect import KiteConnect
-        token = os.environ.get('ZERODHA_ACCESS_TOKEN', '')
-        if not token:
-            return None
-        kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
-        kite.set_access_token(token)
-        kite.profile()  # validate token
-        _dashboard_kite = kite
-        return kite
-    except Exception as e:
-        print(f"⚠️ Dashboard KiteConnect init failed: {e}")
-        return None
+    from kiteconnect import KiteConnect
 
-# ── App setup ────────────────────────────────────────────────
+    # Fast path: re-validate cached instance
+    if _dashboard_kite is not None:
+        try:
+            _dashboard_kite.profile()
+            return _dashboard_kite
+        except Exception:
+            print("Dashboard cached Kite token expired, attempting renewal")
+            _dashboard_kite = None
+
+    # Try current env token
+    token = os.environ.get('ZERODHA_ACCESS_TOKEN', '')
+    if token:
+        try:
+            kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
+            kite.set_access_token(token)
+            kite.profile()
+            _dashboard_kite = kite
+            return kite
+        except Exception:
+            print("Dashboard .env ZERODHA_ACCESS_TOKEN invalid, trying auto-renewal")
+
+    # Auto-renew via kite_token_manager (same as bot)
+    try:
+        from kite_token_manager import renew_kite_token
+        print("Dashboard: headless Kite token renewal via TOTP...")
+        if renew_kite_token(restart_service=False):
+            new_token = os.environ.get('ZERODHA_ACCESS_TOKEN', '')
+            if new_token:
+                kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
+                kite.set_access_token(new_token)
+                kite.profile()
+                _dashboard_kite = kite
+                print("Dashboard Kite token auto-renewed successfully")
+                return kite
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"Dashboard auto-renewal failed: {e}")
+
+    return None
+
+
+def _get_completed_order_fill_price(kite, order_id: str) -> float:
+    """Return broker-reported average fill for a completed order."""
+    if not kite or not order_id:
+        return 0.0
+    try:
+        order_history = kite.order_history(order_id)
+        for item in reversed(order_history):
+            avg_price = float(item.get('average_price') or 0)
+            if item.get('status') == 'COMPLETE' and avg_price > 0:
+                return avg_price
+    except Exception:
+        pass
+    return 0.0
+
+# â”€â”€ App setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
 LOG_DIR = Path(__file__).resolve().parent.parent / 'logs'
 TRADE_LEDGER_DIR = Path(__file__).parent / 'trade_ledger'
 
-# ── Utility ──────────────────────────────────────────────────
+# â”€â”€ Utility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _today() -> str:
     return datetime.now().strftime('%Y-%m-%d')
@@ -71,7 +114,7 @@ def _safe_json(obj):
     return str(obj)
 
 
-# ── Server-Sent Events: live log tail ────────────────────────
+# â”€â”€ Server-Sent Events: live log tail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _tail_file(filepath: str, n=200):
     try:
@@ -86,8 +129,8 @@ def _sse_log_stream(filepath: str):
     """Generator: yield new lines as SSE data events.
     
     Optimisations vs original:
-    - 100ms poll instead of 500ms → 5x faster log delivery
-    - SSE heartbeat comment every 15s → keeps connection alive through
+    - 100ms poll instead of 500ms â†’ 5x faster log delivery
+    - SSE heartbeat comment every 15s â†’ keeps connection alive through
       proxies / gunicorn timeout, prevents [Errno 110] TimeoutError
     - Handles log file rotation (re-open when truncated)
     """
@@ -106,7 +149,7 @@ def _sse_log_stream(filepath: str):
                     try:
                         cur_size = os.path.getsize(filepath)
                         if cur_size < where:
-                            # File was rotated — reopen from start
+                            # File was rotated â€” reopen from start
                             f.seek(0)
                             continue
                     except OSError:
@@ -120,13 +163,15 @@ def _sse_log_stream(filepath: str):
         yield f"data: {json.dumps('[log file not found]')}\n\n"
 
 
-# ══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  ROUTES
-# ══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-# Server boot timestamp — changes on every restart (i.e. every deploy)
+# Server boot timestamp â€” changes on every restart (i.e. every deploy)
+# Use file mtime so all gunicorn workers share the same version
+# (avoids reload-loop when round-robin hits different worker boot times)
 import time as _time
-_SERVER_BOOT = str(int(_time.time()))
+_SERVER_BOOT = str(int(os.path.getmtime(__file__)))
 
 @app.route('/')
 def index():
@@ -141,7 +186,7 @@ def version():
     return jsonify({'v': _SERVER_BOOT})
 
 
-# ── Live log SSE streams ─────────────────────────────────────
+# â”€â”€ Live log SSE streams â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/logs/stream')
 def log_stream():
     logfile = str(LOG_DIR / 'titan.log')
@@ -174,7 +219,7 @@ def recent_errors():
     return jsonify({'lines': [l.rstrip() for l in lines]})
 
 
-# ── Smart Log Reader with Bookmarks ──────────────────────────
+# â”€â”€ Smart Log Reader with Bookmarks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Bookmark file stores {file_key: {"line": N, "ts": "ISO"}} so the AI agent
 # can call ?set_bookmark=true after reading, and next call with
 # ?since_bookmark=true returns ONLY new lines since that position.
@@ -272,14 +317,14 @@ def smart_logs():
     """Smart log reader with bookmark support.
 
     Query params:
-      file          – log key: titan|titan_error|dashboard_error|watchdog|bot_debug
+      file          â€“ log key: titan|titan_error|dashboard_error|watchdog|bot_debug
                       (default: titan). Use "all" for metadata-only overview.
-      lines         – max lines to return (default: 300)
-      since_bookmark – if "true", return only new lines after saved bookmark
-      set_bookmark  – if "true", save current end-of-file as bookmark after read
-      from_scan     – if "true", return lines starting from last SCAN CYCLE
-      grep          – optional regex filter applied to returned lines
-      tail          – if "true" (default), read last N lines; if "false", read from bookmark/scan
+      lines         â€“ max lines to return (default: 300)
+      since_bookmark â€“ if "true", return only new lines after saved bookmark
+      set_bookmark  â€“ if "true", save current end-of-file as bookmark after read
+      from_scan     â€“ if "true", return lines starting from last SCAN CYCLE
+      grep          â€“ optional regex filter applied to returned lines
+      tail          â€“ if "true" (default), read last N lines; if "false", read from bookmark/scan
 
     Returns:
       {meta: {file_key: {exists, size, total_lines, modified, bookmark_line}},
@@ -298,7 +343,7 @@ def smart_logs():
 
     bookmarks = _load_bookmarks()
 
-    # ── Always return metadata for ALL log files ──
+    # â”€â”€ Always return metadata for ALL log files â”€â”€
     meta = {}
     for key, path in _LOG_FILES.items():
         fm = _file_meta(path)
@@ -307,7 +352,7 @@ def smart_logs():
         fm['new_lines'] = max(0, fm['total_lines'] - bm_line) if fm['exists'] else 0
         meta[key] = fm
 
-    # ── If "all", return just metadata overview ──
+    # â”€â”€ If "all", return just metadata overview â”€â”€
     if file_key == 'all':
         if set_bm:
             for key in _LOG_FILES:
@@ -328,7 +373,7 @@ def smart_logs():
     total = meta[file_key]['total_lines']
     bm_was = bookmarks.get(file_key, {}).get('line', 0)
 
-    # ── Decide start line ──
+    # â”€â”€ Decide start line â”€â”€
     if from_scan and file_key == 'titan':
         scan_line = _find_last_scan_cycle_line(log_path)
         start = scan_line if scan_line > 0 else max(1, total - max_lines + 1)
@@ -342,15 +387,15 @@ def smart_logs():
     lines = _read_lines_from(log_path, start, max_lines)
     end_line = start + len(lines) - 1 if lines else start
 
-    # ── Optional grep filter ──
+    # â”€â”€ Optional grep filter â”€â”€
     if grep_pat:
         try:
             pat = _re.compile(grep_pat, _re.IGNORECASE)
             lines = [l for l in lines if pat.search(l)]
         except _re.error:
-            pass  # bad regex — return unfiltered
+            pass  # bad regex â€” return unfiltered
 
-    # ── Set bookmark ──
+    # â”€â”€ Set bookmark â”€â”€
     bm_now = None
     if set_bm:
         bm_now = total
@@ -370,7 +415,7 @@ def smart_logs():
     })
 
 
-# ── Bot control (start / stop / restart) ─────────────────────
+# â”€â”€ Bot control (start / stop / restart) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route('/api/bot/stop', methods=['POST'])
 def bot_stop():
@@ -405,7 +450,423 @@ def bot_restart():
         return jsonify({'ok': False, 'action': 'restart', 'msg': str(e)}), 500
 
 
-# ── Manual position exit (dashboard → signal file → bot) ─────
+# ── Reverse trade: EXIT current position + OPEN opposite ───────
+
+@app.route('/api/reverse_trade', methods=['POST'])
+def reverse_trade():
+    """Reverse a position: exit current, then open opposite (PE↔CE, same strike/lots).
+    Fetches live market LTP via Kite API, calculates SL/target like the bot does."""
+    try:
+        import re, random
+        data = request.get_json(force=True, silent=True) or {}
+        symbol = data.get('symbol', '').strip()
+        underlying = data.get('underlying', '').strip()
+        direction = data.get('direction', '').strip()  # reversed direction
+        quantity = int(data.get('quantity', 0))
+        is_option = data.get('is_option', False)
+        option_type = data.get('option_type', '')
+        strike = data.get('strike', 0)
+        expiry = data.get('expiry', '')
+        lots = int(data.get('lots', 1))
+
+        if not symbol or not direction or quantity <= 0:
+            return jsonify({'ok': False, 'msg': 'Missing required fields'}), 400
+
+        db = get_state_db()
+        today = _today()
+
+        # ── STEP 1: EXIT the current position ──
+        positions, realized_pnl, paper_capital = db.load_active_trades(today)
+        target_pos = None
+        remaining = []
+        for pos in positions:
+            pos_sym = pos.get('symbol') or pos.get('option_symbol') or ''
+            if pos_sym == symbol and pos.get('status', 'OPEN') == 'OPEN' and target_pos is None:
+                target_pos = pos
+            else:
+                remaining.append(pos)
+
+        # GUARD: don't create a ghost reverse if the original position is gone.
+        # This happens when the dashboard row is stale (user clicks reverse twice
+        # before auto-refresh fires, or after the bot auto-exited on SL/target).
+        # Without this guard every stale click would silently spawn a new BUY,
+        # piling up unwanted positions after a few clicks.
+        if target_pos is None:
+            return jsonify({
+                'ok': False,
+                'msg': f'Position {symbol} no longer open (already exited/flipped). Refresh and try again.'
+            }), 409
+
+        exit_pnl = 0
+        exit_price = 0
+        exit_msg = ''
+        if target_pos:
+            # Get current LTP for P&L calc
+            live = db.load_live_pnl() or {}
+            lp = live.get(symbol) or live.get(symbol.replace('NFO:', ''))
+            ltp_exit = 0
+            if isinstance(lp, dict):
+                ltp_exit = lp.get('ltp', 0)
+            elif isinstance(lp, (int, float)):
+                ltp_exit = float(lp)
+
+            entry_price = target_pos.get('avg_price') or target_pos.get('entry_price') or 0
+            exit_qty = abs(target_pos.get('quantity', 0))
+            side = target_pos.get('side') or target_pos.get('direction', 'BUY')
+
+            if ltp_exit > 0 and entry_price > 0:
+                if side in ('BUY', 'LONG'):
+                    exit_pnl = (ltp_exit - entry_price) * exit_qty
+                else:
+                    exit_pnl = (entry_price - ltp_exit) * exit_qty
+            else:
+                exit_pnl = target_pos.get('unrealized_pnl', 0)
+
+            exit_price = ltp_exit if ltp_exit > 0 else entry_price
+
+            # Write exit signal for bot (in-memory cleanup)
+            exit_signal = {
+                'symbol': symbol,
+                'exit_price': round(exit_price, 2),
+                'pnl': round(exit_pnl, 2),
+                'exit_time': datetime.now().isoformat(),
+                'exit_type': 'MANUAL_REVERSE_EXIT',
+                'direction': side,
+                'quantity': exit_qty,
+                'entry_price': round(entry_price, 2),
+                'trade': target_pos,
+                'live_exit_placed': False,
+            }
+            exit_pending = []
+            if MANUAL_EXIT_FILE.exists():
+                try:
+                    exit_pending = json.loads(MANUAL_EXIT_FILE.read_text())
+                except Exception:
+                    exit_pending = []
+            exit_pending.append(exit_signal)
+            MANUAL_EXIT_FILE.write_text(json.dumps(exit_pending, indent=2, default=str))
+
+            # Log EXIT in trade_ledger
+            try:
+                ledger = get_trade_ledger()
+                _underlying = target_pos.get('underlying', '')
+                if not _underlying:
+                    m = re.match(r'(?:NFO:)?([A-Z]+)\d', symbol.replace('NFO:', ''))
+                    _underlying = f"NSE:{m.group(1)}" if m else symbol
+                _hold_mins = 0
+                try:
+                    from dateutil.parser import parse as _dp
+                    _hold_mins = int((datetime.now() - _dp(target_pos.get('timestamp', ''))).total_seconds() / 60)
+                except Exception:
+                    pass
+                ledger.log_exit(
+                    symbol=symbol,
+                    underlying=_underlying,
+                    exit_price=round(exit_price, 2),
+                    exit_time=datetime.now().isoformat(),
+                    exit_type='MANUAL_REVERSE_EXIT',
+                    pnl=round(exit_pnl, 2),
+                    hold_time_minutes=_hold_mins,
+                    entry_data=target_pos,
+                )
+            except Exception:
+                pass
+
+            realized_pnl += exit_pnl
+            exit_msg = f'Exited {symbol} P&L={exit_pnl:+,.0f} | '
+
+        # ── STEP 2: BUILD reverse position (PE↔CE) ──
+        rev_symbol = symbol
+        if is_option and option_type in ('CE', 'PE'):
+            orig_type = 'PE' if option_type == 'CE' else 'CE'
+            rev_symbol = re.sub(rf'{orig_type}$', option_type, symbol)
+
+        # Fetch REAL market LTP via Kite API
+        market_ltp = 0
+        kite = _get_dashboard_kite()
+        if not kite:
+            # Still save the exit
+            if target_pos:
+                db.save_active_trades(remaining, realized_pnl, paper_capital)
+            return jsonify({'ok': False, 'msg': f'{exit_msg}Kite API not available for reverse'}), 503
+
+        nfo_symbol = f'NFO:{rev_symbol}' if not rev_symbol.startswith('NFO:') else rev_symbol
+        try:
+            ltp_data = kite.ltp([nfo_symbol])
+            if nfo_symbol in ltp_data:
+                market_ltp = ltp_data[nfo_symbol]['last_price']
+        except Exception as e:
+            print(f"\u26a0\ufe0f Reverse trade LTP fetch failed for {nfo_symbol}: {e}")
+
+        if market_ltp <= 0:
+            if target_pos:
+                db.save_active_trades(remaining, realized_pnl, paper_capital)
+            return jsonify({'ok': False, 'msg': f'{exit_msg}Could not fetch price for {rev_symbol}'}), 400
+
+        stoploss_premium = round(market_ltp * 0.72, 2)
+        target_premium = round(market_ltp * 1.60, 2)
+        total_premium = round(market_ltp * quantity, 2)
+        max_loss = round((market_ltp - stoploss_premium) * quantity, 2)
+
+        paper_id = f'PAPER_REV_{random.randint(100000, 999999)}'
+        trade_id = f'REV_{datetime.now().strftime("%H%M%S")}_{random.randint(1000,9999)}'
+
+        new_pos = {
+            'symbol': rev_symbol,
+            'underlying': underlying or symbol,
+            'quantity': quantity,
+            'lots': lots,
+            'avg_price': market_ltp,
+            'side': 'BUY',
+            'direction': direction,
+            'option_type': option_type if is_option else '',
+            'strike': strike if is_option else 0,
+            'expiry': expiry if is_option else '',
+            'stop_loss': stoploss_premium,
+            'target': target_premium,
+            'order_id': paper_id,
+            'trade_id': trade_id,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'OPEN',
+            'is_option': is_option,
+            'total_premium': total_premium,
+            'max_loss': max_loss,
+            'setup_type': 'REVERSE_SHADOW',
+            'strategy_type': 'NAKED_OPTION',
+            'rationale': f'Reverse of {symbol} \u2192 {rev_symbol} @ \u20b9{market_ltp:.2f} (same strike/lots)',
+            'entry_score': 0,
+            'score_tier': 'manual',
+            'smart_score': 0,
+            'lot_multiplier': 1.0,
+            'sector': '',
+            'trigger_type': 'MANUAL_REVERSE',
+            'is_sniper': False,
+            'delta': 0, 'theta': 0, 'iv': 0,
+        }
+
+        # Write entry signal for bot (in-memory injection)
+        signal_file = os.path.join(os.path.dirname(__file__), 'manual_entry_requests.json')
+        pending = []
+        if os.path.exists(signal_file):
+            try:
+                with open(signal_file, 'r') as sf:
+                    pending = json.loads(sf.read().strip() or '[]')
+            except Exception:
+                pending = []
+        pending.append(new_pos)
+        with open(signal_file, 'w') as sf:
+            json.dump(pending, sf)
+
+        # Save to state_db: remaining (without exited) + new reverse position
+        remaining.append(new_pos)
+        db.save_active_trades(remaining, realized_pnl, paper_capital)
+
+        # Seed live_pnl IMMEDIATELY so the dashboard renders the flipped
+        # position with its correct entry LTP instead of the old symbol's
+        # stale cached value. Without this the row shows no PnL or wrong
+        # PnL until the bot's next ticker cycle (~2-5s).
+        try:
+            _live = db.load_live_pnl() or {}
+            _snaps = []
+            _total = 0.0
+            _exited_sym = symbol if target_pos else None
+            for _k, _v in _live.items():
+                if _k.startswith('_') or not isinstance(_v, dict):
+                    continue
+                if _exited_sym and _k == _exited_sym:
+                    continue  # drop old symbol from cache
+                _snaps.append({
+                    'symbol': _k,
+                    'ltp': _v.get('ltp', 0),
+                    'unrealized_pnl': _v.get('unrealized_pnl', 0),
+                })
+                _total += _v.get('unrealized_pnl', 0) or 0
+            # Add seed entry for the NEW reverse position
+            _snaps.append({'symbol': rev_symbol, 'ltp': market_ltp, 'unrealized_pnl': 0.0})
+            db.save_live_pnl(_snaps, round(_total, 2))
+        except Exception:
+            pass
+
+        return jsonify({
+            'ok': True,
+            'msg': f'{exit_msg}Opened {rev_symbol} @ \u20b9{market_ltp:.2f} | SL \u20b9{stoploss_premium:.2f} | TGT \u20b9{target_premium:.2f}',
+            'order_id': paper_id,
+            'ltp': market_ltp,
+            'stop_loss': stoploss_premium,
+            'target': target_premium,
+        })
+
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'Reverse trade failed: {str(e)}'}), 500
+
+
+# ── Candles endpoint: lightweight chart data from Kite historical API ──
+
+_CANDLES_CACHE = {}  # {(symbol, interval): (ts, payload)}
+_CANDLES_TTL = 2     # 2s cache — matches 3s client poll, still dedupes bursts
+_INSTRUMENT_TOKEN_CACHE = {}  # {'NSE:RELIANCE': 738561}
+_INSTRUMENT_TOKEN_CACHE_TS = 0
+
+@app.route('/api/candles', methods=['GET'])
+def candles():
+    """Return recent OHLC candles for a symbol. Used by dashboard chart modal.
+
+    Query params:
+      symbol   e.g. NSE:RELIANCE or MCX:CRUDEOIL (prefix required)
+      interval 1m|3m|5m|15m|30m|60m|D  (default 5m)
+
+    Response: {ok, candles: [{t,o,h,l,c,v}, ...]}
+    """
+    try:
+        symbol = (request.args.get('symbol') or '').strip().upper()
+        iv_raw = (request.args.get('interval') or '5m').strip()
+        if not symbol or ':' not in symbol:
+            return jsonify({'ok': False, 'msg': 'symbol=NSE:XYZ required'}), 400
+
+        iv_map = {
+            '1': 'minute', '1m': 'minute',
+            '3': '3minute', '3m': '3minute',
+            '5': '5minute', '5m': '5minute',
+            '15': '15minute', '15m': '15minute',
+            '30': '30minute', '30m': '30minute',
+            '60': '60minute', '60m': '60minute', '1h': '60minute',
+            'd': 'day', 'D': 'day', '1d': 'day',
+        }
+        kite_iv = iv_map.get(iv_raw.lower()) or iv_map.get(iv_raw) or '5minute'
+
+        # Cache check (30s TTL — fast successive opens return instantly)
+        import time as _t
+        now = _t.time()
+        ck = (symbol, kite_iv)
+        hit = _CANDLES_CACHE.get(ck)
+        if hit and (now - hit[0]) < _CANDLES_TTL:
+            return jsonify(hit[1])
+
+        kite = _get_dashboard_kite()
+        if not kite:
+            return jsonify({'ok': False, 'msg': 'Kite not available'}), 503
+
+        # Resolve instrument_token (cached 1h)
+        global _INSTRUMENT_TOKEN_CACHE_TS
+        tok = _INSTRUMENT_TOKEN_CACHE.get(symbol)
+        if not tok:
+            # Cheapest path: kite.ltp() returns instrument_token in payload
+            try:
+                lp = kite.ltp([symbol])
+                if symbol in lp:
+                    tok = lp[symbol].get('instrument_token')
+                    if tok:
+                        _INSTRUMENT_TOKEN_CACHE[symbol] = tok
+            except Exception as e:
+                return jsonify({'ok': False, 'msg': f'ltp lookup failed: {e}'}), 400
+
+        if not tok:
+            return jsonify({'ok': False, 'msg': f'No instrument_token for {symbol}'}), 404
+
+        # Window: last N bars — keep small for speed
+        from datetime import datetime as _dt, timedelta as _td
+        now_dt = _dt.now()
+        if kite_iv == 'day':
+            frm = now_dt - _td(days=120)
+        elif kite_iv == '60minute':
+            frm = now_dt - _td(days=15)
+        elif kite_iv == '30minute':
+            frm = now_dt - _td(days=8)
+        elif kite_iv == '15minute':
+            frm = now_dt - _td(days=5)
+        elif kite_iv == '5minute':
+            frm = now_dt - _td(days=2)
+        elif kite_iv == '3minute':
+            frm = now_dt - _td(days=2)
+        else:  # 1minute — today's session only (9:15 IST)
+            frm = now_dt.replace(hour=9, minute=15, second=0, microsecond=0)
+            if frm > now_dt:
+                # Pre-open — show previous trading day session
+                frm = frm - _td(days=1)
+
+        try:
+            raw = kite.historical_data(tok, frm, now_dt, kite_iv)
+        except Exception as e:
+            return jsonify({'ok': False, 'msg': f'historical_data failed: {e}'}), 502
+
+        out = []
+        for r in raw[-400:]:  # cap 400 bars for payload size
+            _ts = r.get('date')
+            # Lightweight-charts expects UNIX seconds (UTC)
+            try:
+                _unix = int(_ts.timestamp())
+            except Exception:
+                continue
+            out.append({
+                't': _unix,
+                'o': r.get('open', 0),
+                'h': r.get('high', 0),
+                'l': r.get('low', 0),
+                'c': r.get('close', 0),
+                'v': r.get('volume', 0),
+            })
+
+        payload = {'ok': True, 'symbol': symbol, 'interval': kite_iv, 'candles': out}
+        _CANDLES_CACHE[ck] = (now, payload)
+        return jsonify(payload)
+
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'candles error: {e}'}), 500
+
+
+# ── Live tick endpoint: <1s price feed for chart & position-less streaming ──
+_LTP_CACHE = {}  # {symbol: (ts, ltp)}
+_LTP_TTL = 0.8   # 800ms — many clients share same ping
+
+@app.route('/api/ltp', methods=['GET'])
+def live_ltp():
+    """Ultra-fast LTP lookup for charting — <100ms round trip.
+
+    Query:  ?symbol=NSE:RELIANCE  (or comma-separated for batch)
+    Return: {ok, ts, ltp: {'NSE:RELIANCE': 1234.5, ...}}
+
+    Uses kite.ltp() which is ~30-80ms per call. Shared 800ms cache across
+    all dashboard clients makes 1s-poll-per-chart effectively free.
+    """
+    try:
+        raw = (request.args.get('symbol') or '').strip().upper()
+        if not raw:
+            return jsonify({'ok': False, 'msg': 'symbol required'}), 400
+        syms = [s.strip() for s in raw.split(',') if s.strip() and ':' in s]
+        if not syms:
+            return jsonify({'ok': False, 'msg': 'need NSE:XYZ format'}), 400
+
+        import time as _tl
+        now = _tl.time()
+        out = {}
+        fetch = []
+        for s in syms:
+            hit = _LTP_CACHE.get(s)
+            if hit and (now - hit[0]) < _LTP_TTL:
+                out[s] = hit[1]
+            else:
+                fetch.append(s)
+
+        if fetch:
+            kite = _get_dashboard_kite()
+            if not kite:
+                return jsonify({'ok': False, 'msg': 'Kite unavailable'}), 503
+            try:
+                data = kite.ltp(fetch)
+                for s in fetch:
+                    px = (data.get(s) or {}).get('last_price')
+                    if px is not None:
+                        _LTP_CACHE[s] = (now, float(px))
+                        out[s] = float(px)
+            except Exception as e:
+                return jsonify({'ok': False, 'msg': f'kite.ltp failed: {e}'}), 502
+
+        return jsonify({'ok': True, 'ts': int(now * 1000), 'ltp': out})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+
+# â”€â”€ Manual position exit (dashboard â†’ signal file â†’ bot) â”€â”€â”€â”€â”€
 
 MANUAL_EXIT_FILE = Path(__file__).parent / 'manual_exit_requests.json'
 
@@ -457,7 +918,7 @@ def exit_position():
         entry_price = target.get('avg_price') or target.get('entry_price') or 0
         qty = abs(target.get('quantity', 0))
         # Use 'side' (actual transaction side: BUY/SELL) NOT 'direction' (market view: BUY=bullish, SELL=bearish)
-        # For PE options: direction=SELL but side=BUY → must use side for correct P&L
+        # For PE options: direction=SELL but side=BUY â†’ must use side for correct P&L
         direction = target.get('side') or target.get('direction', 'BUY')
 
         # For debit spreads, use net premium as entry
@@ -480,7 +941,7 @@ def exit_position():
 
         exit_price = ltp if ltp > 0 else entry_price
 
-        # 1️⃣  LIVE MODE: Place real exit order immediately from dashboard
+        # 1ï¸âƒ£  LIVE MODE: Place real exit order immediately from dashboard
         live_exit_placed = False
         live_exit_msg = ''
         if not PAPER_MODE:
@@ -519,6 +980,7 @@ def exit_position():
                         exit_side = 'SELL' if direction in ('BUY', 'LONG') else 'BUY'
                         legs.append((symbol, exit_side))
 
+                    order_ids = []
                     # Place exit order for each leg
                     for leg_sym, leg_action in legs:
                         exch, tsym = leg_sym.split(':')
@@ -534,14 +996,24 @@ def exit_position():
                             validity=kite.VALIDITY_DAY,
                             tag='TITAN_MANUAL'
                         )
+                        order_ids.append(order_id)
                         live_exit_msg += f' order:{order_id}'
+
+                    if len(order_ids) == 1:
+                        fill_price = _get_completed_order_fill_price(kite, order_ids[0])
+                        if fill_price > 0:
+                            exit_price = fill_price
+                            if direction in ('BUY', 'LONG'):
+                                pnl = (exit_price - entry_price) * qty
+                            else:
+                                pnl = (entry_price - exit_price) * qty
 
                     live_exit_placed = True
                 except Exception as e:
-                    live_exit_msg = f'⚠️ LIVE exit order failed: {e}'
-                    print(f"   🚨 Dashboard LIVE exit failed for {symbol}: {e}")
+                    live_exit_msg = f'âš ï¸ LIVE exit order failed: {e}'
+                    print(f"   ðŸš¨ Dashboard LIVE exit failed for {symbol}: {e}")
 
-        # 2️⃣  Write signal file for bot (in-memory cleanup + sync)
+        # 2ï¸âƒ£  Write signal file for bot (in-memory cleanup + sync)
         signal = {
             'symbol': symbol,
             'exit_price': round(exit_price, 2),
@@ -563,11 +1035,11 @@ def exit_position():
         pending.append(signal)
         MANUAL_EXIT_FILE.write_text(json.dumps(pending, indent=2, default=str))
 
-        # 2️⃣  Remove from state_db immediately (UI refreshes)
+        # 2ï¸âƒ£  Remove from state_db immediately (UI refreshes)
         new_realized = realized_pnl + pnl
         db.save_active_trades(remaining, new_realized, paper_capital)
 
-        # 3️⃣  Log EXIT in trade_ledger
+        # 3ï¸âƒ£  Log EXIT in trade_ledger
         try:
             ledger = get_trade_ledger()
             import re
@@ -603,12 +1075,12 @@ def exit_position():
                 entry_time=target.get('timestamp', ''),
             )
         except Exception as e:
-            print(f"⚠️ Trade ledger log failed for manual exit: {e}")
+            print(f"âš ï¸ Trade ledger log failed for manual exit: {e}")
 
         _mode_label = 'LIVE' if not PAPER_MODE else 'PAPER'
-        _exit_msg = f'[{_mode_label}] Exited {symbol} @ ₹{exit_price:.2f} | P&L: ₹{pnl:+,.2f}'
+        _exit_msg = f'[{_mode_label}] Exited {symbol} @ â‚¹{exit_price:.2f} | P&L: â‚¹{pnl:+,.2f}'
         if live_exit_placed:
-            _exit_msg += ' | Broker order placed ✅'
+            _exit_msg += ' | Broker order placed âœ…'
         elif not PAPER_MODE:
             _exit_msg += f' | {live_exit_msg}'
 
@@ -629,7 +1101,7 @@ def exit_position():
 
 @app.route('/api/exit_all', methods=['POST'])
 def exit_all_positions():
-    """Exit ALL open positions at market price — emergency kill switch.
+    """Exit ALL open positions at market price â€” emergency kill switch.
 
     Iterates every OPEN position, places market exit orders (live mode),
     writes manual-exit signals for the bot, and clears active_trades.
@@ -672,7 +1144,7 @@ def exit_all_positions():
             elif isinstance(lp, (int, float)):
                 ltp = float(lp)
 
-            # P&L calculation — same logic as single exit
+            # P&L calculation â€” same logic as single exit
             if pos.get('is_debit_spread') or pos.get('is_credit_spread'):
                 entry_price = pos.get('net_premium', entry_price)
                 pnl = 0
@@ -725,10 +1197,11 @@ def exit_all_positions():
                         exit_side = 'SELL' if direction in ('BUY', 'LONG') else 'BUY'
                         legs.append((symbol, exit_side))
 
+                    order_ids = []
                     for leg_sym, leg_action in legs:
                         exch, tsym = leg_sym.split(':')
                         tx = kite.TRANSACTION_TYPE_SELL if leg_action == 'SELL' else kite.TRANSACTION_TYPE_BUY
-                        kite.place_order(
+                        order_id = kite.place_order(
                             variety=kite.VARIETY_REGULAR,
                             exchange=exch,
                             tradingsymbol=tsym,
@@ -739,6 +1212,16 @@ def exit_all_positions():
                             validity=kite.VALIDITY_DAY,
                             tag='TITAN_EXITALL'
                         )
+                        order_ids.append(order_id)
+
+                    if len(order_ids) == 1:
+                        fill_price = _get_completed_order_fill_price(kite, order_ids[0])
+                        if fill_price > 0:
+                            exit_price = fill_price
+                            if direction in ('BUY', 'LONG'):
+                                pnl = (exit_price - entry_price) * qty
+                            else:
+                                pnl = (entry_price - exit_price) * qty
                     live_exit_placed = True
                 except Exception as e:
                     live_exit_msg = str(e)
@@ -789,10 +1272,10 @@ def exit_all_positions():
                     entry_time=pos.get('timestamp', ''),
                 )
             except Exception as e:
-                print(f"⚠️ Trade ledger log failed (exit_all) for {symbol}: {e}")
+                print(f"âš ï¸ Trade ledger log failed (exit_all) for {symbol}: {e}")
 
             total_pnl += pnl
-            status = '✅' if live_exit_placed or PAPER_MODE else f'⚠️ {live_exit_msg}'
+            status = 'âœ…' if live_exit_placed or PAPER_MODE else f'âš ï¸ {live_exit_msg}'
             results.append({'symbol': symbol, 'pnl': round(pnl, 2), 'status': status})
 
         # Write all signals at once
@@ -803,8 +1286,8 @@ def exit_all_positions():
         db.save_active_trades([], new_realized, paper_capital)
 
         _mode = 'LIVE' if not PAPER_MODE else 'PAPER'
-        msg = f'[{_mode}] Exited {len(results)} positions | Net P&L: ₹{total_pnl:+,.2f}'
-        print(f"🚨 EXIT ALL: {msg}")
+        msg = f'[{_mode}] Exited {len(results)} positions | Net P&L: â‚¹{total_pnl:+,.2f}'
+        print(f"ðŸš¨ EXIT ALL: {msg}")
 
         return jsonify({
             'ok': True,
@@ -820,7 +1303,7 @@ def exit_all_positions():
         return jsonify({'ok': False, 'msg': f'Exit All failed: {str(e)}'}), 500
 
 
-# ── Helpers: enrich positions with exit-state LTP & unrealized P&L ──
+# â”€â”€ Helpers: enrich positions with exit-state LTP & unrealized P&L â”€â”€
 
 def _enrich_positions(positions: list, db) -> list:
     """Merge live P&L data into each position dict so the dashboard
@@ -832,6 +1315,9 @@ def _enrich_positions(positions: list, db) -> list:
 
     for pos in positions:
         sym = pos.get('symbol') or pos.get('option_symbol') or ''
+        # Tag exchange â€” all state_db positions are NSE/NFO
+        if not pos.get('exchange'):
+            pos['exchange'] = 'NSE'
         # Derive underlying from NFO symbol  e.g. NFO:DLF26MAR590PE -> DLF
         if not pos.get('underlying'):
             m = re.match(r'(?:NFO:)?([A-Z]+)\d', sym.replace('NFO:', ''))
@@ -848,7 +1334,274 @@ def _enrich_positions(positions: list, db) -> list:
     return positions
 
 
-# ── System status ────────────────────────────────────────────
+# â”€â”€ News Targets (Early Bird Mode D) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.route('/api/news_targets')
+def get_news_targets():
+    """Return pre-market news scan results for dashboard display."""
+    try:
+        scan_file = os.path.join(os.path.dirname(__file__), 'news_scan_results.json')
+        if not os.path.exists(scan_file):
+            return jsonify({'targets': [], 'scan_time': None})
+        with open(scan_file, 'r') as f:
+            data = json.load(f)
+        # Check if scan is from today
+        scan_time = data.get('scan_time', '')
+        today = _today()
+        if scan_time and not scan_time.startswith(today):
+            return jsonify({'targets': [], 'scan_time': None, 'stale': True})
+        # Check which targets have been bought (have active positions)
+        db = get_state_db()
+        positions, _, _ = db.load_active_trades(today)
+        open_syms = set()
+        for p in positions:
+            sym = (p.get('symbol') or '').replace('NSE:', '')
+            underlying = (p.get('underlying') or '').replace('NSE:', '')
+            open_syms.add(sym)
+            open_syms.add(underlying)
+        targets = data.get('targets', [])
+        for t in targets:
+            t['bought'] = t.get('symbol', '') in open_syms
+        # Filter out acted/bought news â€” once traded, don't show in dashboard
+        targets = [t for t in targets if not t.get('bought')]
+        return jsonify({
+            'targets': targets,
+            'scan_time': scan_time,
+            'lookback_hours': data.get('lookback_hours', 18),
+            'total_scanned': data.get('total_scanned', len(targets)),
+            'tradeable_count': data.get('tradeable_count', 0),
+        })
+    except Exception as e:
+        return jsonify({'targets': [], 'scan_time': None, 'error': str(e)})
+
+
+# â”€â”€ Manual news trade (dashboard button â†’ real Kite order) â”€â”€â”€
+
+@app.route('/api/place_news_trade', methods=['POST'])
+def place_news_trade():
+    """Place a REAL option order from a news target via Kite API.
+    Finds ITM-1 strike from Kite instruments, places market order."""
+    try:
+        import random, time as _time
+        from options_trader import FNO_LOT_SIZES
+
+        data = request.get_json(force=True, silent=True) or {}
+        symbol = data.get('symbol', '').strip()
+        sentiment = data.get('sentiment', '').strip().upper()
+        confidence = int(data.get('confidence', 0))
+
+        if not symbol or sentiment not in ('BULLISH', 'BEARISH'):
+            return jsonify({'ok': False, 'msg': 'Missing symbol or invalid sentiment'}), 400
+
+        direction = 'BUY' if sentiment == 'BULLISH' else 'SELL'
+        option_type = 'CE' if sentiment == 'BULLISH' else 'PE'
+
+        kite = _get_dashboard_kite()
+        if not kite:
+            return jsonify({'ok': False, 'msg': 'Kite API not available'}), 503
+
+        # â”€â”€ Get underlying LTP to find ATM strike â”€â”€
+        nse_sym = f'NSE:{symbol}'
+        try:
+            ltp_data = kite.ltp([nse_sym])
+            underlying_price = ltp_data.get(nse_sym, {}).get('last_price', 0)
+        except Exception as e:
+            return jsonify({'ok': False, 'msg': f'Cannot fetch price for {symbol}: {e}'}), 400
+
+        if underlying_price <= 0:
+            return jsonify({'ok': False, 'msg': f'No market price for {symbol}'}), 400
+
+        # â”€â”€ Find ATM strike gap â”€â”€
+        if symbol in ('NIFTY', 'BANKNIFTY', 'FINNIFTY'):
+            strike_gap = 50
+        elif underlying_price > 5000:
+            strike_gap = 100
+        elif underlying_price > 2500:
+            strike_gap = 50
+        elif underlying_price > 1000:
+            strike_gap = 20
+        elif underlying_price > 500:
+            strike_gap = 10
+        else:
+            strike_gap = 5
+
+        atm_strike = round(underlying_price / strike_gap) * strike_gap
+
+        # ITM-1: BULLISH â†’ CE 1 strike below ATM, BEARISH â†’ PE 1 strike above ATM
+        if sentiment == 'BULLISH':
+            target_strike = atm_strike - strike_gap
+        else:
+            target_strike = atm_strike + strike_gap
+
+        # â”€â”€ Find correct trading symbol from Kite instruments â”€â”€
+        from datetime import date
+        today_date = date.today()
+        nfo_instruments = kite.instruments('NFO')
+
+        # Filter to this symbol's options with matching type
+        candidates = []
+        for inst in nfo_instruments:
+            if (inst.get('name') == symbol and
+                inst.get('instrument_type') == option_type and
+                inst.get('expiry') is not None):
+                exp = inst['expiry']
+                if isinstance(exp, str):
+                    exp = datetime.strptime(exp, '%Y-%m-%d').date()
+                if exp >= today_date:
+                    candidates.append({
+                        'tradingsymbol': inst['tradingsymbol'],
+                        'strike': float(inst.get('strike', 0)),
+                        'expiry': exp,
+                        'lot_size': int(inst.get('lot_size', 1)),
+                    })
+
+        if not candidates:
+            return jsonify({'ok': False, 'msg': f'No NFO instruments found for {symbol} {option_type}'}), 400
+
+        # Find nearest expiry
+        nearest_expiry = min(set(c['expiry'] for c in candidates))
+        # Filter to nearest expiry
+        candidates = [c for c in candidates if c['expiry'] == nearest_expiry]
+        # Find the contract closest to our target strike
+        candidates.sort(key=lambda c: abs(c['strike'] - target_strike))
+        chosen = candidates[0]
+
+        tradingsymbol = chosen['tradingsymbol']
+        actual_strike = chosen['strike']
+        lot_size = chosen['lot_size']
+        expiry_str = str(nearest_expiry)
+
+        # Override lot_size from our known map if available
+        lot_size = FNO_LOT_SIZES.get(symbol, lot_size)
+        lots = 1
+        quantity = lot_size * lots
+
+        # â”€â”€ Get option LTP â”€â”€
+        nfo_key = f'NFO:{tradingsymbol}'
+        try:
+            ld = kite.ltp([nfo_key])
+            opt_ltp = ld.get(nfo_key, {}).get('last_price', 0)
+        except Exception:
+            opt_ltp = 0
+
+        if opt_ltp <= 0:
+            return jsonify({'ok': False, 'msg': f'No market price for {tradingsymbol}'}), 400
+
+        # â”€â”€ Place REAL Kite order (or paper if PAPER_MODE) â”€â”€
+        fill_price = opt_ltp
+        order_tag = 'TITAN_NEWS'
+
+        if PAPER_MODE:
+            order_id = f'OPTION_PAPER_{random.randint(100000, 999999)}'
+            is_live = False
+            print(f"ðŸ“° NEWS MANUAL (PAPER): BUY {tradingsymbol} x{quantity} @ â‚¹{opt_ltp:.2f}")
+        else:
+            # REAL LIVE ORDER
+            try:
+                order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange='NFO',
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=kite.TRANSACTION_TYPE_BUY,
+                    quantity=quantity,
+                    product=kite.PRODUCT_MIS,
+                    order_type=kite.ORDER_TYPE_MARKET,
+                    tag=order_tag,
+                )
+                order_id = str(order_id)
+                is_live = True
+                print(f"ðŸ“° NEWS MANUAL (LIVE): BUY {tradingsymbol} x{quantity} order_id={order_id}")
+
+                # Wait for fill and get actual price
+                _time.sleep(0.5)
+                try:
+                    order_history = kite.order_history(order_id)
+                    for oh in reversed(order_history):
+                        if oh.get('status') == 'COMPLETE' and oh.get('average_price', 0) > 0:
+                            fill_price = oh['average_price']
+                            break
+                except Exception:
+                    pass  # Use LTP as fallback
+
+            except Exception as e:
+                return jsonify({'ok': False, 'msg': f'Kite order failed: {str(e)}'}), 500
+
+        # â”€â”€ SL/Target: 28% SL, 60% target â”€â”€
+        stoploss = round(fill_price * 0.72, 2)
+        target = round(fill_price * 1.60, 2)
+        total_premium = round(fill_price * quantity, 2)
+        max_loss = round((fill_price - stoploss) * quantity, 2)
+
+        trade_id = f'NEWSMAN_{datetime.now().strftime("%H%M%S")}_{random.randint(1000,9999)}'
+
+        pos = {
+            'symbol': f'NFO:{tradingsymbol}',
+            'underlying': nse_sym,
+            'quantity': quantity,
+            'lots': lots,
+            'avg_price': fill_price,
+            'side': 'BUY',
+            'direction': direction,
+            'option_type': option_type,
+            'strike': int(actual_strike),
+            'expiry': expiry_str,
+            'stop_loss': stoploss,
+            'target': target,
+            'order_id': order_id,
+            'trade_id': trade_id,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'OPEN',
+            'is_option': True,
+            'is_live': is_live,
+            'total_premium': total_premium,
+            'max_loss': max_loss,
+            'setup_type': 'WATCHER_EARLYBIRD_D_UP' if sentiment == 'BULLISH' else 'WATCHER_EARLYBIRD_D_DOWN',
+            'strategy_type': 'NAKED_OPTION',
+            'rationale': f'Manual news: {sentiment} {symbol} conf={confidence} â†’ {option_type} {int(actual_strike)} @ â‚¹{fill_price:.2f}',
+            'entry_score': confidence,
+            'score_tier': 'premium' if confidence >= 80 else 'standard',
+            'smart_score': confidence,
+            'lot_multiplier': 1.5,
+            'sector': '',
+            'trigger_type': 'MANUAL_NEWS',
+            'is_sniper': False,
+            'delta': 0, 'theta': 0, 'iv': 0,
+        }
+
+        # ── Write to signal file so the bot injects into its in-memory positions ──
+        signal_file = os.path.join(os.path.dirname(__file__), 'manual_entry_requests.json')
+        pending = []
+        if os.path.exists(signal_file):
+            try:
+                with open(signal_file, 'r') as sf:
+                    pending = json.loads(sf.read().strip() or '[]')
+            except Exception:
+                pending = []
+        pending.append(pos)
+        with open(signal_file, 'w') as sf:
+            json.dump(pending, sf)
+
+        # Also write to state_db for immediate dashboard display
+        db = get_state_db()
+        today = _today()
+        positions, realized_pnl, paper_capital = db.load_active_trades(today)
+        positions.append(pos)
+        db.save_active_trades(positions, realized_pnl, paper_capital)
+
+        mode_label = 'PAPER' if PAPER_MODE else 'LIVE'
+        return jsonify({
+            'ok': True,
+            'msg': f'[{mode_label}] BUY {tradingsymbol} @ â‚¹{fill_price:.2f} | SL â‚¹{stoploss:.2f} | TGT â‚¹{target:.2f} | {lots}L',
+            'order_id': order_id,
+            'ltp': fill_price,
+            'stop_loss': stoploss,
+            'target': target,
+        })
+
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'News trade failed: {str(e)}'}), 500
+
+
+# â”€â”€ System status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/status')
 def get_status():
     db = get_state_db()
@@ -901,19 +1654,166 @@ def get_status():
     })
 
 
-# ── Trade ledger ─────────────────────────────────────────────
+@app.route('/api/pnl_live')
+def pnl_live():
+    """Ultra-lightweight real-time P&L patch feed.
+    Returns only {symbol: {ltp, upnl}} for open positions, plus totals.
+    Meant for 1-2s client-side polling to patch cells in-place without
+    touching systemctl / ledger / risk state. Typical response <2KB.
+
+    Freshness strategy:
+      1. Preferred: bot's live_pnl table (updated each scan cycle).
+      2. Stale (>3s old): fresh batched kite.ltp() call, cached 800ms.
+      3. Kite fetch fails: use _LAST_GOOD_LTP from previous successful call
+         (prevents P&L collapsing to 0 when upstream hiccups).
+    """
+    try:
+        db = get_state_db()
+        today = _today()
+        positions, realized_pnl, _cap = db.load_active_trades(today)
+        live = db.load_live_pnl() or {}
+
+        import time as _t
+        now_wall = _t.time()
+        last_iso = live.get('_last_updated')
+        stale = True
+        if last_iso:
+            try:
+                from datetime import datetime as _dt
+                last_dt = _dt.fromisoformat(last_iso.replace('Z', ''))
+                age = (_dt.now() - last_dt).total_seconds()
+                stale = age > 3.0
+            except Exception:
+                stale = True
+
+        pos_syms = []
+        for p in positions or []:
+            s = p.get('symbol') or p.get('option_symbol') or ''
+            if s:
+                pos_syms.append(s)
+
+        fresh_ltps = {}
+        kite_err = None
+        if stale and pos_syms:
+            try:
+                to_fetch = []
+                for s in pos_syms:
+                    hit = _LTP_CACHE.get(s)
+                    if hit and (now_wall - hit[0]) < 0.8:
+                        fresh_ltps[s] = hit[1]
+                    else:
+                        to_fetch.append(s)
+                if to_fetch:
+                    kite = _get_dashboard_kite()
+                    if kite:
+                        lookup = []
+                        key_map = {}
+                        for s in to_fetch:
+                            k = s if ':' in s else ('NFO:' + s)
+                            lookup.append(k)
+                            key_map[k] = s
+                        data = kite.ltp(lookup) or {}
+                        for k, v in data.items():
+                            lp = (v or {}).get('last_price')
+                            if lp is not None:
+                                orig = key_map.get(k, k)
+                                _LTP_CACHE[orig] = (now_wall, float(lp))
+                                fresh_ltps[orig] = float(lp)
+                    else:
+                        kite_err = 'no_kite'
+            except Exception as _e:
+                kite_err = str(_e)[:80]
+
+        # Last-good per-symbol cache (module-scoped; survives across requests)
+        # Stored as {sym: (ts, ltp)} so we can expire stuck values after 30s.
+        global _LAST_GOOD_LTP
+        try:
+            _LAST_GOOD_LTP
+        except NameError:
+            _LAST_GOOD_LTP = {}
+        _LAST_GOOD_TTL = 30.0  # don't serve a cached LTP older than this
+
+        out = {}
+        total_unreal = 0.0
+        for p in positions or []:
+            sym = p.get('symbol') or p.get('option_symbol') or ''
+            if not sym:
+                continue
+            entry = p.get('avg_price') or p.get('entry_price') or p.get('net_premium', 0) or 0
+            qty = abs(p.get('quantity', 0) or 0)
+            d = p.get('direction') or ('LONG' if p.get('side') == 'BUY' else 'SHORT')
+            spread = p.get('is_debit_spread') or p.get('is_credit_spread') or p.get('is_iron_condor')
+
+            # Candidate LTPs in priority order
+            ltp = 0.0
+            unreal = 0.0
+            db_lp = live.get(sym) or live.get(sym.replace('NFO:', ''))
+            db_ltp = 0.0
+            if isinstance(db_lp, dict):
+                db_ltp = float(db_lp.get('ltp') or 0)
+            elif isinstance(db_lp, (int, float)):
+                db_ltp = float(db_lp)
+
+            lg = _LAST_GOOD_LTP.get(sym)
+            lg_fresh = isinstance(lg, tuple) and (now_wall - lg[0]) < _LAST_GOOD_TTL
+
+            if sym in fresh_ltps and fresh_ltps[sym] > 0:
+                ltp = float(fresh_ltps[sym])          # 1. Fresh Kite LTP
+            elif not stale and db_ltp > 0:
+                ltp = db_ltp                          # 2. Recent bot-written LTP
+            elif lg_fresh:
+                ltp = float(lg[1])                    # 3. Last good (<30s)
+            elif db_ltp > 0:
+                ltp = db_ltp                          # 4. Stale DB as last resort
+
+            if ltp > 0 and sym in fresh_ltps:
+                _LAST_GOOD_LTP[sym] = (now_wall, ltp)  # only remember fresh fetches
+
+            # Compute unrealized
+            if spread and isinstance(db_lp, dict):
+                unreal = float(db_lp.get('unrealized_pnl') or 0)
+            elif ltp > 0 and entry > 0 and qty > 0:
+                if d in ('BUY', 'LONG'):
+                    unreal = (ltp - entry) * qty
+                else:
+                    unreal = (entry - ltp) * qty
+
+            premium = p.get('total_premium') or (entry * qty) or 0
+            pnl_pct = (unreal / premium * 100) if premium > 0 else 0
+            out[sym] = {
+                'ltp': round(ltp, 2),
+                'upnl': round(unreal, 2),
+                'pct': round(pnl_pct, 2),
+            }
+            total_unreal += unreal
+        return jsonify({
+            'ok': True,
+            'ts': int(time.time()),
+            'stale': stale,
+            'fresh_count': len(fresh_ltps),
+            'kite_err': kite_err,
+            'positions': out,
+            'total_unrealized': round(total_unreal, 2),
+            'realized_pnl': round(realized_pnl or 0, 2),
+            'net_pnl': round((realized_pnl or 0) + total_unreal, 2),
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+
+# â”€â”€ Trade ledger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route('/api/trade_summary')
 def trade_summary():
     """One-call comprehensive trade summary for today.
-    Includes: positions, P&L, ledger events, risk state — everything."""
+    Includes: positions, P&L, ledger events, risk state â€” everything."""
     import re as _re
     db = get_state_db()
     today = _today()
     positions, realized_pnl, capital = db.load_active_trades(today)
     live = db.load_live_pnl() or {}
 
-    # ── Enrich open positions ──
+    # â”€â”€ Enrich open positions â”€â”€
     open_positions = []
     total_unreal = 0
     for p in positions:
@@ -977,7 +1877,7 @@ def trade_summary():
             'status': 'winning' if unreal >= 0 else 'losing',
         })
 
-    # ── Ledger events ──
+    # â”€â”€ Ledger events â”€â”€
     ledger = get_trade_ledger()
     ledger_entries = []
     ledger_exits = []
@@ -1016,10 +1916,10 @@ def trade_summary():
     except Exception:
         pass
 
-    # ── Risk state ──
+    # â”€â”€ Risk state â”€â”€
     risk = db.load_risk_state(today) or {}
 
-    # ── Build summary ──
+    # â”€â”€ Build summary â”€â”€
     net_pnl = realized_pnl + total_unreal
     winners = sum(1 for p in open_positions if p['status'] == 'winning')
     losers = sum(1 for p in open_positions if p['status'] == 'losing')
@@ -1075,7 +1975,7 @@ def trades_for_day(date_str):
     return jsonify(summary)
 
 
-# ── Scan decisions ───────────────────────────────────────────
+# â”€â”€ Scan decisions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/scans')
 def scan_decisions():
     db = get_state_db()
@@ -1086,7 +1986,7 @@ def scan_decisions():
     return jsonify(decisions)
 
 
-# ── Slippage log ─────────────────────────────────────────────
+# â”€â”€ Slippage log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/slippage')
 def slippage():
     db = get_state_db()
@@ -1095,7 +1995,7 @@ def slippage():
     return jsonify(records)
 
 
-# ── Orders ───────────────────────────────────────────────────
+# â”€â”€ Orders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/orders')
 def orders():
     db = get_state_db()
@@ -1103,7 +2003,7 @@ def orders():
     return jsonify({'placed_ids': list(placed_ids), 'records': records})
 
 
-# ── Exit states ──────────────────────────────────────────────
+# â”€â”€ Exit states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/exits')
 def exit_states():
     db = get_state_db()
@@ -1111,7 +2011,7 @@ def exit_states():
     return jsonify(states)
 
 
-# ── Ledger dates ─────────────────────────────────────────────
+# â”€â”€ Ledger dates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/ledger-dates')
 def ledger_dates():
     dates = []
@@ -1122,7 +2022,7 @@ def ledger_dates():
     return jsonify(dates[:60])
 
 
-# ── P&L calendar ─────────────────────────────────────────────
+# â”€â”€ P&L calendar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/pnl-calendar')
 def pnl_calendar():
     days = int(request.args.get('days', 30))
@@ -1136,7 +2036,7 @@ def pnl_calendar():
     return jsonify(result)
 
 
-# ── Config ───────────────────────────────────────────────────
+# â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/config')
 def config_route():
     return jsonify({
@@ -1144,14 +2044,15 @@ def config_route():
         'universe': APPROVED_UNIVERSE,
         'tier1': TIER_1_OPTIONS,
         'tier2': TIER_2_OPTIONS,
+        'tier3': TIER_3_OPTIONS,
         'trading_hours': TRADING_HOURS,
         'paper_mode': PAPER_MODE,
     })
 
 
-# ══════════════════════════════════════════════════════════════
-#  SETTINGS — Single source of truth via settings_manager
-# ══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  SETTINGS â€” Single source of truth via settings_manager
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 from settings_manager import settings as _sm
 
@@ -1351,7 +2252,7 @@ def kill_switch():
         except Exception:
             pass
 
-        return jsonify({'ok': True, 'msg': '🚨 KILL SWITCH ACTIVATED — Bot stopped, all trading halted.'})
+        return jsonify({'ok': True, 'msg': 'ðŸš¨ KILL SWITCH ACTIVATED â€” Bot stopped, all trading halted.'})
     except Exception as e:
         return jsonify({'ok': False, 'msg': f'Kill switch failed: {e}'}), 500
 
@@ -1371,7 +2272,7 @@ def reset_settings():
         return jsonify({'ok': False, 'msg': f'Reset failed: {e}'}), 500
 
 
-# ── Pre-market health check ─────────────────────────────────
+# â”€â”€ Pre-market health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.route('/api/health-check', methods=['POST'])
 def health_check():
     """Run pre-market health check and return results."""
@@ -1382,9 +2283,9 @@ def health_check():
             cwd=str(Path(__file__).parent),
         )
         lines = (r.stdout + r.stderr).strip().split('\n')
-        passed = sum(1 for l in lines if '✅' in l)
-        warned = sum(1 for l in lines if '⚠' in l)
-        failed = sum(1 for l in lines if '❌' in l)
+        passed = sum(1 for l in lines if 'âœ…' in l)
+        warned = sum(1 for l in lines if 'âš ' in l)
+        failed = sum(1 for l in lines if 'âŒ' in l)
         return jsonify({
             'ok': failed == 0,
             'passed': passed,
@@ -1399,7 +2300,7 @@ def health_check():
         return jsonify({'ok': False, 'msg': str(e)}), 500
 
 
-# ── Watchdog alerts ──────────────────────────────────────────
+# â”€â”€ Watchdog alerts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 WATCHDOG_ALERTS_FILE = LOG_DIR / 'watchdog_alerts.json'
 
 @app.route('/api/alerts')
@@ -1425,13 +2326,13 @@ def watchdog_log():
     return jsonify({'lines': [l.rstrip() for l in lines]})
 
 
-# ══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Entry point
-# ══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def run_dashboard(host='0.0.0.0', port=5000, debug=False):
     print(f"\n{'='*56}")
-    print(f"  TITAN v5 — Monitoring Dashboard")
+    print(f"  TITAN v5 â€” Monitoring Dashboard")
     print(f"  http://{host}:{port}")
     print(f"  Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
     print(f"{'='*56}\n")

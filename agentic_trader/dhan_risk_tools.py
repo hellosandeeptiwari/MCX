@@ -52,7 +52,6 @@ SEGMENTS = {
     'NSE_FNO': 'NSE_FNO',
     'BSE_EQ': 'BSE_EQ',
     'BSE_FNO': 'BSE_FNO',
-    'MCX_COMM': 'MCX_COMM',
     'IDX_I': 'IDX_I',
 }
 

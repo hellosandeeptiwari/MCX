@@ -1,7 +1,7 @@
 {
   "regime": "DOWN",
-  "threshold": 0.23338043366645334,
-  "base_down_rate": 0.1685434293018443,
+  "threshold": 0.31665532999059737,
+  "base_down_rate": 0.18115917821947553,
   "config": {
     "input_dim": 84,
     "latent_dim": 16,
@@ -22,6 +22,7 @@
     "calibrator_n_estimators": 100,
     "calibrator_max_depth": 2,
     "calibrator_lr": 0.05,
+    "calibrator_l2_reg": 0.0,
     "calibrator_val_split": 0.6,
     "down_lookahead": 8,
     "down_atr_factor": 3.0,
@@ -30,7 +31,11 @@
     "target_flag_rate": 0.15,
     "min_lift": 1.05,
     "test_days": 20,
-    "val_days": 20
+    "val_days": 30,
+    "use_cosine_lr": false,
+    "use_swa": false,
+    "swa_start_frac": 0.7,
+    "vae_weight_decay": 1e-05
   },
-  "timestamp": "2026-02-20 22:03:49"
+  "timestamp": "2026-03-21 15:37:51"
 }

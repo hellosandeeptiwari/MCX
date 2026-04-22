@@ -219,8 +219,8 @@ class ZerodhaTools:
                 self.ticker = get_ticker(ZERODHA_API_KEY, self.access_token, self.kite)
                 self.ticker.start()
                 # Subscribe to universe stocks
-                from config import TIER_1_OPTIONS, TIER_2_OPTIONS
-                all_symbols = TIER_1_OPTIONS + TIER_2_OPTIONS
+                from config import TIER_1_OPTIONS, TIER_2_OPTIONS, TIER_3_OPTIONS
+                all_symbols = TIER_1_OPTIONS + TIER_2_OPTIONS + TIER_3_OPTIONS
                 # Add NIFTY 50 index
                 all_symbols.append("NSE:NIFTY 50")
                 # Add sectoral indices for sector cross-validation
@@ -329,9 +329,67 @@ class ZerodhaTools:
         if option_syms:
             self.ticker.subscribe_symbols(list(option_syms), mode='quote')
             # print(f"🔌 Ticker: Subscribed {len(option_syms)} option contracts for live PnL")
+            # Eagerly seed live_pnl so dashboard sees positions immediately
+            try:
+                self._seed_live_pnl_for_new_positions(list(option_syms))
+            except Exception:
+                pass
+
+    def _seed_live_pnl_for_new_positions(self, symbols):
+        """Fetch LTPs via REST and seed state_db.live_pnl so the dashboard
+        displays fresh unrealized P&L within one poll after a new entry,
+        without waiting for the 3-second monitor cycle."""
+        if not symbols:
+            return
+        try:
+            ltp_data = self.kite.ltp(symbols)
+        except Exception:
+            return
+        live_snaps = []
+        total_upnl = 0.0
+        with self._positions_lock:
+            trades = [t for t in self.paper_positions if t.get('status', 'OPEN') == 'OPEN']
+        for t in trades:
+            sym = t.get('symbol', '')
+            ltp = 0.0
+            upnl = 0.0
+            if t.get('is_credit_spread'):
+                s_ltp = (ltp_data.get(t.get('sold_symbol', ''), {}) or {}).get('last_price', 0)
+                h_ltp = (ltp_data.get(t.get('hedge_symbol', ''), {}) or {}).get('last_price', 0)
+                ltp = s_ltp - h_ltp
+                upnl = (t.get('net_credit', 0) - ltp) * t.get('quantity', 0)
+            elif t.get('is_debit_spread'):
+                b_ltp = (ltp_data.get(t.get('buy_symbol', ''), {}) or {}).get('last_price', 0)
+                s_ltp = (ltp_data.get(t.get('sell_symbol', ''), {}) or {}).get('last_price', 0)
+                ltp = b_ltp - s_ltp
+                upnl = (ltp - t.get('net_debit', 0)) * t.get('quantity', 0)
+            elif t.get('is_iron_condor'):
+                s_ce = (ltp_data.get(t.get('sold_ce_symbol', ''), {}) or {}).get('last_price', 0)
+                h_ce = (ltp_data.get(t.get('hedge_ce_symbol', ''), {}) or {}).get('last_price', 0)
+                s_pe = (ltp_data.get(t.get('sold_pe_symbol', ''), {}) or {}).get('last_price', 0)
+                h_pe = (ltp_data.get(t.get('hedge_pe_symbol', ''), {}) or {}).get('last_price', 0)
+                ltp = (s_ce - h_ce) + (s_pe - h_pe)
+                upnl = (t.get('total_credit', 0) - ltp) * t.get('quantity', 0)
+            elif sym in ltp_data:
+                ltp = (ltp_data.get(sym, {}) or {}).get('last_price', 0)
+                entry = t.get('avg_price', 0)
+                qty = t.get('quantity', 0)
+                if t.get('side') == 'BUY':
+                    upnl = (ltp - entry) * qty
+                else:
+                    upnl = (entry - ltp) * qty
+            total_upnl += upnl
+            live_snaps.append({'symbol': sym, 'ltp': round(ltp, 2), 'unrealized_pnl': round(upnl, 2)})
+        if live_snaps:
+            try:
+                get_state_db().save_live_pnl(live_snaps, round(total_upnl, 2))
+            except Exception:
+                pass
 
     # Path to signal file for dashboard manual exits
     MANUAL_EXIT_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_exit_requests.json')
+    # Path to signal file for dashboard manual entries (news buy button)
+    MANUAL_ENTRY_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_entry_requests.json')
 
     def _save_active_trades(self):
         """Save active trades to SQLite (caller must hold _positions_lock).
@@ -341,7 +399,8 @@ class ZerodhaTools:
         overwrites the dashboard's state_db changes with stale in-memory
         state that still includes the manually exited position.
         """
-        # ── Consume manual exit signals BEFORE saving ──
+        # ── Consume manual entry/exit signals BEFORE saving ──
+        self._consume_manual_entry_signals()
         self._consume_manual_exit_signals()
         
         try:
@@ -426,7 +485,59 @@ class ZerodhaTools:
                 pass
         except Exception as e:
             print(f"   ⚠️ Manual exit signal consumption error: {e}")
-    
+
+    def _consume_manual_entry_signals(self):
+        """Consume pending manual entry signals from the dashboard.
+
+        Reads positions from the signal file and appends them to
+        in-memory paper_positions so they survive the next save cycle.
+        Called by _save_active_trades() on every save cycle.
+        """
+        if not os.path.exists(self.MANUAL_ENTRY_SIGNAL):
+            return
+
+        try:
+            with open(self.MANUAL_ENTRY_SIGNAL, 'r') as f:
+                raw = f.read().strip()
+            if not raw:
+                os.remove(self.MANUAL_ENTRY_SIGNAL)
+                return
+
+            entries = json.loads(raw)
+            if not isinstance(entries, list) or not entries:
+                os.remove(self.MANUAL_ENTRY_SIGNAL)
+                return
+
+            added = []
+            for pos in entries:
+                sym = pos.get('symbol', '')
+                # Deduplicate: skip if we already have this symbol open
+                already = any(
+                    t.get('symbol') == sym and t.get('status', 'OPEN') == 'OPEN'
+                    for t in self.paper_positions
+                )
+                if already:
+                    print(f"   📰 Manual entry SKIP (duplicate): {sym}")
+                    continue
+
+                pos['status'] = 'OPEN'
+                self.paper_positions.append(pos)
+                added.append(sym)
+                print(f"   📰 Manual entry INJECTED: {sym} qty={pos.get('quantity')} @ ₹{pos.get('avg_price', 0):.2f}")
+
+            os.remove(self.MANUAL_ENTRY_SIGNAL)
+
+            if added:
+                print(f"   📰 _save_active_trades: injected {len(added)} manual entry(ies): {added}")
+
+        except json.JSONDecodeError:
+            try:
+                os.remove(self.MANUAL_ENTRY_SIGNAL)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"   ⚠️ Manual entry signal consumption error: {e}")
+
     # =================================================================
     # AUTOSLICE — Freeze Quantity Protection
     # =================================================================
@@ -865,6 +976,61 @@ class ZerodhaTools:
                     return trade
         return None
     
+    def _fetch_broker_fill_price(self, order_id: str, timeout_s: float = 3.0) -> float:
+        """Poll kite.order_history for a completed fill and return average_price.
+
+        Returns 0.0 if the order never completes within timeout or lookup fails.
+        Short retry loop because MARKET orders may take ~1s to reach COMPLETE.
+        """
+        if not order_id or str(order_id).startswith(('PAPER_', 'OPTION_PAPER_', 'SPREAD_', 'IC_')):
+            return 0.0
+        deadline = time.time() + max(0.5, float(timeout_s))
+        last_avg = 0.0
+        while time.time() < deadline:
+            try:
+                history = self.kite.order_history(order_id)
+                for item in reversed(history or []):
+                    avg = float(item.get('average_price') or 0)
+                    if item.get('status') == 'COMPLETE' and avg > 0:
+                        return avg
+                    if avg > 0:
+                        last_avg = avg
+            except Exception:
+                pass
+            time.sleep(0.4)
+        return last_avg
+
+    def _apply_broker_fill_to_trade(self, trade: Dict, exit_order_id: str) -> bool:
+        """Override trade['exit_price'] and trade['pnl'] with broker-confirmed fill.
+
+        Also fixes self.paper_pnl delta (caller already added LTP-based pnl).
+        Returns True if override applied.
+        """
+        fill = self._fetch_broker_fill_price(exit_order_id)
+        if fill <= 0:
+            return False
+        try:
+            entry = float(trade.get('avg_price') or trade.get('entry_price') or 0)
+            qty = int(trade.get('quantity') or 0)
+            side = str(trade.get('side') or trade.get('direction') or 'BUY').upper()
+            if entry <= 0 or qty <= 0:
+                return False
+            new_pnl = (fill - entry) * qty if side in ('BUY', 'LONG') else (entry - fill) * qty
+            old_pnl = float(trade.get('pnl') or 0)
+            trade['exit_price'] = fill
+            trade['exit_order_id'] = exit_order_id
+            trade['pnl'] = new_pnl
+            delta = new_pnl - old_pnl
+            try:
+                self.paper_pnl += delta
+            except Exception:
+                pass
+            print(f"   📏 Broker fill override: {trade.get('symbol','')} exit={fill:.2f} (was {trade.get('exit_price_ltp', 'n/a')}) pnl={new_pnl:.2f} (Δ{delta:+.2f})")
+            return True
+        except Exception as e:
+            print(f"   ⚠️ Broker fill override failed: {e}")
+            return False
+
     def _execute_live_exit(self, trade: Dict, exit_qty: int | None = None):
         """Place real exit order(s) on Zerodha to close a live position.
         
@@ -924,6 +1090,14 @@ class ZerodhaTools:
             )
             
             print(f"   ✅ Live EXIT order placed: {exit_side} {qty} {symbol} (order_id: {exit_order_id})")
+
+            # Override trade exit_price/pnl with broker-confirmed fill (single-leg, full exit only)
+            if exit_order_id and (exit_qty is None or exit_qty == trade.get('quantity', 0)):
+                try:
+                    trade.setdefault('exit_price_ltp', trade.get('exit_price'))
+                    self._apply_broker_fill_to_trade(trade, exit_order_id)
+                except Exception as _e:
+                    print(f"   ⚠️ Broker fill override skipped: {_e}")
             
         except Exception as e:
             # CRITICAL FAILURE: Position still open at broker!
@@ -1079,8 +1253,19 @@ class ZerodhaTools:
                         if not self.paper_mode and status != 'STOPLOSS_HIT' and status != 'SL_HIT':
                             # Don't place exit for SL_HIT — the SL-M order already triggered at broker
                             self._execute_live_exit(trade)
-                        
-                        self._save_to_history(trade, status, pnl or 0, exit_detail=exit_detail)
+                        elif not self.paper_mode and status in ('STOPLOSS_HIT', 'SL_HIT'):
+                            # SL-M order already triggered at broker — fetch its actual fill
+                            _sl_oid = trade.get('sl_order_id')
+                            if _sl_oid and not str(_sl_oid).startswith('PAPER_') and '|' not in str(trade.get('symbol', '')):
+                                try:
+                                    trade.setdefault('exit_price_ltp', trade.get('exit_price'))
+                                    self._apply_broker_fill_to_trade(trade, _sl_oid)
+                                except Exception as _e:
+                                    print(f"   ⚠️ SL fill lookup failed: {_e}")
+
+                        # Use broker-confirmed pnl if _execute_live_exit updated it
+                        _final_pnl = trade.get('pnl') if trade.get('pnl') is not None else (pnl or 0)
+                        self._save_to_history(trade, status, _final_pnl, exit_detail=exit_detail)
                         if status != 'PARTIAL_PROFIT':
                             # === CANCEL GTT SAFETY NET ON TRADE EXIT ===
                             gtt_id = trade.get('gtt_trigger_id')
@@ -4222,9 +4407,10 @@ class ZerodhaTools:
             from options_trader import get_intraday_scorer as _get_scorer_eb
             _scorer_inst_eb = _get_scorer_eb()
             _eb_threshold_override = _scorer_inst_eb.BLOCK_THRESHOLD
-            _scorer_inst_eb.BLOCK_THRESHOLD = 35  # EB watcher gates ≫ scorer at 9:15
+            _scorer_inst_eb.BLOCK_THRESHOLD = 15  # EB watcher gates ≫ scorer at 9:15 (scorer indicators barely formed)
             _scorer_inst_eb._eb_micro_override = True  # Skip microstructure hard-block (spreads wide at 9:15)
-            print(f"   🐦 EARLYBIRD THRESHOLD: {_eb_threshold_override} → 35 + micro-bypass (watcher-validated)")
+            _scorer_inst_eb._eb_conviction_override = True  # Relax conviction gate (follow-through=0 at 9:15)
+            print(f"   🐦 EARLYBIRD THRESHOLD: {_eb_threshold_override} → 15 + micro-bypass + conviction-relax (watcher-validated)")
         
         plan = options_trader.create_option_order(
             underlying=underlying,
@@ -4246,6 +4432,7 @@ class ZerodhaTools:
             _scorer_eb2 = _get_scorer_eb2()
             _scorer_eb2.BLOCK_THRESHOLD = _eb_threshold_override
             _scorer_eb2._eb_micro_override = False  # Restore microstructure hard-block
+            _scorer_eb2._eb_conviction_override = False  # Restore conviction gate
         
         if plan is None:
             # Track rejection so autonomous_trader won't retry this symbol

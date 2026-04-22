@@ -71,6 +71,7 @@ logger = logging.getLogger("dhan_oi_fetcher")
 # ─── Symbol-to-Dhan SecurityID mapping ─────────────────────────────
 # Indices use IDX_I, stocks use NSE_FNO
 # These are the UNDERLYING security IDs (not option contract IDs)
+# Auto-generated from DhanHQ instruments CSV — covers ALL NSE F&O stocks
 
 DHAN_SCRIP_MAP = {
     # === INDICES ===
@@ -80,63 +81,287 @@ DHAN_SCRIP_MAP = {
     'NIFTY BANK':  {'scrip_id': 25,    'segment': 'IDX_I'},
     'FINNIFTY':    {'scrip_id': 27,    'segment': 'IDX_I'},
     'MIDCPNIFTY':  {'scrip_id': 442,   'segment': 'IDX_I'},
-    
-    # === F&O STOCKS (Top 50 by options liquidity) ===
-    'ADANIENT':    {'scrip_id': 25,    'segment': 'NSE_FNO'},
-    'ADANIPORTS':  {'scrip_id': 15083, 'segment': 'NSE_FNO'},
-    'APOLLOHOSP':  {'scrip_id': 157,   'segment': 'NSE_FNO'},
-    'ASIANPAINT':  {'scrip_id': 236,   'segment': 'NSE_FNO'},
-    'AXISBANK':    {'scrip_id': 5900,  'segment': 'NSE_FNO'},
-    'BAJAJ-AUTO':  {'scrip_id': 16669, 'segment': 'NSE_FNO'},
-    'BAJFINANCE':  {'scrip_id': 317,   'segment': 'NSE_FNO'},
-    'BAJAJFINSV':  {'scrip_id': 16675, 'segment': 'NSE_FNO'},
-    'BHARTIARTL':  {'scrip_id': 10604, 'segment': 'NSE_FNO'},
-    'BPCL':        {'scrip_id': 526,   'segment': 'NSE_FNO'},
-    'BRITANNIA':   {'scrip_id': 547,   'segment': 'NSE_FNO'},
-    'CIPLA':       {'scrip_id': 694,   'segment': 'NSE_FNO'},
-    'COALINDIA':   {'scrip_id': 20374, 'segment': 'NSE_FNO'},
-    'DIVISLAB':    {'scrip_id': 10940, 'segment': 'NSE_FNO'},
-    'DRREDDY':     {'scrip_id': 881,   'segment': 'NSE_FNO'},
-    'EICHERMOT':   {'scrip_id': 910,   'segment': 'NSE_FNO'},
-    'GRASIM':      {'scrip_id': 1232,  'segment': 'NSE_FNO'},
-    'HCLTECH':     {'scrip_id': 7229,  'segment': 'NSE_FNO'},
-    'HDFCBANK':    {'scrip_id': 1333,  'segment': 'NSE_FNO'},
-    'HDFCLIFE':    {'scrip_id': 467,   'segment': 'NSE_FNO'},
-    'HEROMOTOCO':  {'scrip_id': 1348,  'segment': 'NSE_FNO'},
-    'HINDALCO':    {'scrip_id': 1363,  'segment': 'NSE_FNO'},
-    'HINDUNILVR':  {'scrip_id': 1394,  'segment': 'NSE_FNO'},
-    'ICICIBANK':   {'scrip_id': 4963,  'segment': 'NSE_FNO'},
-    'INDUSINDBK':  {'scrip_id': 5258,  'segment': 'NSE_FNO'},
-    'INFY':        {'scrip_id': 1594,  'segment': 'NSE_FNO'},
-    'ITC':         {'scrip_id': 1660,  'segment': 'NSE_FNO'},
-    'JSWSTEEL':    {'scrip_id': 11723, 'segment': 'NSE_FNO'},
-    'KOTAKBANK':   {'scrip_id': 1922,  'segment': 'NSE_FNO'},
-    'LT':          {'scrip_id': 11483, 'segment': 'NSE_FNO'},
-    'LTM':         {'scrip_id': 17818, 'segment': 'NSE_FNO'},
-    'M&M':         {'scrip_id': 2031,  'segment': 'NSE_FNO'},
-    'MARUTI':      {'scrip_id': 10999, 'segment': 'NSE_FNO'},
-    'NESTLEIND':   {'scrip_id': 17963, 'segment': 'NSE_FNO'},
-    'NTPC':        {'scrip_id': 11630, 'segment': 'NSE_FNO'},
-    'ONGC':        {'scrip_id': 2475,  'segment': 'NSE_FNO'},
-    'POWERGRID':   {'scrip_id': 14977, 'segment': 'NSE_FNO'},
-    'RELIANCE':    {'scrip_id': 2885,  'segment': 'NSE_FNO'},
-    'SBILIFE':     {'scrip_id': 21808, 'segment': 'NSE_FNO'},
-    'SBIN':        {'scrip_id': 3045,  'segment': 'NSE_FNO'},
-    'SUNPHARMA':   {'scrip_id': 3351,  'segment': 'NSE_FNO'},
-    'TATAMOTORS':  {'scrip_id': 3456,  'segment': 'NSE_FNO'},
-    'TATASTEEL':   {'scrip_id': 3499,  'segment': 'NSE_FNO'},
-    'TCS':         {'scrip_id': 11536, 'segment': 'NSE_FNO'},
-    'TECHM':       {'scrip_id': 13538, 'segment': 'NSE_FNO'},
-    'TITAN':       {'scrip_id': 3506,  'segment': 'NSE_FNO'},
-    'ULTRACEMCO':  {'scrip_id': 11532, 'segment': 'NSE_FNO'},
-    'WIPRO':       {'scrip_id': 3787,  'segment': 'NSE_FNO'},
-    
-    # === MCX Commodity ===
-    'CRUDEOIL':    {'scrip_id': 444,   'segment': 'MCX_COMM'},
-    'NATURALGAS':  {'scrip_id': 460,   'segment': 'MCX_COMM'},
-    'GOLD':        {'scrip_id': 445,   'segment': 'MCX_COMM'},
-    'SILVER':      {'scrip_id': 456,   'segment': 'MCX_COMM'},
+
+    # === ALL NSE F&O STOCKS (211 stocks, auto-generated 2026-04-17) ===
+    '360ONE':       {'scrip_id': 13061, 'segment': 'NSE_FNO'},
+    'ABB':          {'scrip_id': 13,    'segment': 'NSE_FNO'},
+    'ABCAPITAL':    {'scrip_id': 21614, 'segment': 'NSE_FNO'},
+    'ADANIENT':     {'scrip_id': 25,    'segment': 'NSE_FNO'},
+    'ADANIENSOL':   {'scrip_id': 10217, 'segment': 'NSE_FNO'},
+    'ADANIGREEN':   {'scrip_id': 3563,  'segment': 'NSE_FNO'},
+    'ADANIPORTS':   {'scrip_id': 15083, 'segment': 'NSE_FNO'},
+    'ADANIPOWER':   {'scrip_id': 17388, 'segment': 'NSE_FNO'},
+    'ALKEM':        {'scrip_id': 11703, 'segment': 'NSE_FNO'},
+    'AMBER':        {'scrip_id': 1185,  'segment': 'NSE_FNO'},
+    'AMBUJACEM':    {'scrip_id': 1270,  'segment': 'NSE_FNO'},
+    'ANGELONE':     {'scrip_id': 324,   'segment': 'NSE_FNO'},
+    'APLAPOLLO':    {'scrip_id': 25780, 'segment': 'NSE_FNO'},
+    'APOLLOHOSP':   {'scrip_id': 157,   'segment': 'NSE_FNO'},
+    'ASHOKLEY':     {'scrip_id': 212,   'segment': 'NSE_FNO'},
+    'ASIANPAINT':   {'scrip_id': 236,   'segment': 'NSE_FNO'},
+    'ASTRAL':       {'scrip_id': 14418, 'segment': 'NSE_FNO'},
+    'AUBANK':       {'scrip_id': 21238, 'segment': 'NSE_FNO'},
+    'AUROPHARMA':   {'scrip_id': 275,   'segment': 'NSE_FNO'},
+    'AXISBANK':     {'scrip_id': 5900,  'segment': 'NSE_FNO'},
+    'BAJAJ-AUTO':   {'scrip_id': 16669, 'segment': 'NSE_FNO'},
+    'BAJAJFINSV':   {'scrip_id': 16675, 'segment': 'NSE_FNO'},
+    'BAJAJHLDNG':   {'scrip_id': 305,   'segment': 'NSE_FNO'},
+    'BAJFINANCE':   {'scrip_id': 317,   'segment': 'NSE_FNO'},
+    'BANDHANBNK':   {'scrip_id': 2263,  'segment': 'NSE_FNO'},
+    'BANKBARODA':   {'scrip_id': 4668,  'segment': 'NSE_FNO'},
+    'BANKINDIA':    {'scrip_id': 4745,  'segment': 'NSE_FNO'},
+    'BDL':          {'scrip_id': 2144,  'segment': 'NSE_FNO'},
+    'BEL':          {'scrip_id': 383,   'segment': 'NSE_FNO'},
+    'BHARATFORG':   {'scrip_id': 422,   'segment': 'NSE_FNO'},
+    'BHARTIARTL':   {'scrip_id': 10604, 'segment': 'NSE_FNO'},
+    'BHEL':         {'scrip_id': 438,   'segment': 'NSE_FNO'},
+    'BIOCON':       {'scrip_id': 11373, 'segment': 'NSE_FNO'},
+    'BLUESTARCO':   {'scrip_id': 8311,  'segment': 'NSE_FNO'},
+    'BOSCHLTD':     {'scrip_id': 2181,  'segment': 'NSE_FNO'},
+    'BPCL':         {'scrip_id': 526,   'segment': 'NSE_FNO'},
+    'BRITANNIA':    {'scrip_id': 547,   'segment': 'NSE_FNO'},
+    'BSE':          {'scrip_id': 19585, 'segment': 'NSE_FNO'},
+    'CAMS':         {'scrip_id': 342,   'segment': 'NSE_FNO'},
+    'CANBK':        {'scrip_id': 10794, 'segment': 'NSE_FNO'},
+    'CDSL':         {'scrip_id': 21174, 'segment': 'NSE_FNO'},
+    'CGPOWER':      {'scrip_id': 760,   'segment': 'NSE_FNO'},
+    'CHOLAFIN':     {'scrip_id': 685,   'segment': 'NSE_FNO'},
+    'CIPLA':        {'scrip_id': 694,   'segment': 'NSE_FNO'},
+    'COALINDIA':    {'scrip_id': 20374, 'segment': 'NSE_FNO'},
+    'COCHINSHIP':   {'scrip_id': 21508, 'segment': 'NSE_FNO'},
+    'COFORGE':      {'scrip_id': 11543, 'segment': 'NSE_FNO'},
+    'COLPAL':       {'scrip_id': 15141, 'segment': 'NSE_FNO'},
+    'CONCOR':       {'scrip_id': 4749,  'segment': 'NSE_FNO'},
+    'CROMPTON':     {'scrip_id': 17094, 'segment': 'NSE_FNO'},
+    'CUMMINSIND':   {'scrip_id': 1901,  'segment': 'NSE_FNO'},
+    'DABUR':        {'scrip_id': 772,   'segment': 'NSE_FNO'},
+    'DALBHARAT':    {'scrip_id': 8075,  'segment': 'NSE_FNO'},
+    'DELHIVERY':    {'scrip_id': 9599,  'segment': 'NSE_FNO'},
+    'DIVISLAB':     {'scrip_id': 10940, 'segment': 'NSE_FNO'},
+    'DIXON':        {'scrip_id': 21690, 'segment': 'NSE_FNO'},
+    'DLF':          {'scrip_id': 14732, 'segment': 'NSE_FNO'},
+    'DMART':        {'scrip_id': 19913, 'segment': 'NSE_FNO'},
+    'DRREDDY':      {'scrip_id': 881,   'segment': 'NSE_FNO'},
+    'EICHERMOT':    {'scrip_id': 910,   'segment': 'NSE_FNO'},
+    'ETERNAL':      {'scrip_id': 5097,  'segment': 'NSE_FNO'},
+    'EXIDEIND':     {'scrip_id': 676,   'segment': 'NSE_FNO'},
+    'FEDERALBNK':   {'scrip_id': 1023,  'segment': 'NSE_FNO'},
+    'FORCEMOT':     {'scrip_id': 11573, 'segment': 'NSE_FNO'},
+    'FORTIS':       {'scrip_id': 14592, 'segment': 'NSE_FNO'},
+    'GAIL':         {'scrip_id': 4717,  'segment': 'NSE_FNO'},
+    'GLENMARK':     {'scrip_id': 7406,  'segment': 'NSE_FNO'},
+    'GMRAIRPORT':   {'scrip_id': 13528, 'segment': 'NSE_FNO'},
+    'GODFRYPHLP':   {'scrip_id': 1181,  'segment': 'NSE_FNO'},
+    'GODREJCP':     {'scrip_id': 10099, 'segment': 'NSE_FNO'},
+    'GODREJPROP':   {'scrip_id': 17875, 'segment': 'NSE_FNO'},
+    'GRASIM':       {'scrip_id': 1232,  'segment': 'NSE_FNO'},
+    'HAL':          {'scrip_id': 2303,  'segment': 'NSE_FNO'},
+    'HAVELLS':      {'scrip_id': 9819,  'segment': 'NSE_FNO'},
+    'HCLTECH':      {'scrip_id': 7229,  'segment': 'NSE_FNO'},
+    'HDFCAMC':      {'scrip_id': 4244,  'segment': 'NSE_FNO'},
+    'HDFCBANK':     {'scrip_id': 1333,  'segment': 'NSE_FNO'},
+    'HDFCLIFE':     {'scrip_id': 467,   'segment': 'NSE_FNO'},
+    'HEROMOTOCO':   {'scrip_id': 1348,  'segment': 'NSE_FNO'},
+    'HINDALCO':     {'scrip_id': 1363,  'segment': 'NSE_FNO'},
+    'HINDPETRO':    {'scrip_id': 1406,  'segment': 'NSE_FNO'},
+    'HINDUNILVR':   {'scrip_id': 1394,  'segment': 'NSE_FNO'},
+    'HINDZINC':     {'scrip_id': 1424,  'segment': 'NSE_FNO'},
+    'HUDCO':        {'scrip_id': 20825, 'segment': 'NSE_FNO'},
+    'HYUNDAI':      {'scrip_id': 25844, 'segment': 'NSE_FNO'},
+    'ICICIBANK':    {'scrip_id': 4963,  'segment': 'NSE_FNO'},
+    'ICICIGI':      {'scrip_id': 21770, 'segment': 'NSE_FNO'},
+    'ICICIPRULI':   {'scrip_id': 18652, 'segment': 'NSE_FNO'},
+    'IDEA':         {'scrip_id': 14366, 'segment': 'NSE_FNO'},
+    'IDFCFIRSTB':   {'scrip_id': 11184, 'segment': 'NSE_FNO'},
+    'IEX':          {'scrip_id': 220,   'segment': 'NSE_FNO'},
+    'INDHOTEL':     {'scrip_id': 1512,  'segment': 'NSE_FNO'},
+    'INDIANB':      {'scrip_id': 14309, 'segment': 'NSE_FNO'},
+    'INDIGO':       {'scrip_id': 11195, 'segment': 'NSE_FNO'},
+    'INDUSINDBK':   {'scrip_id': 5258,  'segment': 'NSE_FNO'},
+    'INDUSTOWER':   {'scrip_id': 29135, 'segment': 'NSE_FNO'},
+    'INFY':         {'scrip_id': 1594,  'segment': 'NSE_FNO'},
+    'INOXWIND':     {'scrip_id': 7852,  'segment': 'NSE_FNO'},
+    'IOC':          {'scrip_id': 1624,  'segment': 'NSE_FNO'},
+    'IREDA':        {'scrip_id': 20261, 'segment': 'NSE_FNO'},
+    'IRFC':         {'scrip_id': 2029,  'segment': 'NSE_FNO'},
+    'ITC':          {'scrip_id': 1660,  'segment': 'NSE_FNO'},
+    'JINDALSTEL':   {'scrip_id': 6733,  'segment': 'NSE_FNO'},
+    'JIOFIN':       {'scrip_id': 18143, 'segment': 'NSE_FNO'},
+    'JSWENERGY':    {'scrip_id': 17869, 'segment': 'NSE_FNO'},
+    'JSWSTEEL':     {'scrip_id': 11723, 'segment': 'NSE_FNO'},
+    'JUBLFOOD':     {'scrip_id': 18096, 'segment': 'NSE_FNO'},
+    'KALYANKJIL':   {'scrip_id': 2955,  'segment': 'NSE_FNO'},
+    'KAYNES':       {'scrip_id': 12092, 'segment': 'NSE_FNO'},
+    'KEI':          {'scrip_id': 13310, 'segment': 'NSE_FNO'},
+    'KFINTECH':     {'scrip_id': 13359, 'segment': 'NSE_FNO'},
+    'KOTAKBANK':    {'scrip_id': 1922,  'segment': 'NSE_FNO'},
+    'KPITTECH':     {'scrip_id': 9683,  'segment': 'NSE_FNO'},
+    'LAURUSLABS':   {'scrip_id': 19234, 'segment': 'NSE_FNO'},
+    'LICHSGFIN':    {'scrip_id': 1997,  'segment': 'NSE_FNO'},
+    'LICI':         {'scrip_id': 9480,  'segment': 'NSE_FNO'},
+    'LODHA':        {'scrip_id': 3220,  'segment': 'NSE_FNO'},
+    'LT':           {'scrip_id': 11483, 'segment': 'NSE_FNO'},
+    'LTF':          {'scrip_id': 24948, 'segment': 'NSE_FNO'},
+    'LTM':          {'scrip_id': 17818, 'segment': 'NSE_FNO'},
+    'LUPIN':        {'scrip_id': 10440, 'segment': 'NSE_FNO'},
+    'M&M':          {'scrip_id': 2031,  'segment': 'NSE_FNO'},
+    'MANAPPURAM':   {'scrip_id': 19061, 'segment': 'NSE_FNO'},
+    'MANKIND':      {'scrip_id': 15380, 'segment': 'NSE_FNO'},
+    'MARICO':       {'scrip_id': 4067,  'segment': 'NSE_FNO'},
+    'MARUTI':       {'scrip_id': 10999, 'segment': 'NSE_FNO'},
+    'MAXHEALTH':    {'scrip_id': 22377, 'segment': 'NSE_FNO'},
+    'MAZDOCK':      {'scrip_id': 509,   'segment': 'NSE_FNO'},
+    'MCX':          {'scrip_id': 31181, 'segment': 'NSE_FNO'},
+    'MFSL':         {'scrip_id': 2142,  'segment': 'NSE_FNO'},
+    'MOTHERSON':    {'scrip_id': 4204,  'segment': 'NSE_FNO'},
+    'MOTILALOFS':   {'scrip_id': 14947, 'segment': 'NSE_FNO'},
+    'MPHASIS':      {'scrip_id': 4503,  'segment': 'NSE_FNO'},
+    'MUTHOOTFIN':   {'scrip_id': 23650, 'segment': 'NSE_FNO'},
+    'NAM-INDIA':    {'scrip_id': 357,   'segment': 'NSE_FNO'},
+    'NATIONALUM':   {'scrip_id': 6364,  'segment': 'NSE_FNO'},
+    'NAUKRI':       {'scrip_id': 13751, 'segment': 'NSE_FNO'},
+    'NBCC':         {'scrip_id': 31415, 'segment': 'NSE_FNO'},
+    'NESTLEIND':    {'scrip_id': 17963, 'segment': 'NSE_FNO'},
+    'NHPC':         {'scrip_id': 17400, 'segment': 'NSE_FNO'},
+    'NMDC':         {'scrip_id': 15332, 'segment': 'NSE_FNO'},
+    'NTPC':         {'scrip_id': 11630, 'segment': 'NSE_FNO'},
+    'NUVAMA':       {'scrip_id': 18721, 'segment': 'NSE_FNO'},
+    'NYKAA':        {'scrip_id': 6545,  'segment': 'NSE_FNO'},
+    'OBEROIRLTY':   {'scrip_id': 20242, 'segment': 'NSE_FNO'},
+    'OFSS':         {'scrip_id': 10738, 'segment': 'NSE_FNO'},
+    'OIL':          {'scrip_id': 17438, 'segment': 'NSE_FNO'},
+    'ONGC':         {'scrip_id': 2475,  'segment': 'NSE_FNO'},
+    'PAGEIND':      {'scrip_id': 14413, 'segment': 'NSE_FNO'},
+    'PATANJALI':    {'scrip_id': 17029, 'segment': 'NSE_FNO'},
+    'PAYTM':        {'scrip_id': 6705,  'segment': 'NSE_FNO'},
+    'PERSISTENT':   {'scrip_id': 18365, 'segment': 'NSE_FNO'},
+    'PETRONET':     {'scrip_id': 11351, 'segment': 'NSE_FNO'},
+    'PFC':          {'scrip_id': 14299, 'segment': 'NSE_FNO'},
+    'PGEL':         {'scrip_id': 25358, 'segment': 'NSE_FNO'},
+    'PHOENIXLTD':   {'scrip_id': 14552, 'segment': 'NSE_FNO'},
+    'PIDILITIND':   {'scrip_id': 2664,  'segment': 'NSE_FNO'},
+    'PIIND':        {'scrip_id': 24184, 'segment': 'NSE_FNO'},
+    'PNB':          {'scrip_id': 10666, 'segment': 'NSE_FNO'},
+    'PNBHOUSING':   {'scrip_id': 18908, 'segment': 'NSE_FNO'},
+    'POLICYBZR':    {'scrip_id': 6656,  'segment': 'NSE_FNO'},
+    'POLYCAB':      {'scrip_id': 9590,  'segment': 'NSE_FNO'},
+    'POWERGRID':    {'scrip_id': 14977, 'segment': 'NSE_FNO'},
+    'POWERINDIA':   {'scrip_id': 18457, 'segment': 'NSE_FNO'},
+    'PPLPHARMA':    {'scrip_id': 11571, 'segment': 'NSE_FNO'},
+    'PREMIERENE':   {'scrip_id': 25049, 'segment': 'NSE_FNO'},
+    'PRESTIGE':     {'scrip_id': 20302, 'segment': 'NSE_FNO'},
+    'RBLBANK':      {'scrip_id': 18391, 'segment': 'NSE_FNO'},
+    'RECLTD':       {'scrip_id': 15355, 'segment': 'NSE_FNO'},
+    'RELIANCE':     {'scrip_id': 2885,  'segment': 'NSE_FNO'},
+    'RVNL':         {'scrip_id': 9552,  'segment': 'NSE_FNO'},
+    'SAIL':         {'scrip_id': 2963,  'segment': 'NSE_FNO'},
+    'SAMMAANCAP':   {'scrip_id': 30125, 'segment': 'NSE_FNO'},
+    'SBICARD':      {'scrip_id': 17971, 'segment': 'NSE_FNO'},
+    'SBILIFE':      {'scrip_id': 21808, 'segment': 'NSE_FNO'},
+    'SBIN':         {'scrip_id': 3045,  'segment': 'NSE_FNO'},
+    'SHREECEM':     {'scrip_id': 3103,  'segment': 'NSE_FNO'},
+    'SHRIRAMFIN':   {'scrip_id': 4306,  'segment': 'NSE_FNO'},
+    'SIEMENS':      {'scrip_id': 3150,  'segment': 'NSE_FNO'},
+    'SOLARINDS':    {'scrip_id': 13332, 'segment': 'NSE_FNO'},
+    'SONACOMS':     {'scrip_id': 4684,  'segment': 'NSE_FNO'},
+    'SRF':          {'scrip_id': 3273,  'segment': 'NSE_FNO'},
+    'SUNPHARMA':    {'scrip_id': 3351,  'segment': 'NSE_FNO'},
+    'SUPREMEIND':   {'scrip_id': 3363,  'segment': 'NSE_FNO'},
+    'SUZLON':       {'scrip_id': 12018, 'segment': 'NSE_FNO'},
+    'SWIGGY':       {'scrip_id': 27066, 'segment': 'NSE_FNO'},
+    'TATACONSUM':   {'scrip_id': 3432,  'segment': 'NSE_FNO'},
+    'TATAELXSI':    {'scrip_id': 3411,  'segment': 'NSE_FNO'},
+    'TATAPOWER':    {'scrip_id': 3426,  'segment': 'NSE_FNO'},
+    'TATASTEEL':    {'scrip_id': 3499,  'segment': 'NSE_FNO'},
+    'TATATECH':     {'scrip_id': 20293, 'segment': 'NSE_FNO'},
+    'TCS':          {'scrip_id': 11536, 'segment': 'NSE_FNO'},
+    'TECHM':        {'scrip_id': 13538, 'segment': 'NSE_FNO'},
+    'TIINDIA':      {'scrip_id': 312,   'segment': 'NSE_FNO'},
+    'TITAN':        {'scrip_id': 3506,  'segment': 'NSE_FNO'},
+    'TMPV':         {'scrip_id': 3456,  'segment': 'NSE_FNO'},
+    'TORNTPHARM':   {'scrip_id': 3518,  'segment': 'NSE_FNO'},
+    'TORNTPOWER':   {'scrip_id': 13786, 'segment': 'NSE_FNO'},
+    'TRENT':        {'scrip_id': 1964,  'segment': 'NSE_FNO'},
+    'TVSMOTOR':     {'scrip_id': 8479,  'segment': 'NSE_FNO'},
+    'ULTRACEMCO':   {'scrip_id': 11532, 'segment': 'NSE_FNO'},
+    'UNIONBANK':    {'scrip_id': 10753, 'segment': 'NSE_FNO'},
+    'UNITDSPR':     {'scrip_id': 10447, 'segment': 'NSE_FNO'},
+    'UNOMINDA':     {'scrip_id': 14154, 'segment': 'NSE_FNO'},
+    'UPL':          {'scrip_id': 11287, 'segment': 'NSE_FNO'},
+    'VBL':          {'scrip_id': 18921, 'segment': 'NSE_FNO'},
+    'VEDL':         {'scrip_id': 3063,  'segment': 'NSE_FNO'},
+    'VMM':          {'scrip_id': 27969, 'segment': 'NSE_FNO'},
+    'VOLTAS':       {'scrip_id': 3718,  'segment': 'NSE_FNO'},
+    'WAAREEENER':   {'scrip_id': 25907, 'segment': 'NSE_FNO'},
+    'WIPRO':        {'scrip_id': 3787,  'segment': 'NSE_FNO'},
+    'YESBANK':      {'scrip_id': 11915, 'segment': 'NSE_FNO'},
+    'ZYDUSLIFE':    {'scrip_id': 7929,  'segment': 'NSE_FNO'},
 }
+
+# Aliases for renamed / commonly-used alternate names
+_SYMBOL_ALIASES = {
+    'TATAMOTORS': 'TMPV',       # renamed 2026
+    'NIFTY50': 'NIFTY',
+    'NIFTYBANK': 'BANKNIFTY',
+    'BANK NIFTY': 'BANKNIFTY',
+    'ZOMATO': 'ETERNAL',        # renamed 2025
+    'LTIM': 'LTM',               # CSV name differs from Kite
+}
+
+# ─── Dynamic CSV refresh (handles new F&O additions) ───────────────
+_dynamic_refresh_done = False
+_dynamic_refresh_lock = threading.Lock()
+
+def _refresh_scrip_map_from_csv():
+    """Download DhanHQ instruments CSV and add any missing F&O stocks."""
+    global _dynamic_refresh_done
+    if _dynamic_refresh_done:
+        return
+    with _dynamic_refresh_lock:
+        if _dynamic_refresh_done:
+            return
+        _dynamic_refresh_done = True
+        try:
+            import re
+            r = requests.get('https://images.dhan.co/api-data/api-scrip-master.csv',
+                             timeout=30)
+            if r.status_code != 200:
+                return
+            reader = csv.DictReader(io.StringIO(r.text))
+            equity_map = {}  # symbol → scrip_id
+            fno_underlyings = set()
+            month_pat = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\d{4}$')
+            for row in reader:
+                exch = row.get('SEM_EXM_EXCH_ID', '')
+                seg = row.get('SEM_SEGMENT', '')
+                inst = row.get('SEM_INSTRUMENT_NAME', '')
+                sym = row.get('SEM_TRADING_SYMBOL', '')
+                if exch == 'NSE' and seg == 'E' and inst == 'EQUITY' and sym:
+                    try:
+                        equity_map[sym] = int(row['SEM_SMST_SECURITY_ID'])
+                    except (ValueError, KeyError):
+                        pass
+                elif exch == 'NSE' and seg == 'D' and inst in ('FUTSTK', 'OPTSTK') and sym:
+                    parts = sym.split('-')
+                    # Reconstruct underlying: everything before the month-year part
+                    underlying_parts = []
+                    for p in parts:
+                        if month_pat.match(p):
+                            break
+                        underlying_parts.append(p)
+                    if underlying_parts:
+                        fno_underlyings.add('-'.join(underlying_parts))
+            added = 0
+            for und in fno_underlyings:
+                if und not in DHAN_SCRIP_MAP and und in equity_map:
+                    if und.endswith('NSETEST'):
+                        continue
+                    DHAN_SCRIP_MAP[und] = {'scrip_id': equity_map[und], 'segment': 'NSE_FNO'}
+                    added += 1
+            if added:
+                logger.info(f"DhanOI: Dynamic refresh added {added} new F&O stocks")
+        except Exception as e:
+            logger.debug(f"DhanOI: Dynamic CSV refresh failed: {e}")
 
 
 # ─── Credentials ───────────────────────────────────────────────────
@@ -292,7 +517,8 @@ class DhanOIFetcher:
         Handles:
           - "NSE:SBIN" → strip exchange prefix
           - "SBIN" → direct lookup
-          - Case-insensitive
+          - Aliases (TATAMOTORS → TMPV, ZOMATO → ETERNAL)
+          - Dynamic CSV refresh on first miss
           
         Returns:
             {'scrip_id': int, 'segment': str} or None
@@ -307,16 +533,14 @@ class DhanOIFetcher:
         if clean in DHAN_SCRIP_MAP:
             return DHAN_SCRIP_MAP[clean]
         
-        # Try common aliases
-        aliases = {
-            'NIFTY50': 'NIFTY',
-            'NIFTY 50': 'NIFTY',
-            'NIFTYBANK': 'BANKNIFTY',
-            'NIFTY BANK': 'BANKNIFTY',
-            'BANK NIFTY': 'BANKNIFTY',
-        }
-        if clean in aliases:
-            return DHAN_SCRIP_MAP.get(aliases[clean])
+        # Try aliases
+        if clean in _SYMBOL_ALIASES:
+            return DHAN_SCRIP_MAP.get(_SYMBOL_ALIASES[clean])
+        
+        # Dynamic refresh: download CSV once to catch newly added F&O stocks
+        _refresh_scrip_map_from_csv()
+        if clean in DHAN_SCRIP_MAP:
+            return DHAN_SCRIP_MAP[clean]
         
         return None
     
@@ -405,6 +629,15 @@ class DhanOIFetcher:
             r = requests.post(self.EXPIRY_URL, headers=self._headers(),
                             json=payload, timeout=15)
             
+            # Retry once on 429 rate-limit
+            if r.status_code == 429:
+                logger.debug(f"DhanOI: 429 rate-limited on expiry for {resolved['scrip_id']}, backing off 6s")
+                time.sleep(6)
+                self._last_request_time = 0.0
+                self._throttle()
+                r = requests.post(self.EXPIRY_URL, headers=self._headers(),
+                                json=payload, timeout=15)
+            
             if r.status_code == 200:
                 data = r.json()
                 expiries = data.get('data', [])
@@ -472,6 +705,15 @@ class DhanOIFetcher:
             
             r = requests.post(self.CHAIN_URL, headers=self._headers(),
                             json=payload, timeout=15)
+            
+            # Retry once on 429 rate-limit
+            if r.status_code == 429:
+                logger.debug(f"DhanOI: 429 rate-limited on chain for {symbol}, backing off 6s")
+                time.sleep(6)
+                self._last_request_time = 0.0  # reset throttle
+                self._throttle()
+                r = requests.post(self.CHAIN_URL, headers=self._headers(),
+                                json=payload, timeout=15)
             
             if r.status_code == 200:
                 raw = r.json()

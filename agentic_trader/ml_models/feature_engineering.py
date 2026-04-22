@@ -1308,13 +1308,15 @@ def _add_oi_context(intraday_df: pd.DataFrame, oi_df: pd.DataFrame) -> pd.DataFr
     available_oi_cols = [c for c in oi_feature_cols if c in oi_merge.columns]
     
     if available_oi_cols:
-        # Normalize timezones to avoid merge_asof tz mismatch
+        # Normalize timezones and resolution to avoid merge_asof mismatch
         _left = result[['date']].copy()
         _right = oi_merge[['date'] + available_oi_cols].copy()
         if _left['date'].dt.tz is not None:
             _left['date'] = _left['date'].dt.tz_localize(None)
         if _right['date'].dt.tz is not None:
             _right['date'] = _right['date'].dt.tz_localize(None)
+        _left['date'] = _left['date'].astype('datetime64[ns]')
+        _right['date'] = _right['date'].astype('datetime64[ns]')
         merged = pd.merge_asof(
             _left,
             _right,
@@ -1503,13 +1505,15 @@ def _add_nifty_context(intraday_df: pd.DataFrame, nifty_5min_df: pd.DataFrame,
     result = result.sort_values('date').reset_index(drop=True)
     
     # Time-aligned merge: each stock candle gets the NIFTY values at same timestamp
-    # Normalize timezones to avoid merge_asof tz mismatch
+    # Normalize timezones and resolution to avoid merge_asof mismatch
     _left = result[['date']].copy()
     _right = nf_merge.copy()
     if _left['date'].dt.tz is not None:
         _left['date'] = _left['date'].dt.tz_localize(None)
     if _right['date'].dt.tz is not None:
         _right['date'] = _right['date'].dt.tz_localize(None)
+    _left['date'] = _left['date'].astype('datetime64[ns]')
+    _right['date'] = _right['date'].astype('datetime64[ns]')
     merged = pd.merge_asof(
         _left,
         _right,
@@ -1791,13 +1795,15 @@ def _add_intraday_oi_context(intraday_df: pd.DataFrame, oi_intra_df: pd.DataFram
     
     result = result.sort_values('date').reset_index(drop=True)
     
-    # Normalize timezones
+    # Normalize timezones and resolution
     _left = result[['date']].copy()
     _right = oi_merge.copy()
     if _left['date'].dt.tz is not None:
         _left['date'] = _left['date'].dt.tz_localize(None)
     if _right['date'].dt.tz is not None:
         _right['date'] = _right['date'].dt.tz_localize(None)
+    _left['date'] = _left['date'].astype('datetime64[ns]')
+    _right['date'] = _right['date'].astype('datetime64[ns]')
     
     merged = pd.merge_asof(
         _left,
@@ -2031,13 +2037,15 @@ def _add_sector_context(intraday_df: pd.DataFrame, sector_5min_df: pd.DataFrame,
     result = result.sort_values('date').reset_index(drop=True)
     
     # Time-aligned merge: each stock candle gets the sector values at same timestamp
-    # Normalize timezones to avoid merge_asof tz mismatch
+    # Normalize timezones and resolution to avoid merge_asof mismatch
     _left = result[['date']].copy()
     _right = sf_merge.copy()
     if _left['date'].dt.tz is not None:
         _left['date'] = _left['date'].dt.tz_localize(None)
     if _right['date'].dt.tz is not None:
         _right['date'] = _right['date'].dt.tz_localize(None)
+    _left['date'] = _left['date'].astype('datetime64[ns]')
+    _right['date'] = _right['date'].astype('datetime64[ns]')
     merged = pd.merge_asof(
         _left,
         _right,

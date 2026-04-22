@@ -354,17 +354,17 @@ class TradeLedger:
         entries = self.get_entries(date_str)
         exits = self.get_exits(date_str)
 
-        # Group exits by order_id first, then by (underlying, direction)
+        # Group exits by order_id first, then by underlying (direction can differ
+        # because EXIT records the option trade direction, not the position direction)
         from collections import defaultdict
         exit_by_order = defaultdict(list)
-        exit_by_sym = defaultdict(list)
+        exit_by_underlying = defaultdict(list)
         for ex in exits:
             oid = ex.get('order_id', '')
             if oid:
                 exit_by_order[oid].append(ex)
             else:
-                key = (ex.get('underlying', ''), ex.get('direction', ''))
-                exit_by_sym[key].append(ex)
+                exit_by_underlying[ex.get('underlying', '')].append(ex)
 
         used_exits = set()
         results = []
@@ -376,9 +376,11 @@ class TradeLedger:
             if oid and oid in exit_by_order:
                 matched_exits = exit_by_order[oid]
             else:
-                # Fallback: match by underlying + direction + closest time
-                key = (entry.get('underlying', ''), entry.get('direction', ''))
-                candidates = exit_by_sym.get(key, []) + exit_by_order.get('', [])
+                # Fallback: match by underlying + entry_time proximity
+                # Direction is NOT used because EXIT may record option trade direction
+                # (e.g., BUY for closing a SELL/PE position)
+                und = entry.get('underlying', '')
+                candidates = exit_by_underlying.get(und, []) + exit_by_order.get('', [])
                 entry_ts = entry.get('ts', '')
                 for ex in candidates:
                     ex_id = id(ex)

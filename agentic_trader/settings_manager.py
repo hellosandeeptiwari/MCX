@@ -40,16 +40,17 @@ SETTINGS_FILE = Path(__file__).parent / 'titan_settings.json'
 # All BREAKOUT_WATCHER keys that should be synced.
 # Format: json_key → config dict key
 _WATCHER_KEYS = [
-    'min_score', 'orb_min_score', 'orb_min_move_prob',
+    'min_score', 'grind_min_score', 'orb_min_score', 'orb_min_move_prob',
     'watcher_min_move_prob', 'watcher_min_adx',
     'max_trades_per_scan', 'max_triggers_per_batch',
     'sustain_seconds', 'sustain_seconds_extreme',
     'sustain_seconds_volume', 'sustain_seconds_grind',
     'sustain_recheck_pct', 'sustain_recheck_pct_volume',
+    'sustain_recheck_pct_spike_down', 'sustain_recheck_pct_spike_up',
     'sustain_retrace_max_pct', 'volume_surge_min_move_pct',
     'price_spike_pct', 'price_spike_pct_open', 'price_spike_open_until',
     'day_extreme_trigger', 'day_extreme_min_move_pct',
-    'volume_surge_multiplier', 'slow_grind_pct',
+    'volume_surge_multiplier', 'slow_grind_pct', 'slow_grind_up_pct',
     'cooldown_seconds', 'max_triggers_per_minute',
     'queue_size', 'priority_bypass_pct',
     'active_after', 'active_until', 'watcher_start',

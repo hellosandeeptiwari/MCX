@@ -1843,6 +1843,12 @@ class IntradayOptionScorer:
         elif score >= 60:
             min_conviction = 8   # decent score = lowered for faster entry
         
+        # EARLYBIRD override: at 9:15-9:25, follow-through/ORB/volume barely exist.
+        # Watcher gates already validated direction with 13 factors.
+        _eb_conv_bypass = getattr(self, '_eb_conviction_override', False)
+        if _eb_conv_bypass:
+            min_conviction = 5  # Only block if zero directional signals
+        
         if directional_strength < min_conviction:
             should_trade = False
             warnings.append(f"🚫 BLOCKED: No directional conviction (best: {directional_strength:.0f}pts, need ≥{min_conviction})")

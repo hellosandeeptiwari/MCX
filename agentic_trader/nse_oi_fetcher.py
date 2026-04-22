@@ -907,6 +907,67 @@ class NSEOIFetcher:
             'nse_pcr_oi_change': 0.0,
         }
     
+    # ── FII/DII Cash Flow (macro institutional signal) ──
+    FII_DII_URL = f"{BASE_URL}/api/fiidiiTradeReact"
+    FII_CACHE_TTL = 300  # 5 min — daily data, no need for fast refresh
+
+    def fetch_fii_dii(self) -> dict:
+        """Fetch FII/DII cash market trading activity from NSE.
+
+        Returns dict with keys:
+            fii_net: float  — FII net buy/sell in crores (negative = selling)
+            fii_ratio: float — FII buy/sell ratio (>1 = buying, <1 = selling)
+            dii_net: float
+            dii_ratio: float
+            fii_direction: str — 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+            ts: float — cache timestamp
+
+        FAIL-SAFE: Returns empty dict on any error.
+        """
+        try:
+            # Check cache
+            if hasattr(self, '_fii_cache') and self._fii_cache:
+                _ct, _cd = self._fii_cache
+                if (time.time() - _ct) < self.FII_CACHE_TTL:
+                    return _cd
+
+            if not self._session_valid or not self._session:
+                if not self._init_session():
+                    return {}
+
+            self._throttle()
+            resp = self._session.get(self.FII_DII_URL, timeout=10)
+            if resp.status_code != 200:
+                return getattr(self, '_fii_cache', (0, {}))[1] if hasattr(self, '_fii_cache') else {}
+
+            rows = resp.json()  # list of {category, date, buyValue, sellValue, netValue}
+            result = {'ts': time.time()}
+            for row in rows:
+                cat = row.get('category', '')
+                buy = float(row.get('buyValue', '0').replace(',', ''))
+                sell = float(row.get('sellValue', '0').replace(',', ''))
+                net = float(row.get('netValue', '0').replace(',', ''))
+                ratio = (buy / sell) if sell > 0 else 1.0
+                if 'FII' in cat or 'FPI' in cat:
+                    result['fii_net'] = net
+                    result['fii_ratio'] = ratio
+                elif 'DII' in cat:
+                    result['dii_net'] = net
+                    result['dii_ratio'] = ratio
+
+            fii_net = result.get('fii_net', 0)
+            if fii_net > 500:
+                result['fii_direction'] = 'BULLISH'
+            elif fii_net < -500:
+                result['fii_direction'] = 'BEARISH'
+            else:
+                result['fii_direction'] = 'NEUTRAL'
+
+            self._fii_cache = (time.time(), result)
+            return result
+        except Exception:
+            return getattr(self, '_fii_cache', (0, {}))[1] if hasattr(self, '_fii_cache') else {}
+
     def reset(self):
         """Reset session and cache. Use after prolonged failures."""
         self._session = None

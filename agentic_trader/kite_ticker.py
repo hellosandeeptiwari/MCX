@@ -432,6 +432,17 @@ class TitanTicker:
                 if token is None:
                     continue
                 
+                # [Apr 17 DIAG] Log first futures tick to verify OI fields
+                if not getattr(self, '_diag_futures_tick_logged', False) and hasattr(self, '_futures_tokens'):
+                    _fut_tok_set = set(self._futures_tokens.values())
+                    if token in _fut_tok_set:
+                        self._diag_futures_tick_logged = True
+                        _fut_sym = self._token_to_symbol.get(token, '?')
+                        print(f"🔬 [DIAG] First futures tick: {_fut_sym} token={token} "
+                              f"keys={list(tick.keys())} oi={tick.get('oi', 'MISSING')} "
+                              f"oi_day_high={tick.get('oi_day_high', 'MISSING')} "
+                              f"volume={tick.get('volume_traded', tick.get('volume', 'MISSING'))}")
+                
                 # Always update LTP
                 ltp = tick.get('last_price')
                 if ltp:
@@ -499,8 +510,16 @@ class TitanTicker:
             tokens_list = list(self._subscribed_tokens)
             try:
                 ws.subscribe(tokens_list)
-                ws.set_mode('quote', tokens_list)
-                print(f"🔌 Ticker: Subscribed {len(tokens_list)} instruments OK")
+                # Futures need 'full' mode for OI data; everything else uses 'quote'
+                _fut_tokens = set(self._futures_tokens.values()) if hasattr(self, '_futures_tokens') else set()
+                _full_tokens = [t for t in tokens_list if t in _fut_tokens]
+                _quote_tokens = [t for t in tokens_list if t not in _fut_tokens]
+                if _quote_tokens:
+                    ws.set_mode('quote', _quote_tokens)
+                if _full_tokens:
+                    ws.set_mode('full', _full_tokens)
+                print(f"🔌 Ticker: Subscribed {len(tokens_list)} instruments OK "
+                      f"(quote={len(_quote_tokens)} full={len(_full_tokens)})")
             except Exception as e:
                 print(f"⚠️ Ticker: Re-subscribe error: {e}")
     
@@ -603,9 +622,16 @@ class TitanTicker:
                 self._token_to_symbol[token] = fut_sym
                 fut_symbols.append(fut_sym)
 
-            # Subscribe all futures in quote mode
-            self.subscribe_symbols(fut_symbols, mode='quote')
-            # print(f"🔌 Ticker: Subscribed {len(fut_symbols)} near-month futures for OI streaming")
+            # Subscribe all futures in FULL mode (OI only available in full mode)
+            self.subscribe_symbols(fut_symbols, mode='full')
+            print(f"🔌 Ticker: Subscribed {len(fut_symbols)} near-month futures for OI streaming | "
+                  f"_futures_tokens={len(self._futures_tokens)} _futures_map={len(self._futures_map)}")
+            # [Apr 17 DIAG] Log sample futures token to verify mapping
+            if self._futures_tokens:
+                _sample_sym = next(iter(self._futures_tokens))
+                _sample_tok = self._futures_tokens[_sample_sym]
+                print(f"🔌 Ticker: Futures sample: {_sample_sym} → token={_sample_tok} "
+                      f"fut={self._futures_map.get(_sample_sym, '?')}")
 
         except Exception as e:
             print(f"⚠️ Ticker: Futures subscription error: {e}")
@@ -625,6 +651,15 @@ class TitanTicker:
 
         token = self._futures_tokens.get(equity_symbol)
         if not token:
+            # [Apr 17 DIAG] Log first 3 misses to diagnose K factor
+            if not hasattr(self, '_fut_oi_miss_count'):
+                self._fut_oi_miss_count = 0
+            if self._fut_oi_miss_count < 3:
+                self._fut_oi_miss_count += 1
+                _sample_keys = list(self._futures_tokens.keys())[:3]
+                print(f"⚠️ [DIAG] get_futures_oi({equity_symbol}): no token. "
+                      f"_futures_tokens has {len(self._futures_tokens)} entries. "
+                      f"Sample keys: {_sample_keys}")
             return None
 
         with self._lock:
@@ -643,6 +678,14 @@ class TitanTicker:
                     'sell_quantity': quote.get('sell_quantity', 0),
                 }
 
+        # [Apr 17 DIAG] Token found but no quote yet
+        if not hasattr(self, '_fut_oi_no_quote_count'):
+            self._fut_oi_no_quote_count = 0
+        if self._fut_oi_no_quote_count < 3:
+            self._fut_oi_no_quote_count += 1
+            print(f"⚠️ [DIAG] get_futures_oi({equity_symbol}): token={token} found but "
+                  f"no quote in cache. _quote_cache has {len(self._quote_cache)} entries. "
+                  f"Token in subscribed={token in self._subscribed_tokens}")
         return None  # Not in cache — caller should REST fallback
 
     def get_futures_oi_batch(self, equity_symbols: List[str]) -> Dict[str, Dict]:
@@ -780,10 +823,15 @@ class BreakoutWatcher:
         self._sustain_secs_volume = config.get('sustain_seconds_volume', 45)
         self._sustain_secs_grind = config.get('sustain_seconds_grind', 15)
         self._sustain_recheck_pct = config.get('sustain_recheck_pct', 0.5)
+        self._sustain_recheck_pct_spike_down = config.get('sustain_recheck_pct_spike_down', self._sustain_recheck_pct)
+        self._sustain_recheck_pct_spike_up = config.get('sustain_recheck_pct_spike_up', self._sustain_recheck_pct)
+        self._sustain_recheck_pct_spike_down = config.get('sustain_recheck_pct_spike_down', self._sustain_recheck_pct)
+        self._sustain_recheck_pct_spike_up = config.get('sustain_recheck_pct_spike_up', self._sustain_recheck_pct)
         self._sustain_recheck_pct_volume = config.get('sustain_recheck_pct_volume', 0.15)
         
         # Slow grind: 5-minute baseline to detect persistent moves
-        self._slow_grind_pct = config.get('slow_grind_pct', 1.0)  # 1% move over 5min = slow grind
+        self._slow_grind_pct = config.get('slow_grind_pct', 1.0)  # 1% move over 5min = slow grind (DOWN)
+        self._slow_grind_up_pct = config.get('slow_grind_up_pct', self._slow_grind_pct)  # UP threshold (tighter)
         
         # Cooldown
         self._cooldown_secs = config.get('cooldown_seconds', 180)
@@ -803,6 +851,7 @@ class BreakoutWatcher:
         
         # Baseline prices: symbol → {price, timestamp} — snapshot at subscribe or periodic reset
         self._baselines: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}  (60s window)
+        self._baselines_b: Dict[str, Dict] = {}  # sym → staggered 2nd baseline, offset 30s from primary
         self._baselines_long: Dict[str, Dict] = {}  # sym → {'price': float, 'ts': float}  (5min window)
         
         # Sustain pending: symbol → {trigger_price, trigger_ts, trigger_type, baseline_price}
@@ -873,16 +922,18 @@ class BreakoutWatcher:
         self._oi_min_strength_for_confirm = config.get('oi_min_strength_for_confirm', 0.35)  # minimum OI strength to count as confirmation
 
         # === EARLYBIRD STATE (Opening Volatility 09:15-09:45) ===
-        from config import EARLYBIRD_COMMON, EARLYBIRD_A, EARLYBIRD_B, EARLYBIRD_C
+        from config import EARLYBIRD_COMMON, EARLYBIRD_A, EARLYBIRD_B, EARLYBIRD_C, EARLYBIRD_D
         self._eb_common = EARLYBIRD_COMMON
         self._eb_a = EARLYBIRD_A
         self._eb_b = EARLYBIRD_B
         self._eb_c = EARLYBIRD_C
+        self._eb_d = EARLYBIRD_D
         self._earlybird_enabled = EARLYBIRD_COMMON.get('enabled', False)
         self._earlybird_trades_fired = 0  # Count of earlybird triggers queued today
         self._prev_close: Dict[str, float] = {}  # sym → previous day close price (from OHLC)
         self._day_open: Dict[str, float] = {}     # sym → today's open price (from OHLC)
-        self._earlybird_fired: Dict[str, set] = {'A': set(), 'B': set(), 'C': set()}  # Per-mode fired symbols
+        self._earlybird_fired: Dict[str, set] = {'A': set(), 'B': set(), 'C': set(), 'D': set()}  # Per-mode fired symbols
+        self._news_targets: Dict[str, dict] = {}  # symbol → news target dict (set by autonomous_trader)
         # NIFTY 50 tracking for market-context gating
         self._nifty_prev_close: float = 0.0    # NIFTY 50 previous day close
         self._nifty_day_open: float = 0.0       # NIFTY 50 today's open
@@ -1224,11 +1275,22 @@ class BreakoutWatcher:
                 self._vol_delta_history[symbol].append(_vol_delta)
         
         # === UPDATE BASELINES ===
-        # Short baseline (60s) — existing, detects fast spikes
+        # Short baseline A (60s) — primary spike detection window
         bl = self._baselines.get(symbol)
         if bl is None or (now - bl['ts']) > 60:
             self._baselines[symbol] = {'price': ltp, 'ts': now}
             # Don't return yet — check long baseline first
+        
+        # Short baseline B (60s, staggered +30s) — overlapping window
+        # Covers the dead zone when baseline A resets: a 1%+ drop spanning
+        # two A-windows is caught by B which straddles the boundary.
+        bl_b = self._baselines_b.get(symbol)
+        if bl_b is None:
+            # Initialize B 30s after A's first reset
+            if bl and (now - bl['ts']) >= 30:
+                self._baselines_b[symbol] = {'price': ltp, 'ts': now}
+        elif (now - bl_b['ts']) > 60:
+            self._baselines_b[symbol] = {'price': ltp, 'ts': now}
         
         # Long baseline (rolling) — detects slow grinds that the 60s window misses.
         # ROLLING design: baseline only resets when (a) grind fires, (b) price REVERSES
@@ -1277,7 +1339,9 @@ class BreakoutWatcher:
                 bl_long['peak_velocity'] = _velocity
             
             # Adaptive grind threshold: lower when volume confirms the move
-            _effective_grind_pct = self._slow_grind_pct * 0.65 if _grind_vol_confirmed else self._slow_grind_pct
+            # Direction-specific: UP grinds need stronger move than DOWN
+            _base_grind_pct = self._slow_grind_up_pct if _long_move > 0 else self._slow_grind_pct
+            _effective_grind_pct = _base_grind_pct * 0.65 if _grind_vol_confirmed else _base_grind_pct
             
             # Check if slow grind threshold crossed
             # TREND-ORIGIN MEMORY: Don't reset baseline on grind fire.
@@ -1289,8 +1353,8 @@ class BreakoutWatcher:
             from datetime import time as _dtime
             _now_t = datetime.now().time()
             _post_open = _now_t >= _dtime(9, 45)
-            _grind_min_age = 300 if _post_open else 180   # 5 min after 09:45, 3 min before
-            _grind_max_vel = 0.40 if _post_open else 0.80  # tighter slope after open settles
+            _grind_min_age = 300 if _post_open else 240   # 5 min after 09:45, 4 min before (was 480 — too strict, zero grinds fired)
+            _grind_max_vel = 0.40 if _post_open else 0.60  # slope cap (was 0.28 — too tight, blocked valid grinds)
             _grind_cooled = self._is_cooled_down(symbol)
             _grind_age_ok = _age >= _grind_min_age
             _grind_vel_ok = _velocity <= _grind_max_vel
@@ -1311,7 +1375,7 @@ class BreakoutWatcher:
             _bl_range = _bl_max - _bl_min
             _net_abs = abs(ltp - bl_long['price'])
             _move_efficiency = (_net_abs / _bl_range) if _bl_range > 0.01 else 1.0
-            _efficiency_ok = _move_efficiency >= 0.60
+            _efficiency_ok = _move_efficiency >= 0.55  # 55%+ linear = true grind (was 0.70 — too strict for choppy markets)
 
             _concentration_ok = True
             _concentration = 0.0
@@ -1321,7 +1385,7 @@ class BreakoutWatcher:
                     _sb_move_abs = abs((ltp - _sb_conc['price']) / _sb_conc['price'] * 100)
                     if abs(_long_move) > 0.01:
                         _concentration = _sb_move_abs / abs(_long_move)
-                        _concentration_ok = _concentration <= 0.50
+                        _concentration_ok = _concentration <= 0.45  # last 60s can't be >45% of total move (was 0.35 — too strict)
 
             if abs(_long_move) >= _effective_grind_pct and symbol not in self._pending and _grind_cooled and _grind_age_ok and _grind_vel_ok and _efficiency_ok and _concentration_ok:
                 _sg_type = 'SLOW_GRIND_UP' if _long_move > 0 else 'SLOW_GRIND_DOWN'
@@ -1368,21 +1432,22 @@ class BreakoutWatcher:
                 # preserved so the next trigger (after cooldown) sees the full
                 # cumulative grind. Baseline only resets on reversion/staleness
                 # or when the trade is actually placed (via mark_grind_traded).
-            elif abs(_long_move) < 0.15 or (abs(_peak_move) >= 0.3 and abs(_long_move) < abs(_peak_move) * 0.5):
-                # Baseline reversion — the grind has died. Two conditions:
-                # (a) Price drifted back to within 0.15% of baseline (flat/reversed), OR
-                # (b) Price retraced >50% of its peak move from baseline (momentum fading).
-                # Old logic: reset at 0.25% flat — killed legitimate grinds with normal noise.
+            elif abs(_long_move) < 0.08:
+                # Baseline reversion — price has truly reverted to near-baseline (very flat).
+                # Only reset if completely flat (<0.08%), NOT on temporary retraces.
+                # Temp spikes/craters are OK — overall slope direction is what matters most.
                 self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0, 'min_price': ltp, 'max_price': ltp}
                 self._grind_start_vol[symbol] = _cum_vol
                 _hist = self._vol_delta_history.get(symbol)
                 self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
             elif _age > 600:
-                # Stale protection: max 10 min baseline age.
-                # But if the stock is actively trending (move > threshold),
-                # extend to 30 min — this IS the trend we want to track.
-                _still_trending = abs(_long_move) >= self._slow_grind_pct
-                _stale_limit = 1800 if _still_trending else 600
+                # Stale protection: allow baselines to accumulate if price is still moving in direction.
+                # Don't reset if move >= threshold (obviously trending), but ALSO don't reset if
+                # price is accumulating (move >= 0.20%) even though it hasn't crossed 1.0% yet.
+                # This allows slow grinds like DRREDDY (49 min, +1.06%) to fire without baseline resets.
+                _still_trending = abs(_long_move) >= (self._slow_grind_up_pct if _long_move > 0 else self._slow_grind_pct)  # Crossed threshold
+                _still_accumulating = abs(_long_move) >= 0.20  # Still moving away from baseline (>0.20%)
+                _stale_limit = 1800 if (_still_trending or _still_accumulating) else 1200
                 if _age > _stale_limit:
                     self._baselines_long[symbol] = {'price': ltp, 'ts': now, 'peak_move': 0.0, 'min_price': ltp, 'max_price': ltp}
                     self._grind_start_vol[symbol] = _cum_vol
@@ -1390,7 +1455,7 @@ class BreakoutWatcher:
                     self._grind_start_avg_delta[symbol] = (sum(_hist) / len(_hist)) if _hist and len(_hist) >= 3 else 0
         
         # If short baseline was just reset, skip trigger detection this tick
-        if bl is None or (now - self._baselines[symbol]['ts']) < 0.01:
+        if bl is None or (now - self._baselines[symbol]['ts']) < 0.002:
             return
         
         # === CHECK SUSTAIN PENDING ===
@@ -1430,8 +1495,12 @@ class BreakoutWatcher:
                         _recheck = self._eb_c.get('sustain_min_hold_pct', 0.7)
                     else:
                         _recheck = self._eb_b.get('sustain_min_hold_pct', 0.5)
+                elif 'SPIKE' in _ttype:
+                    _recheck = self._sustain_recheck_pct_spike_down if 'DOWN' in _ttype else self._sustain_recheck_pct_spike_up
                 elif 'VOLUME' in _ttype:
                     _recheck = self._sustain_recheck_pct_volume
+                elif 'SPIKE' in _ttype:
+                    _recheck = self._sustain_recheck_pct_spike_down if 'DOWN' in _ttype else self._sustain_recheck_pct_spike_up
                 else:
                     _recheck = self._sustain_recheck_pct
                 # Early market hardening: require larger sustained move before 09:55
@@ -1444,8 +1513,10 @@ class BreakoutWatcher:
                         _em_min_sustain = self._config.get('early_market_min_sustain_pct', 1.0)
                         _recheck = max(_recheck, _em_min_sustain)
                 _peak_move = pending.get('_peak_move_pct', move_pct)
-                # Anti-retrace: if price retraced >50% of its peak move, the move is fading
-                _retrace_max = self._config.get('sustain_retrace_max_pct', 50.0)
+                # Anti-retrace: if price retraced >70% of its peak move, the move is truly fading.
+                # Allow 70%+ retraces because small spikes/craters within the grind are fine.
+                # Overall slope direction (still UP/DOWN) is what matters most.
+                _retrace_max = self._config.get('sustain_retrace_max_pct', 70.0)
                 _retraced_pct = ((1 - move_pct / _peak_move) * 100) if _peak_move > 0 else 0
                 _retrace_fail = _peak_move > 0 and _retraced_pct > _retrace_max
 
@@ -1665,6 +1736,54 @@ class BreakoutWatcher:
                                 self._stats['earlybird_c_detected'] = self._stats.get('earlybird_c_detected', 0) + 1
                                 _ctx_tag = '★IDIO' if _is_idiosyncratic else ('βETA' if _is_beta_driven else 'NEUTRAL')
                                 print(f"   🐦C Watcher: {symbol} {_eb_ttype} ({_eb_reason}) nifty={_nifty_change:+.1f}% [{_ctx_tag}] → sustain {_eb_sustain}s")
+                    
+                    # --- MODE D: News-Based (fires on news-identified stocks) ---
+                    # Only fires on stocks pre-identified by the news scanner.
+                    # Direction is SET by news sentiment — just needs price confirmation.
+                    _eb_d_cfg = self._eb_d
+                    _sym_clean = symbol.replace('NSE:', '')
+                    if (not _earlybird_triggered and _eb_d_cfg.get('enabled', False) and
+                        _sym_clean in self._news_targets and
+                        _sym_clean not in self._earlybird_fired.get('D', set())):
+                        _news_info = self._news_targets[_sym_clean]
+                        _news_sentiment = _news_info.get('sentiment', '')
+                        _news_conf = _news_info.get('confidence', 0)
+                        _news_min_move = _eb_d_cfg.get('min_open_move_pct', 0.3)
+
+                        # Price must move in the NEWS direction (confirmation)
+                        _news_dir_confirmed = False
+                        if _news_sentiment == 'BULLISH' and _open_move_pct >= _news_min_move:
+                            _news_dir_confirmed = True
+                        elif _news_sentiment == 'BEARISH' and _open_move_pct <= -_news_min_move:
+                            _news_dir_confirmed = True
+
+                        if _news_dir_confirmed:
+                            _eb_dir_move = _open_move_pct
+                            _eb_ttype = 'EARLYBIRD_D_UP' if _news_sentiment == 'BULLISH' else 'EARLYBIRD_D_DOWN'
+                            _eb_sustain = _eb_d_cfg.get('sustain_seconds', 5)
+                            _eb_reason = f'NEWS({_news_sentiment[:4]},conf={_news_conf})+MOVE({_open_move_pct:+.1f}%)'
+                            self._pending[symbol] = {
+                                'trigger_price': ltp, 'trigger_ts': now,
+                                'trigger_type': _eb_ttype, 'baseline_price': _eb_baseline,
+                                'move_pct': _eb_dir_move,
+                                'gap_pct': round(_gap_pct, 2), 'open_move_pct': round(_open_move_pct, 2),
+                                'has_gap': _has_gap, 'strong_gap': _strong_gap,
+                                'earlybird_mode': 'D', 'earlybird_reason': _eb_reason,
+                                'news_confidence': _news_conf,
+                                'news_sentiment': _news_sentiment,
+                                'news_reason': _news_info.get('reason', ''),
+                                'news_headline': _news_info.get('headline', ''),
+                                '_earlybird_sustain': _eb_sustain,
+                                'nifty_change_pct': round(_nifty_change, 2),
+                                'is_idiosyncratic': _is_idiosyncratic,
+                                'is_beta_driven': _is_beta_driven,
+                            }
+                            _earlybird_triggered = True
+                            self._earlybird_fired.setdefault('D', set()).add(_sym_clean)
+                            self._earlybird_trades_fired += 1
+                            self._stats['earlybird_d_detected'] = self._stats.get('earlybird_d_detected', 0) + 1
+                            _arrow = '🟢' if _news_sentiment == 'BULLISH' else '🔴'
+                            print(f"   📰D Watcher: {symbol} {_eb_ttype} ({_eb_reason}) nifty={_nifty_change:+.1f}% {_arrow} → sustain {_eb_sustain}s")
         
         if _earlybird_triggered:
             return  # Earlybird entered sustain — skip normal trigger detection this tick
@@ -1675,6 +1794,18 @@ class BreakoutWatcher:
             return
         
         move_pct = (ltp - baseline_price) / baseline_price * 100
+        
+        # Overlapping baseline B: whichever baseline shows a LARGER move, use that.
+        # This catches drops that span two A-windows (e.g. Coal India 12:43-12:45).
+        _bl_b = self._baselines_b.get(symbol)
+        _move_pct_b = 0.0
+        if _bl_b and _bl_b['price'] > 0 and (now - _bl_b['ts']) >= 5:  # B must be ≥5s old
+            _move_pct_b = (ltp - _bl_b['price']) / _bl_b['price'] * 100
+        # Pick the baseline that shows the larger absolute move
+        if abs(_move_pct_b) > abs(move_pct):
+            move_pct = _move_pct_b
+            baseline_price = _bl_b['price']
+        
         trigger_type = None
         _spike_plus_surge = False
         _spike_surge_ratio = 0.0
@@ -1686,6 +1817,8 @@ class BreakoutWatcher:
         #    [FIX Mar 10] Add volume confirmation — reject spikes on dry volume.
         #    Add acceleration tracking and spike magnitude to trigger metadata.
         #    [FIX Mar 16] Time-aware threshold: higher bar before 09:45 (opening noise)
+        #    [FIX Apr 10] Overlapping baselines: use max(|moveA|, |moveB|) to catch
+        #    drops spanning two 60s windows (Coal India -4.75% miss).
         _open_spike_pct = self._config.get('price_spike_pct_open', 1.0)
         _open_cutoff = self._config.get('price_spike_open_until', '09:45')
         _h, _m = int(_open_cutoff.split(':')[0]), int(_open_cutoff.split(':')[1])
@@ -1855,6 +1988,13 @@ class BreakoutWatcher:
             if 'SPIKE' in trigger_type:
                 _trigger_meta['spike_accel'] = _spike_accel
                 _trigger_meta['spike_magnitude'] = round(abs(move_pct), 2)
+                # Compute vol_ratio for spike meat score (current vol vs rolling avg)
+                _spike_vol_hist = list(self._vol_delta_history.get(symbol, []))
+                if len(_spike_vol_hist) >= 3 and _vol_delta > 0:
+                    _spike_vol_avg = sum(_spike_vol_hist) / len(_spike_vol_hist)
+                    _trigger_meta['vol_ratio'] = round(_vol_delta / _spike_vol_avg, 2) if _spike_vol_avg > 0 else 1.0
+                else:
+                    _trigger_meta['vol_ratio'] = 1.0
                 # Co-fire: PRICE_SPIKE + VOLUME_SURGE both met → double lot signal
                 if _spike_plus_surge:
                     _trigger_meta['spike_plus_surge'] = True
@@ -1901,6 +2041,7 @@ class BreakoutWatcher:
             'EARLYBIRD_C_UP': 5, 'EARLYBIRD_C_DOWN': 5,
             'EARLYBIRD_B_UP': 6, 'EARLYBIRD_B_DOWN': 6,
             'EARLYBIRD_A_UP': 7, 'EARLYBIRD_A_DOWN': 7,
+            'EARLYBIRD_D_UP': 8, 'EARLYBIRD_D_DOWN': 8,  # News-based — highest priority
         }
         if not self._is_cooled_down(symbol):
             # Check if this trigger outranks the one that set the cooldown
@@ -1959,7 +2100,8 @@ class BreakoutWatcher:
                           '_oi_confirmed', '_oi_contradicted',
                           '_oi_signal', '_oi_strength', '_oi_participant',
                           'gap_pct', 'open_move_pct', 'has_gap', 'strong_gap',
-                          'earlybird_mode', 'earlybird_reason'):
+                          'earlybird_mode', 'earlybird_reason',
+                          'news_confidence', 'news_sentiment', 'news_reason', 'news_headline'):
             if _meta_key in pending:
                 trigger_data[_meta_key] = pending[_meta_key]
         
@@ -2035,7 +2177,8 @@ class BreakoutWatcher:
         self._earlybird_trades_fired = 0
         self._prev_close.clear()
         self._day_open.clear()
-        self._earlybird_fired = {'A': set(), 'B': set(), 'C': set()}
+        self._earlybird_fired = {'A': set(), 'B': set(), 'C': set(), 'D': set()}
+        self._news_targets = {}  # Clear news targets for new day
         self._nifty_prev_close = 0.0
         self._nifty_day_open = 0.0
         self._nifty_ltp = 0.0

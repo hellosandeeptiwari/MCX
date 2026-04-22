@@ -34,6 +34,11 @@ class GMMDataCollector:
         self._pending_tracks = {}
         self._load_pending()
 
+        # Score delta tracking (Apr 9, 2026):
+        # Store previous cycle's scores per symbol to compute deltas
+        # Rising DOWNDR is more dangerous than static; falling UPDR signals clearing risk
+        self._prev_scores: dict = {}  # {symbol: {updr, downdr, move_prob, smart_score}}
+
     # ── PUBLIC API ──────────────────────────────────────────────────
 
     def record_scan(self, ml_results: dict, pre_scores: dict, market_data: dict,
@@ -105,6 +110,12 @@ class GMMDataCollector:
                     'ml_elite_ok': ml.get('ml_elite_ok', False),
                     'ml_chop_hint': ml.get('ml_chop_hint', False),
 
+                    # === Score Deltas (vs previous scan cycle) ===
+                    'updr_delta': round(ml.get('ml_up_score', 0) - self._prev_scores.get(sym, {}).get('updr', ml.get('ml_up_score', 0)), 6),
+                    'downdr_delta': round(ml.get('ml_down_score', 0) - self._prev_scores.get(sym, {}).get('downdr', ml.get('ml_down_score', 0)), 6),
+                    'move_prob_delta': round(ml.get('ml_move_prob', 0) - self._prev_scores.get(sym, {}).get('move_prob', ml.get('ml_move_prob', 0)), 4),
+                    'smart_score_delta': round(pre_scores.get(sym, 0) - self._prev_scores.get(sym, {}).get('smart_score', pre_scores.get(sym, 0)), 2),
+
                     # === Direction from Scorer ===
                     'scorer_direction': direction,
                     'scorer_dir_confidence': dir_confidence,
@@ -124,6 +135,16 @@ class GMMDataCollector:
                 }
 
                 self._pending_tracks[track_id] = record
+
+            # Update previous scores cache for next cycle's delta computation
+            for sym, ml in ml_results.items():
+                if ml.get('ml_up_score') is not None or ml.get('ml_down_score') is not None:
+                    self._prev_scores[sym] = {
+                        'updr': ml.get('ml_up_score', 0),
+                        'downdr': ml.get('ml_down_score', 0),
+                        'move_prob': ml.get('ml_move_prob', 0),
+                        'smart_score': pre_scores.get(sym, 0),
+                    }
 
             self._save_pending()
 

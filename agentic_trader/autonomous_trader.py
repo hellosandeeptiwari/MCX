@@ -26,7 +26,7 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS, FULL_FNO_SCAN, BREAKOUT_WATCHER, calc_brokerage, CAPITAL_SWAP
+from config import HARD_RULES, APPROVED_UNIVERSE, TRADING_HOURS, FNO_CONFIG, TIER_1_OPTIONS, TIER_2_OPTIONS, TIER_3_OPTIONS, FULL_FNO_SCAN, BREAKOUT_WATCHER, calc_brokerage, CAPITAL_SWAP
 from llm_agent import TradingAgent
 from zerodha_tools import get_tools, reset_tools
 from market_scanner import get_market_scanner
@@ -40,6 +40,7 @@ from position_reconciliation import get_position_reconciliation
 from data_health_gate import get_data_health_gate
 from trade_ledger import get_trade_ledger
 from state_db import get_state_db
+from oi_watcher_engine import OIWatcherEngine
 
 
 # OI signals that indicate BEARISH direction (operators positioned for down move)
@@ -111,7 +112,7 @@ class AutonomousTrader:
         print(f"  Risk per trade: {HARD_RULES['RISK_PER_TRADE']*100}%")
         print(f"  Max daily loss: {HARD_RULES['MAX_DAILY_LOSS']*100}%")
         print(f"  Max positions: {HARD_RULES['MAX_POSITIONS']}")
-        print(f"\n  Universe: {len(APPROVED_UNIVERSE)} stocks ({len(TIER_1_OPTIONS)} Tier-1 + {len(TIER_2_OPTIONS)} Tier-2)")
+        print(f"\n  Universe: {len(APPROVED_UNIVERSE)} stocks ({len(TIER_1_OPTIONS)} Tier-1 + {len(TIER_2_OPTIONS)} Tier-2 + {len(TIER_3_OPTIONS)} Tier-3)")
         print(f"  Scanner: ALL F&O stocks (~200) scanned each cycle for wild-card movers")
         
         if not paper_mode:
@@ -279,8 +280,15 @@ class AutonomousTrader:
         self._watcher_total_gate_blocked = 0         # Total blocked by pipeline gates
         self._watcher_total_placed = 0               # Total trades successfully placed
         self._watcher_total_pos_exhausted = 0        # Times blocked by position limit
-        self._earlybird_total_placed = 0             # Total EARLYBIRD trades placed today
-        self._earlybird_mode_placed = {'A': 0, 'B': 0, 'C': 0}  # Per-mode counter
+        self._earlybird_total_placed = 0             # EARLYBIRD REMOVED — stub for compat
+        self._grind_last_placed_ts = {}              # [Apr 17] sym → timestamp of last grind trade (20-min cooldown)
+        self._earlybird_mode_placed = {}  # EARLYBIRD REMOVED
+
+        # NEWS SCANNER — pre-market news-based stock identification for Mode D
+        self._news_scanner = None       # Lazy-init NewsScanner instance
+        self._news_scan_done = False    # True after pre-market scan completes
+        self._news_targets = {}         # symbol → NewsTarget dict (top 5 tradeable)
+        self._news_all_scanned = []     # All scanned targets (up to 10) for dashboard
         self._watcher_score_history = {}              # sym → [(timestamp, score, direction), ...] for conviction & momentum
         self._trade_lock = threading.Lock()               # Serialises order placement between scan & watcher threads
         self._watcher_pipe_busy = False                   # True while watcher pipeline thread is running
@@ -289,7 +297,7 @@ class AutonomousTrader:
         # OI_WATCHER — pure OI-based trade (no model, no scoring)
         self._oi_watcher_fired_this_session = set()       # Symbols traded via OI_WATCHER today
         self._oi_watcher_total_placed = 0                 # Total OI_WATCHER trades placed today
-        self._oi_watcher_min_strength = 0.60              # Minimum OI buildup strength to fire
+        self._oi_watcher_min_strength = 0.50              # Minimum OI buildup strength to fire (0.60→0.50 Apr 16)
         self._oi_watcher_max_per_day = 999                # [FIX Mar 19] No artificial cap — risk governor handles limits
         self._oi_watcher_entry_snapshots = {}              # underlying → {signal, strength, direction, participant}
         self._oi_watcher_thesis_exits = 0                  # Count of OI thesis-based exits today
@@ -300,9 +308,9 @@ class AutonomousTrader:
         # Only enter when >= _oi_min_confirmations factors align.
         self._oi_min_confirmations = 4                     # Minimum confirming factors to entry (out of 12)
         self._oi_pending_confirm = {}                      # LEGACY — kept for OI_AGGR path
-        self._oi_confirm_seconds = 50                      # LEGACY — kept for OI_AGGR path
+        self._oi_confirm_seconds = 45                      # Apr 20: tightened 35→35s
         self._oi_confirm_expiry = 300                      # purge pending entries older than 5 min
-        self._oi_confirm_min_price_delta = 0.15            # LEGACY — kept for OI_AGGR path
+        self._oi_confirm_min_price_delta = 0.20            # Apr 20: tightened 0.15→0.15% (adaptive gate applies multipliers)
 
         # OI_WATCHER AGGRESSIVE SCANNER — independent OI buildup detection loop
         # Runs every 90s in monitor loop, scans top movers for LB/SB buildup,
@@ -310,10 +318,19 @@ class AutonomousTrader:
         self._oi_aggr_strength_history = {}  # sym → [(ts, strength, signal), ...] last 5 readings
         self._oi_aggr_last_scan_ts = 0       # Last aggressive OI scan timestamp
         self._oi_aggr_scan_interval = 90     # Scan every 90 seconds
-        self._oi_aggr_max_symbols = 15       # Max symbols to scan per cycle (API budget)
+        self._oi_aggr_max_symbols = 33       # Apr 21: 40→33 — matches avg coverage under 120s budget w/ 12 workers (tail latency on Kite); guarantees full-universe completion every cycle
+        self._oi_aggr_dhan_symbols = 15      # Apr 21: horizontal shard — ranks 34-48 routed to DhanHQ (separate 3s-global rate bucket, isolated from Kite); total coverage = 33 Kite + 15 Dhan = 48 syms/cycle
         self._oi_aggr_accel_threshold = 0.08 # Strength increase ≥0.08 across 2 reads = acceleration
-        self._oi_aggr_accel_min_str = 0.25   # Lower strength floor when acceleration detected (vs 0.35)
-        self._oi_aggr_strong_str = 0.45      # Strength ≥ this = fire immediately, no acceleration needed
+        self._oi_aggr_accel_min_str = 0.35   # Apr 20: tightened 0.25, Lower strength floor when acceleration detected (vs 0.35)
+        self._oi_aggr_strong_str = 0.55      # Apr 20: tightened 0.45, Strength ≥ this = fire immediately, no acceleration needed
+
+        # OI Watcher Engine — extracted module with 13-factor + anchor gate
+        # GUARD: If this import or init is missing, inline OI code has regressed
+        from oi_watcher_engine import _ENGINE_LOADED
+        assert _ENGINE_LOADED, "oi_watcher_engine not loaded — OI_WATCHER regression detected!"
+        self._oi_engine = OIWatcherEngine(self)
+        assert hasattr(self._oi_engine, 'run_watcher_scan'), "OIWatcherEngine missing run_watcher_scan!"
+        assert hasattr(self._oi_engine, 'aggressive_buildup_scan'), "OIWatcherEngine missing aggressive_buildup_scan!"
 
         # === SETTINGS — Single source of truth via settings_manager ===
         from settings_manager import settings as _sm
@@ -355,18 +372,12 @@ class AutonomousTrader:
         self._test_xgb_trades_today = 0
         self._test_xgb_date = datetime.now().date()
         self._test_xgb_symbols = set()
-        # ARBTR: Sector Arbitrage — laggard convergence play
+        # ARBTR: DISABLED Apr 8
         try:
-            from config import ARBTR_CONFIG, ARBTR_SECTOR_MAP
-            self._arbtr_cfg = ARBTR_CONFIG
+            from config import ARBTR_SECTOR_MAP
             self._arbtr_sector_map = ARBTR_SECTOR_MAP
         except ImportError:
-            self._arbtr_cfg = {'enabled': False}
             self._arbtr_sector_map = {}
-        self._arbtr_trades_today = 0
-        self._arbtr_date = datetime.now().date()
-        self._arbtr_symbols = set()
-        self._arbtr_sector_cooldowns = {}  # sector_name → last_entry_time
         # GCR: GMM Conviction Recheck — re-query GMM on losing positions
         try:
             from config import GCR_CONFIG
@@ -1343,6 +1354,165 @@ class AutonomousTrader:
             traceback.print_exc()
             return False
 
+    # ========== PRE-MARKET NEWS SCAN (EARLY BIRD MODE D) ==========
+    def _run_news_scan(self, _dbg=None):
+        """
+        Run the pre-market news scanner to identify stocks impacted by overnight news.
+        Called once at startup if before 9:15 AM. Results are stored in self._news_targets
+        and passed to kite_ticker for Mode D detection.
+        """
+        _log = _dbg or (lambda msg: print(msg))
+        try:
+            from config import EARLYBIRD_D as _EB_D
+            if not _EB_D.get('enabled', False):
+                return
+
+            from news_scanner import NewsScanner
+
+            # Initialize scanner with config
+            scanner_cfg = {
+                'max_targets': _EB_D.get('max_news_targets', 10),
+                'trade_targets': _EB_D.get('trade_targets', 5),
+                'min_confidence': _EB_D.get('min_news_confidence', 60),
+                'lookback_hours': _EB_D.get('lookback_hours', 18),
+                'llm_model': _EB_D.get('llm_model', 'gpt-4o-mini'),
+                'feed_timeout_sec': _EB_D.get('feed_timeout_sec', 10),
+            }
+            self._news_scanner = NewsScanner(scanner_cfg)
+
+            # Run the scan
+            targets = self._news_scanner.scan(force=True)
+            self._news_scan_done = True
+
+            if not targets:
+                _log("📰 NEWS_SCAN: No actionable news targets found")
+                return
+
+            # Store targets for earlybird Mode D (only top 5 tradeable)
+            self._news_targets = {}
+            for t in targets:
+                self._news_targets[t.symbol] = t.to_dict()
+                arrow = '🟢' if t.sentiment == 'BULLISH' else '🔴'
+                _log(f"   {arrow} NEWS TARGET: {t.symbol} {t.sentiment} conf={t.confidence} — {t.reason}")
+
+            # Store ALL scanned (up to 10) for dashboard display
+            self._news_all_scanned = self._news_scanner.get_all_scanned()
+
+            _log(f"📰 NEWS_SCAN: {len(self._news_targets)} tradeable / {len(self._news_all_scanned)} scanned for Early Bird Mode D")
+
+            # Pass news targets to kite_ticker so it can fire Mode D triggers
+            ticker = getattr(self.tools, 'ticker', None)
+            if ticker and hasattr(ticker, 'breakout_watcher') and ticker.breakout_watcher:
+                watcher = ticker.breakout_watcher
+                watcher._news_targets = self._news_targets.copy()
+                watcher._earlybird_fired['D'] = set()
+                _log(f"   → Passed {len(self._news_targets)} news targets to kite_ticker watcher")
+
+            # If market is already open, Mode D earlybird won't fire (it only detects
+            # at open). Inject targets directly as INTRADAY_NEWS triggers so the
+            # pipeline picks them up on the next cycle.
+            _now_hm = datetime.now().strftime('%H:%M')
+            if _now_hm >= '09:20' and _now_hm <= '15:15' and ticker and hasattr(ticker, 'breakout_watcher') and ticker.breakout_watcher:
+                _log(f"   ⚡ Market already open ({_now_hm}) — injecting {len(self._news_targets)} news targets as INTRADAY_NEWS triggers")
+                watcher = ticker.breakout_watcher
+                for sym, tgt in self._news_targets.items():
+                    nse_sym = f"NSE:{sym}"
+                    direction = 'BUY' if tgt['sentiment'] == 'BULLISH' else 'SELL'
+                    trigger_data = {
+                        'symbol': nse_sym,
+                        'direction': direction,
+                        'trigger_type': 'INTRADAY_NEWS',
+                        'news_confidence': tgt['confidence'],
+                        'reason': tgt.get('reason', ''),
+                        'catalyst_type': tgt.get('catalyst_type', ''),
+                        'intraday': True,
+                    }
+                    priority = tgt['confidence'] / 100.0 * 2.0
+                    watcher._queue.put(trigger_data, priority)
+                    arrow = '🟢' if direction == 'BUY' else '🔴'
+                    _log(f"   {arrow} Queued {sym} {direction} conf={tgt['confidence']} into pipeline (priority={priority:.1f})")
+
+        except Exception as e:
+            _log(f"WARN: News scan failed (non-fatal): {e}")
+            import traceback
+            _log(f"  {traceback.format_exc()}")
+
+    def _run_intraday_news_check(self, _dbg=None):
+        """
+        Lightweight intraday news check — runs every 15 min during market hours.
+
+        Design: RSS fetch is FREE (no tokens). GPT is only called if ≥2 new
+        stock-relevant headlines appeared since last check. This saves tokens
+        while catching breaking news (earnings warnings, SEBI actions, big
+        geopolitical events) that create tradeable moves during the day.
+
+        Intraday targets get injected into the breakout watcher as priority
+        symbols — the regular scoring/ML/OI pipeline still validates them.
+        """
+        _log = _dbg or (lambda msg: print(msg))
+        try:
+            from config import EARLYBIRD_D as _EB_D
+            if not _EB_D.get('enabled', False):
+                _log("📰 INTRADAY_NEWS: Skipped — EARLYBIRD_D disabled")
+                return
+
+            if not self._news_scanner:
+                _log("📰 INTRADAY_NEWS: Skipped — news_scanner not initialized (pre-market scan may have been missed)")
+                _log(f"   [NEWS_DBG] _news_scan_done={self._news_scan_done}, _news_targets={len(self._news_targets)}")
+                return
+
+            # Run the delta-only intraday scan
+            targets = self._news_scanner.intraday_scan()
+            if not targets:
+                _log(f"📰 INTRADAY_NEWS: No new actionable targets found (next check in 7.5 min)")
+                return
+
+            _log(f"⚡ INTRADAY_NEWS: {len(targets)} breaking news target(s) found!")
+
+            # Build intraday targets dict
+            intraday_map = {}
+            for t in targets:
+                intraday_map[t.symbol] = t.to_dict()
+                arrow = '🟢' if t.sentiment == 'BULLISH' else '🔴'
+                _log(f"  {arrow} BREAKING: {t.symbol} {t.sentiment} conf={t.confidence} [{t.catalyst_type}/{t.directness}]")
+                _log(f"     {t.score_breakdown}")
+                _log(f"     {t.reason}")
+
+            # Merge into existing news targets (don't replace pre-market ones)
+            for sym, tgt in intraday_map.items():
+                tgt['intraday'] = True  # Flag so we know it's a mid-day discovery
+                self._news_targets[sym] = tgt
+
+            # Push to kite_ticker watcher — these become priority scan symbols
+            ticker = getattr(self.tools, 'ticker', None)
+            if ticker and hasattr(ticker, 'breakout_watcher') and ticker.breakout_watcher:
+                watcher = ticker.breakout_watcher
+                watcher._news_targets = self._news_targets.copy()
+                _log(f"  → Pushed {len(intraday_map)} intraday news targets to watcher (total: {len(self._news_targets)})")
+
+            # Also inject into the breakout queue so scan_and_trade picks them up
+            # on the NEXT cycle without waiting for a breakout detection
+            if ticker and hasattr(ticker, 'breakout_watcher') and ticker.breakout_watcher:
+                watcher = ticker.breakout_watcher
+                for sym, tgt in intraday_map.items():
+                    nse_sym = f"NSE:{sym}"
+                    direction = 'BUY' if tgt['sentiment'] == 'BULLISH' else 'SELL'
+                    trigger_data = {
+                        'symbol': nse_sym,
+                        'direction': direction,
+                        'trigger_type': 'INTRADAY_NEWS',
+                        'news_confidence': tgt['confidence'],
+                        'reason': tgt.get('reason', ''),
+                        'catalyst_type': tgt.get('catalyst_type', ''),
+                        'intraday': True,
+                    }
+                    priority = tgt['confidence'] / 100.0 * 2.0  # Map conf to priority (higher = more priority)
+                    watcher._queue.put(trigger_data, priority)
+                    _log(f"  → Queued {sym} {direction} into breakout pipeline (priority={priority:.1f})")
+
+        except Exception as e:
+            _log(f"WARN: Intraday news check failed (non-fatal): {e}")
+
     # ========== BREAKOUT WATCHER QUEUE DRAIN ==========
     def _process_breakout_triggers(self):
         """
@@ -1358,9 +1528,7 @@ class AutonomousTrader:
             return
         
         # --- Watcher start time gate (let ORB settle before reacting) ---
-        # EARLYBIRD triggers bypass this gate — they fire from 09:16
-        from config import EARLYBIRD_COMMON as _EB_COM, EARLYBIRD_A as _EB_A, EARLYBIRD_B as _EB_B, EARLYBIRD_C as _EB_C
-        _earlybird_active = _EB_COM.get('enabled', False)
+        _earlybird_active = False  # EARLYBIRD REMOVED
         _ws_start = BREAKOUT_WATCHER.get('watcher_start')
         if _ws_start:
             _now_t = datetime.now().time()
@@ -1417,7 +1585,7 @@ class AutonomousTrader:
         # eligible for a watcher breakout trade if it's a new trigger event.
         actionable = []
         _skip_reasons = []
-        # If before watcher_start, only allow EARLYBIRD triggers through
+        # If before watcher_start, skip all triggers
         _before_watcher_start = False
         if _ws_start:
             _now_t_chk = datetime.now().time()
@@ -1426,8 +1594,8 @@ class AutonomousTrader:
         for t in triggers:
             sym = t['symbol']
             _ttype_filter = t.get('trigger_type', '')
-            # Before watcher_start, only EARLYBIRD triggers are allowed
-            if _before_watcher_start and 'EARLYBIRD' not in _ttype_filter:
+            # Before watcher_start, skip all triggers (earlybird removed)
+            if _before_watcher_start:
                 _skip_reasons.append(f"{sym.replace('NSE:', '')}=pre-watcher-start")
                 continue
             if self.tools.is_symbol_in_active_trades(sym):
@@ -1470,7 +1638,9 @@ class AutonomousTrader:
             for _bt in _batch:
                 _l1_futures[_l1_exec.submit(
                     self._oi_analyzer.analyze, _bt['symbol'])] = _bt['symbol']
-            _l1_timeout = max(12, len(_batch) * 2)  # [FIX Mar 19] Reduced from 30s→12s to avoid blocking main thread
+            # Apr 21: raised 12s→20s — OI_AGGR (8 workers × 33 syms) can congest Kite
+            # during its 120s window; Layer-1 needs headroom to avoid bypass-with-NO_DATA.
+            _l1_timeout = max(20, len(_batch) * 3)
             try:
                 for _f in _l1_done(_l1_futures, timeout=_l1_timeout):
                     _l1_sym = _l1_futures[_f]
@@ -1503,11 +1673,16 @@ class AutonomousTrader:
                     # Don't block strong price action because of data fetch issues.
                     _bt_ttype = _bt.get('trigger_type', '')
                     _bt_move = abs(_bt.get('move_pct', 0))
+                    _bt_news_conf = _bt.get('news_confidence', 0)
                     _bt_is_strong = (
                         _bt_move >= 1.0
                         or 'SPIKE' in _bt_ttype
                         or _bt.get('spike_plus_surge', False)
-                        or 'EARLYBIRD' in _bt_ttype  # Earlybird always bypasses OI (too early for reliable OI)
+
+                        or 'GRIND' in _bt_ttype       # Apr 15: Slow grinds already passed multi-min sustain + vol checks
+                        or 'VOLUME' in _bt_ttype      # Apr 15: Vol surges already passed consecutive-tick + min-move checks
+                        or 'DAY' in _bt_ttype          # Apr 15: Day extremes (new high/low breaks) are inherently directional
+                        or (_bt_ttype == 'INTRADAY_NEWS' and _bt_news_conf >= 70)  # News with high confidence bypasses OI
                     )
                     if _bt_is_strong:
                         _l1_passed.append(_bt)
@@ -1529,508 +1704,10 @@ class AutonomousTrader:
             self._wlog(f"✅ LAYER-1 OI PASSED: {len(_batch)} → [{_l1_summary}]")
 
         # ================================================================
-        # OI_WATCHER — Pure OI-based trade, no model, no scoring.
-        # Picks the top-1 symbol by OI buildup strength from Layer 1 data
-        # and fires immediately before the expensive pipeline runs.
+        # OI_WATCHER — 13-factor conviction engine with 10+3 anchor gate
+        # Delegated to oi_watcher_engine.OIWatcherEngine
         # ================================================================
-        if _layer1_oi and self._oi_watcher_total_placed < self._oi_watcher_max_per_day:
-            _oi_candidates = []
-            for _oi_sym, _oi_res in _layer1_oi.items():
-                _oi_sig = _oi_signal_from_result(_oi_res)
-                _oi_dir = _oi_direction(_oi_sig)
-                _oi_str = _oi_res.get('nse_oi_buildup_strength', 0.0)
-                # PCR surrogate: when raw OI strength=0 but PCR gave a directional
-                # signal, use flow_confidence as strength (same pattern as Gate F2).
-                if _oi_str < 0.01 and _oi_sig and _oi_sig not in ('NEUTRAL', ''):
-                    _fc_ow = _oi_res.get('flow_confidence', 0.0)
-                    if _fc_ow > 0.1:
-                        _oi_str = _fc_ow
-                if not _oi_dir:
-                    continue  # NEUTRAL — skip
-                if _oi_str < self._oi_watcher_min_strength:
-                    continue  # Below strength threshold
-                if _oi_sym in self._oi_watcher_fired_this_session:
-                    continue  # Already fired OI_WATCHER on this symbol today
-                if self.tools.is_symbol_in_active_trades(_oi_sym):
-                    continue  # Already holding this symbol
-                _oi_candidates.append((_oi_sym, _oi_dir, _oi_sig, _oi_str, _oi_res))
-
-            if _oi_candidates:
-                # ── SMART QUALITY SCORING ──
-                # Instead of just raw strength, compute a composite quality score
-                # that rewards confluence: participant + cross-validation + price confirmation + OI trend.
-                # No harsh gates — everything is a boost/discount to effective strength.
-                _ticker = getattr(self.tools, 'ticker', None)
-                for _oci in range(len(_oi_candidates)):
-                    _oc_sym, _oc_dir, _oc_sig, _oc_str, _oc_res = _oi_candidates[_oci]
-                    _oc_eff_str = _oc_str
-                    _oc_boosts = []
-                    _oc_confirms = 0  # Independent confirming factor count
-
-                    # (A) Participant quality: GRANULAR writer/buyer ratio
-                    # Raw writer_oi/buyer_oi numbers reveal conviction depth.
-                    # 90%+ writer = margin-locked, will defend level = near-guaranteed.
-                    # 50-65% writer = fragile, can flip = low conviction.
-                    # Buyer-dominated = hedging noise, NOT directional.
-                    _oc_part = _oc_res.get('oi_participant_id', 'UNKNOWN')
-                    _oc_pid_detail = _oc_res.get('oi_participant_detail', {})
-                    _oc_writer_ratio = None
-                    if _oc_pid_detail:
-                        if _oc_dir == 'BUY':  # LONG_BUILDUP → PE writers are conviction
-                            _oc_w_oi = _oc_pid_detail.get('pe_writer_oi', 0)
-                            _oc_b_oi = _oc_pid_detail.get('pe_buyer_oi', 0)
-                        else:  # SHORT_BUILDUP → CE writers are conviction
-                            _oc_w_oi = _oc_pid_detail.get('ce_writer_oi', 0)
-                            _oc_b_oi = _oc_pid_detail.get('ce_buyer_oi', 0)
-                        _oc_total_classified = _oc_w_oi + _oc_b_oi
-                        if _oc_total_classified > 0:
-                            _oc_writer_ratio = _oc_w_oi / _oc_total_classified
-                    if _oc_writer_ratio is not None:
-                        if _oc_writer_ratio >= 0.85:
-                            _oc_eff_str *= 1.25  # 85%+ writer = rock solid institutional conviction
-                            _oc_boosts.append(f'W✓✓{_oc_writer_ratio:.0%}')
-                            _oc_confirms += 1
-                        elif _oc_writer_ratio >= 0.65:
-                            _oc_eff_str *= 1.12  # Strong writer majority
-                            _oc_boosts.append(f'W✓{_oc_writer_ratio:.0%}')
-                            _oc_confirms += 1
-                        elif _oc_writer_ratio >= 0.50:
-                            _oc_eff_str *= 1.0   # Neutral — no boost
-                            _oc_boosts.append(f'W~{_oc_writer_ratio:.0%}')
-                        else:
-                            _oc_eff_str *= 0.75  # Buyer-dominated = hedging, NOT directional
-                            _oc_boosts.append(f'B✗{_oc_writer_ratio:.0%}')
-                    else:
-                        # Fallback to label when detail not available
-                        if _oc_part == 'WRITER_DOMINANT':
-                            _oc_eff_str *= 1.15
-                            _oc_boosts.append('W+')
-                        elif _oc_part == 'BUYER_DOMINANT':
-                            _oc_eff_str *= 0.85
-                            _oc_boosts.append('B-')
-
-                    # (B) Cross-validation: Kite PCR + DhanHQ both agree = high conviction
-                    if _oc_res.get('oi_cross_validated'):
-                        _oc_eff_str *= 1.10  # Both sources agree → 10% boost
-                        _oc_boosts.append('XV✓')
-                        _oc_confirms += 1
-
-                    # (C) Price confirmation: check if stock move aligns with OI direction
-                    # OI says BUY + stock is actually rising = confluence
-                    # OI says BUY + stock is falling = divergence (could still work, but less confident)
-                    if _ticker:
-                        try:
-                            _oc_clean = _oc_sym.replace('NSE:', '')
-                            _oc_tok = None
-                            with getattr(_ticker, '_lock', threading.Lock()):
-                                for _tk, _tsym in _ticker._token_to_symbol.items():
-                                    if _tsym == _oc_sym:
-                                        _oc_tok = _tk
-                                        break
-                                if _oc_tok:
-                                    _oc_q = _ticker._quote_cache.get(_oc_tok, {})
-                                    _oc_ltp = _oc_q.get('last_price', 0)
-                                    _oc_close = (_oc_q.get('ohlc', {}) or {}).get('close', 0)
-                                    if _oc_ltp > 0 and _oc_close > 0:
-                                        _oc_chg = ((_oc_ltp - _oc_close) / _oc_close) * 100
-                                        _price_agrees = (
-                                            (_oc_dir == 'BUY' and _oc_chg > 0.3) or
-                                            (_oc_dir == 'SELL' and _oc_chg < -0.3)
-                                        )
-                                        _price_diverges = (
-                                            (_oc_dir == 'BUY' and _oc_chg < -0.5) or
-                                            (_oc_dir == 'SELL' and _oc_chg > 0.5)
-                                        )
-                                        if _price_agrees:
-                                            _oc_eff_str *= 1.08  # Price confirms OI → 8% boost
-                                            _oc_boosts.append(f'P✓{_oc_chg:+.1f}%')
-                                        elif _price_diverges:
-                                            _oc_eff_str *= 0.90  # Price diverges → 10% discount
-                                            _oc_boosts.append(f'P✗{_oc_chg:+.1f}%')
-                        except Exception as e:
-                            print(f"⚠️ FALLBACK [trader/oi_price_check]: {e}")
-
-                    # (D) OI trend: check if strength is BUILDING (from aggr history)
-                    # If we've seen this symbol before with lower strength, it's getting stronger = good
-                    _oc_hist = self._oi_aggr_strength_history.get(_oc_sym, [])
-                    if len(_oc_hist) >= 2:
-                        _oc_prev_str = _oc_hist[-1][1]  # Most recent prior reading
-                        if _oc_eff_str > _oc_prev_str * 1.05:  # 5% stronger than last
-                            _oc_eff_str *= 1.05  # Building → 5% boost
-                            _oc_boosts.append('OI↑')
-                            _oc_confirms += 1
-                        elif _oc_eff_str < _oc_prev_str * 0.80:  # 20% weaker than last
-                            _oc_eff_str *= 0.90  # Fading → 10% discount
-                            _oc_boosts.append('OI↓')
-
-                    # (E) Sector alignment: if sector index is moving same direction = strong confluence
-                    _oc_s2s = getattr(self, '_stock_to_sector', {})
-                    _oc_sec_chgs = getattr(self, '_sector_index_changes_cache', {})
-                    _oc_sec_info = _oc_s2s.get(_oc_sym.replace('NSE:', ''))
-                    if _oc_sec_info and _oc_sec_chgs:
-                        _oc_sec_name, _oc_sec_idx = _oc_sec_info
-                        _oc_sec_chg = _oc_sec_chgs.get(_oc_sec_idx, 0)
-                        _oc_sec_agrees = (
-                            (_oc_dir == 'BUY' and _oc_sec_chg > 0.3) or
-                            (_oc_dir == 'SELL' and _oc_sec_chg < -0.3)
-                        )
-                        _oc_sec_oppose = (
-                            (_oc_dir == 'BUY' and _oc_sec_chg < -0.5) or
-                            (_oc_dir == 'SELL' and _oc_sec_chg > 0.5)
-                        )
-                        if _oc_sec_agrees:
-                            _oc_eff_str *= 1.08  # Sector confirms → 8% boost
-                            _oc_boosts.append('SEC✓')
-                            _oc_confirms += 1
-                        elif _oc_sec_oppose:
-                            _oc_eff_str *= 0.88  # Swimming against sector → 12% discount
-                            _oc_boosts.append('SEC✗')
-
-                    # (F) Futures OI buildup cross-check: ML feature #1 (46.5% importance)
-                    # If futures show LONG_BUILDUP and OI says BUY = triple confluence
-                    _oc_ml = getattr(self, '_cycle_ml_results', {})
-                    _oc_ml_data = _oc_ml.get(_oc_sym, {})
-                    _oc_fut_buildup = _oc_ml_data.get('fut_oi_buildup', 0) if isinstance(_oc_ml_data, dict) else 0
-                    if _oc_fut_buildup:
-                        _oc_fut_agrees = (
-                            (_oc_dir == 'BUY' and _oc_fut_buildup > 0) or
-                            (_oc_dir == 'SELL' and _oc_fut_buildup < 0)
-                        )
-                        _oc_fut_strong = abs(_oc_fut_buildup) >= 0.75  # LB/SB not SC/LU
-                        if _oc_fut_agrees and _oc_fut_strong:
-                            _oc_eff_str *= 1.12  # Futures + Options agree strongly → 12% boost
-                            _oc_boosts.append('FUT✓✓')
-                            _oc_confirms += 1
-                        elif _oc_fut_agrees:
-                            _oc_eff_str *= 1.05  # Mild agreement → 5% boost
-                            _oc_boosts.append('FUT✓')
-                            _oc_confirms += 1
-                        elif not _oc_fut_agrees and _oc_fut_strong:
-                            _oc_eff_str *= 0.85  # Futures strongly disagree → 15% discount
-                            _oc_boosts.append('FUT✗✗')
-
-                    # (G) Live Futures Basis: premium/discount from ticker cache (0 API calls)
-                    # Futures at premium + BUY = smart money paying up (urgency) → boost
-                    # Futures at discount + BUY = no urgency → slight discount
-                    if _ticker:
-                        try:
-                            _oc_fut_data = _ticker.get_futures_oi(_oc_sym)
-                            if _oc_fut_data and _oc_fut_data.get('ltp', 0) > 0:
-                                _oc_fut_ltp = _oc_fut_data['ltp']
-                                # Get equity spot from ticker cache
-                                _oc_eq_ltp = 0
-                                with getattr(_ticker, '_lock', threading.Lock()):
-                                    for _tk2, _tsym2 in _ticker._token_to_symbol.items():
-                                        if _tsym2 == _oc_sym:
-                                            _oc_eq_ltp = _ticker._quote_cache.get(_tk2, {}).get('last_price', 0)
-                                            break
-                                if _oc_eq_ltp > 0:
-                                    _oc_basis_pct = ((_oc_fut_ltp - _oc_eq_ltp) / _oc_eq_ltp) * 100
-                                    _oc_basis_agrees = (
-                                        (_oc_dir == 'BUY' and _oc_basis_pct > 0.05) or
-                                        (_oc_dir == 'SELL' and _oc_basis_pct < -0.05)
-                                    )
-                                    _oc_basis_disagrees = (
-                                        (_oc_dir == 'BUY' and _oc_basis_pct < -0.10) or
-                                        (_oc_dir == 'SELL' and _oc_basis_pct > 0.10)
-                                    )
-                                    if _oc_basis_agrees:
-                                        _oc_eff_str *= 1.10  # Smart money paying premium in your direction
-                                        _oc_boosts.append(f'BASIS✓{_oc_basis_pct:+.2f}%')
-                                        _oc_confirms += 1
-                                    elif _oc_basis_disagrees:
-                                        _oc_eff_str *= 0.90  # Futures pricing against you
-                                        _oc_boosts.append(f'BASIS✗{_oc_basis_pct:+.2f}%')
-                        except Exception as e:
-                            print(f"⚠️ FALLBACK [trader/oi_basis_check]: {e}")
-
-                    # (H) OI Concentration vs Spot: WHERE is buildup happening?
-                    # Buildup at/near ATM = institutional conviction (skin in the game)
-                    # Buildup far OTM = hedging/premium collection, NOT directional conviction
-                    _oc_spot = _oc_res.get('spot_price', 0) or _oc_res.get('dhan_spot_price', 0)
-                    if _oc_spot > 0:
-                        # For BUY direction, check put OI buildup (support building)
-                        # For SELL direction, check call OI buildup (resistance building)
-                        _oc_relevant_strikes = (
-                            _oc_res.get('nse_top_put_oi_change', []) if _oc_dir == 'BUY'
-                            else _oc_res.get('nse_top_call_oi_change', [])
-                        )
-                        if _oc_relevant_strikes and len(_oc_relevant_strikes) > 0:
-                            # Each entry is (strike, oi_change) tuple
-                            _oc_top_strike = _oc_relevant_strikes[0][0] if isinstance(_oc_relevant_strikes[0], (list, tuple)) else 0
-                            if _oc_top_strike > 0:
-                                _oc_strike_dist = abs(_oc_top_strike - _oc_spot) / _oc_spot * 100
-                                if _oc_strike_dist <= 2.0:
-                                    _oc_eff_str *= 1.10  # Near-money buildup = institutional conviction
-                                    _oc_boosts.append(f'ATM✓{_oc_strike_dist:.1f}%')
-                                    _oc_confirms += 1
-                                elif _oc_strike_dist >= 5.0:
-                                    _oc_eff_str *= 0.92  # Far OTM = hedging, not conviction
-                                    _oc_boosts.append(f'OTM✗{_oc_strike_dist:.1f}%')
-
-                    # (I) PCR Shift Rate: rate of PCR change (already computed, not used in scoring)
-                    # Fast-rising PCR = aggressive put writing = building support NOW
-                    # Fast-falling PCR = aggressive call writing = building resistance NOW
-                    _oc_pcr_rate = _oc_res.get('pcr_shift_rate', 0)
-                    if abs(_oc_pcr_rate) > 0.005:  # Meaningful rate of change
-                        _oc_pcr_rate_confirms = (
-                            (_oc_dir == 'BUY' and _oc_pcr_rate > 0.01) or   # Rising PCR = bullish (put support)
-                            (_oc_dir == 'SELL' and _oc_pcr_rate < -0.01)     # Falling PCR = bearish
-                        )
-                        _oc_pcr_rate_opposes = (
-                            (_oc_dir == 'BUY' and _oc_pcr_rate < -0.01) or
-                            (_oc_dir == 'SELL' and _oc_pcr_rate > 0.01)
-                        )
-                        if _oc_pcr_rate_confirms:
-                            _oc_eff_str *= 1.08  # PCR shifting your way NOW
-                            _oc_boosts.append(f'PCR↗{_oc_pcr_rate:+.3f}')
-                            _oc_confirms += 1
-                        elif _oc_pcr_rate_opposes:
-                            _oc_eff_str *= 0.92  # PCR shifting against you
-                            _oc_boosts.append(f'PCR↘{_oc_pcr_rate:+.3f}')
-
-                    # (J) Volume PCR: today's trading intent vs stale OI
-                    # Volume PCR captures what traders are DOING today. OI PCR includes
-                    # stale overnight positions. When volume PCR strongly confirms = fresh conviction.
-                    _oc_vol_pcr = _oc_res.get('nse_pcr_volume', 0)
-                    _oc_oi_pcr = _oc_res.get('pcr_oi', 1.0)
-                    if _oc_vol_pcr and _oc_vol_pcr > 0:
-                        _oc_vol_confirms = (
-                            (_oc_dir == 'BUY' and _oc_vol_pcr > 1.3) or    # Heavy put volume = support
-                            (_oc_dir == 'SELL' and _oc_vol_pcr < 0.7)      # Heavy call volume = pressure
-                        )
-                        _oc_vol_opposes = (
-                            (_oc_dir == 'BUY' and _oc_vol_pcr < 0.6) or
-                            (_oc_dir == 'SELL' and _oc_vol_pcr > 1.5)
-                        )
-                        if _oc_vol_confirms:
-                            _oc_eff_str *= 1.08  # Today's volume confirms direction
-                            _oc_boosts.append(f'VP✓{_oc_vol_pcr:.2f}')
-                            _oc_confirms += 1
-                        elif _oc_vol_opposes:
-                            _oc_eff_str *= 0.90  # Today's volume against direction
-                            _oc_boosts.append(f'VP✗{_oc_vol_pcr:.2f}')
-
-                    # (K) Futures Conviction Boost: OI Day-High + Order Book Imbalance
-                    # Kite WebSocket streams futures OI + buy/sell qty in real-time (0 API calls).
-                    # BOOST-ONLY: helps the BEST signals rise to the top for entry.
-                    # buy_quantity = total pending BUY orders in futures order book (bullish demand)
-                    # sell_quantity = total pending SELL orders in futures order book (bearish supply)
-                    if _ticker:
-                        try:
-                            _oc_fk = _ticker.get_futures_oi(_oc_sym)
-                            if _oc_fk and _oc_fk.get('oi', 0) > 0:
-                                _oc_fk_oi = _oc_fk['oi']
-                                _oc_fk_high = _oc_fk.get('oi_day_high', 0)
-                                _oc_fk_low = _oc_fk.get('oi_day_low', 0)
-
-                                # K1: OI at Day-High = institutions actively adding RIGHT NOW
-                                if _oc_fk_high > _oc_fk_low > 0:
-                                    _oc_fk_range = _oc_fk_high - _oc_fk_low
-                                    _oc_fk_pos = (_oc_fk_oi - _oc_fk_low) / _oc_fk_range  # 0=low, 1=high
-                                    if _oc_fk_pos >= 0.85:  # OI at/near day high = fresh positions
-                                        _oc_eff_str *= 1.18
-                                        _oc_boosts.append(f'FOIDH✓{_oc_fk_pos:.0%}')
-                                        _oc_confirms += 1
-                                    elif _oc_fk_pos >= 0.65:  # OI trending up = steady buildup
-                                        _oc_eff_str *= 1.08
-                                        _oc_boosts.append(f'FOIDH~{_oc_fk_pos:.0%}')
-
-                                # K2: Futures Order Book Imbalance — who's lining up?
-                                # buy_qty > sell_qty = bullish demand, sell_qty > buy_qty = bearish pressure
-                                _oc_fk_buy = _oc_fk.get('buy_quantity', 0)
-                                _oc_fk_sell = _oc_fk.get('sell_quantity', 0)
-                                if _oc_fk_buy > 0 and _oc_fk_sell > 0:
-                                    _oc_fk_imb = _oc_fk_buy / (_oc_fk_buy + _oc_fk_sell)  # 0.5 = balanced
-                                    _oc_fk_imb_confirms = (
-                                        (_oc_dir == 'BUY' and _oc_fk_imb > 0.55) or
-                                        (_oc_dir == 'SELL' and _oc_fk_imb < 0.45)
-                                    )
-                                    if _oc_fk_imb_confirms:
-                                        _oc_boost_mult = 1.08 + min(0.10, abs(_oc_fk_imb - 0.50) * 0.5)  # Scale: 55%→1.105, 65%→1.155
-                                        _oc_eff_str *= _oc_boost_mult
-                                        _oc_boosts.append(f'FOBI✓{_oc_fk_imb:.0%}')
-                                        _oc_confirms += 1
-                        except Exception as e:
-                            print(f"⚠️ FALLBACK [trader/oi_fobi_check]: {e}")
-
-                    # (L) OI Velocity — is strength ACCELERATING vs recent readings?
-                    # Real institutional flow shows rising OI over multiple scan cycles.
-                    # Noise OI is flat or random. Check if current > 1.15x avg of last 3.
-                    _oc_vel_hist = self._oi_aggr_strength_history.get(_oc_sym, [])
-                    if len(_oc_vel_hist) >= 2:
-                        _oc_vel_avg = sum(h[1] for h in _oc_vel_hist[-3:]) / min(3, len(_oc_vel_hist))
-                        if _oc_vel_avg > 0 and _oc_str > _oc_vel_avg * 1.15:
-                            _oc_eff_str *= 1.10  # Accelerating OI = fresh institutional entry
-                            _oc_boosts.append(f'VEL✓{_oc_str/_oc_vel_avg:.2f}x')
-                            _oc_confirms += 1
-
-                    _oc_eff_str = min(1.0, _oc_eff_str)
-                    _oi_candidates[_oci] = (_oc_sym, _oc_dir, _oc_sig, _oc_eff_str, _oc_res)
-                    # Store boost tags + confirm count for logging
-                    _oc_res['_quality_boosts'] = ' '.join(_oc_boosts) if _oc_boosts else ''
-                    _oc_res['_confirm_count'] = _oc_confirms
-                # Sort by (confirm_count DESC, effective_strength DESC) — conviction first, strength second
-                _oi_candidates.sort(key=lambda x: (x[4].get('_confirm_count', 0), x[3]), reverse=True)
-                _oi_max_fire = 1  # Fire ONLY the single best-convicted candidate per cycle
-                _oi_placed_count = 0
-                _oi_top_confirms = _oi_candidates[0][4].get('_confirm_count', 0) if _oi_candidates else 0
-                self._wlog(f"🔬 OI_WATCHER: {len(_oi_candidates)} candidates, "
-                           f"top conviction={_oi_top_confirms}/{self._oi_min_confirmations} factors")
-                for _oi_rank, _oi_top in enumerate(_oi_candidates[:_oi_max_fire]):
-                    if self._oi_watcher_total_placed >= self._oi_watcher_max_per_day:
-                        break
-                    _oi_sym, _oi_dir, _oi_sig, _oi_str, _oi_res = _oi_top
-                    _oi_pcr = _oi_res.get('pcr_oi', 1.0)
-                    _oi_bias = _oi_res.get('flow_bias', 'NEUTRAL')
-
-                    # ── OI HEATMAP STRIKE PICKER ──
-                    _oi_strike_sel = 'ATM'
-                    _oi_hm_tag = ''
-                    try:
-                        from dhan_oi_fetcher import DhanOIFetcher
-                        _hm_strikes = _oi_res.get('dhan_strikes', [])
-                        _hm_spot = _oi_res.get('dhan_spot_price', 0)
-                        if _hm_strikes and _hm_spot > 0:
-                            _hm = DhanOIFetcher.find_optimal_strike(_oi_dir, _hm_strikes, _hm_spot)
-                            if _hm.get('score', 0) > 0:
-                                _oi_strike_sel = _hm['selection']
-                                _oi_hm_tag = (f" | HEATMAP: {_hm['selection']}@{_hm['strike']:.0f} "
-                                              f"score={_hm['score']:.0f} ({_hm['reason']})")
-                    except Exception as e:
-                        print(f"⚠️ FALLBACK [trader/oi_heatmap_strike]: {e}")
-
-                    _oi_part_id = _oi_res.get('oi_participant_id', 'UNKNOWN')
-
-                    _oi_quality_tags = _oi_res.get('_quality_boosts', '')
-                    _oi_confirm_ct = _oi_res.get('_confirm_count', 0)
-                    self._wlog(f"🔬 OI_WATCHER: #{_oi_rank+1} pick {_oi_sym.replace('NSE:', '')} "
-                               f"signal={_oi_sig} strength={_oi_str:.3f} dir={_oi_dir} "
-                               f"bias={_oi_bias} PCR={_oi_pcr:.2f} part={_oi_part_id} "
-                               f"conviction={_oi_confirm_ct}/{self._oi_min_confirmations} "
-                               f"factors=[{_oi_quality_tags}] "
-                               f"strike={_oi_strike_sel}{_oi_hm_tag}")
-
-                    _oi_ml_data = {
-                        'oi_signal': _oi_sig,
-                        'oi_strength': _oi_str,
-                        'oi_pcr': _oi_pcr,
-                        'oi_bias': _oi_bias,
-                        'oi_participant_id': _oi_part_id,
-                        'trade_type': 'OI_WATCHER',
-                        'oi_heatmap_strike': _oi_strike_sel,
-                    }
-
-                    # ── OI CONVICTION GATE (Instant — No Time Delay) ──
-                    # Instead of waiting 60s (by which time the move is over or you're chasing),
-                    # use CONFLUENCE COUNT: how many independent market microstructure factors
-                    # confirm the signal RIGHT NOW. ≥ N factors = enter immediately.
-                    _oi_confirms = _oi_res.get('_confirm_count', 0)
-                    if _oi_confirms < self._oi_min_confirmations:
-                        self._wlog(f"  ⛔ OI_WATCHER LOW CONVICTION: {_oi_sym.replace('NSE:', '')} "
-                                   f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                                   f"only {_oi_confirms}/{self._oi_min_confirmations} factors confirm "
-                                   f"[{_oi_res.get('_quality_boosts', '')}] — need more confluence")
-                        continue
-                    self._wlog(f"  ✅ OI_WATCHER HIGH CONVICTION: {_oi_sym.replace('NSE:', '')} "
-                               f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                               f"{_oi_confirms}/{self._oi_min_confirmations} factors confirm "
-                               f"[{_oi_res.get('_quality_boosts', '')}] → FIRING INSTANTLY")
-
-                    try:
-                        with self._trade_lock:
-                            _oi_result = self.tools.place_option_order(
-                                underlying=_oi_sym,
-                                direction=_oi_dir,
-                                strike_selection=_oi_strike_sel,
-                                rationale=(f"OI_WATCHER: {_oi_confirms}-factor conviction — {_oi_sig} "
-                                           f"strength={_oi_str:.2f} PCR={_oi_pcr:.2f} "
-                                           f"bias={_oi_bias} strike={_oi_strike_sel}"
-                                           f"{_oi_hm_tag}"
-                                           f" | factors=[{_oi_res.get('_quality_boosts', '')}]"),
-                                setup_type='OI_WATCHER',
-                                ml_data=_oi_ml_data,
-                                pre_fetched_market_data={}
-                            )
-
-                        if _oi_result and _oi_result.get('success'):
-                            self._wlog(f"  🎯 OI_WATCHER FIRED: {_oi_sym.replace('NSE:', '')} "
-                                       f"({_oi_dir}) signal={_oi_sig} strength={_oi_str:.3f} "
-                                       f"strike={_oi_strike_sel} order={_oi_result.get('order_id', '?')}")
-                            self._oi_watcher_fired_this_session.add(_oi_sym)
-                            self._oi_watcher_total_placed += 1
-                            self._watcher_fired_this_session.add(_oi_sym)  # Prevent pipeline re-fire
-                            _oi_placed_count += 1
-                            # Store entry OI snapshot for exit intelligence
-                            self._oi_watcher_entry_snapshots[_oi_sym] = {
-                                'signal': _oi_sig,
-                                'strength': _oi_str,
-                                'direction': _oi_dir,
-                                'participant': _oi_res.get('oi_participant_id', 'UNKNOWN'),
-                                'pcr': _oi_pcr,
-                                'bias': _oi_bias,
-                            }
-                            self._log_decision(
-                                _wt.strftime('%Y-%m-%d %H:%M:%S'), _oi_sym, _oi_str * 100,
-                                'OI_WATCHER_FIRED',
-                                reason=(f'{_oi_confirms}-factor conviction: {_oi_sig} strength={_oi_str:.3f} '
-                                        f'PCR={_oi_pcr:.2f} bias={_oi_bias} '
-                                        f'factors=[{_oi_res.get("_quality_boosts", "")}]'),
-                                direction=_oi_dir, setup='OI_WATCHER')
-                        else:
-                            _oi_err = _oi_result.get('error', 'unknown') if _oi_result else 'no result'
-                            # ── CAPITAL SWAP for OI_WATCHER (highest priority) ──
-                            _oi_exp_block = ('RISK GOVERNOR BLOCK' in str(_oi_err) and 'exposure' in str(_oi_err).lower()) or \
-                                            ('REGIME POSITION LIMIT' in str(_oi_err))
-                            if _oi_exp_block and CAPITAL_SWAP.get('enabled', False):
-                                self._wlog(f"  🔄 OI_WATCHER SWAP: {_oi_sym.replace('NSE:', '')} blocked — searching for eviction candidate...")
-                                _oi_evict = self._find_eviction_candidate('OI_WATCHER')
-                                if _oi_evict:
-                                    with self._trade_lock:
-                                        _oi_evicted = self._execute_eviction(_oi_evict, f"OI_WATCHER:{_oi_sym.replace('NSE:', '')}")
-                                    if _oi_evicted:
-                                        import time as _oi_et
-                                        _oi_et.sleep(0.5)
-                                        with self._trade_lock:
-                                            _oi_result = self.tools.place_option_order(
-                                                underlying=_oi_sym, direction=_oi_dir,
-                                                strike_selection=_oi_strike_sel,
-                                                rationale=(f"CAPITAL_SWAP→OI_WATCHER: {_oi_sig} str={_oi_str:.2f} "
-                                                           f"(evicted {_oi_evict['symbol']})"),
-                                                setup_type='OI_WATCHER', ml_data=_oi_ml_data, pre_fetched_market_data={}
-                                            )
-                                        if _oi_result and _oi_result.get('success'):
-                                            self._wlog(f"  🎯 OI_WATCHER SWAP FIRED: {_oi_sym.replace('NSE:', '')} "
-                                                       f"({_oi_dir}) — replaced {_oi_evict['symbol']}")
-                                            self._oi_watcher_fired_this_session.add(_oi_sym)
-                                            self._oi_watcher_total_placed += 1
-                                            self._watcher_fired_this_session.add(_oi_sym)
-                                            _oi_placed_count += 1
-                                            self._oi_watcher_entry_snapshots[_oi_sym] = {
-                                                'signal': _oi_sig, 'strength': _oi_str,
-                                                'direction': _oi_dir,
-                                                'participant': _oi_res.get('oi_participant_id', 'UNKNOWN'),
-                                                'pcr': _oi_pcr, 'bias': _oi_bias,
-                                            }
-                                            self._log_decision(
-                                                _wt.strftime('%Y-%m-%d %H:%M:%S'), _oi_sym, _oi_str * 100,
-                                                'OI_WATCHER_SWAP_FIRED',
-                                                reason=(f'CAPITAL_SWAP: evicted {_oi_evict["symbol"]} for OI trade: '
-                                                        f'{_oi_sig} str={_oi_str:.3f}'),
-                                                direction=_oi_dir, setup='OI_WATCHER')
-                                        else:
-                                            _retry_err = _oi_result.get('error', 'unknown') if _oi_result else 'no result'
-                                            self._wlog(f"  ⚠️ OI_WATCHER SWAP RETRY FAILED: {_retry_err}")
-                                else:
-                                    self._wlog(f"  ❌ OI_WATCHER: No eviction candidate available")
-                            else:
-                                self._wlog(f"  ⚠️ OI_WATCHER FAILED: {_oi_sym.replace('NSE:', '')} — {_oi_err}")
-                    except Exception as _oi_exc:
-                        self._wlog(f"  ❌ OI_WATCHER ERROR: {_oi_exc}")
-                if _oi_placed_count > 0:
-                    self._wlog(f"🔬 OI_WATCHER: Fired {_oi_placed_count}/{_oi_max_fire} candidates this cycle")
-            else:
-                self._wlog(f"🔬 OI_WATCHER: No candidates with strength >= {self._oi_watcher_min_strength}")
+        self._oi_engine.run_watcher_scan(_layer1_oi)
 
         self._watcher_total_pipeline_sent += len(_batch)
         
@@ -2078,556 +1755,11 @@ class AutonomousTrader:
         self._watcher_pipe_thread.start()
 
     # ========== AGGRESSIVE OI BUILDUP SCANNER ==========
-    # Runs independently from breakout triggers (every 90s from monitor loop).
-    # Scans top F&O movers by change%, fetches OI in parallel, tracks strength
-    # history for acceleration detection, fires OI_WATCHER immediately on
-    # strong LB/SB signals WITHOUT waiting for price breakouts.
+    # Delegated to oi_watcher_engine.OIWatcherEngine
     def _aggressive_oi_buildup_scan(self):
-        """Independent OI buildup scanner — finds LB/SB before price triggers."""
-        import time as _oiag_t
-        from datetime import datetime as _oiag_dt
+        """Independent OI buildup scanner — delegated to OIWatcherEngine."""
+        self._oi_engine.aggressive_buildup_scan()
 
-        # Pre-checks
-        if not self._oi_analyzer:
-            return
-        if self._oi_watcher_total_placed >= self._oi_watcher_max_per_day:
-            return
-        _now = _oiag_dt.now()
-        _hm = _now.strftime('%H:%M')
-        if _hm < '09:35' or _hm > '14:45':
-            return  # Only during active trading window
-
-        # Get ticker reference
-        _ticker = getattr(self.tools, 'ticker', None)
-        if not _ticker:
-            return
-
-        # Build list of equity symbols from ticker's token map, compute change%
-        _syms_with_change = []
-        with getattr(_ticker, '_lock', threading.Lock()):
-            for _tok, _sym in _ticker._token_to_symbol.items():
-                if not _sym.startswith('NSE:') or ':NIFTY' in _sym or 'NFO:' in _sym:
-                    continue
-                _q = _ticker._quote_cache.get(_tok)
-                if not _q:
-                    continue
-                _ltp = _q.get('last_price', 0)
-                _ohlc = _q.get('ohlc', {})
-                _close = _ohlc.get('close', 0)
-                if _ltp <= 0 or _close <= 0:
-                    continue
-                _chg_pct = ((_ltp - _close) / _close) * 100
-                _syms_with_change.append((_sym, abs(_chg_pct), _chg_pct))
-
-        if not _syms_with_change:
-            return
-
-        # Sort by absolute change%, pick top N movers for OI analysis
-        _syms_with_change.sort(key=lambda x: x[1], reverse=True)
-        _scan_syms = []
-        for _s, _abs_chg, _chg in _syms_with_change:
-            if _abs_chg < 0.3:
-                break  # Below 0.3% change — not worth scanning
-            if _s in self._oi_watcher_fired_this_session:
-                continue
-            if self.tools.is_symbol_in_active_trades(_s):
-                continue
-            _scan_syms.append(_s)
-            if len(_scan_syms) >= self._oi_aggr_max_symbols:
-                break
-
-        if not _scan_syms:
-            return
-
-        # Parallel OI fetch (3 workers, budget-conscious)
-        from concurrent.futures import ThreadPoolExecutor as _OITP, as_completed as _oi_done
-        _oi_raw = {}
-        _fetch_start = _oiag_t.time()
-        with _OITP(max_workers=3, thread_name_prefix='oi-aggr') as _ex:
-            _futs = {_ex.submit(self._oi_analyzer.analyze, _s): _s for _s in _scan_syms}
-            try:
-                for _f in _oi_done(_futs, timeout=max(25, len(_scan_syms) * 3)):
-                    _sym = _futs[_f]
-                    try:
-                        _res = _f.result()
-                        if _res:
-                            _oi_raw[_sym] = _res
-                    except Exception as e:
-                        print(f"⚠️ FALLBACK [trader/oi_aggr_result]: {e}")
-            except Exception as e:
-                print(f"⚠️ FALLBACK [trader/oi_aggr_timeout]: {e}")  # Timeout — proceed with partial data
-        _fetch_dur = _oiag_t.time() - _fetch_start
-
-        # Score candidates: extract signal, strength, track history, detect acceleration
-        _candidates = []
-        _now_ts = _oiag_t.time()
-        for _sym, _res in _oi_raw.items():
-            _sig = _oi_signal_from_result(_res)
-            _dir = _oi_direction(_sig)
-            if not _dir:
-                continue  # NEUTRAL — skip
-            _str = _res.get('nse_oi_buildup_strength', 0.0)
-            # PCR surrogate (same as existing OI_WATCHER)
-            if _str < 0.01 and _sig and _sig not in ('NEUTRAL', ''):
-                _fc = _res.get('flow_confidence', 0.0)
-                if _fc > 0.1:
-                    _str = _fc
-
-            # ── SMART QUALITY SCORING (same as primary OI_WATCHER) ──
-            _part = _res.get('oi_participant_id', 'UNKNOWN')
-            _eff_str = _str
-            _ag_boosts = []
-            # (A) Participant quality: GRANULAR writer/buyer ratio
-            _ag_pid_detail = _res.get('oi_participant_detail', {})
-            _ag_writer_ratio = None
-            if _ag_pid_detail:
-                if _dir == 'BUY':  # LONG_BUILDUP → PE writers are conviction
-                    _ag_w_oi = _ag_pid_detail.get('pe_writer_oi', 0)
-                    _ag_b_oi = _ag_pid_detail.get('pe_buyer_oi', 0)
-                else:  # SHORT_BUILDUP → CE writers are conviction
-                    _ag_w_oi = _ag_pid_detail.get('ce_writer_oi', 0)
-                    _ag_b_oi = _ag_pid_detail.get('ce_buyer_oi', 0)
-                _ag_total_classified = _ag_w_oi + _ag_b_oi
-                if _ag_total_classified > 0:
-                    _ag_writer_ratio = _ag_w_oi / _ag_total_classified
-            if _ag_writer_ratio is not None:
-                if _ag_writer_ratio >= 0.85:
-                    _eff_str *= 1.25  # 85%+ writer = rock solid institutional conviction
-                    _ag_boosts.append(f'W✓✓{_ag_writer_ratio:.0%}')
-                elif _ag_writer_ratio >= 0.65:
-                    _eff_str *= 1.12  # Strong writer majority
-                    _ag_boosts.append(f'W✓{_ag_writer_ratio:.0%}')
-                elif _ag_writer_ratio >= 0.50:
-                    _eff_str *= 1.0   # Neutral — no boost
-                    _ag_boosts.append(f'W~{_ag_writer_ratio:.0%}')
-                else:
-                    _eff_str *= 0.75  # Buyer-dominated = hedging, NOT directional
-                    _ag_boosts.append(f'B✗{_ag_writer_ratio:.0%}')
-            else:
-                # Fallback to label when detail not available
-                if _part == 'WRITER_DOMINANT':
-                    _eff_str *= 1.15
-                    _ag_boosts.append('W+')
-                elif _part == 'BUYER_DOMINANT':
-                    _eff_str *= 0.85
-                    _ag_boosts.append('B-')
-            # (B) Cross-validation boost
-            if _res.get('oi_cross_validated'):
-                _eff_str *= 1.10
-                _ag_boosts.append('XV✓')
-            # (C) Price confirmation (we already have change% from _syms_with_change)
-            _ag_chg = next((_c for _s, _, _c in _syms_with_change if _s == _sym), None)
-            if _ag_chg is not None:
-                _ag_price_agrees = (
-                    (_dir == 'BUY' and _ag_chg > 0.3) or
-                    (_dir == 'SELL' and _ag_chg < -0.3)
-                )
-                _ag_price_diverges = (
-                    (_dir == 'BUY' and _ag_chg < -0.5) or
-                    (_dir == 'SELL' and _ag_chg > 0.5)
-                )
-                if _ag_price_agrees:
-                    _eff_str *= 1.08
-                    _ag_boosts.append(f'P✓{_ag_chg:+.1f}%')
-                elif _ag_price_diverges:
-                    _eff_str *= 0.90
-                    _ag_boosts.append(f'P✗{_ag_chg:+.1f}%')
-
-            # (E) Sector alignment (same as primary OI_WATCHER)
-            _ag_s2s = getattr(self, '_stock_to_sector', {})
-            _ag_sec_chgs = getattr(self, '_sector_index_changes_cache', {})
-            _ag_sec_info = _ag_s2s.get(_sym.replace('NSE:', ''))
-            if _ag_sec_info and _ag_sec_chgs:
-                _ag_sec_name, _ag_sec_idx = _ag_sec_info
-                _ag_sec_chg = _ag_sec_chgs.get(_ag_sec_idx, 0)
-                _ag_sec_agrees = (
-                    (_dir == 'BUY' and _ag_sec_chg > 0.3) or
-                    (_dir == 'SELL' and _ag_sec_chg < -0.3)
-                )
-                _ag_sec_oppose = (
-                    (_dir == 'BUY' and _ag_sec_chg < -0.5) or
-                    (_dir == 'SELL' and _ag_sec_chg > 0.5)
-                )
-                if _ag_sec_agrees:
-                    _eff_str *= 1.08
-                    _ag_boosts.append('SEC✓')
-                elif _ag_sec_oppose:
-                    _eff_str *= 0.88
-                    _ag_boosts.append('SEC✗')
-
-            # (F) Futures OI buildup cross-check
-            _ag_ml = getattr(self, '_cycle_ml_results', {})
-            _ag_ml_data = _ag_ml.get(_sym, {})
-            _ag_fut_buildup = _ag_ml_data.get('fut_oi_buildup', 0) if isinstance(_ag_ml_data, dict) else 0
-            if _ag_fut_buildup:
-                _ag_fut_agrees = (
-                    (_dir == 'BUY' and _ag_fut_buildup > 0) or
-                    (_dir == 'SELL' and _ag_fut_buildup < 0)
-                )
-                _ag_fut_strong = abs(_ag_fut_buildup) >= 0.75
-                if _ag_fut_agrees and _ag_fut_strong:
-                    _eff_str *= 1.12
-                    _ag_boosts.append('FUT✓✓')
-                elif _ag_fut_agrees:
-                    _eff_str *= 1.05
-                    _ag_boosts.append('FUT✓')
-                elif not _ag_fut_agrees and _ag_fut_strong:
-                    _eff_str *= 0.85
-                    _ag_boosts.append('FUT✗✗')
-
-            # (G) Live Futures Basis: premium/discount from ticker cache (0 API calls)
-            if _ticker:
-                try:
-                    _ag_fut_data = _ticker.get_futures_oi(_sym)
-                    if _ag_fut_data and _ag_fut_data.get('ltp', 0) > 0:
-                        _ag_fut_ltp = _ag_fut_data['ltp']
-                        _ag_eq_ltp = 0
-                        with getattr(_ticker, '_lock', threading.Lock()):
-                            for _tk2, _tsym2 in _ticker._token_to_symbol.items():
-                                if _tsym2 == _sym:
-                                    _ag_eq_ltp = _ticker._quote_cache.get(_tk2, {}).get('last_price', 0)
-                                    break
-                        if _ag_eq_ltp > 0:
-                            _ag_basis_pct = ((_ag_fut_ltp - _ag_eq_ltp) / _ag_eq_ltp) * 100
-                            _ag_basis_agrees = (
-                                (_dir == 'BUY' and _ag_basis_pct > 0.05) or
-                                (_dir == 'SELL' and _ag_basis_pct < -0.05)
-                            )
-                            _ag_basis_disagrees = (
-                                (_dir == 'BUY' and _ag_basis_pct < -0.10) or
-                                (_dir == 'SELL' and _ag_basis_pct > 0.10)
-                            )
-                            if _ag_basis_agrees:
-                                _eff_str *= 1.10
-                                _ag_boosts.append(f'BASIS✓{_ag_basis_pct:+.2f}%')
-                            elif _ag_basis_disagrees:
-                                _eff_str *= 0.90
-                                _ag_boosts.append(f'BASIS✗{_ag_basis_pct:+.2f}%')
-                except Exception as e:
-                    print(f"⚠️ FALLBACK [trader/oi_aggr_basis]: {e}")
-
-            # (H) OI Concentration vs Spot: near-ATM buildup = conviction, far OTM = hedging
-            _ag_spot = _res.get('spot_price', 0) or _res.get('dhan_spot_price', 0)
-            if _ag_spot > 0:
-                _ag_rel_strikes = (
-                    _res.get('nse_top_put_oi_change', []) if _dir == 'BUY'
-                    else _res.get('nse_top_call_oi_change', [])
-                )
-                if _ag_rel_strikes and len(_ag_rel_strikes) > 0:
-                    _ag_top_stk = _ag_rel_strikes[0][0] if isinstance(_ag_rel_strikes[0], (list, tuple)) else 0
-                    if _ag_top_stk > 0:
-                        _ag_stk_dist = abs(_ag_top_stk - _ag_spot) / _ag_spot * 100
-                        if _ag_stk_dist <= 2.0:
-                            _eff_str *= 1.10
-                            _ag_boosts.append(f'ATM✓{_ag_stk_dist:.1f}%')
-                        elif _ag_stk_dist >= 5.0:
-                            _eff_str *= 0.92
-                            _ag_boosts.append(f'OTM✗{_ag_stk_dist:.1f}%')
-
-            # (I) PCR Shift Rate: rate of PCR change
-            _ag_pcr_rate = _res.get('pcr_shift_rate', 0)
-            if abs(_ag_pcr_rate) > 0.005:
-                _ag_pcr_confirms = (
-                    (_dir == 'BUY' and _ag_pcr_rate > 0.01) or
-                    (_dir == 'SELL' and _ag_pcr_rate < -0.01)
-                )
-                _ag_pcr_opposes = (
-                    (_dir == 'BUY' and _ag_pcr_rate < -0.01) or
-                    (_dir == 'SELL' and _ag_pcr_rate > 0.01)
-                )
-                if _ag_pcr_confirms:
-                    _eff_str *= 1.08
-                    _ag_boosts.append(f'PCR↗{_ag_pcr_rate:+.3f}')
-                elif _ag_pcr_opposes:
-                    _eff_str *= 0.92
-                    _ag_boosts.append(f'PCR↘{_ag_pcr_rate:+.3f}')
-
-            # (J) Volume PCR: today's volume intent vs stale OI
-            _ag_vol_pcr = _res.get('nse_pcr_volume', 0)
-            if _ag_vol_pcr and _ag_vol_pcr > 0:
-                _ag_vp_confirms = (
-                    (_dir == 'BUY' and _ag_vol_pcr > 1.3) or
-                    (_dir == 'SELL' and _ag_vol_pcr < 0.7)
-                )
-                _ag_vp_opposes = (
-                    (_dir == 'BUY' and _ag_vol_pcr < 0.6) or
-                    (_dir == 'SELL' and _ag_vol_pcr > 1.5)
-                )
-                if _ag_vp_confirms:
-                    _eff_str *= 1.08
-                    _ag_boosts.append(f'VP✓{_ag_vol_pcr:.2f}')
-                elif _ag_vp_opposes:
-                    _eff_str *= 0.90
-                    _ag_boosts.append(f'VP✗{_ag_vol_pcr:.2f}')
-
-            # (K) Futures Conviction Boost: OI Day-High + Order Book Imbalance (BOOST-ONLY)
-            # Same as OI_WATCHER Factor K — uses Kite WebSocket futures data (0 API calls).
-            if _ticker:
-                try:
-                    _ag_fk = _ticker.get_futures_oi(_sym)
-                    if _ag_fk and _ag_fk.get('oi', 0) > 0:
-                        _ag_fk_oi = _ag_fk['oi']
-                        _ag_fk_high = _ag_fk.get('oi_day_high', 0)
-                        _ag_fk_low = _ag_fk.get('oi_day_low', 0)
-
-                        # K1: OI at Day-High = institutions actively adding
-                        if _ag_fk_high > _ag_fk_low > 0:
-                            _ag_fk_range = _ag_fk_high - _ag_fk_low
-                            _ag_fk_pos = (_ag_fk_oi - _ag_fk_low) / _ag_fk_range
-                            if _ag_fk_pos >= 0.85:
-                                _eff_str *= 1.18
-                                _ag_boosts.append(f'FOIDH✓{_ag_fk_pos:.0%}')
-                            elif _ag_fk_pos >= 0.65:
-                                _eff_str *= 1.08
-                                _ag_boosts.append(f'FOIDH~{_ag_fk_pos:.0%}')
-
-                        # K2: Futures Order Book Imbalance — confirms direction
-                        _ag_fk_buy = _ag_fk.get('buy_quantity', 0)
-                        _ag_fk_sell = _ag_fk.get('sell_quantity', 0)
-                        if _ag_fk_buy > 0 and _ag_fk_sell > 0:
-                            _ag_fk_imb = _ag_fk_buy / (_ag_fk_buy + _ag_fk_sell)
-                            _ag_fk_imb_confirms = (
-                                (_dir == 'BUY' and _ag_fk_imb > 0.55) or
-                                (_dir == 'SELL' and _ag_fk_imb < 0.45)
-                            )
-                            if _ag_fk_imb_confirms:
-                                _ag_boost_mult = 1.08 + min(0.10, abs(_ag_fk_imb - 0.50) * 0.5)
-                                _eff_str *= _ag_boost_mult
-                                _ag_boosts.append(f'FOBI✓{_ag_fk_imb:.0%}')
-                except Exception as e:
-                    print(f"⚠️ FALLBACK [trader/oi_aggr_fobi]: {e}")
-
-            _eff_str = min(1.0, _eff_str)
-            _res['_quality_boosts'] = ' '.join(_ag_boosts) if _ag_boosts else ''
-
-            # Track history for acceleration detection (keep last 5 reads)
-            if _sym not in self._oi_aggr_strength_history:
-                self._oi_aggr_strength_history[_sym] = []
-            _hist = self._oi_aggr_strength_history[_sym]
-            _hist.append((_now_ts, _eff_str, _sig))
-            if len(_hist) > 5:
-                self._oi_aggr_strength_history[_sym] = _hist[-5:]
-
-            # Detect acceleration: strength increasing across last 2 reads
-            _is_accel = False
-            _accel_delta = 0.0
-            if len(_hist) >= 2:
-                _prev_str = _hist[-2][1]
-                _accel_delta = _eff_str - _prev_str
-                _prev_sig_dir = _oi_direction(_hist[-2][2])
-                # Acceleration = same direction + strength increasing
-                if _accel_delta >= self._oi_aggr_accel_threshold and _prev_sig_dir == _dir:
-                    _is_accel = True
-
-            # Decision logic:
-            # 1. Strong buildup (≥0.45) → fire immediately, no acceleration needed
-            # 2. Moderate with acceleration (≥0.25 + accel) → fire immediately
-            # 3. Below thresholds → skip
-            _fire = False
-            _reason = ''
-            if _eff_str >= self._oi_aggr_strong_str:
-                _fire = True
-                _reason = f'STRONG str={_eff_str:.3f}≥{self._oi_aggr_strong_str}'
-            elif _is_accel and _eff_str >= self._oi_aggr_accel_min_str:
-                _fire = True
-                _reason = f'ACCEL str={_eff_str:.3f} Δ={_accel_delta:+.3f}'
-            elif _eff_str >= self._oi_watcher_min_strength:
-                # Standard threshold met but no acceleration — still add as candidate
-                # but lower priority than accelerating signals
-                _fire = True
-                _reason = f'STANDARD str={_eff_str:.3f}≥{self._oi_watcher_min_strength}'
-
-            if _fire:
-                _candidates.append((_sym, _dir, _sig, _eff_str, _res, _reason, _is_accel, _accel_delta))
-
-        if not _candidates:
-            self._wlog(f"🔬 OI_AGGR: Scanned {len(_scan_syms)} movers, fetched {len(_oi_raw)} OI "
-                       f"({_fetch_dur:.1f}s) — no LB/SB candidates")
-            return
-
-        # Sort: accelerating first, then by strength
-        _candidates.sort(key=lambda x: (x[6], x[3]), reverse=True)
-
-        self._wlog(f"🔬 OI_AGGR: Scanned {len(_scan_syms)} movers → {len(_candidates)} candidates "
-                   f"({_fetch_dur:.1f}s)")
-        for _c in _candidates[:5]:
-            _tag = '🚀ACCEL' if _c[6] else '⚡'
-            _ag_qt = _c[4].get('_quality_boosts', '')
-            self._wlog(f"  {_tag} {_c[0].replace('NSE:', '')} {_c[2]} str={_c[3]:.3f} "
-                       f"dir={_c[1]} part={_c[4].get('oi_participant_id', '?')} "
-                       f"quality=[{_ag_qt}] [{_c[5]}]")
-
-        # Fire top candidates — up to 3 if accelerating, 2 otherwise
-        _placed_this_scan = 0
-        _max_fire = 3 if _candidates[0][6] else 2  # [FIX Mar 19] Fire top-3 if accelerating, top-2 otherwise
-
-        for _c in _candidates:
-            if _placed_this_scan >= _max_fire:
-                break
-            if self._oi_watcher_total_placed >= self._oi_watcher_max_per_day:
-                break
-
-            _sym, _dir, _sig, _str, _res, _reason, _is_accel, _accel_delta = _c
-            _pcr = _res.get('pcr_oi', 1.0)
-            _bias = _res.get('flow_bias', 'NEUTRAL')
-            _part_id = _res.get('oi_participant_id', 'UNKNOWN')
-
-            # Heatmap strike picker
-            _strike_sel = 'ATM'
-            _hm_tag = ''
-            try:
-                from dhan_oi_fetcher import DhanOIFetcher
-                _hm_strikes = _res.get('dhan_strikes', [])
-                _hm_spot = _res.get('dhan_spot_price', 0)
-                if _hm_strikes and _hm_spot > 0:
-                    _hm = DhanOIFetcher.find_optimal_strike(_dir, _hm_strikes, _hm_spot)
-                    if _hm.get('score', 0) > 0:
-                        _strike_sel = _hm['selection']
-                        _hm_tag = (f" | HEATMAP: {_hm['selection']}@{_hm['strike']:.0f} "
-                                   f"score={_hm['score']:.0f} ({_hm['reason']})")
-            except Exception as e:
-                print(f"⚠️ FALLBACK [trader/oi_aggr_heatmap]: {e}")
-
-            _accel_tag = f' ACCEL(Δ={_accel_delta:+.3f})' if _is_accel else ''
-            self._wlog(f"🎯 OI_AGGR FIRE: {_sym.replace('NSE:', '')} {_sig} "
-                       f"str={_str:.3f} dir={_dir} PCR={_pcr:.2f} part={_part_id} "
-                       f"[{_reason}]{_accel_tag} strike={_strike_sel}{_hm_tag}")
-
-            _ml_data = {
-                'oi_signal': _sig,
-                'oi_strength': _str,
-                'oi_pcr': _pcr,
-                'oi_bias': _bias,
-                'oi_participant_id': _part_id,
-                'trade_type': 'OI_WATCHER',
-                'oi_heatmap_strike': _strike_sel,
-                'oi_aggressive': True,
-                'oi_acceleration': _is_accel,
-                'oi_accel_delta': round(_accel_delta, 4),
-            }
-
-            # ── 60-SECOND OI CONFIRMATION GATE + PRICE DELTA (OI_AGGR) ──
-            _ag_now_ts = _oiag_t.time()
-            _ag_spot_now = _res.get('spot_price', 0) or _res.get('dhan_spot_price', 0)
-            if not _ag_spot_now and _ticker:
-                try:
-                    with getattr(_ticker, '_lock', threading.Lock()):
-                        for _tk, _tsym in _ticker._token_to_symbol.items():
-                            if _tsym == _sym:
-                                _ag_spot_now = _ticker._quote_cache.get(_tk, {}).get('last_price', 0)
-                                break
-                except Exception as e:
-                    print(f"⚠️ FALLBACK [trader/oi_aggr_spot]: {e}")
-            _ag_pending = self._oi_pending_confirm.get(_sym)
-            if _ag_pending is None:
-                self._oi_pending_confirm[_sym] = {
-                    'ts': _ag_now_ts, 'direction': _dir,
-                    'strength': _str, 'signal': _sig, 'source': 'OI_AGGR',
-                    'spot_price': _ag_spot_now,
-                }
-                self._wlog(f"  ⏳ OI_AGGR PENDING: {_sym.replace('NSE:', '')} "
-                           f"{_sig} str={_str:.3f} dir={_dir} "
-                           f"spot={_ag_spot_now:.2f} — "
-                           f"waiting {self._oi_confirm_seconds}s confirmation")
-                continue
-            _ag_elapsed = _ag_now_ts - _ag_pending['ts']
-            if _ag_pending['direction'] != _dir:
-                self._oi_pending_confirm[_sym] = {
-                    'ts': _ag_now_ts, 'direction': _dir,
-                    'strength': _str, 'signal': _sig, 'source': 'OI_AGGR',
-                    'spot_price': _ag_spot_now,
-                }
-                self._wlog(f"  🔄 OI_AGGR RESET: {_sym.replace('NSE:', '')} "
-                           f"direction flipped {_ag_pending['direction']}→{_dir} — "
-                           f"restarting {self._oi_confirm_seconds}s wait")
-                continue
-            if _ag_elapsed < self._oi_confirm_seconds:
-                self._wlog(f"  ⏳ OI_AGGR WAITING: {_sym.replace('NSE:', '')} "
-                           f"{_sig} str={_str:.3f} — {_ag_elapsed:.0f}s / "
-                           f"{self._oi_confirm_seconds}s elapsed")
-                continue
-            # Time elapsed — check PRICE DELTA
-            _ag_spot_entry = _ag_pending.get('spot_price', 0)
-            _ag_price_ok = True
-            _ag_price_delta_pct = 0.0
-            if _ag_spot_entry > 0 and _ag_spot_now > 0:
-                _ag_price_delta_pct = ((_ag_spot_now - _ag_spot_entry) / _ag_spot_entry) * 100
-                if _dir == 'BUY' and _ag_price_delta_pct < self._oi_confirm_min_price_delta:
-                    _ag_price_ok = False
-                elif _dir == 'SELL' and _ag_price_delta_pct > -self._oi_confirm_min_price_delta:
-                    _ag_price_ok = False
-            if not _ag_price_ok:
-                self._wlog(f"  ❌ OI_AGGR PRICE REJECT: {_sym.replace('NSE:', '')} "
-                           f"{_sig} dir={_dir} — OI held {_ag_elapsed:.0f}s but "
-                           f"price Δ={_ag_price_delta_pct:+.2f}% — OI trap, skipping")
-                del self._oi_pending_confirm[_sym]
-                continue
-            # ✅ CONFIRMED: OI persisted + price moved in OI direction
-            self._wlog(f"  ✅ OI_AGGR CONFIRMED: {_sym.replace('NSE:', '')} "
-                       f"{_sig} str={_str:.3f} dir={_dir} — "
-                       f"held {_ag_elapsed:.0f}s, price Δ={_ag_price_delta_pct:+.2f}% → FIRING")
-            del self._oi_pending_confirm[_sym]
-
-            try:
-                with self._trade_lock:
-                    _result = self.tools.place_option_order(
-                        underlying=_sym,
-                        direction=_dir,
-                        strike_selection=_strike_sel,
-                        rationale=(f"OI_WATCHER_AGGR: {_sig} str={_str:.2f} "
-                                   f"PCR={_pcr:.2f} bias={_bias} "
-                                   f"[{_reason}]{_accel_tag} strike={_strike_sel}"
-                                   f"{_hm_tag}"),
-                        setup_type='OI_WATCHER',
-                        ml_data=_ml_data,
-                        pre_fetched_market_data={}
-                    )
-
-                if _result and _result.get('success'):
-                    self._wlog(f"  ✅ OI_AGGR PLACED: {_sym.replace('NSE:', '')} "
-                               f"({_dir}) {_sig} str={_str:.3f} order={_result.get('order_id', '?')}")
-                    self._oi_watcher_fired_this_session.add(_sym)
-                    self._oi_watcher_total_placed += 1
-                    self._watcher_fired_this_session.add(_sym)
-                    self._oi_watcher_entry_snapshots[_sym] = {
-                        'signal': _sig,
-                        'strength': _str,
-                        'direction': _dir,
-                        'participant': _part_id,
-                        'pcr': _pcr,
-                        'bias': _bias,
-                    }
-                    _cycle_ts = _oiag_dt.now().strftime('%Y-%m-%d %H:%M:%S')
-                    self._log_decision(
-                        _cycle_ts, _sym, _str * 100,
-                        'OI_WATCHER_AGGR_FIRED',
-                        reason=(f'Aggressive OI: {_sig} str={_str:.3f} '
-                                f'PCR={_pcr:.2f} [{_reason}]{_accel_tag}'),
-                        direction=_dir, setup='OI_WATCHER')
-                    _placed_this_scan += 1
-                else:
-                    _err = _result.get('error', 'unknown') if _result else 'no result'
-                    self._wlog(f"  ⚠️ OI_AGGR FAILED: {_sym.replace('NSE:', '')} — {_err}")
-            except Exception as _exc:
-                self._wlog(f"  ❌ OI_AGGR ERROR: {_sym.replace('NSE:', '')} — {_exc}")
-
-        # Prune stale history entries (older than 15 min or symbols not in scan)
-        _cutoff = _now_ts - 900
-        _stale_keys = [k for k, v in self._oi_aggr_strength_history.items()
-                       if v and v[-1][0] < _cutoff]
-        for _k in _stale_keys:
-            del self._oi_aggr_strength_history[_k]
-
-        # Prune stale OI pending confirmations (older than 5 min = signal expired)
-        _confirm_cutoff = _now_ts - self._oi_confirm_expiry
-        _stale_pending = [k for k, v in self._oi_pending_confirm.items()
-                          if v['ts'] < _confirm_cutoff]
-        for _k in _stale_pending:
-            self._wlog(f"  🗑️ OI PENDING EXPIRED: {_k.replace('NSE:', '')} — "
-                       f"signal did not reconfirm within {self._oi_confirm_expiry}s")
-            del self._oi_pending_confirm[_k]
-
-    # ========== WATCHER FOCUSED SCAN (FULL PIPELINE) ==========
     def _watcher_focused_scan(self, triggers: list):  # type: ignore[reportGeneralIssues]
         """
         Run the IDENTICAL pipeline as scan_and_trade for watcher-detected stocks.
@@ -2658,12 +1790,6 @@ class AutonomousTrader:
         
         No shortcuts.  No bypasses.  Full pipeline parity.
         """
-        from config import (
-            EARLYBIRD_COMMON as _EB_COM,
-            EARLYBIRD_A as _EB_A,
-            EARLYBIRD_B as _EB_B,
-            EARLYBIRD_C as _EB_C,
-        )
         _ts = datetime.now().strftime('%H:%M:%S')
         _trigger_map = {t['symbol']: t for t in triggers}
         _symbols = [t['symbol'] for t in triggers]
@@ -2899,7 +2025,8 @@ class AutonomousTrader:
             _drain_oi_results = dict(_prefetched_oi)  # Start with Layer 1 pre-fetched OI
             if _oi_futures:
                 try:
-                    for _fut in _as_done(_oi_futures, timeout=30):
+                    # Apr 21: 30s→45s — tolerate Kite congestion during OI_AGGR window
+                    for _fut in _as_done(_oi_futures, timeout=45):
                         _oi_sym = _oi_futures[_fut]
                         try:
                             _oi_result = _fut.result()
@@ -2981,11 +2108,12 @@ class AutonomousTrader:
                     if not _cd or not _cd.get('decision'):
                         continue
                     _scored_dir = _cd['decision'].recommended_direction
-                    # OI overrides even HOLD — operators have positioned, follow them
+                    # Log OI vs scorer direction for diagnostics (no override —
+                    # direction reconciliation happens in gate check where trigger
+                    # direction is known). OI+trigger alignment is handled there.
                     if _scored_dir != _oi_dir:
-                        _cd['decision'].recommended_direction = _oi_dir
-                        self._wlog(f"OI OVERRIDE: {_oi_sym.replace('NSE:', '')} "
-                              f"{_scored_dir} → {_oi_dir} (OI={_oi_signal})")
+                        self._wlog(f"OI NOTE: {_oi_sym.replace('NSE:', '')} "
+                              f"scorer={_scored_dir} vs OI={_oi_signal} — resolved at gate check")
                 except Exception as e:
                     print(f"⚠️ FALLBACK [trader/oi_direction_override]: {e}")
             
@@ -3200,47 +2328,12 @@ class AutonomousTrader:
                                 _trigger_bonus += 1  # Smart money backing surge
                         elif _vs_oi_dir and _vs_oi_dir != _vs_expect and _vs_oi_str >= 0.30:
                             _trigger_bonus -= 3  # OI contradicts surge — likely noise
-                elif 'EARLYBIRD' in _trigger_type:
-                    # Per-mode Earlybird bonus: A > B > C
-                    _eb_mode = _trigger.get('earlybird_mode', 'B')
-                    if _eb_mode == 'A':
-                        _trigger_bonus = _EB_A.get('trigger_bonus', 15)
-                        if _trigger.get('has_gap', False):
-                            _trigger_bonus += _EB_A.get('gap_bonus', 5)
-                        if _trigger.get('strong_gap', False):
-                            _trigger_bonus += _EB_A.get('strong_gap_bonus', 3)
-                    elif _eb_mode == 'C':
-                        _trigger_bonus = _EB_C.get('trigger_bonus', 7)
-                    else:
-                        _trigger_bonus = _EB_B.get('trigger_bonus', 10)
-                    # Large opening move bonus (all modes)
-                    _eb_open_move = abs(_trigger.get('open_move_pct', 0))
-                    if _eb_open_move >= 1.5:
+                elif _trigger_type == 'INTRADAY_NEWS':
+                    # Breaking news during market hours — moderate bonus
+                    _news_conf = _trigger.get('news_confidence', 0)
+                    _trigger_bonus = 12  # Lower than earlybird (less pre-validated)
+                    if _news_conf >= 65:
                         _trigger_bonus += 3
-                    elif _eb_open_move >= 1.0:
-                        _trigger_bonus += 1
-                    # Market-context adjustments
-                    if _EB_COM.get('market_context_enabled', True):
-                        if _trigger.get('is_idiosyncratic', False):
-                            _trigger_bonus += _EB_COM.get('idiosyncratic_bonus', 4)
-                        if _trigger.get('is_beta_driven', False):
-                            _trigger_bonus -= _EB_COM.get('beta_penalty', 5)
-                        # Sector alignment check: if sector index moves same direction, penalize
-                        _eb_sec_chgs = getattr(self, '_sector_index_changes_cache', {})
-                        if _eb_sec_chgs:
-                            _eb_stock_clean = _sym.replace('NSE:', '')
-                            _eb_sec_penalty_applied = False
-                            for _eb_sec_name, _eb_sec_info in self._arbtr_sector_map.items():
-                                if _eb_stock_clean in _eb_sec_info.get('stocks', []):
-                                    _eb_sec_idx = _eb_sec_info.get('index', '')
-                                    _eb_sec_chg = _eb_sec_chgs.get(_eb_sec_idx, 0)
-                                    _eb_stock_dir = _trigger.get('open_move_pct', 0)
-                                    if abs(_eb_sec_chg) >= 0.3 and (
-                                        (_eb_sec_chg > 0 and _eb_stock_dir > 0) or
-                                        (_eb_sec_chg < 0 and _eb_stock_dir < 0)):
-                                        _trigger_bonus -= _EB_COM.get('sector_aligned_penalty', 3)
-                                        _eb_sec_penalty_applied = True
-                                    break
                 _final_score += _trigger_bonus
                 
                 # ── OI Sustain Confirmation score bonus ──
@@ -3279,12 +2372,12 @@ class AutonomousTrader:
                 direction = None
                 _ml_data_spike_rev = False  # Set True by Gate F2 spike reversal flip
                 _trigger_dir = None  # What the trigger implies
-                if _trigger_type in ('PRICE_SPIKE_UP', 'NEW_DAY_HIGH', 'SLOW_GRIND_UP', 'EARLYBIRD_UP',
-                                     'EARLYBIRD_A_UP', 'EARLYBIRD_B_UP', 'EARLYBIRD_C_UP'):
+                if _trigger_type in ('PRICE_SPIKE_UP', 'NEW_DAY_HIGH', 'SLOW_GRIND_UP'):
                     _trigger_dir = 'BUY'
-                elif _trigger_type in ('PRICE_SPIKE_DOWN', 'NEW_DAY_LOW', 'SLOW_GRIND_DOWN', 'EARLYBIRD_DOWN',
-                                       'EARLYBIRD_A_DOWN', 'EARLYBIRD_B_DOWN', 'EARLYBIRD_C_DOWN'):
+                elif _trigger_type in ('PRICE_SPIKE_DOWN', 'NEW_DAY_LOW', 'SLOW_GRIND_DOWN'):
                     _trigger_dir = 'SELL'
+                elif _trigger_type == 'INTRADAY_NEWS':
+                    _trigger_dir = _trigger.get('direction', 'BUY')
                 else:
                     _trigger_dir = 'BUY' if _move_pct > 0 else 'SELL'
                 
@@ -3292,6 +2385,16 @@ class AutonomousTrader:
                 _dir_conf_val = 0
                 if hasattr(_decision, 'recommended_direction') and _decision.recommended_direction not in ('HOLD', None, ''):
                     _scorer_dir = _decision.recommended_direction
+                
+                # [FIX Apr 9] SPIKE BUY → use scorer direction, not tracker direction
+                # Rationale: upward spikes are often exhaustion moves / traps;
+                # scorer's technical view is more reliable than raw spike direction.
+                # SELL spikes are kept as-is (momentum is trustworthy on the downside).
+                if _trigger_type == 'PRICE_SPIKE_UP' and _scorer_dir:
+                    if _scorer_dir != _trigger_dir:
+                        self._wlog(f"🔄 SPIKE_BUY→SCORER: {_sym.replace('NSE:', '')} "
+                                   f"spike_dir=BUY but scorer={_scorer_dir} → using scorer direction")
+                    _trigger_dir = _scorer_dir  # override tracker dir with scorer dir
                 
                 if _scorer_dir and _scorer_dir == _trigger_dir:
                     # Agreement — strongest signal, use scorer direction
@@ -3323,18 +2426,30 @@ class AutonomousTrader:
                         if _fc > 0.1:
                             _oi_str_dc = _fc
                             _oi_src = 'PCR'
-                    # Double conviction requires: OI agrees with scorer + scorer confident + OI strong enough
-                    _double_conviction = (_oi_dir_dc == _scorer_dir and _dir_conf_val >= 60 and _oi_str_dc >= 0.35)
-                    if _double_conviction:
-                        # Scorer + OI consensus overrides trigger direction
-                        direction = _scorer_dir
-                        # Scale penalty by OI strength: stronger OI = more conviction = less penalty
-                        _dc_penalty = 3 if _oi_str_dc < 0.50 else (1 if _oi_str_dc >= 0.70 else 2)
-                        _final_score -= _dc_penalty
-                        self._wlog(f"🔄 DOUBLE CONVICTION: {_sym.replace('NSE:', '')} "
+                    # ── DOUBLE CONVICTION: OI + TRIGGER ALIGNMENT ──
+                    # When OI buildup confirms trigger direction, that's the strongest
+                    # conviction — institutional flow + real price movement aligned.
+                    # Scorer alone should NOT override trigger+OI alignment.
+                    _oi_trigger_aligned = (_oi_dir_dc == _trigger_dir and _oi_str_dc >= 0.35)
+                    _oi_scorer_aligned = (_oi_dir_dc == _scorer_dir and _dir_conf_val >= 60 and _oi_str_dc >= 0.35)
+                    if _oi_trigger_aligned:
+                        # OI + trigger agree → strongest conviction, use trigger direction + bonus
+                        direction = _trigger_dir
+                        _dc_bonus = 3 if _oi_str_dc >= 0.70 else (2 if _oi_str_dc >= 0.50 else 1)
+                        _final_score += _dc_bonus
+                        self._wlog(f"✅ DOUBLE CONVICTION: {_sym.replace('NSE:', '')} "
+                                   f"{_oi_src}={_oi_sig_dc}(str={_oi_str_dc:.0%}) + trigger={_trigger_dir}({_trigger_type}) ALIGNED "
+                                   f"→ CONFIRMING {_trigger_dir} (score +{_dc_bonus}) "
+                                   f"[scorer={_scorer_dir}(conf={_dir_conf_val:.0f}%) disagrees — overruled] "
+                                   f"[ΔCE:{_oi_ce_chg:+,} ΔPE:{_oi_pe_chg:+,} PCR:{_oi_pcr:.2f}]")
+                    elif _oi_scorer_aligned:
+                        # OI + scorer agree against trigger — trust price action, keep trigger
+                        direction = _trigger_dir
+                        _final_score -= 2
+                        self._wlog(f"⚠️ DOUBLE CONFLICT: {_sym.replace('NSE:', '')} "
                                    f"scorer={_scorer_dir}(conf={_dir_conf_val:.0f}%) + {_oi_src}={_oi_sig_dc}(str={_oi_str_dc:.0%}) "
-                                   f"BOTH oppose trigger={_trigger_dir}({_trigger_type}) "
-                                   f"→ FLIPPING to {_scorer_dir} (score -{_dc_penalty}) "
+                                   f"oppose trigger={_trigger_dir}({_trigger_type}) "
+                                   f"→ KEEPING {_trigger_dir} (score -2, trusting price action) "
                                    f"[ΔCE:{_oi_ce_chg:+,} ΔPE:{_oi_pe_chg:+,} PCR:{_oi_pcr:.2f}]")
                     else:
                         # Single-sided conflict: trust trigger momentum
@@ -3349,9 +2464,9 @@ class AutonomousTrader:
                     # Scorer said HOLD — use trigger direction
                     direction = _trigger_dir
                 
-                # ── OI DIRECTION OVERRIDE — OI is authoritative, overrides both ──
-                # Operators build OI positions first, then move the underlying.
-                # If OI says directional, it overrides scorer AND trigger.
+                # ── OI DIRECTION OVERRIDE ──
+                # OI confirms trigger → boost already done in DOUBLE CONVICTION.
+                # OI opposes trigger → only override if very strong (≥0.70).
                 _oi_override_dir = None
                 _sym_oi = _oi_results.get(_sym, {})
                 if _sym_oi:
@@ -3360,12 +2475,41 @@ class AutonomousTrader:
                     _oi_str_here = _sym_oi.get('nse_oi_buildup_strength', 0.0)
                     if _oi_dir_here and _oi_str_here >= 0.40:
                         if _oi_dir_here != direction:
-                            _oi_override_dir = _oi_dir_here
-                            self._wlog(f"🔄 OI OVERRIDE: {_sym.replace('NSE:', '')} "
-                                       f"{direction} → {_oi_dir_here} "
-                                       f"(OI={_oi_sig_here} str={_oi_str_here:.2f} > trigger={_trigger_dir})")
-                            direction = _oi_dir_here
+                            if _oi_dir_here == _trigger_dir:
+                                # OI agrees with trigger, aligns direction
+                                _oi_override_dir = _oi_dir_here
+                                self._wlog(f"🔄 OI+TRIGGER ALIGN: {_sym.replace('NSE:', '')} "
+                                           f"{direction} → {_oi_dir_here} "
+                                           f"(OI={_oi_sig_here} str={_oi_str_here:.2f} confirms trigger={_trigger_dir})")
+                                direction = _oi_dir_here
+                            elif _oi_str_here >= 0.70:
+                                # OI opposes trigger but very strong — override with penalty
+                                _oi_override_dir = _oi_dir_here
+                                _final_score -= 3
+                                self._wlog(f"🔄 OI OVERRIDE(STRONG): {_sym.replace('NSE:', '')} "
+                                           f"{direction} → {_oi_dir_here} "
+                                           f"(OI={_oi_sig_here} str={_oi_str_here:.2f} opposes trigger={_trigger_dir}, very strong) (score -3)")
+                                direction = _oi_dir_here
+                            else:
+                                self._wlog(f"⚠️ OI OVERRIDE SKIPPED: {_sym.replace('NSE:', '')} "
+                                           f"OI={_oi_sig_here} str={_oi_str_here:.2f} opposes trigger={_trigger_dir} "
+                                           f"— not strong enough to override (need ≥0.70)")
                 
+
+                # -- Gate: WATCHER BREADTH CONFLICT (Apr 20) --
+                # Don't buy CEs in BEARISH market, don't buy PEs in BULLISH market
+                if _market_breadth in ('BULLISH', 'BEARISH'):
+                    _watcher_breadth_conflict = (
+                        (direction == 'SELL' and _market_breadth == 'BULLISH') or
+                        (direction == 'BUY' and _market_breadth == 'BEARISH')
+                    )
+                    if _watcher_breadth_conflict:
+                        self._wlog(f"  BLOCKED(BREADTH): {_stock_name} {direction} conflicts with {_market_breadth} market")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_BREADTH_CONFLICT',
+                                          reason=f'{direction} trade vs {_market_breadth} market breadth',
+                                          direction=direction)
+                        continue
                 # ── Direction-aware VIX penalty ──
                 # High VIX + SELL direction on bearish day = PE buying = VIX helps → no penalty
                 # High VIX + BUY direction on bearish day = CE buying = VIX hurts → full penalty
@@ -3476,6 +2620,11 @@ class AutonomousTrader:
                     _late_decay = -12
                 elif _abs_change >= 1.8:
                     _late_decay = -6
+                # INTRADAY_NEWS triggers have fundamental catalysts that sustain moves.
+                # Skip late-decay entirely — the move is news-driven, not exhaustion.
+                if _late_decay < 0 and _trigger_type == 'INTRADAY_NEWS':
+                    self._wlog(f"  LATE-DECAY SKIP: {_stock_name} is INTRADAY_NEWS — catalyst-driven move, no penalty (was {_late_decay})")
+                    _late_decay = 0
                 # SLOW_GRIND = persistent multi-minute trend, not exhaustion.
                 # A stock grinding steadily for hours IS the trend — penalize
                 # less than a sudden spike at the same intraday level.
@@ -3535,7 +2684,7 @@ class AutonomousTrader:
                     if _g_adx < 20 and not _g_vol_confirmed:
                         _grind_slope_blocked = True
                         _grind_slope_reason = f'no-trend: ADX={_g_adx:.0f}<20 + no vol'
-                    elif _g_freshness < 0.25 and _final_score < 55:
+                    elif _g_freshness < 0.20 and _final_score < 55:
                         _grind_slope_blocked = True
                         _grind_slope_reason = f'chasing-crumbs: fresh={_g_freshness:.2f} score={_final_score:.0f}'
 
@@ -3553,17 +2702,17 @@ class AutonomousTrader:
                     # Each negative signal adds weighted points. If total >= threshold → block.
                     if not _grind_slope_blocked and not _g_strong and not _g_writer_backed:
                         # --- Penalties (grind is dying) ---
-                        # Velocity dying: current vel < 40% of peak (ADX≥50+vol overrides)
+                        # Velocity dying: current vel < 30% of peak (ADX≥50+vol overrides)
                         if _g_peak_vel > 0.10:
                             _vel_ratio = _g_velocity / _g_peak_vel if _g_peak_vel > 0 else 1.0
-                            if _vel_ratio < 0.40 and not (_g_adx >= 50 and _g_vol_confirmed):
-                                _fade_score += 3
+                            if _vel_ratio < 0.30 and not (_g_adx >= 50 and _g_vol_confirmed):
+                                _fade_score += 2
                                 _fade_tags.append(f'vel({_vel_ratio:.2f})')
 
                         # 60s stall: last minute barely moved (skip early market — gaps show false stalls)
                         if _g_sb_move >= 0 and abs(_move_pct) > 0.3 and not _g_early:
-                            if _g_sb_move / abs(_move_pct) < 0.15:
-                                _fade_score += 3
+                            if _g_sb_move / abs(_move_pct) < 0.10:
+                                _fade_score += 2
                                 _fade_tags.append('stall_60s')
 
                         # Staleness: trigger is chasing the tail of the move
@@ -3598,7 +2747,7 @@ class AutonomousTrader:
                             _fade_score -= 1  # ML sees continuation probability
 
                         # Block threshold: weaker score = easier to block
-                        _fade_thresh = 3 if _final_score < 50 else 5 if _final_score < 65 else 99
+                        _fade_thresh = 5 if _final_score < 50 else 7 if _final_score < 65 else 99
                         if _fade_score >= _fade_thresh:
                             _grind_slope_blocked = True
                             _grind_slope_reason = (f'fading({_fade_score}/{_fade_thresh}): '
@@ -3619,23 +2768,27 @@ class AutonomousTrader:
                         self._wlog(f"  ⚠️ SLOPE-WARN: {_stock_name} fade={_fade_score}/{_fade_thresh} [{'+'.join(_fade_tags) if _fade_tags else 'ok'}] | {_slope_detail}")
                 
                 # --- GATE A: Score threshold (with early-market hardening) ---
-                # EARLYBIRD uses per-mode min_score (A most relaxed, C tightest)
-                _is_earlybird = 'EARLYBIRD' in _trigger_type
-                _eb_mode = _trigger.get('earlybird_mode', 'B') if _is_earlybird else ''
+                _is_earlybird = False  # EARLYBIRD REMOVED
+                _is_news_trigger = (_trigger_type == 'INTRADAY_NEWS')
+                _eb_mode = ''  # EARLYBIRD removed
                 _now_t = datetime.now()
                 _early_mkt_end = BREAKOUT_WATCHER.get('early_market_end', '09:55')
                 _em_h, _em_m = int(_early_mkt_end.split(':')[0]), int(_early_mkt_end.split(':')[1])
                 _is_early_market = _now_t.hour < _em_h or (_now_t.hour == _em_h and _now_t.minute < _em_m)
-                if _is_earlybird:
-                    _eb_mode_cfg = {'A': _EB_A, 'B': _EB_B, 'C': _EB_C}.get(_eb_mode, _EB_B)
-                    _effective_min = _eb_mode_cfg.get('min_score', 25)
+                if _is_news_trigger:
+                    _effective_min = 15  # Min score for news triggers
                 elif _is_early_market:
                     _early_min_score = BREAKOUT_WATCHER.get('early_market_min_score', 50)
                     _effective_min = max(_min_score, _early_min_score)
                 else:
                     _effective_min = _min_score
+                # [Apr 16] Grind-specific min_score — grinds are slower moves, need
+                # stronger conviction than spikes/day-breaks.
+                if _trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN'):
+                    _grind_min = BREAKOUT_WATCHER.get('grind_min_score', 48)
+                    _effective_min = max(_effective_min, _grind_min)
                 if _final_score <= _effective_min:
-                    _tag = "A-SCORE-EARLY" if _is_early_market and _effective_min > _min_score else "A-SCORE"
+                    _tag = "A-SCORE-EARLY" if _is_early_market and _effective_min > _min_score else ("A-GRIND" if _trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN') and _effective_min >= _grind_min else "A-SCORE")
                     self._wlog(f"  BLOCKED({_tag}): {_stock_name} score={_final_score:.0f} <= {_effective_min}{' (early market hardening)' if _is_early_market and _effective_min > _min_score else ''}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_SCORE',
@@ -3687,15 +2840,60 @@ class AutonomousTrader:
                               f'vol={vol}({"✓" if _b2_vol_ok else "✗"}) '
                               f'VWAP={_b2_vwap}({"✓" if _b2_vwap_ok else "✗"})')
 
-                if _b2_confirms < 2:
-                    self._wlog(f"  BLOCKED(B2-CONVICTION): {_stock_name} {_b2_confirms}/4 confirms: {_b2_detail}")
+                _b2_min_needed = 2
+                if _b2_confirms < _b2_min_needed:
+                    self._wlog(f"  BLOCKED(B2-CONVICTION): {_stock_name} {_b2_confirms}/4 confirms < {_b2_min_needed}: {_b2_detail}")
                     self._watcher_total_gate_blocked += 1
                     self._log_decision(_ts, _sym, _final_score, 'WATCHER_LOW_CONVICTION',
-                                      reason=f'Momentum conviction {_b2_confirms}/4 < 2: {_b2_detail}',
+                                      reason=f'Momentum conviction {_b2_confirms}/4 < {_b2_min_needed}: {_b2_detail}',
                                       direction=direction)
                     continue
                 _conviction_tag = '🔥HIGH' if _b2_confirms >= 3 else '✓OK'
                 self._wlog(f"  PASSED(B2-CONVICTION): {_stock_name} {_b2_confirms}/4 [{_conviction_tag}]: {_b2_detail}")
+
+                # --- GATE B2-OI-ANCHOR: Grind must pass 1/4 OI anchor factors (F, H, K, N) ---
+                # Apr 2: SLOW_GRIND needs institutional OI validation via the OI_WATCHER
+                # anchor pool. The OI_WATCHER engine computes _mf_F (Futures OI buildup),
+                # _mf_H (OI concentration near ATM), _mf_K (Futures conviction),
+                # _mf_N (Net OI / volume) on Layer 1 data.
+                # Require at least 1 of evaluable anchors to confirm for grind trades.
+                # Apr 15 RCA: Only count factors where data was available to evaluate.
+                # "No data" (F/H/K/N not evaluable) ≠ "data says no" (F/H/K/N = False).
+                # Many stocks lack futures data or strike-level OI — don't block on missing data.
+                if _trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN'):
+                    _grind_oi_data = _oi_results.get(_sym, {})
+                    _grind_mf_F = _grind_oi_data.get('_mf_F', False)
+                    _grind_mf_H = _grind_oi_data.get('_mf_H', False)
+                    _grind_mf_K = _grind_oi_data.get('_mf_K', False)
+                    _grind_mf_N = _grind_oi_data.get('_mf_N', False)
+                    _grind_anchor_count = sum([_grind_mf_F, _grind_mf_H, _grind_mf_K, _grind_mf_N])
+                    # Apr 15 RCA: Check how many factors had data to evaluate
+                    _grind_eval_F = _grind_oi_data.get('_mf_F_eval', False)
+                    _grind_eval_H = _grind_oi_data.get('_mf_H_eval', False)
+                    _grind_eval_K = _grind_oi_data.get('_mf_K_eval', False)
+                    _grind_eval_N = _grind_oi_data.get('_mf_N_eval', False)
+                    _grind_evaluable = sum([_grind_eval_F, _grind_eval_H, _grind_eval_K, _grind_eval_N])
+                    _grind_anchor_detail = (f'F(FutOI)={"✓" if _grind_mf_F else "?" if not _grind_eval_F else "✗"} '
+                                            f'H(ATM)={"✓" if _grind_mf_H else "?" if not _grind_eval_H else "✗"} '
+                                            f'K(FutConv)={"✓" if _grind_mf_K else "?" if not _grind_eval_K else "✗"} '
+                                            f'N(NetOI)={"✓" if _grind_mf_N else "?" if not _grind_eval_N else "✗"}')
+                    if _grind_evaluable == 0:
+                        # Apr 20 FIX: No institutional data = BLOCK (was bypass)
+                        self._wlog(f"  BLOCKED(B2-OI-ANCHOR): {_stock_name} GRIND -- 0/4 factors evaluable (no data) -- {_grind_anchor_detail}")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_GRIND_NO_OI_DATA',
+                                          reason=f'Grind OI anchor: 0/4 factors evaluable (no institutional data): {_grind_anchor_detail}',
+                                          direction=direction)
+                        continue
+                    elif _grind_anchor_count < 1:
+                        self._wlog(f"  BLOCKED(B2-OI-ANCHOR): {_stock_name} GRIND needs ≥1/{_grind_evaluable} anchor — {_grind_anchor_detail}")
+                        self._watcher_total_gate_blocked += 1
+                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_GRIND_NO_OI_ANCHOR',
+                                          reason=f'Grind OI anchor 0/{_grind_evaluable}: {_grind_anchor_detail}',
+                                          direction=direction)
+                        continue
+                    else:
+                        self._wlog(f"  PASSED(B2-OI-ANCHOR): {_stock_name} {_grind_anchor_count}/{_grind_evaluable} anchors — {_grind_anchor_detail}")
 
                 # --- GATE C2: MOVE BUDGET — ATR-based entry quality (options-specific) ---
                 # Options premium inflates as the stock moves further from open.
@@ -3710,7 +2908,7 @@ class AutonomousTrader:
                 # Relaxations:
                 #   - Breadth-aligned trending days: threshold 90% (trend extends range)
                 #   - Score ≥ 60: threshold 90% (strong conviction = momentum continuation)
-                #   - EARLYBIRD: skip (range hasn't formed yet)
+
                 _c2_open = _data.get('open', 0)
                 _c2_ltp = _data.get('ltp', 0)
                 _c2_high = _data.get('high', _c2_ltp)
@@ -3727,16 +2925,15 @@ class AutonomousTrader:
                     _breadth_aligns = ((direction == 'BUY' and _breadth == 'BULLISH') or
                                        (direction == 'SELL' and _breadth == 'BEARISH'))
                     if _breadth_aligns:
-                        _c2_thresh = 0.90
-                        _c2_boosts.append(f'breadth({_breadth})+10%')
+                        _c2_thresh = 0.85  # [FIX Apr 9] tightened from 0.90
+                        _c2_boosts.append(f'breadth({_breadth})+5%')
                 if _final_score >= 60:
                     _c2_thresh = max(_c2_thresh, 0.90)
                     _c2_boosts.append(f'score({_final_score:.0f})+10%')
                 _c2_boost_str = f" (relaxed to {_c2_thresh:.0%}: {','.join(_c2_boosts)})" if _c2_boosts else ""
 
-                _is_earlybird = 'EARLYBIRD' in _trigger_type
                 adx_val = _data.get('adx', 20)  # Needed by Gate E below
-                if not _is_earlybird and _c2_budget_used >= _c2_thresh and _c2_range > 0.5:
+                if _c2_budget_used >= _c2_thresh and _c2_range > 0.5:
                     self._wlog(f"  BLOCKED(C2-BUDGET): {_stock_name} move_budget={_c2_budget_pct:.0f}% >= {_c2_thresh:.0%} | "
                                f"open={_c2_open:.1f} ltp={_c2_ltp:.1f} range={_c2_range:.1f}{_c2_boost_str}")
                     self._watcher_total_gate_blocked += 1
@@ -3751,6 +2948,7 @@ class AutonomousTrader:
                 # adx_val already fetched above for FT gate
                 # [Mar-28] Skip for SLOW_GRIND triggers — G-SLOPE Layer 1 already
                 # checks ADX<20+no_vol for grinds, so E is redundant for them.
+
                 _adx_min = BREAKOUT_WATCHER.get('watcher_min_adx', 20)
                 if adx_val < _adx_min and _trigger_type not in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN'):
                     self._wlog(f"  BLOCKED(E-ADX): {_stock_name} ADX={adx_val:.0f} < {_adx_min}")
@@ -3964,7 +3162,7 @@ class AutonomousTrader:
                     or (direction == 'BUY' and _breadth in ('BULLISH',))
                 )
                 if _breadth_confirms_ei:
-                    _ei_threshold += 15  # 70 → 85 on regime-aligned trending days
+                    _ei_threshold += 10  # [FIX Apr 9] tightened from +15 → +10 (70 → 80)
                 # Score-based EI boost: high score = many confirming signals.
                 # If the scorer rated this setup highly DESPITE the big move,
                 # the move is momentum-backed, not exhaustion.
@@ -4100,22 +3298,9 @@ class AutonomousTrader:
                 _ml_data['depth_imbalance'] = _trigger.get('depth_imbalance', 0)
                 # SPIKE + SURGE co-fire → double lot flag
                 _ml_data['spike_plus_surge'] = _trigger.get('spike_plus_surge', False)
-                # EARLYBIRD metadata for position tracking (per-mode)
-                if 'EARLYBIRD' in _trigger_type:
-                    _ml_data['earlybird'] = True
-                    _ml_data['earlybird_mode'] = _trigger.get('earlybird_mode', 'B')
-                    _ml_data['earlybird_gap_pct'] = _trigger.get('gap_pct', 0)
-                    _ml_data['earlybird_reason'] = _trigger.get('earlybird_reason', '')
-                    _ml_data['earlybird_has_gap'] = _trigger.get('has_gap', False)
-                    _ml_data['earlybird_strong_gap'] = _trigger.get('strong_gap', False)
-                    _ml_data['earlybird_nifty_change'] = _trigger.get('nifty_change_pct', 0)
-                    _ml_data['earlybird_idiosyncratic'] = _trigger.get('is_idiosyncratic', False)
-                    _ml_data['earlybird_beta_driven'] = _trigger.get('is_beta_driven', False)
                 
                 # Setup type includes trigger for identification in positions tab
-                if 'EARLYBIRD' in _trigger_type:
-                    _setup_type = f'WATCHER_{_trigger_type}'
-                elif 'DAY' in _trigger_type or 'SPIKE' in _trigger_type:
+                if 'DAY' in _trigger_type or 'SPIKE' in _trigger_type:
                     _setup_type = f'WATCHER_{_trigger_type}'
                 elif 'GRIND' in _trigger_type:
                     _setup_type = f'WATCHER_{_trigger_type}'
@@ -4125,18 +3310,18 @@ class AutonomousTrader:
                     _setup_type = f'WATCHER_{_trigger_type}' if _trigger_type else 'WATCHER'
                 
                 # --- GATE I: ORB-specific tightening (higher bar for SPIKE/DAY triggers) ---
-                # EARLYBIRD skips this gate (has its own scoring)
-                if not _is_earlybird and ('DAY' in _trigger_type or 'SPIKE' in _trigger_type):
+                if not _is_news_trigger and ('DAY' in _trigger_type or 'SPIKE' in _trigger_type):
                     _orb_min_score = BREAKOUT_WATCHER.get('orb_min_score', 45)
                     _orb_min_move_base = BREAKOUT_WATCHER.get('orb_min_move_prob', 0.55)
                     # Relax ORB P(move) when breadth confirms direction
-                    _orb_min_move = 0.45 if _breadth_confirms_dir else _orb_min_move_base
+                    # [FIX Apr 9] tightened from 0.45 → 0.48
+                    _orb_min_move = 0.48 if _breadth_confirms_dir else _orb_min_move_base
                     _xgb_mp = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
-                    if _final_score < _orb_min_score:
-                        self._wlog(f"  BLOCKED(I-ORB_SCORE): {_stock_name} ORB score={_final_score:.0f} < {_orb_min_score}")
+                    if _final_score <= _orb_min_score:
+                        self._wlog(f"  BLOCKED(I-ORB_SCORE): {_stock_name} ORB score={_final_score:.0f} <= {_orb_min_score}")
                         self._watcher_total_gate_blocked += 1
                         self._log_decision(_ts, _sym, _final_score, 'WATCHER_ORB_LOW_SCORE',
-                                          reason=f'ORB_BREAKOUT score {_final_score:.0f} < {_orb_min_score}',
+                                          reason=f'ORB_BREAKOUT score {_final_score:.0f} <= {_orb_min_score}',
                                           direction=direction)
                         continue
                     if _xgb_mp > 0 and _xgb_mp < _orb_min_move:
@@ -4149,23 +3334,28 @@ class AutonomousTrader:
 
                 # --- GATE I-W: WATCHER P(move) floor (all non-SPIKE/DAY watcher triggers) ---
                 elif _setup_type.startswith('WATCHER'):
-                    # EARLYBIRD uses per-mode P(move) floor
-                    if _is_earlybird:
-                        _eb_mode_cfg = {'A': _EB_A, 'B': _EB_B, 'C': _EB_C}.get(_eb_mode, _EB_B)
-                        _w_min_move = _eb_mode_cfg.get('min_move_prob', 0.35)
+                    if _is_news_trigger:
+                        _w_min_move = 0.25  # News P(move) floor
                     else:
                         _w_min_move = BREAKOUT_WATCHER.get('watcher_min_move_prob', 0.50)
                     
-                    # VOLUME_SURGE relaxation: institutional volume bursts may have moderate
-                    # ML scores because XGB wasn't trained on volume-surge patterns.
-                    # Strong surge_ratio or depth_imbalance = genuine institutional intent.
+                    # [FIX Apr 9] VOLUME_SURGE tightened: require depth_imbalance ≥0.15
+                    # and raise P(move) floors (0.40→0.45, 0.48→0.50) to filter noise.
                     if _trigger_type == 'VOLUME_SURGE':
                         _vs_surge = _trigger.get('surge_ratio', 0)
                         _vs_depth = abs(_trigger.get('depth_imbalance', 0))
+                        # Hard gate: must have some order-book imbalance to confirm intent
+                        if _vs_depth < 0.15:
+                            self._wlog(f"  BLOCKED(I-W_VSDEPTH): {_stock_name} VolSurge depth={_vs_depth:.2f} < 0.15 — no book imbalance")
+                            self._watcher_total_gate_blocked += 1
+                            self._log_decision(_ts, _sym, _final_score, 'WATCHER_VOLSURGE_NO_DEPTH',
+                                              reason=f'VolSurge depth_imbalance={_vs_depth:.2f} < 0.15',
+                                              direction=direction)
+                            continue
                         if _vs_surge >= 5.0 or (_vs_surge >= 4.0 and _vs_depth >= 0.25):
-                            _w_min_move = 0.40  # Strong institutional signal — trust volume
+                            _w_min_move = 0.45  # Strong institutional signal
                         elif _vs_surge >= 3.5:
-                            _w_min_move = 0.48  # Moderate surge — partial relaxation
+                            _w_min_move = 0.50  # Moderate surge — no relaxation, standard floor
                     
                     _w_mp = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
                     if _w_mp > 0 and _w_mp < _w_min_move:
@@ -4228,6 +3418,19 @@ class AutonomousTrader:
                     _setup_type = _cand['setup_type']
                     _final_score = _cand['score']
                     _ml_data = _cand['ml_data']
+
+                    # [Apr 17] GRIND 20-min repeat cooldown — no re-entry on same stock within 20 min
+                    if _trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN'):
+                        import time as _gt
+                        _grind_cd_secs = 20 * 60  # 20 minutes
+                        _grind_last = self._grind_last_placed_ts.get(_sym, 0)
+                        _grind_elapsed = _gt.time() - _grind_last
+                        if _grind_elapsed < _grind_cd_secs:
+                            _grind_remain = int(_grind_cd_secs - _grind_elapsed)
+                            self._wlog(f"  ⛔ GRIND COOLDOWN: {_sym.replace('NSE:', '')} — "
+                                       f"last grind placed {int(_grind_elapsed)}s ago, "
+                                       f"need {_grind_remain}s more (20-min cooldown)")
+                            continue
                     
                     # ── OI HEATMAP STRIKE PICKER for watcher pipeline ──
                     _w_strike_sel = 'ATM'
@@ -4252,17 +3455,48 @@ class AutonomousTrader:
                     if _cand.get('spike_plus_surge'):
                         _lot_mult = 2.0
                         _surge_tag = ' [SPIKE+SURGE→2x LOT]'
-                    elif 'EARLYBIRD' in _trigger_type:
-                        _eb_trigger = _trigger_map.get(_sym, {})
-                        _eb_m = _eb_trigger.get('earlybird_mode', 'B')
-                        _eb_m_cfg = {'A': _EB_A, 'B': _EB_B, 'C': _EB_C}.get(_eb_m, _EB_B)
-                        if _eb_m == 'A' and _eb_trigger.get('strong_gap', False):
-                            _lot_mult = _EB_A.get('gap_strong_lot_multiplier', 2.0)
-                            _surge_tag = f' [EB-A STRONG GAP→{_lot_mult}x LOT]'
+                    elif _trigger_type == 'INTRADAY_NEWS':
+                        _intra_trigger = _trigger_map.get(_sym, {})
+                        _news_conf = _intra_trigger.get('news_confidence', 0)
+                        if _news_conf >= 65:
+                            _lot_mult = 1.5
+                            _surge_tag = f' [INTRADAY NEWS conf={_news_conf}→1.5x LOT]'
                         else:
-                            _lot_mult = _eb_m_cfg.get('lot_multiplier', 1.0)
-                            if _lot_mult != 1.0:
-                                _surge_tag = f' [EB-{_eb_m}→{_lot_mult}x LOT]'
+                            _lot_mult = 1.0
+                            _surge_tag = f' [INTRADAY NEWS→1x LOT]'
+
+                    # ── SPIKE MEAT SCORE — adjust lot sizing by remaining momentum ──
+                    _meat_score_info = None
+                    if 'SPIKE' in _trigger_type:
+                        _meat_trigger = _trigger_map.get(_sym, {})
+                        _meat_data = market_data.get(_sym, {})
+                        _meat_score_info = self._compute_spike_meat_score(_meat_trigger, _meat_data, _direction)
+                        _ms = _meat_score_info['score']
+                        # Sizing adjustment: high-meat → reward, low-meat → block
+                        if _ms < 40:
+                            self._wlog(f"  ⛔ MEAT GATE: {_sym.replace('NSE:', '')} score={_ms}/100 < 40 — "
+                                       f"BLOCKED (low conviction) | {_meat_score_info['breakdown']}")
+                            continue  # Hard gate — skip this candidate
+                        if _ms >= 75:
+                            _meat_mult = 1.5
+                        elif _ms >= 60:
+                            _meat_mult = 1.2
+                        elif _ms >= 50:
+                            _meat_mult = 1.0  # Standard sizing
+                        else:
+                            _meat_mult = 0.85  # 40-49: thin meat — smaller size
+                        # Apply meat multiplier on top of existing lot_mult
+                        _lot_mult = round(_lot_mult * _meat_mult, 2)
+                        _surge_tag += f' [MEAT={_ms}/100→{_meat_mult}x ({_meat_score_info["breakdown"]})]'
+                        self._wlog(f"  🥩 MEAT SCORE: {_sym.replace('NSE:', '')} score={_ms}/100 "
+                                   f"→ lot_mult={_lot_mult:.2f} | {_meat_score_info['breakdown']} | "
+                                   f"accel={_meat_score_info['accel']} vol_r={_meat_score_info['vol_ratio']} "
+                                   f"runway={_meat_score_info['runway_pct']}% hold={_meat_score_info['hold_ratio']}%")
+
+                    # Attach meat score to ml_data for ledger persistence
+                    if _meat_score_info:
+                        _ml_data['spike_meat_score'] = _meat_score_info['score']
+                        _ml_data['spike_meat_breakdown'] = _meat_score_info['breakdown']
 
                     with self._trade_lock:
                         result = self.tools.place_option_order(
@@ -4290,16 +3524,15 @@ class AutonomousTrader:
                         self._auto_fired_this_session.add(_sym)  # Prevent ELITE re-fire
                         _fired_count += 1
                         self._watcher_total_placed += 1
-                        if 'EARLYBIRD' in _trigger_type:
-                            self._earlybird_total_placed += 1
-                            _eb_m_log = _trigger_map.get(_sym, {}).get('earlybird_mode', '?')
-                            self._earlybird_mode_placed[_eb_m_log] = self._earlybird_mode_placed.get(_eb_m_log, 0) + 1
-                            _eb_ctx = 'IDIO' if _trigger_map.get(_sym, {}).get('is_idiosyncratic') else ('BETA' if _trigger_map.get(_sym, {}).get('is_beta_driven') else 'NEUTRAL')
-                            self._wlog(f"  🐦{_eb_m_log} EARLYBIRD #{self._earlybird_total_placed}: {_sym.replace('NSE:', '')} ({_direction}) mode={_eb_m_log} gap={_trigger_map.get(_sym, {}).get('gap_pct', 0):+.1f}% ctx={_eb_ctx}")
                         # Reset grind trend-origin baseline now that we've acted
                         _bw = getattr(getattr(self.tools, 'ticker', None), 'breakout_watcher', None)
                         if 'GRIND' in _trigger_type and _bw and hasattr(_bw, 'mark_grind_traded'):
                             _bw.mark_grind_traded(_sym)
+                            import time as _gt2
+                            self._grind_last_placed_ts[_sym] = _gt2.time()  # [Apr 17] 20-min cooldown
+                        # Mark news-triggered trades as acted (prevent re-trigger from same news)
+                        if _trigger_type == 'INTRADAY_NEWS' and self._news_scanner:
+                            self._news_scanner.mark_acted(_sym.replace('NSE:', ''))
                         
                         # === SPIKE REVERSAL: Tag position for fast exit management ===
                         # Spike reversals are quick scalps — tight target, tight SL, fast time guard.
@@ -5759,7 +4992,14 @@ class AutonomousTrader:
         min_gate = cfg.get('min_gate_prob', 0.55)
         score_tier = cfg.get('score_tier', 'premium')
         
-        print(f"\n   🎯 SNIPER SCAN: gates → UPDR<{max_dr_up}/DownDR<{max_dr_down}, smart>={min_smart}, gate>={min_gate}, dir_conf>={cfg.get('min_direction_confidence', 55)} | {self._gmm_sniper_trades_today}/{max_per_day} used")
+        # --- VIX-Adaptive DR Thresholds (Apr 9, 2026) ---
+        # Scale DR caps based on current VIX regime: tighter in calm, looser in volatile
+        _vix_dr_mult = self._get_vix_dr_multiplier(cfg)
+        if _vix_dr_mult != 1.0:
+            max_dr_up = round(max_dr_up * _vix_dr_mult, 4)
+            max_dr_down = round(max_dr_down * _vix_dr_mult, 4)
+        
+        print(f"\n   🎯 SNIPER SCAN: gates → UPDR<{max_dr_up}/DownDR<{max_dr_down} (VIX={getattr(self, '_current_vix', 14.0):.1f}, mult={_vix_dr_mult:.2f}), smart>={min_smart}, gate>={min_gate}, dir_conf>={cfg.get('min_direction_confidence', 55)}, elite={cfg.get('require_elite_ok', False)}, !chop={cfg.get('reject_chop_hint', False)}, xgb!FLAT={cfg.get('require_xgb_directional', False)} | {self._gmm_sniper_trades_today}/{max_per_day} used")
         
         # Import sector mapping
         try:
@@ -5846,33 +5086,31 @@ class AutonomousTrader:
                 continue
             
             # ── XGB DIRECTION CHECK REMOVED ──
-            # XGB direction (UP/DOWN) no longer used for trade decisions.
-            # Direction comes purely from IntradayScorer. Only P(move) gate remains.
+            # XGB model has NO say in sniper trades (Apr 15, 2026).
+            # Direction comes purely from IntradayScorer.
             _sniper_was_flipped = False
             _xgb_signal = ml.get('ml_signal', 'UNKNOWN')  # Keep for logging/ml_data only
+            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))  # Keep for logging only
             
-            # XGB gate probability floor
-            ml_move_prob = ml.get('ml_move_prob', ml.get('ml_p_move', 0.0))
-            if ml_move_prob < min_gate:
-                _sniper_reject_counts['gate_low'] += 1
-                _sniper_near_misses.append(f"{sym_diag}(gate={ml_move_prob:.2f}<{min_gate}, {self._dr_tag(ml)}={dr_score:.3f})")
+            # ── SNIPER STOCK BLACKLIST (calibration: 0% or <13% WR) ──
+            _sniper_blacklist = cfg.get('blacklist_symbols', [])
+            if _sniper_blacklist and sym_diag in _sniper_blacklist:
+                _sniper_reject_counts.setdefault('blacklisted', 0)
+                _sniper_reject_counts['blacklisted'] += 1
                 continue
             
-            # ── ML DIRECTION CONFLICT FILTER REMOVED (Sniper) ──
-            # XGB direction (UP/DOWN) no longer used. Only P(move) gate above is kept.
-            _xgb_disagrees = False
-            
-            # Compute smart score (same formula as model-tracker)
+            # Compute smart score — XGB-free (Apr 15, 2026)
+            # Direction comes from IntradayScorer, risk from GMM DR.
+            # ml_move_prob kept for logging only, NOT used in scoring or gating.
             p_score = pre_scores.get(sym, 0)
-            conviction = ml_move_prob * min(p_score / 100.0, 1.0) * 40.0
+            conviction = min(p_score / 100.0, 1.0) * 40.0
             safety = (1.0 - min(dr_score, 1.0)) * 20.0 + 5.0
             technical = min(p_score, 100) * 0.20
-            move_bonus = ml_move_prob * 15.0
-            smart_score = conviction + safety + technical + move_bonus
+            smart_score = conviction + safety + technical
             
             if smart_score < min_smart:
                 _sniper_reject_counts['smart_low'] += 1
-                _sniper_near_misses.append(f"{sym_diag}(smart={smart_score:.1f}<{min_smart}, {self._dr_tag(ml)}={dr_score:.3f}, gate={ml_move_prob:.2f})")
+                _sniper_near_misses.append(f"{sym_diag}(smart={smart_score:.1f}<{min_smart}, {self._dr_tag(ml)}={dr_score:.3f})")
                 continue
             
             sym_clean = sym.replace('NSE:', '')
@@ -7060,6 +6298,19 @@ class AutonomousTrader:
             'vix': self._current_vix,
         }
 
+    def _get_vix_dr_multiplier(self, strategy_cfg: dict) -> float:
+        """Return VIX-adaptive DR score multiplier for a strategy config.
+        
+        Scales max_updr_score / max_downdr_score based on current VIX regime.
+        Low VIX → tighter DR caps (scores are lower, demand higher quality).
+        High VIX → looser DR caps (scores inflate, avoid blocking clean setups).
+        
+        Strategy config should have keys like vix_dr_multiplier_low, _normal, _high, _extreme.
+        Falls back to 1.0 (no scaling) if keys missing.
+        """
+        regime = getattr(self, '_vix_regime', 'NORMAL').lower()
+        return strategy_cfg.get(f'vix_dr_multiplier_{regime}', 1.0)
+
     # ═══════════════════════════════════════════════════════════════════════════
     # GCR — GMM CONVICTION RECHECK
     # Re-queries GMM DR scores on open LOSING positions every scan cycle.
@@ -7650,6 +6901,77 @@ class AutonomousTrader:
         if hedged_this_cycle:
             print(f"\n🛡️ PROACTIVE HEDGE CYCLE: converted {len(hedged_this_cycle)} positions")
 
+    def _sync_positions_from_db(self):
+        """Bring bot's in-memory paper_positions into alignment with SQLite.
+
+        The dashboard's /api/reverse_trade writes directly to the active_trades
+        table (exits old symbol + appends new reversed one). That change is
+        invisible to the bot unless we reconcile — causing the new symbol to
+        never be subscribed to the ticker, so its LTP and P&L stay frozen at
+        the seeded entry price.
+
+        Strategy (runs every monitor tick, ~3s):
+          - For every OPEN symbol in SQLite that's missing from memory:
+              append the full position dict and subscribe its option token.
+          - For every OPEN symbol in memory whose symbol is missing from
+              SQLite for 2+ consecutive ticks: mark CLOSED (prevents races
+              with the bot's own adds that may be mid-flight).
+        """
+        try:
+            from state_db import get_state_db
+            today = str(datetime.now().date())
+            db_positions, _, _ = get_state_db().load_active_trades(today)
+            if not isinstance(db_positions, list):
+                return
+            db_open = {t.get('symbol'): t for t in db_positions
+                       if t.get('symbol') and t.get('status', 'OPEN') == 'OPEN'}
+            added = []
+            missing_syms = []
+            with self.tools._positions_lock:
+                mem_open_syms = {t.get('symbol') for t in self.tools.paper_positions
+                                 if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol')}
+                # ADD: SQLite-only → memory
+                for sym, pos in db_open.items():
+                    if sym not in mem_open_syms:
+                        self.tools.paper_positions.append(dict(pos))
+                        added.append(sym)
+                # REMOVE: memory-only → debounce 2 ticks, then mark CLOSED
+                if not hasattr(self, '_sync_missing_counter'):
+                    self._sync_missing_counter = {}
+                for t in self.tools.paper_positions:
+                    if t.get('status', 'OPEN') != 'OPEN':
+                        continue
+                    s = t.get('symbol')
+                    if s and s not in db_open:
+                        self._sync_missing_counter[s] = self._sync_missing_counter.get(s, 0) + 1
+                        if self._sync_missing_counter[s] >= 2:
+                            t['status'] = 'CLOSED'
+                            t['exit_reason'] = t.get('exit_reason') or 'SYNC_MISSING_FROM_DB'
+                            missing_syms.append(s)
+                    elif s:
+                        self._sync_missing_counter.pop(s, None)
+            # Subscribe newly-added option symbols to the ticker + seed LTP
+            if added and self.tools.ticker:
+                opt_syms = [s for s in added if ':' in s]
+                if opt_syms:
+                    try:
+                        self.tools.ticker.subscribe_symbols(opt_syms, mode='quote')
+                        self.tools._seed_live_pnl_for_new_positions(opt_syms)
+                        print(f"🔄 SYNC: Added {len(added)} reversed/dashboard position(s) → subscribed {opt_syms}")
+                    except Exception as _sub_e:
+                        print(f"   ⚠️ SYNC: subscribe failed: {_sub_e}")
+            if missing_syms:
+                print(f"🔄 SYNC: Marked {len(missing_syms)} stale in-memory position(s) CLOSED: {missing_syms}")
+        except Exception as _sync_e:
+            # Non-fatal — next tick will retry
+            import time as _t_sync
+            if not hasattr(self, '_last_sync_error_ts'):
+                self._last_sync_error_ts = 0
+            _now = _t_sync.time()
+            if _now - self._last_sync_error_ts >= 60:
+                self._last_sync_error_ts = _now
+                print(f"   ⚠️ SYNC error: {_sync_e}")
+
     def _realtime_monitor_loop(self):
         """Continuous loop that checks positions every few seconds"""
         candle_timer = 0  # Track time for candle increment
@@ -7661,6 +6983,10 @@ class AutonomousTrader:
         while self.monitor_running:
             try:
                 if self.is_trading_hours():
+                    # Reconcile dashboard-driven changes (e.g. /api/reverse_trade)
+                    # into the bot's in-memory position list before running
+                    # exit/LTP logic. Cheap: one SQLite read per ~3s tick.
+                    self._sync_positions_from_db()
                     # TIE runs every 60s, not every 3s — throttle via timer
                     _tie_timer += self.monitor_interval
                     _run_tie = False
@@ -8087,11 +7413,168 @@ class AutonomousTrader:
         except Exception as e:
             print(f"⚠️ EOD DB maintenance error: {e}")
 
+    # ════════════════════════════════════════════════════════════════
+    # SPIKE MEAT SCORE — measures how much momentum remains at entry
+    # ════════════════════════════════════════════════════════════════
+    def _compute_spike_meat_score(self, trigger: dict, data: dict, direction: str) -> dict:
+        """Compute a 0-100 composite score measuring remaining spike momentum.
+
+        Factors (weighted):
+          1. Velocity persistence  (25 pts) — is price still accelerating?
+          2. Volume persistence     (20 pts) — is volume still flowing?
+          3. ATR runway             (20 pts) — how much daily range is left?
+          4. OI buildup type        (15 pts) — fresh positions (buildup) vs unwind?
+          5. Sustain quality        (10 pts) — clean hold during sustain phase?
+          6. Sector tailwind        (10 pts) — sector index moving same direction?
+
+        Returns dict with 'score' (0-100), 'breakdown' (str), and per-factor values.
+        """
+        _pts = {}
+
+        # ── Factor 1: Velocity persistence (25 pts) ──
+        # spike_accel > 1.0 means accelerating at detection.
+        # We scale: accel >= 2.0 → full 25, accel >= 1.0 → 15, < 1.0 → 5 (decelerating)
+        _accel = trigger.get('spike_accel', 1.0)
+        if _accel >= 2.0:
+            _pts['velocity'] = 25
+        elif _accel >= 1.5:
+            _pts['velocity'] = 22
+        elif _accel >= 1.0:
+            _pts['velocity'] = 15
+        elif _accel >= 0.7:
+            _pts['velocity'] = 8
+        else:
+            _pts['velocity'] = 3
+
+        # ── Factor 2: Volume persistence (20 pts) ──
+        # vol_ratio > 2.0 → strong volume, > 1.5 → decent, < 1.0 → drying up
+        _vol_ratio = trigger.get('vol_ratio', 1.0)
+        if _vol_ratio >= 3.0:
+            _pts['volume'] = 20
+        elif _vol_ratio >= 2.0:
+            _pts['volume'] = 17
+        elif _vol_ratio >= 1.5:
+            _pts['volume'] = 12
+        elif _vol_ratio >= 1.0:
+            _pts['volume'] = 7
+        else:
+            _pts['volume'] = 2
+
+        # ── Factor 3: ATR runway (20 pts) ──
+        # How much of today's range has been consumed? Less consumed = more room.
+        # Uses day range as ATR proxy (same logic as GATE C2).
+        _open = data.get('open', 0)
+        _ltp = data.get('ltp', 0)
+        _high = data.get('high', _ltp)
+        _low = data.get('low', _ltp)
+        _day_range = _high - _low if _high > _low else 0.01
+        _move_from_open = abs(_ltp - _open) if _open > 0 else 0
+        _budget_used = min(_move_from_open / _day_range, 1.0) if _day_range > 0.01 else 0.5
+        # For spikes: HIGH range utilization = conviction (move IS the range)
+        # For non-spikes: less used = more runway (inverted)
+        _is_spike = 'SPIKE' in trigger.get('trigger_type', '')
+        if _is_spike:
+            # Spike conviction: budget_used ≥ 0.60 means spike IS the day's move → strong
+            if _budget_used >= 0.60:
+                _pts['atr_runway'] = 20
+            elif _budget_used >= 0.45:
+                _pts['atr_runway'] = 16
+            elif _budget_used >= 0.30:
+                _pts['atr_runway'] = 11
+            elif _budget_used >= 0.15:
+                _pts['atr_runway'] = 6
+            else:
+                _pts['atr_runway'] = 2  # Tiny move relative to range — weak spike
+        else:
+            _runway_pct = 1.0 - _budget_used
+            if _runway_pct >= 0.60:
+                _pts['atr_runway'] = 20
+            elif _runway_pct >= 0.40:
+                _pts['atr_runway'] = 15
+            elif _runway_pct >= 0.25:
+                _pts['atr_runway'] = 10
+            elif _runway_pct >= 0.15:
+                _pts['atr_runway'] = 6
+            else:
+                _pts['atr_runway'] = 2
+
+        # ── Factor 4: OI buildup type (15 pts) ──
+        # BUILDUP (fresh positions) = bullish/bearish conviction.
+        # UNWIND = positions closing = less directional fuel.
+        _oi_signal = trigger.get('_oi_signal', '')
+        _oi_strength = trigger.get('_oi_strength', 0)
+        _oi_confirmed = trigger.get('_oi_confirmed', False)
+        if _oi_confirmed and _oi_strength >= 0.6:
+            _pts['oi_type'] = 15  # Strong buildup confirming direction
+        elif _oi_confirmed and _oi_strength >= 0.4:
+            _pts['oi_type'] = 12
+        elif _oi_confirmed:
+            _pts['oi_type'] = 8
+        elif trigger.get('_oi_contradicted', False):
+            _pts['oi_type'] = 2  # OI opposing the move
+        else:
+            _pts['oi_type'] = 6  # No clear signal — neutral
+
+        # ── Factor 5: Sustain quality (10 pts) ──
+        # How well did price hold during the sustain phase?
+        # _sustain_held_pct / _peak_move_pct → ratio of peak that's still held
+        _peak = abs(trigger.get('_peak_move_pct', 0))
+        _held = abs(trigger.get('_sustain_held_pct', 0))
+        _hold_ratio = (_held / _peak) if _peak > 0.01 else 0.5
+        if _hold_ratio >= 0.85:
+            _pts['sustain'] = 10  # Held almost all of peak — very clean
+        elif _hold_ratio >= 0.70:
+            _pts['sustain'] = 8
+        elif _hold_ratio >= 0.55:
+            _pts['sustain'] = 5
+        else:
+            _pts['sustain'] = 2  # Retraced significantly
+
+        # ── Factor 6: Sector tailwind (10 pts) ──
+        # Is the stock's sector index moving in the trade direction?
+        _sec_pts = 5  # Default neutral
+        try:
+            _sec_chgs = getattr(self, '_sector_index_changes_cache', {})
+            if _sec_chgs:
+                _stock_clean = trigger.get('symbol', '').replace('NSE:', '')
+                for _sec_name, _sec_info in self._arbtr_sector_map.items():
+                    if _stock_clean in _sec_info.get('stocks', []):
+                        _sec_idx = _sec_info.get('index', '')
+                        _sec_chg = _sec_chgs.get(_sec_idx, 0)
+                        # Tailwind: sector moves WITH trade direction
+                        _is_buy = direction == 'BUY'
+                        if (_is_buy and _sec_chg > 0.05) or (not _is_buy and _sec_chg < -0.05):
+                            _sec_pts = 10  # Sector supports the trade
+                        elif (_is_buy and _sec_chg < -0.10) or (not _is_buy and _sec_chg > 0.10):
+                            _sec_pts = 1  # Sector opposes
+                        else:
+                            _sec_pts = 5  # Neutral
+                        break
+        except Exception:
+            pass
+        _pts['sector'] = _sec_pts
+
+        _total = sum(_pts.values())
+        _breakdown = (f"vel={_pts['velocity']} vol={_pts['volume']} "
+                      f"atr={_pts['atr_runway']} oi={_pts['oi_type']} "
+                      f"sus={_pts['sustain']} sec={_pts['sector']}")
+        # For spikes, report budget_used as conviction %; for others, runway %
+        _report_pct = round(_budget_used * 100, 1) if _is_spike else round((1.0 - _budget_used) * 100, 1)
+        return {
+            'score': _total,
+            'breakdown': _breakdown,
+            'factors': _pts,
+            'accel': round(_accel, 2),
+            'vol_ratio': round(_vol_ratio, 2),
+            'runway_pct': _report_pct,
+            'hold_ratio': round(_hold_ratio * 100, 1),
+        }
+
     def _check_portfolio_profit_target(self):
-        """KILL-ALL PROFIT SWITCH: Close ALL positions when realized + unrealized P&L >= 15% of capital.
+        """KILL-ALL PROFIT SWITCH: Close ALL positions when unrealized P&L >= target % of capital.
         
-        Uses _compute_live_unrealized_pnl() for real-time unrealized P&L
-        plus today's realized P&L from state_db.
+        Uses _compute_live_unrealized_pnl() for real-time unrealized P&L only.
+        Realized P&L is NOT included — only open position gains trigger the kill-all.
         Runs every 60s in background. After booking profit, resets so next scan can continue.
         """
         if self._profit_target_hit:
@@ -8102,19 +7585,13 @@ class AutonomousTrader:
         target_amount = self.start_capital * target_pct
         
         unrealized = self._compute_live_unrealized_pnl()
-        realized = 0
-        try:
-            _, realized, _ = get_state_db().load_active_trades()
-        except Exception:
-            pass
-        total_pnl = unrealized + realized
-        if total_pnl < target_amount:
+        if unrealized < target_amount:
             return  # Not yet at target
         
         # ═══ PROFIT TARGET HIT — CLOSE EVERYTHING ═══
         self._profit_target_hit = True
         print(f"\n{'='*70}")
-        print(f"💰💰💰 PORTFOLIO PROFIT TARGET HIT! Realized: ₹{realized:+,.0f} + Unrealized: ₹{unrealized:+,.0f} = ₹{total_pnl:+,.0f} >= {target_pct*100:.0f}% of ₹{self.start_capital:,.0f} (₹{target_amount:,.0f})")
+        print(f"💰💰💰 PORTFOLIO PROFIT TARGET HIT! Unrealized: ₹{unrealized:+,.0f} >= {target_pct*100:.0f}% of ₹{self.start_capital:,.0f} (₹{target_amount:,.0f})")
         print(f"💰💰💰 CLOSING ALL POSITIONS TO BOOK PROFIT")
         print(f"{'='*70}\n")
         
@@ -8457,9 +7934,23 @@ class AutonomousTrader:
         # For PE options: direction=SELL but side=BUY → must use side for correct P&L
         direction = local_pos.get('side') or local_pos.get('direction', 'BUY')
         
-        # Try to get last traded price for P&L calculation
+        # Prefer actual broker fill for manual/Kite exits; fall back to LTP.
         ltp = 0
+        exit_price = 0
         try:
+            if self.tools.kite:
+                tradingsymbol = symbol.split(':', 1)[-1]
+                exit_txn = 'SELL' if direction in ('BUY', 'LONG') else 'BUY'
+                for order in reversed(self.tools.kite.orders()):
+                    avg_price = float(order.get('average_price') or 0)
+                    if (
+                        order.get('tradingsymbol') == tradingsymbol
+                        and order.get('status') == 'COMPLETE'
+                        and order.get('transaction_type') == exit_txn
+                        and avg_price > 0
+                    ):
+                        exit_price = avg_price
+                        break
             if self.tools.ticker and self.tools.ticker.connected:
                 cached = self.tools.ticker.get_ltp_batch([symbol])
                 ltp = cached.get(symbol, 0)
@@ -8469,13 +7960,14 @@ class AutonomousTrader:
                 ltp = lp['ltp'] if lp else 0
         except Exception:
             pass
-        
-        if ltp > 0 and entry_price > 0:
-            pnl = (ltp - entry_price) * qty if direction in ('BUY', 'LONG') else (entry_price - ltp) * qty
+
+        if exit_price <= 0:
+            exit_price = ltp if ltp > 0 else entry_price
+
+        if exit_price > 0 and entry_price > 0:
+            pnl = (exit_price - entry_price) * qty if direction in ('BUY', 'LONG') else (entry_price - exit_price) * qty
         else:
             pnl = local_pos.get('unrealized_pnl', 0)
-        
-        exit_price = ltp if ltp > 0 else entry_price
         
         # Remove from in-memory positions
         with self.tools._positions_lock:
@@ -8620,7 +8112,16 @@ class AutonomousTrader:
                         pass
         else:
             quotes = {}
-        
+
+        # ── EARLY LIVE P&L SNAPSHOT (dashboard bridge) ─────────────
+        # Write as soon as quotes are available so the dashboard sees
+        # fresh LTP/unrealized_pnl even if later checks raise errors.
+        if active_trades and quotes:
+            try:
+                self._persist_live_pnl_snapshot(active_trades, quotes)
+            except Exception:
+                pass
+
         # Print position status every ~30 seconds (every 10th check)
         if not hasattr(self, '_monitor_count'):
             self._monitor_count = 0
@@ -9568,8 +9069,7 @@ class AutonomousTrader:
                 _type_tag = '🧪GMM'
             elif _setup == 'TEST_XGB':
                 _type_tag = '🧪XGB'
-            elif _setup == 'ARBTR':
-                _type_tag = '🔄ARBTR'
+            # ARBTR removed Apr 8
             elif _setup in ('', 'MANUAL', 'GPT') or not _setup:
                 _type_tag = '🤖GPT'
             else:
@@ -9638,46 +9138,58 @@ class AutonomousTrader:
             print(self.exit_manager.get_status_summary())
 
         # ── Always persist live P&L snapshot for dashboard (not gated by show_status) ──
+        # NOTE: already written early after quotes fetch; this is a safety refresh
+        # using the same helper so any late exit/SL mutations are reflected.
         if active_trades and quotes:
             try:
-                live_snaps = []
-                _total_upnl = 0.0
-                for t in active_trades:
-                    if t.get('status', 'OPEN') != 'OPEN':
-                        continue
-                    sym = t['symbol']
-                    ltp = 0.0
-                    upnl = 0.0
-                    if t.get('is_credit_spread'):
-                        sold_sym = t.get('sold_symbol', '')
-                        hedge_sym = t.get('hedge_symbol', '')
-                        s_ltp = quotes.get(sold_sym, {}).get('last_price', 0)
-                        h_ltp = quotes.get(hedge_sym, {}).get('last_price', 0)
-                        ltp = s_ltp - h_ltp
-                        upnl = (t.get('net_credit', 0) - ltp) * t['quantity']
-                    elif t.get('is_debit_spread'):
-                        b_ltp = quotes.get(t.get('buy_symbol', ''), {}).get('last_price', 0)
-                        sl_ltp = quotes.get(t.get('sell_symbol', ''), {}).get('last_price', 0)
-                        ltp = b_ltp - sl_ltp
-                        upnl = (ltp - t.get('net_debit', 0)) * t['quantity']
-                    elif t.get('is_iron_condor'):
-                        s_ce = quotes.get(t.get('sold_ce_symbol', ''), {}).get('last_price', 0)
-                        h_ce = quotes.get(t.get('hedge_ce_symbol', ''), {}).get('last_price', 0)
-                        s_pe = quotes.get(t.get('sold_pe_symbol', ''), {}).get('last_price', 0)
-                        h_pe = quotes.get(t.get('hedge_pe_symbol', ''), {}).get('last_price', 0)
-                        ltp = (s_ce - h_ce) + (s_pe - h_pe)
-                        upnl = (t.get('total_credit', 0) - ltp) * t['quantity']
-                    elif sym in quotes:
-                        ltp = quotes[sym]['last_price']
-                        if t['side'] == 'BUY':
-                            upnl = (ltp - t['avg_price']) * t['quantity']
-                        else:
-                            upnl = (t['avg_price'] - ltp) * t['quantity']
-                    _total_upnl += upnl
-                    live_snaps.append({'symbol': sym, 'ltp': round(ltp, 2), 'unrealized_pnl': round(upnl, 2)})
-                get_state_db().save_live_pnl(live_snaps, round(_total_upnl, 2))
-            except Exception as e:
+                self._persist_live_pnl_snapshot(active_trades, quotes)
+            except Exception:
                 pass  # Silent — don't spam logs with dashboard bridge errors
+
+    def _persist_live_pnl_snapshot(self, active_trades, quotes):
+        """Compute per-trade LTP + unrealized P&L and save to state_db.live_pnl.
+
+        Centralized so _check_positions_realtime can call it both early (right
+        after quotes) and late (after mutations). Errors are swallowed by the
+        caller — this method itself raises on programmer errors.
+        """
+        live_snaps = []
+        _total_upnl = 0.0
+        for t in active_trades:
+            if t.get('status', 'OPEN') != 'OPEN':
+                continue
+            sym = t['symbol']
+            ltp = 0.0
+            upnl = 0.0
+            if t.get('is_credit_spread'):
+                sold_sym = t.get('sold_symbol', '')
+                hedge_sym = t.get('hedge_symbol', '')
+                s_ltp = quotes.get(sold_sym, {}).get('last_price', 0)
+                h_ltp = quotes.get(hedge_sym, {}).get('last_price', 0)
+                ltp = s_ltp - h_ltp
+                upnl = (t.get('net_credit', 0) - ltp) * t['quantity']
+            elif t.get('is_debit_spread'):
+                b_ltp = quotes.get(t.get('buy_symbol', ''), {}).get('last_price', 0)
+                sl_ltp = quotes.get(t.get('sell_symbol', ''), {}).get('last_price', 0)
+                ltp = b_ltp - sl_ltp
+                upnl = (ltp - t.get('net_debit', 0)) * t['quantity']
+            elif t.get('is_iron_condor'):
+                s_ce = quotes.get(t.get('sold_ce_symbol', ''), {}).get('last_price', 0)
+                h_ce = quotes.get(t.get('hedge_ce_symbol', ''), {}).get('last_price', 0)
+                s_pe = quotes.get(t.get('sold_pe_symbol', ''), {}).get('last_price', 0)
+                h_pe = quotes.get(t.get('hedge_pe_symbol', ''), {}).get('last_price', 0)
+                ltp = (s_ce - h_ce) + (s_pe - h_pe)
+                upnl = (t.get('total_credit', 0) - ltp) * t['quantity']
+            elif sym in quotes:
+                ltp = quotes[sym].get('last_price', 0) if isinstance(quotes[sym], dict) else 0
+                if t.get('side') == 'BUY':
+                    upnl = (ltp - t.get('avg_price', 0)) * t.get('quantity', 0)
+                else:
+                    upnl = (t.get('avg_price', 0) - ltp) * t.get('quantity', 0)
+            _total_upnl += upnl
+            live_snaps.append({'symbol': sym, 'ltp': round(ltp, 2), 'unrealized_pnl': round(upnl, 2)})
+        if live_snaps:
+            get_state_db().save_live_pnl(live_snaps, round(_total_upnl, 2))
     
     def reset_agent(self):
         """Reset agent to clear conversation history - but KEEP positions"""
@@ -10130,8 +9642,9 @@ class AutonomousTrader:
                 # === WATCHER MID-SCAN DRAIN (between market data batches) ===
                 try:
                     self._process_breakout_triggers()
-                except Exception:
-                    pass
+                except Exception as _wdex:
+                    import traceback; traceback.print_exc()
+                    self._wlog(f"⚠️ WATCHER DRAIN CRASH (mid-scan): {_wdex}")
                 print(f"   📡 Market data: batch 2/{2} ({len(scan_universe) - _mid} stocks)...")
                 market_data.update(self.tools.get_market_data(scan_universe[_mid:]))
             else:
@@ -10142,8 +9655,9 @@ class AutonomousTrader:
             try:
                 if BREAKOUT_WATCHER.get('enabled', False):
                     self._process_breakout_triggers()
-            except Exception:
-                pass
+            except Exception as _wdex:
+                import traceback; traceback.print_exc()
+                self._wlog(f"⚠️ WATCHER DRAIN CRASH (post-data): {_wdex}")
             
             # Get volume analysis for EOD predictions
             volume_analysis = self.tools.get_volume_analysis(scan_universe)
@@ -10499,8 +10013,9 @@ class AutonomousTrader:
                     if BREAKOUT_WATCHER.get('enabled', False):
                         print(f"   ⚡ Watcher mid-scan drain (post-ML)...")
                         self._process_breakout_triggers()
-                except Exception:
-                    pass
+                except Exception as _wdex:
+                    import traceback; traceback.print_exc()
+                    self._wlog(f"⚠️ WATCHER DRAIN CRASH (post-ML): {_wdex}")
                 
                 # === OI FLOW OVERLAY: Adjust ML predictions with live options chain data ===
                 # Only analyze top-scoring F&O stocks to minimize API calls (max 15)
@@ -10532,14 +10047,18 @@ class AutonomousTrader:
                             except Exception:
                                 return _oi_sym, None
                         
-                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
                         _oi_raw = {}
                         with ThreadPoolExecutor(max_workers=5) as _oi_executor:
                             _oi_futures = {_oi_executor.submit(_analyze_oi_one, s): s for s in _oi_candidates}
-                            for _fut in as_completed(_oi_futures):
-                                _sym, _data = _fut.result()
-                                if _data:
-                                    _oi_raw[_sym] = _data
+                            try:
+                                for _fut in as_completed(_oi_futures, timeout=90):
+                                    _sym, _data = _fut.result(timeout=10)
+                                    if _data:
+                                        _oi_raw[_sym] = _data
+                            except (FuturesTimeout, TimeoutError):
+                                _completed = sum(1 for f in _oi_futures if f.done())
+                                print(f"   ⚠️ OI overlay timeout: {_completed}/{len(_oi_futures)} completed in 90s — proceeding with partial data")
                         
                         # Apply OI overlay to ML predictions (single-threaded — modifies shared dicts)
                         for _oi_sym, _oi_data in _oi_raw.items():
@@ -10575,8 +10094,9 @@ class AutonomousTrader:
                     if BREAKOUT_WATCHER.get('enabled', False):
                         print(f"   ⚡ Watcher mid-scan drain (post-OI)...")
                         self._process_breakout_triggers()
-                except Exception:
-                    pass
+                except Exception as _wdex:
+                    import traceback; traceback.print_exc()
+                    self._wlog(f"⚠️ WATCHER DRAIN CRASH (post-OI): {_wdex}")
                 
                 # === OI AUTHORITY ON SCORES ===
                 # OI = leading indicator. Operators build positions first, then move the stock.
@@ -10824,14 +10344,17 @@ class AutonomousTrader:
                 # Picks the cleanest GMM candidate (lowest dr_score) with strict gates.
                 # Separate from model-tracker — this is the alpha trade.
                 # [FIX Mar 18] Sniper uses expanded pool (all quality stocks, not just top-10).
-                try:
-                    _sniper_ml = getattr(self, '_sniper_expanded_ml', _ml_results)
-                    _sniper_scores = getattr(self, '_sniper_expanded_scores', _pre_scores)
-                    self._place_gmm_sniper_trade(
-                        _sniper_ml, _sniper_scores, market_data, datetime.now().strftime('%H:%M:%S')
-                    )
-                except Exception as _snp_err:
-                    print(f"   ⚠️ GMM Sniper error (non-fatal): {_snp_err}")
+                # [FIX Apr 8] Time gate: only 09:55-15:00 (avoid opening noise & late decay)
+                _gmm_sniper_time = datetime.now().strftime('%H:%M')
+                if '09:55' <= _gmm_sniper_time <= '15:00':
+                    try:
+                        _sniper_ml = getattr(self, '_sniper_expanded_ml', _ml_results)
+                        _sniper_scores = getattr(self, '_sniper_expanded_scores', _pre_scores)
+                        self._place_gmm_sniper_trade(
+                            _sniper_ml, _sniper_scores, market_data, datetime.now().strftime('%H:%M:%S')
+                        )
+                    except Exception as _snp_err:
+                        print(f"   ⚠️ GMM Sniper error (non-fatal): {_snp_err}")
                 
                 # === TEST_GMM: Pure DR model play (bypass ALL gates) ===
                 # DR < 6% = model extremely confident no downside → BUY CALL
@@ -10852,21 +10375,17 @@ class AutonomousTrader:
                 except Exception as _tx_err:
                     print(f"   ⚠️ TEST_XGB error (non-fatal): {_tx_err}")
 
-                # === ARBTR: Sector Arbitrage — laggard convergence play ===
-                # When sector index moves but peer stock lags, trade the laggard.
-                try:
-                    self._place_arbtr_trades(
-                        _ml_results, _pre_scores, market_data,
-                        _sector_index_changes, datetime.now().strftime('%H:%M:%S')
-                    )
-                except Exception as _arb_err:
-                    print(f"   ⚠️ ARBTR error (non-fatal): {_arb_err}")
+                # === ARBTR: DISABLED Apr 8 — surgically removed per user request ===
 
                 # === SNIPER STRATEGIES: OI Unwinding + PCR Extreme ===
                 # Scans OI data for high-edge reversal / contrarian setups.
                 # Independent from GMM Sniper — these use OI flow signals + GMM confirmation.
+                # Only active between 09:55 and 15:00.
+                _sniper_time = datetime.now().strftime('%H:%M')
                 try:
-                    if getattr(self, '_sniper_engine', None) and _oi_results and _ml_results:
+                    if getattr(self, '_sniper_engine', None) and _oi_results and _ml_results and '09:55' <= _sniper_time <= '15:00':
+                        # Sync VIX regime to sniper engine for adaptive DR thresholds
+                        self._sniper_engine._vix_regime = getattr(self, '_vix_regime', 'NORMAL')
                         # --- Diagnostic: show OI data availability for snipers ---
                         _snp_unwind_syms = [s.replace('NSE:', '') for s, d in _oi_results.items()
                                             if d.get('nse_oi_buildup') in ('LONG_UNWINDING', 'SHORT_COVERING')]
@@ -11367,249 +10886,8 @@ class AutonomousTrader:
             except Exception as _sr_guard_err:
                 print(f"   ⚠️ Spike reversal management error (non-fatal): {_sr_guard_err}")
             
-            # === ARBTR SPEED GATE: Exit ARBTR if no +3% premium gain in 15 min ===
-            # Mar 10 lesson: NATIONALUM held 87min (-₹9,538), MPHASIS 65min (-₹4,347),
-            # BHARATFORG 107min (-₹5,750). ARBTR thesis is "laggard converges to sector" —
-            # if convergence hasn't started in 15 min, the thesis is dead. Cut early.
-            try:
-                from config import ARBTR_CONFIG as _arb_cfg
-                _arb_speed_min = _arb_cfg.get('speed_gate_minutes', 15)
-                _arb_speed_gain = _arb_cfg.get('speed_gate_min_gain_pct', 3.0)
-                _arbtr_positions = [t for t in self.tools.paper_positions 
-                                   if t.get('status', 'OPEN') == 'OPEN' 
-                                   and t.get('setup_type') == 'ARBTR'
-                                   and not t.get('is_credit_spread') and not t.get('is_debit_spread')
-                                   and not t.get('is_iron_condor')]
-                for _arb_pos in _arbtr_positions:
-                    _arb_sym = _arb_pos.get('symbol', '')
-                    _arb_entry_price = _arb_pos.get('avg_price', 0)
-                    _arb_entry_time_str = _arb_pos.get('entry_time', '')
-                    if not _arb_entry_time_str or not _arb_entry_price:
-                        continue
-                    
-                    try:
-                        _arb_entry_dt = datetime.fromisoformat(_arb_entry_time_str)
-                    except Exception:
-                        continue
-                    
-                    _arb_held_min = (datetime.now() - _arb_entry_dt).total_seconds() / 60
-                    
-                    # Only check after configured minutes
-                    if _arb_held_min < _arb_speed_min:
-                        continue
-                    
-                    # Get current price
-                    try:
-                        _arb_ltp_data = self.tools.kite.ltp([_arb_sym])
-                        if _arb_sym not in _arb_ltp_data:
-                            continue
-                        _arb_ltp = _arb_ltp_data[_arb_sym]['last_price']
-                    except Exception:
-                        continue
-                    
-                    _arb_pnl_pct = ((_arb_ltp - _arb_entry_price) / _arb_entry_price) * 100
-                    
-                    # If premium gained enough, thesis is working — let it ride
-                    if _arb_pnl_pct >= _arb_speed_gain:
-                        continue
-                    
-                    # Thesis not playing out — cut the position
-                    _arb_qty = _arb_pos.get('quantity', 0)
-                    _arb_pnl = (_arb_ltp - _arb_entry_price) * _arb_qty
-                    
-                    from config import calc_brokerage
-                    _arb_brokerage = calc_brokerage(_arb_entry_price, _arb_ltp, _arb_qty)
-                    _arb_pnl -= _arb_brokerage
-                    
-                    _arb_underlying = _arb_pos.get('underlying', '')
-                    print(f"\n   ⏱️ ARBTR SPEED GATE: {_arb_underlying} held {_arb_held_min:.0f}min, "
-                          f"P&L {_arb_pnl_pct:+.1f}% (< {_arb_speed_gain}%) — cutting stale ARBTR")
-                    print(f"      Entry: ₹{_arb_entry_price:.2f} → ₹{_arb_ltp:.2f} | P&L: ₹{_arb_pnl:+,.0f}")
-                    
-                    _arb_exit_detail = {
-                        'exit_type': 'ARBTR_SPEED_GATE',
-                        'exit_reason': (f'ARBTR held {_arb_held_min:.0f}min with only {_arb_pnl_pct:+.1f}% gain '
-                                       f'— convergence thesis not playing out, speed gate exit'),
-                        'held_minutes': round(_arb_held_min, 1),
-                        'pnl_pct_at_exit': round(_arb_pnl_pct, 2),
-                        'brokerage': round(_arb_brokerage, 2),
-                    }
-                    
-                    self.tools.update_trade_status(_arb_sym, 'ARBTR_SPEED_GATE', _arb_ltp, _arb_pnl, exit_detail=_arb_exit_detail)
-                    with self._pnl_lock:
-                        self.daily_pnl += _arb_pnl
-                        self.capital += _arb_pnl
-                    
-                    _arb_was_win = _arb_pnl > 0
-                    _arb_open = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != _arb_sym]
-                    _arb_unreal = self.risk_governor._calc_unrealized_pnl(_arb_open)
-                    self.risk_governor.record_trade_result(_arb_sym, _arb_pnl, _arb_was_win, unrealized_pnl=_arb_unreal)
-                    self.risk_governor.update_capital(self.capital)
-                    
-                    self._log_decision(_cycle_time, _arb_underlying, 0, 'ARBTR_SPEED_GATE',
-                                      reason=f'ARBTR held {_arb_held_min:.0f}min, {_arb_pnl_pct:+.1f}%, P&L={_arb_pnl:+,.0f}',
-                                      direction=_arb_pos.get('direction', ''), setup='ARBTR')
-                    
-                    print(f"      ✅ ARBTR speed gate exit | {'Profit' if _arb_was_win else 'Cut loss'}: ₹{_arb_pnl:+,.0f}")
-                    
-            except Exception as _arb_speed_err:
-                print(f"   ⚠️ ARBTR speed gate error (non-fatal): {_arb_speed_err}")
-            
-            # === ARBTR CONVERGENCE EXIT: Thesis complete — laggard caught up ===
-            # The ARBTR thesis is: a sector moved but a laggard didn't → we buy the
-            # laggard expecting it to converge. When that convergence happens (the
-            # stock is now at par with its sector/peers), the trade is complete.
-            # This is the THESIS EXIT — take profit when the job is done.
-            try:
-                from config import ARBTR_CONFIG as _arb_conv_cfg
-                _arbtr_conv_positions = [t for t in self.tools.paper_positions
-                                         if t.get('status', 'OPEN') == 'OPEN'
-                                         and t.get('setup_type') == 'ARBTR'
-                                         and not t.get('is_credit_spread') and not t.get('is_debit_spread')
-                                         and not t.get('is_iron_condor')]
-
-                for _ac_pos in _arbtr_conv_positions:
-                    _ac_sym = _ac_pos.get('symbol', '')
-                    _ac_ul = _ac_pos.get('underlying', '')
-                    _ac_meta = _ac_pos.get('arbtr_meta', {})
-                    if not _ac_meta or not _ac_ul:
-                        continue  # No ARBTR metadata — can't check convergence
-
-                    _ac_sector = _ac_meta.get('sector', '')
-                    _ac_idx = _ac_meta.get('sector_index', '')
-                    _ac_entry_div = _ac_meta.get('divergence_pct', 0)
-                    _ac_entry_stk_chg = _ac_meta.get('stock_change_pct', 0)
-                    _ac_entry_sec_chg = _ac_meta.get('sector_change_pct', 0)
-                    _ac_direction = _ac_pos.get('direction', 'BUY')
-
-                    if not _ac_idx or _ac_entry_div <= 0:
-                        continue
-
-                    # Fetch CURRENT stock and sector change %
-                    _ac_cur_stk_chg = None
-                    _ac_cur_sec_chg = None
-                    try:
-                        # Stock change from ticker cache (free, no API cost)
-                        if self.tools.ticker and self.tools.ticker.connected:
-                            _ac_ws = self.tools.ticker.get_quote_batch([_ac_ul])
-                            _ac_q = _ac_ws.get(_ac_ul, {})
-                            if _ac_q:
-                                _ac_ohlc = _ac_q.get('ohlc', {})
-                                _ac_prev = _ac_ohlc.get('close', 0)
-                                _ac_ltp_ul = _ac_q.get('last_price', 0)
-                                if _ac_prev > 0 and _ac_ltp_ul > 0:
-                                    _ac_cur_stk_chg = ((_ac_ltp_ul - _ac_prev) / _ac_prev) * 100
-
-                        # Sector index change from cached sector data
-                        _ac_cur_sec_chg = getattr(self, '_sector_index_changes_cache', {}).get(_ac_idx)
-
-                        # Fallback: fetch from Kite if not cached
-                        if _ac_cur_sec_chg is None:
-                            try:
-                                _ac_idx_q = self.tools.kite.quote([_ac_idx])
-                                if _ac_idx in _ac_idx_q:
-                                    _ac_idx_data = _ac_idx_q[_ac_idx]
-                                    _ac_idx_ohlc = _ac_idx_data.get('ohlc', {})
-                                    _ac_idx_prev = _ac_idx_ohlc.get('close', 0)
-                                    _ac_idx_ltp = _ac_idx_data.get('last_price', 0)
-                                    if _ac_idx_prev > 0 and _ac_idx_ltp > 0:
-                                        _ac_cur_sec_chg = ((_ac_idx_ltp - _ac_idx_prev) / _ac_idx_prev) * 100
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                    if _ac_cur_stk_chg is None or _ac_cur_sec_chg is None:
-                        continue  # Can't compute convergence without both
-
-                    # Compute current divergence — directional
-                    # For BUY (bullish sector): divergence = sector_chg - stock_chg (positive when lagging)
-                    # For SELL (bearish sector): divergence = abs(sector_chg) - abs(stock_chg)
-                    if _ac_direction == 'BUY':
-                        _ac_cur_div = _ac_cur_sec_chg - _ac_cur_stk_chg
-                    else:
-                        _ac_cur_div = abs(_ac_cur_sec_chg) - abs(_ac_cur_stk_chg)
-
-                    # Convergence ratio: how much of the entry gap has closed
-                    # 1.0 = fully converged, >1.0 = overshooting
-                    if _ac_entry_div > 0:
-                        _ac_conv_ratio = 1.0 - (_ac_cur_div / _ac_entry_div)
-                    else:
-                        continue
-
-                    # ── Convergence exit thresholds ──
-                    # Exit if ≥70% of the gap has closed (stock caught up to peers)
-                    # OR stock has overshot (moved more than sector → take profit)
-                    _ac_conv_threshold = 0.70  # 70% gap closure = convergence
-                    _ac_converged = _ac_conv_ratio >= _ac_conv_threshold
-                    _ac_overshot = _ac_cur_div < 0  # Stock moved MORE than sector
-
-                    if not _ac_converged and not _ac_overshot:
-                        continue  # Still lagging — let it run
-
-                    # Get option premium LTP
-                    try:
-                        _ac_ltp_data = self.tools.kite.ltp([_ac_sym])
-                        if _ac_sym not in _ac_ltp_data:
-                            continue
-                        _ac_opt_ltp = _ac_ltp_data[_ac_sym]['last_price']
-                    except Exception:
-                        continue
-
-                    _ac_entry_price = _ac_pos.get('avg_price', 0)
-                    _ac_qty = _ac_pos.get('quantity', 0)
-                    _ac_pnl_pct = ((_ac_opt_ltp - _ac_entry_price) / _ac_entry_price * 100) if _ac_entry_price > 0 else 0
-                    _ac_pnl = (_ac_opt_ltp - _ac_entry_price) * _ac_qty
-
-                    from config import calc_brokerage
-                    _ac_brokerage = calc_brokerage(_ac_entry_price, _ac_opt_ltp, _ac_qty)
-                    _ac_pnl -= _ac_brokerage
-
-                    _ac_reason = 'OVERSHOOT' if _ac_overshot else 'CONVERGED'
-                    _ac_ul_short = _ac_ul.replace('NSE:', '')
-
-                    print(f"\n   🔄 ARBTR CONVERGENCE EXIT: {_ac_ul_short} ({_ac_sector}) — {_ac_reason}")
-                    print(f"      Entry: sector={_ac_entry_sec_chg:+.1f}% stk={_ac_entry_stk_chg:+.1f}% div={_ac_entry_div:.1f}%")
-                    print(f"      Now:   sector={_ac_cur_sec_chg:+.1f}% stk={_ac_cur_stk_chg:+.1f}% div={_ac_cur_div:.1f}% conv={_ac_conv_ratio:.0%}")
-                    print(f"      Premium: ₹{_ac_entry_price:.2f} → ₹{_ac_opt_ltp:.2f} | P&L: ₹{_ac_pnl:+,.0f} ({_ac_pnl_pct:+.1f}%)")
-
-                    _ac_exit_detail = {
-                        'exit_type': f'ARBTR_CONVERGENCE_{_ac_reason}',
-                        'exit_reason': (f'ARBTR thesis complete — {_ac_reason}: '
-                                       f'entry_div={_ac_entry_div:.1f}% → now_div={_ac_cur_div:.1f}% '
-                                       f'conv={_ac_conv_ratio:.0%} | '
-                                       f'sector={_ac_cur_sec_chg:+.1f}% stock={_ac_cur_stk_chg:+.1f}%'),
-                        'sector': _ac_sector,
-                        'entry_divergence': _ac_entry_div,
-                        'current_divergence': round(_ac_cur_div, 2),
-                        'convergence_ratio': round(_ac_conv_ratio, 2),
-                        'entry_sector_chg': _ac_entry_sec_chg,
-                        'current_sector_chg': round(_ac_cur_sec_chg, 2),
-                        'entry_stock_chg': _ac_entry_stk_chg,
-                        'current_stock_chg': round(_ac_cur_stk_chg, 2),
-                        'pnl_pct': round(_ac_pnl_pct, 2),
-                        'brokerage': round(_ac_brokerage, 2),
-                    }
-
-                    self.tools.update_trade_status(_ac_sym, f'ARBTR_CONVERGENCE_{_ac_reason}', _ac_opt_ltp, _ac_pnl, exit_detail=_ac_exit_detail)
-                    with self._pnl_lock:
-                        self.daily_pnl += _ac_pnl
-                        self.capital += _ac_pnl
-
-                    _ac_was_win = _ac_pnl > 0
-                    _ac_open_after = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != _ac_sym]
-                    _ac_unreal = self.risk_governor._calc_unrealized_pnl(_ac_open_after)
-                    self.risk_governor.record_trade_result(_ac_sym, _ac_pnl, _ac_was_win, unrealized_pnl=_ac_unreal)
-                    self.risk_governor.update_capital(self.capital)
-
-                    self._log_decision(_cycle_time, _ac_ul, 0, f'ARBTR_CONVERGENCE_{_ac_reason}',
-                                      reason=f'{_ac_sector}: div {_ac_entry_div:.1f}%→{_ac_cur_div:.1f}% conv={_ac_conv_ratio:.0%} P&L=₹{_ac_pnl:+,.0f}',
-                                      direction=_ac_direction, setup='ARBTR')
-
-                    print(f"      ✅ ARBTR convergence exit | {'Profit' if _ac_was_win else 'Loss'}: ₹{_ac_pnl:+,.0f}")
-
-            except Exception as _arb_conv_err:
-                print(f"   ⚠️ ARBTR convergence exit error (non-fatal): {_arb_conv_err}")
+            # === ARBTR SPEED GATE + CONVERGENCE EXIT: REMOVED Apr 8 ===
+            # (ARBTR trade type surgically removed — no new ARBTR trades placed)
 
             # === CONVICTION REVERSAL EXIT: Your own system says you're wrong ===
             # Pro trader rule: if your system flips direction on a stock you're holding
@@ -12071,9 +11349,9 @@ class AutonomousTrader:
                         # by 12 (average micro contribution for liquid F&O stocks) to avoid
                         # filtering out stocks that would pass at trade time.
                         _micro_absent_offset = 12
-                        # GPT-selected minimum: score + micro offset must reach 70
-                        # (raw score ~58+ since micro adds ~12) [was 66, tightened Mar 2 +4pts]
-                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 70:
+                        # GPT-selected minimum: score + micro offset must reach 75
+                        # (raw score ~63+ since micro adds ~12) [was 70, tightened Apr 10 +5pts]
+                        if _fno_score > 0 and _fno_score + _micro_absent_offset < 75:
                             continue
                         # Append ML signal tag if available (fail-safe: empty string if not)
                         _ml_tag = ""
@@ -13322,6 +12600,14 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         schedule.every(current_interval).minutes.do(self.scan_and_trade)
         _dbg(f"DEBUG: scheduled scan_and_trade every {current_interval} min")
         
+        # === PRE-MARKET NEWS SCAN (Mode D) ===
+        try:
+            if False:  # EARLYBIRD REMOVED
+                _dbg("NEWS_SCAN: Initializing pre-market news scanner...")
+                self._run_news_scan(_dbg)
+        except Exception as _news_e:
+            _dbg(f"WARN: News scan init failed (non-fatal): {_news_e}")
+
         # Initial scan
         _dbg("DEBUG: calling initial scan_and_trade()...")
         try:
@@ -13367,6 +12653,35 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                         self._apply_settings_overrides()
                     except Exception:
                         pass
+
+                # === DAILY NEWS RE-SCAN (Mode D) — runs once per day at ~08:50 ===
+                if _loop_count % 120 == 0:  # Check every ~60s
+                    try:
+                        _now_hm = datetime.now().strftime('%H:%M')
+                        if _now_hm >= '08:48' and _now_hm <= '08:55' and not self._news_scan_done:
+                            _dbg("📰 NEWS_SCAN: Daily pre-market re-scan triggered")
+                            self._news_scan_done = False  # Allow fresh scan
+                            self._run_news_scan(_dbg)
+                        elif _now_hm >= '15:31':
+                            self._news_scan_done = False  # Reset for next day
+                    except Exception:
+                        pass
+
+                # === INTRADAY NEWS CHECK — every 15 min during market hours ===
+                # RSS fetch is FREE; GPT only called if ≥2 new relevant headlines
+                # Use wall-clock time (loop iterations are variable-speed)
+                try:
+                    _now_dt = datetime.now()
+                    _now_hm = _now_dt.strftime('%H:%M')
+                    if '09:30' <= _now_hm <= '15:15':
+                        _last_intraday_news = getattr(self, '_last_intraday_news_ts', None)
+                        _elapsed = (_now_dt - _last_intraday_news).total_seconds() if _last_intraday_news else 99999
+                        if _last_intraday_news is None or _elapsed >= 450:
+                            _dbg(f"📰 INTRADAY_NEWS: Triggering scan (last={_last_intraday_news}, elapsed={_elapsed:.0f}s)")
+                            self._last_intraday_news_ts = _now_dt
+                            self._run_intraday_news_check(_dbg)
+                except Exception as _intra_e:
+                    _dbg(f"WARN: Intraday news loop error: {_intra_e}")
                 
                 _loop_count += 1
 
@@ -13402,7 +12717,6 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
                                              f"piped={self._watcher_total_pipeline_sent} "
                                              f"gated={self._watcher_total_gate_blocked} "
                                              f"placed={self._watcher_total_placed} "
-                                             f"earlybird={self._earlybird_total_placed}(A={self._earlybird_mode_placed.get('A',0)}/B={self._earlybird_mode_placed.get('B',0)}/C={self._earlybird_mode_placed.get('C',0)}) "
                                              f"pos_full={self._watcher_total_pos_exhausted} "
                                              f"fired={len(self._watcher_fired_this_session)}"
                                              f" | oi_watcher: placed={self._oi_watcher_total_placed}"

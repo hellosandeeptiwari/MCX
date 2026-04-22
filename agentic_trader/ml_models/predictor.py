@@ -592,7 +592,8 @@ class MovePredictor:
     
     def get_titan_signals(self, candles_df, daily_df=None, oi_df=None, futures_oi_df=None,
                            nifty_5min_df=None, nifty_daily_df=None,
-                           sector_5min_df=None, sector_daily_df=None) -> dict:
+                           sector_5min_df=None, sector_daily_df=None,
+                           symbol=None) -> dict:
         """All-in-one Titan integration signals.
         
         FAIL-SAFE: Returns neutral defaults on ANY error.
@@ -625,8 +626,9 @@ class MovePredictor:
             
             # ── Futures OI staleness check ──
             # fut_oi_buildup + oi_price_confirm = ~30% of direction model importance.
-            # ONLY penalize when OI data EXISTS but is outdated (>3 days).
+            # ONLY penalize when OI data EXISTS but is outdated (>5 days).
             # Missing OI (None / not in universe) is NOT stale — just unavailable.
+            # Threshold 5 handles long weekends + holidays (e.g. Good Friday + weekend = 4 days).
             oi_stale = False
             oi_available = False
             if futures_oi_df is not None and not futures_oi_df.empty:
@@ -634,8 +636,8 @@ class MovePredictor:
                 try:
                     last_oi_date = pd.Timestamp(futures_oi_df['date'].max())
                     now = pd.Timestamp.now()
-                    # Allow for weekends: check if last date is > 3 calendar days ago
-                    if (now - last_oi_date).days > 3:
+                    # Allow for weekends + holidays: >5 calendar days = genuinely stale
+                    if (now - last_oi_date).days > 5:
                         oi_stale = True
                 except Exception:
                     oi_stale = True

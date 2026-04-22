@@ -1,6 +1,15 @@
-"""OI Watcher Engine — extracted from autonomous_trader.py"""
+"""OI Watcher Engine — extracted from autonomous_trader.py
+
+CRITICAL: This module MUST be imported and used by autonomous_trader.py.
+If autonomous_trader.py has inline OI_WATCHER scoring instead of calling
+OIWatcherEngine, the 13-factor + anchor gate structure is lost.
+See commit 1f51144 for the original extraction.
+"""
 import threading
 from config import CAPITAL_SWAP
+
+# ── GUARD: Fail loudly if this module isn't being imported ──
+_ENGINE_LOADED = True  # autonomous_trader checks this at startup
 
 
 # OI signals that indicate BEARISH direction (operators positioned for down move)
@@ -64,11 +73,16 @@ class OIWatcherEngine:
             # [FIX Mar 24 v2] SHORT_COVERING / LONG_UNWINDING need higher base (weaker signals)
             if _oi_sig in ('SHORT_COVERING', 'LONG_UNWINDING') and _oi_str < 0.40:
                 continue
+            # Apr 15 RCA: Don't filter out already-fired/active-trade symbols HERE.
+            # The _mf_* enrichment must run for ALL directional symbols above threshold,
+            # because the pipeline's B2-OI-ANCHOR gate reads these flags later.
+            # Mark them as skip-for-fire instead, and filter after enrichment.
+            _oi_skip_fire = False
             if _oi_sym in t._oi_watcher_fired_this_session:
-                continue  # Already fired OI_WATCHER on this symbol today
+                _oi_skip_fire = True  # Already fired — enrich but don't fire again
             if t.tools.is_symbol_in_active_trades(_oi_sym):
-                continue  # Already holding this symbol
-            _oi_candidates.append((_oi_sym, _oi_dir, _oi_sig, _oi_str, _oi_res))
+                _oi_skip_fire = True  # Already holding — enrich but don't fire again
+            _oi_candidates.append((_oi_sym, _oi_dir, _oi_sig, _oi_str, _oi_res, _oi_skip_fire))
 
         if _oi_candidates:
             # ── SMART QUALITY SCORING ──
@@ -76,8 +90,17 @@ class OIWatcherEngine:
             # that rewards confluence: participant + cross-validation + price confirmation + OI trend.
             # No harsh gates — everything is a boost/discount to effective strength.
             _ticker = getattr(t.tools, 'ticker', None)
+
+            # (N) FII/DII Cash Flow — macro institutional direction (fetched once, cached 5 min)
+            _oc_fii_data = {}
+            try:
+                from nse_oi_fetcher import get_nse_oi_fetcher
+                _oc_fii_data = get_nse_oi_fetcher().fetch_fii_dii()
+            except Exception:
+                pass
+
             for _oci in range(len(_oi_candidates)):
-                _oc_sym, _oc_dir, _oc_sig, _oc_str, _oc_res = _oi_candidates[_oci]
+                _oc_sym, _oc_dir, _oc_sig, _oc_str, _oc_res, _oc_skip_fire = _oi_candidates[_oci]
                 _oc_eff_str = _oc_str
                 _oc_boosts = []
                 _oc_confirms = 0  # Independent confirming factor count
@@ -105,8 +128,8 @@ class OIWatcherEngine:
                         _oc_eff_str *= 1.25  # 85%+ writer = rock solid institutional conviction
                         _oc_boosts.append(f'W✓✓{_oc_writer_ratio:.0%}')
                         _oc_confirms += 1
-                    elif _oc_writer_ratio >= 0.65:
-                        _oc_eff_str *= 1.12  # Strong writer majority
+                    elif _oc_writer_ratio >= 0.70:
+                        _oc_eff_str *= 1.12  # Strong writer majority (tightened 0.65→0.70)
                         _oc_boosts.append(f'W✓{_oc_writer_ratio:.0%}')
                         _oc_confirms += 1
                     elif _oc_writer_ratio >= 0.50:
@@ -136,7 +159,7 @@ class OIWatcherEngine:
                 # OI says BUY + stock is falling = divergence (could still work, but less confident)
                 _oc_C_confirmed = False
                 _oc_C_price_chg = 0.0
-                _oc_C_min_delta = getattr(t, '_oi_watcher_min_price_delta', 0.15)
+                _oc_C_min_delta = getattr(t, '_oi_watcher_min_price_delta', 0.20)  # Apr 7: tightened 0.15→0.20%
                 if _ticker:
                     try:
                         _oc_clean = _oc_sym.replace('NSE:', '')
@@ -177,7 +200,7 @@ class OIWatcherEngine:
                 _oc_hist = t._oi_aggr_strength_history.get(_oc_sym, [])
                 if len(_oc_hist) >= 2:
                     _oc_prev_str = _oc_hist[-1][1]  # Most recent prior reading
-                    if _oc_eff_str > _oc_prev_str * 1.05:  # 5% stronger than last
+                    if _oc_eff_str > _oc_prev_str * 1.10:  # 10% stronger than last (tightened 1.05→1.10)
                         _oc_eff_str *= 1.05  # Building → 5% boost
                         _oc_boosts.append('OI↑')
                         _oc_confirms += 1
@@ -193,8 +216,8 @@ class OIWatcherEngine:
                     _oc_sec_name, _oc_sec_idx = _oc_sec_info
                     _oc_sec_chg = _oc_sec_chgs.get(_oc_sec_idx, 0)
                     _oc_sec_agrees = (
-                        (_oc_dir == 'BUY' and _oc_sec_chg > 0.3) or
-                        (_oc_dir == 'SELL' and _oc_sec_chg < -0.3)
+                        (_oc_dir == 'BUY' and _oc_sec_chg > 0.40) or
+                        (_oc_dir == 'SELL' and _oc_sec_chg < -0.40)
                     )
                     _oc_sec_oppose = (
                         (_oc_dir == 'BUY' and _oc_sec_chg < -0.5) or
@@ -212,9 +235,22 @@ class OIWatcherEngine:
                 # If futures show LONG_BUILDUP and OI says BUY = triple confluence
                 # [MANDATORY FACTOR] — tracked for conviction gate
                 _oc_F_confirmed = False
-                _oc_ml = getattr(t, '_cycle_ml_results', {})
-                _oc_ml_data = _oc_ml.get(_oc_sym, {})
-                _oc_fut_buildup = _oc_ml_data.get('fut_oi_buildup', 0) if isinstance(_oc_ml_data, dict) else 0
+                _oc_F_strong_confirmed = False  # True only for FUT✓✓ (|buildup| ≥ 0.75)
+                _oc_F_evaluable = False  # Apr 15 RCA: True when futures data exists (vs no data at all)
+                # [FIX Apr 6] Read from _futures_oi_data (raw parquet), NOT _cycle_ml_results
+                # _cycle_ml_results contains ML predictions (ml_signal, ml_prob_up etc.)
+                # _futures_oi_data contains raw features (fut_oi_buildup, fut_basis_pct etc.)
+                _oc_fut_buildup = 0
+                try:
+                    _oc_foi = getattr(t, '_futures_oi_data', None) or {}
+                    # Apr 21 FIX: load_all_futures_oi_daily() keys are bare symbols
+                    # ("MANAPPURAM"), but _oc_sym is "NSE:MANAPPURAM". Try both.
+                    _oc_foi_df = _oc_foi.get(_oc_sym) or _oc_foi.get(_oc_sym.replace('NSE:', ''))
+                    if _oc_foi_df is not None and len(_oc_foi_df) > 0:
+                        _oc_fut_buildup = float(_oc_foi_df.iloc[-1].get('fut_oi_buildup', 0))
+                        _oc_F_evaluable = True  # Futures data exists
+                except Exception:
+                    _oc_fut_buildup = 0
                 if _oc_fut_buildup:
                     _oc_fut_agrees = (
                         (_oc_dir == 'BUY' and _oc_fut_buildup > 0) or
@@ -222,12 +258,13 @@ class OIWatcherEngine:
                     )
                     _oc_fut_strong = abs(_oc_fut_buildup) >= 0.75  # LB/SB not SC/LU
                     if _oc_fut_agrees and _oc_fut_strong:
-                        _oc_eff_str *= 1.12  # Futures + Options agree strongly → 12% boost
+                        _oc_eff_str *= 1.15  # Futures + Options agree strongly → 15% boost
                         _oc_boosts.append('FUT✓✓')
                         _oc_confirms += 1
                         _oc_F_confirmed = True
+                        _oc_F_strong_confirmed = True
                     elif _oc_fut_agrees:
-                        _oc_eff_str *= 1.05  # Mild agreement → 5% boost
+                        _oc_eff_str *= 1.08  # Mild agreement → 8% boost
                         _oc_boosts.append('FUT✓')
                         _oc_confirms += 1
                         _oc_F_confirmed = True
@@ -242,6 +279,7 @@ class OIWatcherEngine:
                     try:
                         _oc_fut_data = _ticker.get_futures_oi(_oc_sym)
                         if _oc_fut_data and _oc_fut_data.get('ltp', 0) > 0:
+                            _oc_F_evaluable = True  # Basis data exists
                             _oc_fut_ltp = _oc_fut_data['ltp']
                             # Get equity spot from ticker cache
                             _oc_eq_ltp = 0
@@ -253,8 +291,8 @@ class OIWatcherEngine:
                             if _oc_eq_ltp > 0:
                                 _oc_basis_pct = ((_oc_fut_ltp - _oc_eq_ltp) / _oc_eq_ltp) * 100
                                 _oc_basis_agrees = (
-                                    (_oc_dir == 'BUY' and _oc_basis_pct > 0.05) or
-                                    (_oc_dir == 'SELL' and _oc_basis_pct < -0.05)
+                                    (_oc_dir == 'BUY' and _oc_basis_pct > 0.10) or
+                                    (_oc_dir == 'SELL' and _oc_basis_pct < -0.10)
                                 )
                                 _oc_basis_disagrees = (
                                     (_oc_dir == 'BUY' and _oc_basis_pct < -0.10) or
@@ -264,6 +302,10 @@ class OIWatcherEngine:
                                     _oc_eff_str *= 1.10  # Smart money paying premium in your direction
                                     _oc_boosts.append(f'BASIS✓{_oc_basis_pct:+.2f}%')
                                     _oc_confirms += 1
+                                    # [FIX Apr 6] Basis agreement = futures anchor fallback
+                                    # If fut_oi_buildup was missing, basis confirms F
+                                    if not _oc_F_confirmed:
+                                        _oc_F_confirmed = True
                                 elif _oc_basis_disagrees:
                                     _oc_eff_str *= 0.90  # Futures pricing against you
                                     _oc_boosts.append(f'BASIS✗{_oc_basis_pct:+.2f}%')
@@ -275,6 +317,7 @@ class OIWatcherEngine:
                 # Buildup far OTM = hedging/premium collection, NOT directional conviction
                 # [MANDATORY FACTOR] — tracked for conviction gate
                 _oc_H_confirmed = False
+                _oc_H_evaluable = False  # Apr 15 RCA: True when strike-level OI data exists
                 _oc_spot = _oc_res.get('spot_price', 0) or _oc_res.get('dhan_spot_price', 0)
                 if _oc_spot > 0:
                     # For BUY direction, check put OI buildup (support building)
@@ -287,9 +330,10 @@ class OIWatcherEngine:
                         # Each entry is (strike, oi_change) tuple
                         _oc_top_strike = _oc_relevant_strikes[0][0] if isinstance(_oc_relevant_strikes[0], (list, tuple)) else 0
                         if _oc_top_strike > 0:
+                            _oc_H_evaluable = True  # Strike data available
                             _oc_strike_dist = abs(_oc_top_strike - _oc_spot) / _oc_spot * 100
-                            if _oc_strike_dist <= 2.0:
-                                _oc_eff_str *= 1.10  # Near-money buildup = institutional conviction
+                            if _oc_strike_dist <= 2.5:  # Apr 7: tightened 3.0→2.5%
+                                _oc_eff_str *= 1.14  # Near-money buildup = institutional conviction
                                 _oc_boosts.append(f'ATM✓{_oc_strike_dist:.1f}%')
                                 _oc_confirms += 1
                                 _oc_H_confirmed = True
@@ -301,14 +345,14 @@ class OIWatcherEngine:
                 # Fast-rising PCR = aggressive put writing = building support NOW
                 # Fast-falling PCR = aggressive call writing = building resistance NOW
                 _oc_pcr_rate = _oc_res.get('pcr_shift_rate', 0)
-                if abs(_oc_pcr_rate) > 0.005:  # Meaningful rate of change
+                if abs(_oc_pcr_rate) > 0.010:  # Meaningful rate of change (tightened 0.005→0.010)
                     _oc_pcr_rate_confirms = (
-                        (_oc_dir == 'BUY' and _oc_pcr_rate > 0.01) or   # Rising PCR = bullish (put support)
-                        (_oc_dir == 'SELL' and _oc_pcr_rate < -0.01)     # Falling PCR = bearish
+                        (_oc_dir == 'BUY' and _oc_pcr_rate >= 0.015) or   # Rising PCR = bullish (tightened 0.01→0.015)
+                        (_oc_dir == 'SELL' and _oc_pcr_rate <= -0.015)     # Falling PCR = bearish
                     )
                     _oc_pcr_rate_opposes = (
-                        (_oc_dir == 'BUY' and _oc_pcr_rate < -0.01) or
-                        (_oc_dir == 'SELL' and _oc_pcr_rate > 0.01)
+                        (_oc_dir == 'BUY' and _oc_pcr_rate <= -0.015) or
+                        (_oc_dir == 'SELL' and _oc_pcr_rate >= 0.015)
                     )
                     if _oc_pcr_rate_confirms:
                         _oc_eff_str *= 1.08  # PCR shifting your way NOW
@@ -318,27 +362,7 @@ class OIWatcherEngine:
                         _oc_eff_str *= 0.92  # PCR shifting against you
                         _oc_boosts.append(f'PCR↘{_oc_pcr_rate:+.3f}')
 
-                # (J) Volume PCR: today's trading intent vs stale OI
-                # Volume PCR captures what traders are DOING today. OI PCR includes
-                # stale overnight positions. When volume PCR strongly confirms = fresh conviction.
-                _oc_vol_pcr = _oc_res.get('nse_pcr_volume', 0)
-                _oc_oi_pcr = _oc_res.get('pcr_oi', 1.0)
-                if _oc_vol_pcr and _oc_vol_pcr > 0:
-                    _oc_vol_confirms = (
-                        (_oc_dir == 'BUY' and _oc_vol_pcr > 1.3) or    # Heavy put volume = support
-                        (_oc_dir == 'SELL' and _oc_vol_pcr < 0.7)      # Heavy call volume = pressure
-                    )
-                    _oc_vol_opposes = (
-                        (_oc_dir == 'BUY' and _oc_vol_pcr < 0.6) or
-                        (_oc_dir == 'SELL' and _oc_vol_pcr > 1.5)
-                    )
-                    if _oc_vol_confirms:
-                        _oc_eff_str *= 1.08  # Today's volume confirms direction
-                        _oc_boosts.append(f'VP✓{_oc_vol_pcr:.2f}')
-                        _oc_confirms += 1
-                    elif _oc_vol_opposes:
-                        _oc_eff_str *= 0.90  # Today's volume against direction
-                        _oc_boosts.append(f'VP✗{_oc_vol_pcr:.2f}')
+                # (J) Volume PCR: REMOVED — PCR extremes gate eliminated
 
                 # (K) Futures Conviction Boost: OI Day-High + Order Book Imbalance
                 # Kite WebSocket streams futures OI + buy/sell qty in real-time (0 API calls).
@@ -347,10 +371,13 @@ class OIWatcherEngine:
                 # sell_quantity = total pending SELL orders in futures order book (bearish supply)
                 # [MANDATORY FACTOR] — tracked for conviction gate
                 _oc_K_confirmed = False
+                _oc_K_strong_confirmed = False  # True only for FOIDH✓ (OI ≥85% of day range)
+                _oc_K_evaluable = False  # Apr 15 RCA: True when ticker has futures data for this stock
                 if _ticker:
                     try:
                         _oc_fk = _ticker.get_futures_oi(_oc_sym)
                         if _oc_fk and _oc_fk.get('oi', 0) > 0:
+                            _oc_K_evaluable = True  # Futures OI data available
                             _oc_fk_oi = _oc_fk['oi']
                             _oc_fk_high = _oc_fk.get('oi_day_high', 0)
                             _oc_fk_low = _oc_fk.get('oi_day_low', 0)
@@ -359,12 +386,13 @@ class OIWatcherEngine:
                             if _oc_fk_high > _oc_fk_low > 0:
                                 _oc_fk_range = _oc_fk_high - _oc_fk_low
                                 _oc_fk_pos = (_oc_fk_oi - _oc_fk_low) / _oc_fk_range  # 0=low, 1=high
-                                if _oc_fk_pos >= 0.85:  # OI at/near day high = fresh positions
+                                if _oc_fk_pos >= 0.75:  # Apr 7: tightened 0.70→0.75
                                     _oc_eff_str *= 1.18
                                     _oc_boosts.append(f'FOIDH✓{_oc_fk_pos:.0%}')
                                     _oc_confirms += 1
                                     _oc_K_confirmed = True
-                                elif _oc_fk_pos >= 0.65:  # OI trending up = steady buildup
+                                    _oc_K_strong_confirmed = True
+                                elif _oc_fk_pos >= 0.60:  # Apr 7: tightened 0.55→0.60
                                     _oc_eff_str *= 1.08
                                     _oc_boosts.append(f'FOIDH~{_oc_fk_pos:.0%}')
 
@@ -393,7 +421,7 @@ class OIWatcherEngine:
                 _oc_vel_hist = t._oi_aggr_strength_history.get(_oc_sym, [])
                 if len(_oc_vel_hist) >= 2:
                     _oc_vel_avg = sum(h[1] for h in _oc_vel_hist[-3:]) / min(3, len(_oc_vel_hist))
-                    if _oc_vel_avg > 0 and _oc_str > _oc_vel_avg * 1.15:
+                    if _oc_vel_avg > 0 and _oc_str > _oc_vel_avg * 1.20:  # tightened 1.15→1.20x
                         _oc_eff_str *= 1.10  # Accelerating OI = fresh institutional entry
                         _oc_boosts.append(f'VEL✓{_oc_str/_oc_vel_avg:.2f}x')
                         _oc_confirms += 1
@@ -417,7 +445,7 @@ class OIWatcherEngine:
                                 # Check recent 3 ticks for sustained elevation
                                 _oc_v_recent = list(_oc_vdh)[-3:]
                                 _oc_v_elevated = sum(1 for _vd in _oc_v_recent if _vd >= _oc_vavg * 1.4)
-                                if _oc_vol_surge_ratio >= 1.79 and _oc_v_elevated >= 2:
+                                if _oc_vol_surge_ratio >= 2.0 and _oc_v_elevated >= 2:  # tightened 1.79→2.0x
                                     # Volume IS surging — check price alignment
                                     with _ticker._lock:
                                         _oc_vtok = None
@@ -486,9 +514,45 @@ class OIWatcherEngine:
                 _oc_res['_mf_C'] = _oc_C_confirmed
                 _oc_res['_mf_C_price_chg'] = _oc_C_price_chg
                 _oc_res['_mf_F'] = _oc_F_confirmed
+                _oc_res['_mf_F_strong'] = _oc_F_strong_confirmed
                 _oc_res['_mf_H'] = _oc_H_confirmed
                 _oc_res['_mf_K'] = _oc_K_confirmed
+                _oc_res['_mf_K_strong'] = _oc_K_strong_confirmed
                 _oc_res['_mf_M'] = _oc_vol_surge_aligned
+                # (N) FII/DII Cash Flow: macro institutional direction
+                # FII net buying confirms BUY, FII net selling confirms SELL.
+                # This is the single strongest macro institutional signal in Indian markets.
+                _oc_N_confirmed = False
+                _oc_N_evaluable = bool(_oc_fii_data and _oc_fii_data.get('fii_direction'))  # Apr 15 RCA
+                if _oc_fii_data and _oc_fii_data.get('fii_direction'):
+                    _oc_fii_dir = _oc_fii_data['fii_direction']
+                    _oc_fii_net = _oc_fii_data.get('fii_net', 0)
+                    _oc_fii_confirms = (
+                        (_oc_dir == 'BUY' and _oc_fii_dir == 'BULLISH') or
+                        (_oc_dir == 'SELL' and _oc_fii_dir == 'BEARISH')
+                    )
+                    _oc_fii_opposes = (
+                        (_oc_dir == 'BUY' and _oc_fii_dir == 'BEARISH') or
+                        (_oc_dir == 'SELL' and _oc_fii_dir == 'BULLISH')
+                    )
+                    if _oc_fii_confirms:
+                        _oc_eff_str *= 1.10  # FII backing your direction
+                        _oc_boosts.append(f'FII✓{_oc_fii_net:+,.0f}Cr')
+                        _oc_confirms += 1
+                        _oc_N_confirmed = True
+                    elif _oc_fii_opposes:
+                        _oc_eff_str *= 0.88  # Swimming against FII flow
+                        _oc_boosts.append(f'FII✗{_oc_fii_net:+,.0f}Cr')
+                    else:
+                        # FII NEUTRAL = not opposing but not confirming either
+                        _oc_boosts.append(f'FII~{_oc_fii_net:+,.0f}Cr')
+                _oc_res['_mf_N'] = _oc_N_confirmed
+                # Apr 17 FIX: Store evaluability flags AFTER all factors computed
+                # (was crashing with NameError: _oc_N_evaluable used before assignment)
+                _oc_res['_mf_F_eval'] = _oc_F_evaluable
+                _oc_res['_mf_H_eval'] = _oc_H_evaluable
+                _oc_res['_mf_K_eval'] = _oc_K_evaluable
+                _oc_res['_mf_N_eval'] = _oc_N_evaluable
 
                 # (B2) Momentum Confluence — 4 signals, ≥2/4 to confirm (anchor factor)
                 # Computed natively from OI watcher data. Joins F,H,K in anchor pool.
@@ -545,24 +609,28 @@ class OIWatcherEngine:
                 # [FIX Mar 24 v2] SHORT_COVERING / LONG_UNWINDING need ≥0.65 effective to fire
                 if _oc_sig in ('SHORT_COVERING', 'LONG_UNWINDING') and _oc_eff_str < 0.65:
                     _oc_eff_str = 0.0  # Will be filtered by min_strength check downstream
-                # [FIX Mar 29] LONG_BUILDUP / SHORT_BUILDUP need ≥0.50 effective — prevent weak noise
-                if _oc_sig in ('LONG_BUILDUP', 'SHORT_BUILDUP') and _oc_eff_str < 0.50:
+                # [FIX Mar 29] LONG_BUILDUP / SHORT_BUILDUP need ≥0.55 effective — prevent weak noise
+                if _oc_sig in ('LONG_BUILDUP', 'SHORT_BUILDUP') and _oc_eff_str < 0.55:
                     _oc_eff_str = 0.0
-                _oi_candidates[_oci] = (_oc_sym, _oc_dir, _oc_sig, _oc_eff_str, _oc_res)
+                _oi_candidates[_oci] = (_oc_sym, _oc_dir, _oc_sig, _oc_eff_str, _oc_res, _oc_skip_fire)
                 # Store boost tags + confirm count for logging
                 _oc_res['_quality_boosts'] = ' '.join(_oc_boosts) if _oc_boosts else ''
                 _oc_res['_confirm_count'] = _oc_confirms
+            # Apr 15 RCA: Filter out skip-for-fire candidates AFTER enrichment
+            # All candidates now have _mf_* flags set on their _oc_res dicts (shared with layer1_oi).
+            # Only fire-eligible candidates go through selection.
+            _oi_fireable = [c for c in _oi_candidates if not c[5]]
             # Sort by (confirm_count DESC, effective_strength DESC) — conviction first, strength second
-            _oi_candidates.sort(key=lambda x: (x[4].get('_confirm_count', 0), x[3]), reverse=True)
-            _oi_max_fire = 1  # Fire ONLY the single best-convicted candidate per cycle
+            _oi_fireable.sort(key=lambda x: (x[4].get('_confirm_count', 0), x[3]), reverse=True)
+            _oi_max_fire = 3  # Fire up to 3 best-convicted candidates per cycle
             _oi_placed_count = 0
-            _oi_top_confirms = _oi_candidates[0][4].get('_confirm_count', 0) if _oi_candidates else 0
-            t._wlog(f"🔬 OI_WATCHER: {len(_oi_candidates)} candidates, "
+            _oi_top_confirms = _oi_fireable[0][4].get('_confirm_count', 0) if _oi_fireable else 0
+            t._wlog(f"🔬 OI_WATCHER: {len(_oi_fireable)} candidates ({len(_oi_candidates)} enriched), "
                        f"top conviction={_oi_top_confirms}/{t._oi_min_confirmations} factors")
-            for _oi_rank, _oi_top in enumerate(_oi_candidates[:_oi_max_fire]):
+            for _oi_rank, _oi_top in enumerate(_oi_fireable[:_oi_max_fire]):
                 if t._oi_watcher_total_placed >= t._oi_watcher_max_per_day:
                     break
-                _oi_sym, _oi_dir, _oi_sig, _oi_str, _oi_res = _oi_top
+                _oi_sym, _oi_dir, _oi_sig, _oi_str, _oi_res, _ = _oi_top
                 _oi_pcr = _oi_res.get('pcr_oi', 1.0)
                 _oi_bias = _oi_res.get('flow_bias', 'NEUTRAL')
 
@@ -616,43 +684,63 @@ class OIWatcherEngine:
                     continue
 
                 # ── CONVICTION FACTOR GATE ──
-                # Anchor pool: F (Futures OI), H (OI concentration), K (Futures conviction)
-                #   → at least 1 of 3 must confirm (strict futures-only validation)
-                # Rest pool: A, B2, C, D, E, G, I, J, L, M (10 factors)
-                #   → at least 4 of 10 must confirm (breadth confirmation)
+                # Anchor pool: F (Futures OI), H (OI concentration), K (Futures conviction), N (FII/DII)
+                #   → at least 1 of 4 must confirm (institutional/futures validation)
+                # Rest pool: A, B2, C, D, E, G, I, L, M (9 factors)
+                #   → at least 4 of 9 must confirm (breadth confirmation)
                 _oi_mf_C = _oi_res.get('_mf_C', False)
                 _oi_mf_C_chg = _oi_res.get('_mf_C_price_chg', 0.0)
                 _oi_mf_F = _oi_res.get('_mf_F', False)
                 _oi_mf_H = _oi_res.get('_mf_H', False)
                 _oi_mf_K = _oi_res.get('_mf_K', False)
                 _oi_mf_M = _oi_res.get('_mf_M', False)
+                _oi_mf_N = _oi_res.get('_mf_N', False)
                 _oi_mf_B2 = _oi_res.get('_mf_B2', False)
+                # Anchor strength tiers: strong vs normal confirmation
+                _oi_mf_F_strong = _oi_res.get('_mf_F_strong', False)  # FUT✓✓ (|buildup|≥0.75)
+                _oi_mf_K_strong = _oi_res.get('_mf_K_strong', False)  # FOIDH✓ (OI≥85% day range)
+                # H has single tier — always STRONG when confirmed (ATM ≤2%)
                 _oi_mf_labels = []
                 if _oi_mf_C: _oi_mf_labels.append('C')
-                if _oi_mf_F: _oi_mf_labels.append('F')
-                if _oi_mf_H: _oi_mf_labels.append('H')
-                if _oi_mf_K: _oi_mf_labels.append('K')
+                if _oi_mf_F: _oi_mf_labels.append('F✦' if _oi_mf_F_strong else 'F')
+                if _oi_mf_H: _oi_mf_labels.append('H✦')  # always strong when confirmed
+                if _oi_mf_K: _oi_mf_labels.append('K✦' if _oi_mf_K_strong else 'K')
                 if _oi_mf_M: _oi_mf_labels.append('M')
+                if _oi_mf_N: _oi_mf_labels.append('N')
                 if _oi_mf_B2: _oi_mf_labels.append('B2')
-                _oi_anchor_count = sum([_oi_mf_F, _oi_mf_H, _oi_mf_K])
+                _oi_anchor_count = sum([_oi_mf_F, _oi_mf_H, _oi_mf_K, _oi_mf_N])
+                _oi_anchor_strong = sum([_oi_mf_F_strong, _oi_mf_H, _oi_mf_K_strong])  # H=always strong
+                # Apr 15 RCA: Track evaluable anchor count — don't block on missing data
+                _oi_eval_F = _oi_res.get('_mf_F_eval', False)
+                _oi_eval_H = _oi_res.get('_mf_H_eval', False)
+                _oi_eval_K = _oi_res.get('_mf_K_eval', False)
+                _oi_eval_N = _oi_res.get('_mf_N_eval', False)
+                _oi_evaluable = sum([_oi_eval_F, _oi_eval_H, _oi_eval_K, _oi_eval_N])
                 _oi_rest_count = _oi_confirms - _oi_anchor_count
                 # B2 confirmed counts toward rest pool (breadth), not anchor
-                if _oi_mf_B2 and not any([_oi_mf_F, _oi_mf_H, _oi_mf_K]):
+                if _oi_mf_B2 and not any([_oi_mf_F, _oi_mf_H, _oi_mf_K, _oi_mf_N]):
                     pass  # B2 alone cannot satisfy anchor — must have futures validation
-                # Gate 1: At least 1 of {F, H, K} must confirm (anchor — futures only)
-                if _oi_anchor_count < 1:
+                # Gate 1: At least 1 of {F, H, K, N} must confirm (anchor — institutional/futures)
+                # Apr 15 RCA: Skip if no anchor factors were evaluable (no data ≠ data says no)
+                if _oi_evaluable == 0:
+                    t._wlog(f"  ⚠️ OI_WATCHER ANCHOR SKIP: {_oi_sym.replace('NSE:', '')} "
+                               f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
+                               f"0/4 anchor factors evaluable (no institutional data), bypassing "
+                               f"[confirmed={','.join(_oi_mf_labels)}] "
+                               f"[{_oi_res.get('_quality_boosts', '')}]")
+                elif _oi_anchor_count < 1:
                     t._wlog(f"  ⛔ OI_WATCHER ANCHOR GATE: {_oi_sym.replace('NSE:', '')} "
                                f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                               f"0/3 of F,H,K confirmed (need ≥1 futures anchor) "
+                               f"{_oi_anchor_count}/{_oi_evaluable} of F,H,K,N confirmed (need ≥1 anchor) "
                                f"[confirmed={','.join(_oi_mf_labels)}] "
                                f"[{_oi_res.get('_quality_boosts', '')}]")
                     continue
-                # Gate 2: At least 4 from the remaining 10 factors incl B2 (breadth)
+                # Gate 2: At least 4 from the remaining 9 factors incl B2 (breadth)
                 if _oi_rest_count < 4:
                     t._wlog(f"  ⛔ OI_WATCHER BREADTH GATE: {_oi_sym.replace('NSE:', '')} "
                                f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
-                               f"only {_oi_rest_count}/10 rest-pool factors confirm (need ≥4) "
-                               f"anchor={_oi_anchor_count}/3 "
+                               f"only {_oi_rest_count}/9 rest-pool factors confirm (need ≥4) "
+                               f"anchor={_oi_anchor_count}/4 "
                                f"[confirmed={','.join(_oi_mf_labels)}] "
                                f"[{_oi_res.get('_quality_boosts', '')}]")
                     continue
@@ -668,10 +756,19 @@ class OIWatcherEngine:
                 _oi_price_delta_str = f'{_oi_mf_C_chg:+.2f}%'
                 _oi_quality_tags_raw = _oi_res.get('_quality_boosts', '')
 
+                # Anchor-based lot sizing: more anchors = higher conviction = bigger size
+                _oi_anchor_lot_mult = 1.0
+                if _oi_anchor_count >= 3:
+                    _oi_anchor_lot_mult = 3.0
+                elif _oi_anchor_count >= 2:
+                    _oi_anchor_lot_mult = 1.5
+
                 t._wlog(f"  ✅ OI_WATCHER HIGH CONVICTION: {_oi_sym.replace('NSE:', '')} "
                            f"{_oi_sig} str={_oi_str:.3f} dir={_oi_dir} — "
                            f"{_oi_confirms}/{t._oi_min_confirmations} factors confirm "
+                           f"anchor={_oi_anchor_count}/4({_oi_anchor_strong}✦) "
                            f"price={_oi_price_delta_str} "
+                           f"lots={_oi_anchor_lot_mult}x "
                            f"[{_oi_quality_tags_raw}] → FIRING")
 
                 try:
@@ -686,6 +783,7 @@ class OIWatcherEngine:
                                        f"{_oi_hm_tag}"
                                        f" | factors=[{_oi_res.get('_quality_boosts', '')}]"),
                             setup_type='OI_WATCHER',
+                            lot_multiplier=_oi_anchor_lot_mult,
                             ml_data=_oi_ml_data,
                             pre_fetched_market_data={}
                         )
@@ -812,6 +910,11 @@ class OIWatcherEngine:
         # Sort by absolute change%, pick top N movers for OI analysis
         _syms_with_change.sort(key=lambda x: x[1], reverse=True)
         _scan_syms = []
+        # Apr 21: collect up to (kite_cap + dhan_cap) — first N go to Kite pool,
+        # next M go to Dhan pool (separate rate bucket, runs concurrently).
+        _n_kite = t._oi_aggr_max_symbols
+        _n_dhan = getattr(t, '_oi_aggr_dhan_symbols', 0)
+        _total_cap = _n_kite + _n_dhan
         for _s, _abs_chg, _chg in _syms_with_change:
             if _abs_chg < 0.3:
                 break  # Below 0.3% change — not worth scanning
@@ -820,20 +923,47 @@ class OIWatcherEngine:
             if t.tools.is_symbol_in_active_trades(_s):
                 continue
             _scan_syms.append(_s)
-            if len(_scan_syms) >= t._oi_aggr_max_symbols:
+            if len(_scan_syms) >= _total_cap:
                 break
 
         if not _scan_syms:
             return
 
-        # Parallel OI fetch (5 workers for faster completion)
+        # Split universe across two independent rate buckets
+        _kite_syms = _scan_syms[:_n_kite]
+        _dhan_syms = _scan_syms[_n_kite:_n_kite + _n_dhan] if _n_dhan > 0 else []
+
+        # Parallel OI fetch — DUAL-SOURCE SHARDING (Apr 21):
+        #   • Kite pool: 8 workers, shares Kite's ~10 req/s bucket w/ ticker+exit_manager+watcher
+        #   • Dhan pool: 3 workers, DhanHQ enforces 3s global serial throttle (more workers just queue)
+        # Two pools run concurrently — Kite handles top-33 movers, Dhan handles next-15,
+        # so a single cycle now covers 48 syms without increasing Kite load.
         from concurrent.futures import ThreadPoolExecutor as _OITP, as_completed as _oi_done
         _oi_raw = {}
         _fetch_start = _oiag_t.time()
-        with _OITP(max_workers=5, thread_name_prefix='oi-aggr') as _ex:
-            _futs = {_ex.submit(t._oi_analyzer.analyze, _s): _s for _s in _scan_syms}
+        # Apr 21 FIX: do NOT use `with` ThreadPoolExecutor — its __exit__ blocks
+        # on shutdown(wait=True) and waits for ALL running analyze() calls to
+        # finish even after as_completed() timed out, which can stretch a 80s
+        # timeout into a 280s stall and starve the next scan cycle.
+        _ex_kite = _OITP(max_workers=8, thread_name_prefix='oi-aggr-kite')
+        _ex_dhan = _OITP(max_workers=3, thread_name_prefix='oi-aggr-dhan') if _dhan_syms else None
+        _timed_out = False
+        _futs = {}
+        try:
+            for _s in _kite_syms:
+                _futs[_ex_kite.submit(t._oi_analyzer.analyze, _s)] = _s
+            if _ex_dhan is not None and hasattr(t._oi_analyzer, 'analyze_dhan_only'):
+                for _s in _dhan_syms:
+                    _futs[_ex_dhan.submit(t._oi_analyzer.analyze_dhan_only, _s)] = _s
+            elif _dhan_syms:
+                # Fallback: if analyze_dhan_only missing, route Dhan shard through Kite pool
+                for _s in _dhan_syms:
+                    _futs[_ex_kite.submit(t._oi_analyzer.analyze, _s)] = _s
+            # Apr 21: floor 120s, scale with n above that — Dhan 15 syms × 3s serial
+            # ≈ 45s worst-case, runs fully within the Kite window.
+            _timeout_s = max(120, len(_kite_syms) * 3)
             try:
-                for _f in _oi_done(_futs, timeout=max(18, len(_scan_syms) * 2)):
+                for _f in _oi_done(_futs, timeout=_timeout_s):
                     _sym = _futs[_f]
                     try:
                         _res = _f.result()
@@ -842,12 +972,36 @@ class OIWatcherEngine:
                     except Exception as e:
                         t._wlog(f"⚠️ FALLBACK [oi_watcher/aggr_result]: {e}")
             except Exception as e:
-                t._wlog(f"⚠️ FALLBACK [oi_watcher/aggr_timeout]: {e}")  # Timeout — proceed with partial data
+                _timed_out = True
+                _pending = sum(1 for _f in _futs if not _f.done())
+                t._wlog(f"⚠️ FALLBACK [oi_watcher/aggr_timeout]: {e} — returning {len(_oi_raw)}/{len(_futs)} after {_timeout_s}s, cancelling {_pending} pending")
+        finally:
+            # cancel_futures=True cancels queued tasks; in-flight ones continue
+            # but we do NOT wait for them — the cycle must move on.
+            for _ex_ in (_ex_kite, _ex_dhan):
+                if _ex_ is None:
+                    continue
+                try:
+                    _ex_.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    # Python <3.9 fallback — at least don't block
+                    for _f in list(_futs.keys()):
+                        _f.cancel()
+                    _ex_.shutdown(wait=False)
         _fetch_dur = _oiag_t.time() - _fetch_start
 
         # Score candidates: extract signal, strength, track history, detect acceleration
         _candidates = []
         _now_ts = _oiag_t.time()
+
+        # (N) FII/DII Cash Flow — macro institutional direction (fetched once, cached 5 min)
+        _ag_fii_data = {}
+        try:
+            from nse_oi_fetcher import get_nse_oi_fetcher
+            _ag_fii_data = get_nse_oi_fetcher().fetch_fii_dii()
+        except Exception:
+            pass
+
         for _sym, _res in _oi_raw.items():
             _sig = _oi_signal_from_result(_res)
             _dir = _oi_direction(_sig)
@@ -876,6 +1030,11 @@ class OIWatcherEngine:
             _ag_mf_H = False   # ATM OI concentration
             _ag_mf_K = False   # Futures conviction (OI day-high or order book)
             _ag_mf_M = False   # Volume surge alignment
+            # Apr 15 RCA: Track evaluability — True when data exists to evaluate the factor
+            _ag_mf_F_eval = False
+            _ag_mf_H_eval = False
+            _ag_mf_K_eval = False
+            _ag_mf_N_eval = False
             _ag_boosts = []
             # (A) Participant quality: GRANULAR writer/buyer ratio
             _ag_pid_detail = _res.get('oi_participant_detail', {})
@@ -918,7 +1077,7 @@ class OIWatcherEngine:
             # (C) Price confirmation (we already have change% from _syms_with_change)
             _ag_chg = next((_c for _s, _, _c in _syms_with_change if _s == _sym), None)
             if _ag_chg is not None:
-                _ag_C_min = getattr(t, '_oi_aggr_min_price_delta', 0.05)
+                _ag_C_min = getattr(t, '_oi_aggr_min_price_delta', 0.15)  # Apr 9: tightened 0.10→0.15%
                 _ag_price_agrees = (
                     (_dir == 'BUY' and _ag_chg >= _ag_C_min) or
                     (_dir == 'SELL' and _ag_chg <= -_ag_C_min)
@@ -943,8 +1102,8 @@ class OIWatcherEngine:
                 _ag_sec_name, _ag_sec_idx = _ag_sec_info
                 _ag_sec_chg = _ag_sec_chgs.get(_ag_sec_idx, 0)
                 _ag_sec_agrees = (
-                    (_dir == 'BUY' and _ag_sec_chg > 0.3) or
-                    (_dir == 'SELL' and _ag_sec_chg < -0.3)
+                    (_dir == 'BUY' and _ag_sec_chg > 0.40) or
+                    (_dir == 'SELL' and _ag_sec_chg < -0.40)
                 )
                 _ag_sec_oppose = (
                     (_dir == 'BUY' and _ag_sec_chg < -0.5) or
@@ -958,23 +1117,34 @@ class OIWatcherEngine:
                     _ag_boosts.append('SEC✗')
 
             # (F) Futures OI buildup cross-check
-            _ag_ml = getattr(t, '_cycle_ml_results', {})
-            _ag_ml_data = _ag_ml.get(_sym, {})
-            _ag_fut_buildup = _ag_ml_data.get('fut_oi_buildup', 0) if isinstance(_ag_ml_data, dict) else 0
+            # [FIX Apr 6] Read from _futures_oi_data (raw parquet), NOT _cycle_ml_results
+            _ag_fut_buildup = 0
+            try:
+                _ag_foi = getattr(t, '_futures_oi_data', None) or {}
+                _ag_foi_df = _ag_foi.get(_sym)
+                if _ag_foi_df is not None and len(_ag_foi_df) > 0:
+                    _ag_fut_buildup = float(_ag_foi_df.iloc[-1].get('fut_oi_buildup', 0))
+                    _ag_mf_F_eval = True  # Apr 15 RCA: futures data exists
+            except Exception:
+                _ag_fut_buildup = 0
             if _ag_fut_buildup:
                 _ag_fut_agrees = (
                     (_dir == 'BUY' and _ag_fut_buildup > 0) or
                     (_dir == 'SELL' and _ag_fut_buildup < 0)
                 )
                 _ag_fut_strong = abs(_ag_fut_buildup) >= 0.75
+                _ag_fut_moderate = abs(_ag_fut_buildup) >= 0.30  # Apr 9: tightened — need ≥0.30 to confirm F
                 if _ag_fut_agrees and _ag_fut_strong:
-                    _eff_str *= 1.12
+                    _eff_str *= 1.15
                     _ag_boosts.append('FUT✓✓')
                     _ag_mf_F = True
-                elif _ag_fut_agrees:
-                    _eff_str *= 1.05
+                elif _ag_fut_agrees and _ag_fut_moderate:
+                    _eff_str *= 1.08
                     _ag_boosts.append('FUT✓')
                     _ag_mf_F = True
+                elif _ag_fut_agrees:
+                    _eff_str *= 1.04  # Apr 9: weak futures — small boost, no F confirm
+                    _ag_boosts.append(f'FUT~{abs(_ag_fut_buildup):.2f}')
                 elif not _ag_fut_agrees and _ag_fut_strong:
                     _eff_str *= 0.85
                     _ag_boosts.append('FUT✗✗')
@@ -984,6 +1154,7 @@ class OIWatcherEngine:
                 try:
                     _ag_fut_data = _ticker.get_futures_oi(_sym)
                     if _ag_fut_data and _ag_fut_data.get('ltp', 0) > 0:
+                        _ag_mf_F_eval = True  # Apr 15 RCA: basis data exists
                         _ag_fut_ltp = _ag_fut_data['ltp']
                         _ag_eq_ltp = 0
                         with _ticker._lock:
@@ -994,8 +1165,8 @@ class OIWatcherEngine:
                         if _ag_eq_ltp > 0:
                             _ag_basis_pct = ((_ag_fut_ltp - _ag_eq_ltp) / _ag_eq_ltp) * 100
                             _ag_basis_agrees = (
-                                (_dir == 'BUY' and _ag_basis_pct > 0.05) or
-                                (_dir == 'SELL' and _ag_basis_pct < -0.05)
+                                (_dir == 'BUY' and _ag_basis_pct > 0.10) or   # Apr 7: tightened 0.05→0.10
+                                (_dir == 'SELL' and _ag_basis_pct < -0.10)      # Apr 7: tightened
                             )
                             _ag_basis_disagrees = (
                                 (_dir == 'BUY' and _ag_basis_pct < -0.10) or
@@ -1004,6 +1175,9 @@ class OIWatcherEngine:
                             if _ag_basis_agrees:
                                 _eff_str *= 1.10
                                 _ag_boosts.append(f'BASIS✓{_ag_basis_pct:+.2f}%')
+                                # [FIX Apr 6] Basis agreement = futures anchor fallback
+                                if not _ag_mf_F:
+                                    _ag_mf_F = True
                             elif _ag_basis_disagrees:
                                 _eff_str *= 0.90
                                 _ag_boosts.append(f'BASIS✗{_ag_basis_pct:+.2f}%')
@@ -1020,9 +1194,10 @@ class OIWatcherEngine:
                 if _ag_rel_strikes and len(_ag_rel_strikes) > 0:
                     _ag_top_stk = _ag_rel_strikes[0][0] if isinstance(_ag_rel_strikes[0], (list, tuple)) else 0
                     if _ag_top_stk > 0:
+                        _ag_mf_H_eval = True  # Apr 15 RCA: strike data available
                         _ag_stk_dist = abs(_ag_top_stk - _ag_spot) / _ag_spot * 100
-                        if _ag_stk_dist <= 2.0:
-                            _eff_str *= 1.10
+                        if _ag_stk_dist <= 2.5:  # Apr 7: tightened 3.0→2.5%
+                            _eff_str *= 1.14
                             _ag_boosts.append(f'ATM✓{_ag_stk_dist:.1f}%')
                             _ag_mf_H = True
                         elif _ag_stk_dist >= 5.0:
@@ -1031,14 +1206,14 @@ class OIWatcherEngine:
 
             # (I) PCR Shift Rate: rate of PCR change
             _ag_pcr_rate = _res.get('pcr_shift_rate', 0)
-            if abs(_ag_pcr_rate) > 0.005:
+            if abs(_ag_pcr_rate) > 0.010:  # tightened 0.005→0.010
                 _ag_pcr_confirms = (
-                    (_dir == 'BUY' and _ag_pcr_rate > 0.01) or
-                    (_dir == 'SELL' and _ag_pcr_rate < -0.01)
+                    (_dir == 'BUY' and _ag_pcr_rate >= 0.015) or   # tightened 0.01→0.015
+                    (_dir == 'SELL' and _ag_pcr_rate <= -0.015)
                 )
                 _ag_pcr_opposes = (
-                    (_dir == 'BUY' and _ag_pcr_rate < -0.01) or
-                    (_dir == 'SELL' and _ag_pcr_rate > 0.01)
+                    (_dir == 'BUY' and _ag_pcr_rate <= -0.015) or
+                    (_dir == 'SELL' and _ag_pcr_rate >= 0.015)
                 )
                 if _ag_pcr_confirms:
                     _eff_str *= 1.08
@@ -1047,23 +1222,7 @@ class OIWatcherEngine:
                     _eff_str *= 0.92
                     _ag_boosts.append(f'PCR↘{_ag_pcr_rate:+.3f}')
 
-            # (J) Volume PCR: today's volume intent vs stale OI
-            _ag_vol_pcr = _res.get('nse_pcr_volume', 0)
-            if _ag_vol_pcr and _ag_vol_pcr > 0:
-                _ag_vp_confirms = (
-                    (_dir == 'BUY' and _ag_vol_pcr > 1.3) or
-                    (_dir == 'SELL' and _ag_vol_pcr < 0.7)
-                )
-                _ag_vp_opposes = (
-                    (_dir == 'BUY' and _ag_vol_pcr < 0.6) or
-                    (_dir == 'SELL' and _ag_vol_pcr > 1.5)
-                )
-                if _ag_vp_confirms:
-                    _eff_str *= 1.08
-                    _ag_boosts.append(f'VP✓{_ag_vol_pcr:.2f}')
-                elif _ag_vp_opposes:
-                    _eff_str *= 0.90
-                    _ag_boosts.append(f'VP✗{_ag_vol_pcr:.2f}')
+            # (J) Volume PCR: REMOVED — PCR extremes gate eliminated
 
             # (K) Futures Conviction Boost: OI Day-High + Order Book Imbalance (BOOST-ONLY)
             # Same as OI_WATCHER Factor K — uses Kite WebSocket futures data (0 API calls).
@@ -1071,6 +1230,7 @@ class OIWatcherEngine:
                 try:
                     _ag_fk = _ticker.get_futures_oi(_sym)
                     if _ag_fk and _ag_fk.get('oi', 0) > 0:
+                        _ag_mf_K_eval = True  # Apr 15 RCA: futures conviction data available
                         _ag_fk_oi = _ag_fk['oi']
                         _ag_fk_high = _ag_fk.get('oi_day_high', 0)
                         _ag_fk_low = _ag_fk.get('oi_day_low', 0)
@@ -1079,11 +1239,11 @@ class OIWatcherEngine:
                         if _ag_fk_high > _ag_fk_low > 0:
                             _ag_fk_range = _ag_fk_high - _ag_fk_low
                             _ag_fk_pos = (_ag_fk_oi - _ag_fk_low) / _ag_fk_range
-                            if _ag_fk_pos >= 0.85:
+                            if _ag_fk_pos >= 0.75:  # Apr 7: tightened 0.70→0.75
                                 _eff_str *= 1.18
                                 _ag_boosts.append(f'FOIDH✓{_ag_fk_pos:.0%}')
                                 _ag_mf_K = True
-                            elif _ag_fk_pos >= 0.65:
+                            elif _ag_fk_pos >= 0.60:  # Apr 7: tightened 0.55→0.60
                                 _eff_str *= 1.08
                                 _ag_boosts.append(f'FOIDH~{_ag_fk_pos:.0%}')
 
@@ -1117,7 +1277,7 @@ class OIWatcherEngine:
                             _ag_vol_surge_ratio = _ag_vlast / _ag_vavg
                             _ag_v_recent = list(_ag_vdh)[-3:]
                             _ag_v_elevated = sum(1 for _vd in _ag_v_recent if _vd >= _ag_vavg * 1.4)
-                            if _ag_vol_surge_ratio >= 1.79 and _ag_v_elevated >= 2:
+                            if _ag_vol_surge_ratio >= 2.2 and _ag_v_elevated >= 2:  # Apr 9: tightened 2.0→2.2x
                                 with _ticker._lock:
                                     _ag_vtok = None
                                     for _tk_v, _tsym_v in _ticker._token_to_symbol.items():
@@ -1138,7 +1298,7 @@ class OIWatcherEngine:
                                             else:
                                                 _eff_str *= 0.80
                                                 _ag_boosts.append(f'VSRG✗{_ag_vol_surge_ratio:.1f}x')
-                            elif _ag_vol_surge_ratio >= 1.46 and _ag_v_elevated >= 1:
+                            elif _ag_vol_surge_ratio >= 1.60 and _ag_v_elevated >= 1:  # Apr 9: tightened 1.46→1.60x
                                 # [FIX Mar 24 v3] Intermediate volume — require price alignment too
                                 with _ticker._lock:
                                     _ag_vtok_int = None
@@ -1181,8 +1341,8 @@ class OIWatcherEngine:
             # [FIX Mar 24 v2] SHORT_COVERING / LONG_UNWINDING need ≥0.65 effective to fire
             if _sig in ('SHORT_COVERING', 'LONG_UNWINDING') and _eff_str < 0.65:
                 continue
-            # [FIX Mar 29] LONG_BUILDUP / SHORT_BUILDUP need ≥0.50 effective — prevent weak noise
-            if _sig in ('LONG_BUILDUP', 'SHORT_BUILDUP') and _eff_str < 0.50:
+            # [FIX Mar 29] LONG_BUILDUP / SHORT_BUILDUP need ≥0.55 effective — prevent weak noise
+            if _sig in ('LONG_BUILDUP', 'SHORT_BUILDUP') and _eff_str < 0.55:
                 continue
             # [FIX Mar 24 v2] Store mandatory factor results for AGGR gate
             _res['_ag_mf_C'] = _ag_mf_C
@@ -1190,6 +1350,38 @@ class OIWatcherEngine:
             _res['_ag_mf_H'] = _ag_mf_H
             _res['_ag_mf_K'] = _ag_mf_K
             _res['_ag_mf_M'] = _ag_mf_M
+            # Apr 15 RCA: Store evaluability flags
+            _res['_ag_mf_F_eval'] = _ag_mf_F_eval
+            _res['_ag_mf_H_eval'] = _ag_mf_H_eval
+            _res['_ag_mf_K_eval'] = _ag_mf_K_eval
+
+            # (N) FII/DII Cash Flow: macro institutional direction
+            _ag_mf_N = False
+            _ag_mf_N_eval = bool(_ag_fii_data and _ag_fii_data.get('fii_direction'))  # Apr 15 RCA
+            if _ag_fii_data and _ag_fii_data.get('fii_direction'):
+                _ag_fii_dir = _ag_fii_data['fii_direction']
+                _ag_fii_net = _ag_fii_data.get('fii_net', 0)
+                _ag_fii_confirms = (
+                    (_dir == 'BUY' and _ag_fii_dir == 'BULLISH') or
+                    (_dir == 'SELL' and _ag_fii_dir == 'BEARISH')
+                )
+                _ag_fii_opposes = (
+                    (_dir == 'BUY' and _ag_fii_dir == 'BEARISH') or
+                    (_dir == 'SELL' and _ag_fii_dir == 'BULLISH')
+                )
+                if _ag_fii_confirms:
+                    _eff_str *= 1.10
+                    _ag_boosts.append(f'FII✓{_ag_fii_net:+,.0f}Cr')
+                    _ag_mf_N = True
+                elif _ag_fii_opposes:
+                    _eff_str *= 0.88
+                    _ag_boosts.append(f'FII✗{_ag_fii_net:+,.0f}Cr')
+                else:
+                    # FII NEUTRAL = not opposing but not confirming either
+                    _ag_boosts.append(f'FII~{_ag_fii_net:+,.0f}Cr')
+            _res['_ag_mf_N'] = _ag_mf_N
+            _res['_ag_mf_N_eval'] = _ag_mf_N_eval  # Apr 15 RCA
+
             _res['_quality_boosts'] = ' '.join(_ag_boosts) if _ag_boosts else ''
 
             # Track history for acceleration detection (keep last 5 reads)
@@ -1233,14 +1425,14 @@ class OIWatcherEngine:
                 _candidates.append((_sym, _dir, _sig, _eff_str, _res, _reason, _is_accel, _accel_delta))
 
         if not _candidates:
-            t._wlog(f"🔬 OI_AGGR: Scanned {len(_scan_syms)} movers, fetched {len(_oi_raw)} OI "
+            t._wlog(f"🔬 OI_AGGR: Scanned {len(_kite_syms)}K+{len(_dhan_syms)}D movers, fetched {len(_oi_raw)} OI "
                        f"({_fetch_dur:.1f}s) — no LB/SB candidates")
             return
 
         # Sort: accelerating first, then by strength
         _candidates.sort(key=lambda x: (x[6], x[3]), reverse=True)
 
-        t._wlog(f"🔬 OI_AGGR: Scanned {len(_scan_syms)} movers → {len(_candidates)} candidates "
+        t._wlog(f"🔬 OI_AGGR: Scanned {len(_kite_syms)}K+{len(_dhan_syms)}D movers → {len(_candidates)} candidates "
                    f"({_fetch_dur:.1f}s)")
         for _c in _candidates[:5]:
             _tag = '🚀ACCEL' if _c[6] else '⚡'
@@ -1249,9 +1441,9 @@ class OIWatcherEngine:
                        f"dir={_c[1]} part={_c[4].get('oi_participant_id', '?')} "
                        f"quality=[{_ag_qt}] [{_c[5]}]")
 
-        # Fire top candidates — up to 3 if accelerating, 2 otherwise
+        # Fire top candidate — 1 per cycle for quality (same as Path 1)
         _placed_this_scan = 0
-        _max_fire = 3 if _candidates[0][6] else 2  # [FIX Mar 19] Fire top-3 if accelerating, top-2 otherwise
+        _max_fire = 3  # [FIX Apr 2] Up to 3 per cycle — conviction gate ensures quality
 
         for _c in _candidates:
             if _placed_this_scan >= _max_fire:
@@ -1264,33 +1456,66 @@ class OIWatcherEngine:
             _bias = _res.get('flow_bias', 'NEUTRAL')
             _part_id = _res.get('oi_participant_id', 'UNKNOWN')
 
-            # [FIX Mar 25] MANDATORY FACTOR GATE for AGGR path
-            # Price (C) is now optional boost/penalty — vol surge (M) + conviction (F/H/K) mandatory
+            # [FIX Apr 9] CONVICTION GATE for AGGR path
+            # Breadth technicals are tighter so ≥2/6 is sufficient:
+            #   1. At least 1/4 of F,H,K,N (anchor — institutional/futures validation)
+            #   2. At least 2/6 total mandatory factors (C,F,H,K,M,N)
+            # This eliminates the #1 source of OI_WATCHER losses: AGGR firing
+            # on weak OI signals with no futures/volume confirmation.
             _ag_mf_C = _res.get('_ag_mf_C', False)
             _ag_mf_F = _res.get('_ag_mf_F', False)
             _ag_mf_H = _res.get('_ag_mf_H', False)
             _ag_mf_K = _res.get('_ag_mf_K', False)
-            _ag_mf_fhk = sum([_ag_mf_F, _ag_mf_H, _ag_mf_K])
             _ag_mf_M = _res.get('_ag_mf_M', False)
-            if not _ag_mf_C:
-                # Price not confirming — penalise strength but don't block
-                _str *= 0.85
-                t._wlog(f"  ⚠️ OI_AGGR PRICE WARN: {_sym.replace('NSE:', '')} "
+            _ag_mf_N = _res.get('_ag_mf_N', False)
+            _ag_mf_anchor = sum([_ag_mf_F, _ag_mf_H, _ag_mf_K, _ag_mf_N])
+            _ag_mf_total = sum([_ag_mf_C, _ag_mf_F, _ag_mf_H, _ag_mf_K, _ag_mf_M, _ag_mf_N])
+            # Apr 15 RCA: Track evaluable anchor count — don't block on missing data
+            _ag_eval_F = _res.get('_ag_mf_F_eval', False)
+            _ag_eval_H = _res.get('_ag_mf_H_eval', False)
+            _ag_eval_K = _res.get('_ag_mf_K_eval', False)
+            _ag_eval_N = _res.get('_ag_mf_N_eval', False)
+            _ag_evaluable = sum([_ag_eval_F, _ag_eval_H, _ag_eval_K, _ag_eval_N])
+            _ag_mf_labels = []
+            if _ag_mf_C: _ag_mf_labels.append('C')
+            if _ag_mf_F: _ag_mf_labels.append('F')
+            if _ag_mf_H: _ag_mf_labels.append('H')
+            if _ag_mf_K: _ag_mf_labels.append('K')
+            if _ag_mf_M: _ag_mf_labels.append('M')
+            if _ag_mf_N: _ag_mf_labels.append('N')
+            # Gate 1: Anchor — at least 1 of F/H/K/N (institutional/futures validation)
+            # Apr 15 RCA: Skip if no anchor factors were evaluable (no data ≠ data says no)
+            if _ag_evaluable == 0:
+                t._wlog(f"  ⚠️ OI_AGGR ANCHOR SKIP: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} dir={_dir} — "
-                           f"price not confirming — strength penalised 15%")
-            if not _ag_mf_M:
-                # Vol surge not confirming — penalise strength but don't block
-                _str *= 0.85
-                t._wlog(f"  ⚠️ OI_AGGR VOL WARN: {_sym.replace('NSE:', '')} "
+                           f"0/4 anchor factors evaluable (no institutional data), bypassing")
+            elif _ag_mf_anchor < 1:
+                t._wlog(f"  ⛔ OI_AGGR ANCHOR BLOCK: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} dir={_dir} — "
-                           f"volume not surging — strength penalised 15%")
-            if _ag_mf_fhk < 1:
-                # [FIX Mar 25] Soft penalty instead of hard block — contrarian signals
-                # on trend days never get cross-validation from F/H/K
-                _str *= 0.80
-                t._wlog(f"  ⚠️ OI_AGGR CONVICTION WARN: {_sym.replace('NSE:', '')} "
-                           f"{_sig} str={_str:.3f} dir={_dir} — "
-                           f"0/{3} of F/H/K confirmed — strength penalised 20%")
+                           f"{_ag_mf_anchor}/{_ag_evaluable} of F,H,K,N confirmed (need ≥1 anchor) "
+                           f"[confirmed={','.join(_ag_mf_labels)}]")
+                continue
+            # Gate 2: Breadth — 2/6 for all entries (Apr 15, 2026)
+            _ag_min_breadth = 2
+            if _ag_mf_total < _ag_min_breadth:
+                t._wlog(f"  ⛔ OI_AGGR BREADTH BLOCK: {_sym.replace('NSE:', '')} "
+                           f"{_sig} str={_str:.3f} dir={_dir} accel={_is_accel} — "
+                           f"only {_ag_mf_total}/6 factors confirm (need ≥{_ag_min_breadth}) "
+                           f"anchor={_ag_mf_anchor}/4 "
+                           f"[confirmed={','.join(_ag_mf_labels)}]")
+                continue
+            # Anchor-based lot sizing: more anchors = higher conviction = bigger size
+            _ag_anchor_lot_mult = 1.0
+            if _ag_mf_anchor >= 3:
+                _ag_anchor_lot_mult = 3.0
+            elif _ag_mf_anchor >= 2:
+                _ag_anchor_lot_mult = 1.5
+
+            t._wlog(f"  ✅ OI_AGGR CONVICTION OK: {_sym.replace('NSE:', '')} "
+                       f"{_sig} str={_str:.3f} dir={_dir} — "
+                       f"{_ag_mf_total}/6 factors, anchor={_ag_mf_anchor}/4 "
+                       f"lots={_ag_anchor_lot_mult}x "
+                       f"[confirmed={','.join(_ag_mf_labels)}]")
 
             # Heatmap strike picker
             _strike_sel = 'ATM'
@@ -1339,16 +1564,44 @@ class OIWatcherEngine:
                 except Exception as e:
                     t._wlog(f"⚠️ FALLBACK [oi_watcher/aggr_spot]: {e}")
             _ag_pending = t._oi_pending_confirm.get(_sym)
+            # Adaptive confirmation gate: strong/accelerating setups confirm faster
+            # with lower required price delta; weak setups stay stricter.
+            # Apr 15 v2: relaxed again — base 35s/0.15%, lower floor 0.08%
+            _ag_confirm_secs = float(getattr(t, '_oi_confirm_seconds', 35))
+            _ag_min_delta = float(getattr(t, '_oi_confirm_min_price_delta', 0.15))
+            if _is_accel:
+                _ag_confirm_secs *= 0.70
+                _ag_min_delta *= 0.70
+            if _ag_mf_M:  # Volume confirmation
+                _ag_confirm_secs *= 0.85
+                _ag_min_delta *= 0.80
+            if _ag_mf_anchor >= 2:
+                _ag_confirm_secs *= 0.85
+                _ag_min_delta *= 0.85
+            if _str >= 0.90:
+                _ag_confirm_secs *= 0.70
+                _ag_min_delta *= 0.75
+            elif _str >= 0.75:
+                _ag_confirm_secs *= 0.85
+                _ag_min_delta *= 0.85
+            elif _str < 0.60:
+                _ag_confirm_secs *= 1.20
+                _ag_min_delta *= 1.15
+            _ag_confirm_secs = max(20.0, min(90.0, _ag_confirm_secs))
+            _ag_min_delta = max(0.08, min(0.30, _ag_min_delta))
             if _ag_pending is None:
                 t._oi_pending_confirm[_sym] = {
                     'ts': _ag_now_ts, 'direction': _dir,
                     'strength': _str, 'signal': _sig, 'source': 'OI_AGGR',
                     'spot_price': _ag_spot_now,
+                    'confirm_seconds': _ag_confirm_secs,
+                    'min_price_delta': _ag_min_delta,
                 }
                 t._wlog(f"  ⏳ OI_AGGR PENDING: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} dir={_dir} "
                            f"spot={_ag_spot_now:.2f} — "
-                           f"waiting {t._oi_confirm_seconds}s confirmation")
+                           f"waiting {_ag_confirm_secs:.0f}s, "
+                           f"need Δ{_ag_min_delta:.2f}% confirmation")
                 continue
             _ag_elapsed = _ag_now_ts - _ag_pending['ts']
             if _ag_pending['direction'] != _dir:
@@ -1356,15 +1609,19 @@ class OIWatcherEngine:
                     'ts': _ag_now_ts, 'direction': _dir,
                     'strength': _str, 'signal': _sig, 'source': 'OI_AGGR',
                     'spot_price': _ag_spot_now,
+                    'confirm_seconds': _ag_confirm_secs,
+                    'min_price_delta': _ag_min_delta,
                 }
                 t._wlog(f"  🔄 OI_AGGR RESET: {_sym.replace('NSE:', '')} "
                            f"direction flipped {_ag_pending['direction']}→{_dir} — "
-                           f"restarting {t._oi_confirm_seconds}s wait")
+                           f"restarting {_ag_confirm_secs:.0f}s / Δ{_ag_min_delta:.2f}% wait")
                 continue
-            if _ag_elapsed < t._oi_confirm_seconds:
+            _req_secs = float(_ag_pending.get('confirm_seconds', t._oi_confirm_seconds))
+            _req_delta = float(_ag_pending.get('min_price_delta', t._oi_confirm_min_price_delta))
+            if _ag_elapsed < _req_secs:
                 t._wlog(f"  ⏳ OI_AGGR WAITING: {_sym.replace('NSE:', '')} "
                            f"{_sig} str={_str:.3f} — {_ag_elapsed:.0f}s / "
-                           f"{t._oi_confirm_seconds}s elapsed")
+                           f"{_req_secs:.0f}s elapsed (Δ need {_req_delta:.2f}%)")
                 continue
             # Time elapsed — check PRICE DELTA
             _ag_spot_entry = _ag_pending.get('spot_price', 0)
@@ -1372,14 +1629,15 @@ class OIWatcherEngine:
             _ag_price_delta_pct = 0.0
             if _ag_spot_entry > 0 and _ag_spot_now > 0:
                 _ag_price_delta_pct = ((_ag_spot_now - _ag_spot_entry) / _ag_spot_entry) * 100
-                if _dir == 'BUY' and _ag_price_delta_pct < t._oi_confirm_min_price_delta:
+                if _dir == 'BUY' and _ag_price_delta_pct < _req_delta:
                     _ag_price_ok = False
-                elif _dir == 'SELL' and _ag_price_delta_pct > -t._oi_confirm_min_price_delta:
+                elif _dir == 'SELL' and _ag_price_delta_pct > -_req_delta:
                     _ag_price_ok = False
             if not _ag_price_ok:
                 t._wlog(f"  ❌ OI_AGGR PRICE REJECT: {_sym.replace('NSE:', '')} "
                            f"{_sig} dir={_dir} — OI held {_ag_elapsed:.0f}s but "
-                           f"price Δ={_ag_price_delta_pct:+.2f}% — OI trap, skipping")
+                           f"price Δ={_ag_price_delta_pct:+.2f}% (need {'+' if _dir == 'BUY' else '-'}{_req_delta:.2f}%) "
+                           f"— OI trap, skipping")
                 del t._oi_pending_confirm[_sym]
                 continue
             # ✅ CONFIRMED: OI persisted + price moved in OI direction
@@ -1398,7 +1656,8 @@ class OIWatcherEngine:
                                    f"PCR={_pcr:.2f} bias={_bias} "
                                    f"[{_reason}]{_accel_tag} strike={_strike_sel}"
                                    f"{_hm_tag}"),
-                        setup_type='OI_WATCHER',
+                        setup_type='OI_WATCHER_AGGR',
+                        lot_multiplier=_ag_anchor_lot_mult,
                         ml_data=_ml_data,
                         pre_fetched_market_data={}
                     )
