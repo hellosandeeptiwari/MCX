@@ -1,0 +1,20 @@
+﻿import urllib.request, json
+r = urllib.request.urlopen("http://localhost:5000/api/status")
+d = json.loads(r.read())
+print("STATUS OK")
+print("open_positions:", d.get("open_positions"))
+positions = d.get("positions", [])
+print("positions count:", len(positions))
+for p in positions:
+    sym = p.get("symbol", "?")
+    status = p.get("status", "?")
+    setup = p.get("setup_type", "?")
+    upnl = p.get("unrealized_pnl", "n/a")
+    entry = p.get("avg_price", p.get("entry_price", "?"))
+    ltp = p.get("ltp", "n/a")
+    print(f"  {sym} | {status} | {setup} | entry={entry} ltp={ltp} upnl={upnl}")
+print()
+print("capital:", d.get("capital"))
+print("realized_pnl:", d.get("realized_pnl"))
+print("service_active:", d.get("service_active"))
+

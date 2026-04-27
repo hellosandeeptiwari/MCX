@@ -1,0 +1,21 @@
+{
+  "scan_time": "2026-04-08T21:21:02.351071",
+  "lookback_hours": 5,
+  "total_scanned": 1,
+  "tradeable_count": 1,
+  "targets": [
+    {
+      "symbol": "LUPIN",
+      "sentiment": "BULLISH",
+      "confidence": 60,
+      "headline": "Lupin gets USFDA nod for diabetes drug tablets, boosting presence in key US market",
+      "source": "CNBCTV18_Stocks",
+      "reason": "Lupin receives USFDA approval for diabetes drug, boosting its US market presence",
+      "catalyst_type": "EARNINGS",
+      "directness": "DIRECT",
+      "score_breakdown": "catalyst(EARNINGS)=30 + direct(DIRECT)=20 + recency=5 + richness=5 = 60",
+      "pub_time": "2026-04-08T18:21",
+      "tradeable": true
+    }
+  ]
+}

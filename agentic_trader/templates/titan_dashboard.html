@@ -546,12 +546,26 @@ a{color:var(--blue);text-decoration:none}
         <button class="btn-exit-all" id="btn-exit-all" onclick="confirmExitAll()" title="Exit all open positions at market">
           &#9888; Exit All
         </button>
+        <button id="btn-autopilot" onclick="toggleAutoPilot()" title="Auto-pilot agent: reads tick flow and auto-uses Reverse / +1 on open NAKED options"
+                style="background:#475569;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-weight:700;font-size:.78rem;cursor:pointer">
+          &#129302; Auto-Pilot: <span id="autopilot-state">OFF</span>
+        </button>
         <span id="pos-count" style="font-size:.8rem;color:var(--txt2)"></span>
       </div>
     </div>
     <!-- Totals summary bar -->
     <div id="pos-totals" style="display:none;padding:10px 16px;background:var(--bg3);border-bottom:1px solid var(--border);
         font-size:.82rem;display:flex;flex-wrap:wrap;gap:18px;align-items:center">
+    </div>
+    <!-- Auto-Pilot activity timeline -->
+    <div id="autopilot-activity" style="display:none;padding:8px 16px;background:linear-gradient(90deg,rgba(99,102,241,0.06),rgba(5,150,105,0.04));border-bottom:1px solid var(--border);font-size:.75rem">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <span style="font-weight:700;color:#6366f1">🤖 Auto-Pilot Activity</span>
+        <span id="ap-activity-summary" style="color:var(--txt3);font-size:.72rem"></span>
+        <button onclick="document.getElementById('ap-activity-list').style.display=(document.getElementById('ap-activity-list').style.display==='none'?'block':'none')"
+                style="margin-left:auto;background:var(--bg3);color:var(--txt2);border:none;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer">toggle</button>
+      </div>
+      <div id="ap-activity-list" style="display:block;max-height:180px;overflow-y:auto;font-family:'SF Mono',Consolas,monospace;font-size:.7rem;line-height:1.5"></div>
     </div>
     <div class="panel-body" style="overflow-x:auto">
       <table class="tbl" id="positions-tbl">
@@ -1078,7 +1092,8 @@ function renderTodayTrades(summary) {
     const ts = (t.ts || '').split('T')[1]?.slice(0,8) || '';
     const sym = (t.underlying || t.symbol || '').replace('NSE:','');
     const pnl = t.total_pnl || 0;
-    const result = t.final_result || 'OPEN';
+    let result = t.final_result || 'OPEN';
+    if (result === 'PROFIT_TARGET_EXIT' && pnl < 0) result = 'PT_KILL_ALL';
     return `<tr>
       <td>${i+1}</td>
       <td>${ts}</td>
@@ -1290,12 +1305,14 @@ async function loadPositions() {
         const target = p.target || 0;
         const exch = p.exchange || 'NSE';
 
-        // Merge exit state for trailing SL info
+        // Merge exit state for trailing SL info. Prefer inline fields on the
+        // position (server-side merge from /api/status) — falls back to the
+        // separate /api/exits lookup if older backend without merge.
         const exitState = exits ? (exits[fullSym] || exits[sym] || null) : null;
         const es = exitState ? (typeof exitState === 'string' ? JSON.parse(exitState) : exitState) : null;
-        const currentSl = es ? (es.current_sl || sl) : sl;
-        const isTrailing = es ? es.trailing_active : false;
-        const isBE = es ? es.breakeven_applied : false;
+        const currentSl = (p.current_sl != null ? p.current_sl : (es ? (es.current_sl || sl) : sl));
+        const isTrailing = (p.trailing_active != null ? !!p.trailing_active : (es ? !!es.trailing_active : false));
+        const isBE = (p.breakeven_applied != null ? !!p.breakeven_applied : (es ? !!es.breakeven_applied : false));
         let slHtml = DASH;
         if(currentSl) {
           slHtml = fmt(currentSl);
@@ -1499,10 +1516,26 @@ async function loadPositions() {
           ? '<span class="exch-mcx">MCX</span>'
           : '<span class="exch-nse">NSE</span>';
 
-        return '<tr style="' + rowStyle + ';cursor:pointer" data-exchange="' + exch + '" data-sym="' + (p.symbol || p.option_symbol || '') + '" data-entry="' + entry + '" data-qty="' + qty + '" data-dir="' + dir + '" data-premium="' + premium + '" data-spread="' + ((p.is_debit_spread||p.is_credit_spread||p.is_iron_condor)?1:0) + '" onclick="if(!event.target.closest(\'button,select,a,input\'))showChart(\'' + underlying + '\',\'' + exch + '\')">' +
+        const sideAttr = (p.side || ((dir === 'BUY' || dir === 'LONG') ? 'BUY' : 'SELL')).toUpperCase();
+        // Auto-Pilot badge for this symbol (if agent has acted on it)
+        const apKey = p.symbol || p.option_symbol || '';
+        const apInfo = (window._apBySym || {})[apKey];
+        let apBadge = '';
+        if (apInfo) {
+          const parts = [];
+          if (apInfo.adds)     parts.push('<span style="color:#059669">+' + apInfo.adds + '</span>');
+          if (apInfo.reverses) parts.push('<span style="color:#6366f1">↻' + apInfo.reverses + '</span>');
+          if (apInfo.vetoed)   parts.push('<span style="color:#d97706">⚑' + apInfo.vetoed + '</span>');
+          if (apInfo.failed)   parts.push('<span style="color:#dc2626">✗' + apInfo.failed + '</span>');
+          const last = apInfo.last || {};
+          const lastTs = (last.ts || '').split('T')[1] || '';
+          const tip = `Auto-Pilot: ${apInfo.executed||0} executed (${apInfo.adds||0} add / ${apInfo.reverses||0} rev), ${apInfo.vetoed||0} vetoed, ${apInfo.failed||0} failed\nLast: ${last.outcome||''} ${last.action||''} at ${lastTs}\n${last.reason||''}`;
+          apBadge = '<br><span title="' + tip.replace(/"/g,'&quot;') + '" style="font-size:.62rem;font-weight:700;display:inline-block;margin-top:2px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.3)">🤖 ' + parts.join(' ') + '</span>';
+        }
+        return '<tr style="' + rowStyle + ';cursor:pointer" data-exchange="' + exch + '" data-sym="' + (p.symbol || p.option_symbol || '') + '" data-entry="' + entry + '" data-qty="' + qty + '" data-dir="' + dir + '" data-side="' + sideAttr + '" data-premium="' + premium + '" data-spread="' + ((p.is_debit_spread||p.is_credit_spread||p.is_iron_condor)?1:0) + '" onclick="if(!event.target.closest(\'button,select,a,input\'))showChart(\'' + underlying + '\',\'' + exch + '\')">' +
           '<td>' + timeHtml + '</td>' +
           '<td>' + exchBadge + '</td>' +
-          '<td><strong>' + sym + '</strong>' + (p.option_type ? ' <span class="badge" style="font-size:.65rem">' + p.strike + ' ' + p.option_type + '</span>' : '') + (p.commodity ? '<br><span style="font-size:.6rem;color:#d97706">' + p.commodity + '</span>' : '') + '</td>' +
+          '<td><strong>' + sym + '</strong>' + (p.option_type ? ' <span class="badge" style="font-size:.65rem">' + p.strike + ' ' + p.option_type + '</span>' : '') + (p.commodity ? '<br><span style="font-size:.6rem;color:#d97706">' + p.commodity + '</span>' : '') + apBadge + '</td>' +
           '<td>' + typeTag + '</td>' +
           '<td style="text-align:center"><span class="chart-icon" onclick="showChart(\'' + underlying + '\', \'' + exch + '\')" title="' + underlying + ' chart">&#128200;</span></td>' +
           '<td><span class="badge ' + (dir==='SELL'?'badge-loss':'badge-win') + '">' + dir + '</span></td>' +
@@ -1536,8 +1569,10 @@ async function loadPositions() {
           '<td style="white-space:nowrap;line-height:1.3">' + mlHtml + '</td>' +
           '<td class="' + upnlClass + '" data-pnl-cell="1">' + pnlStr + '</td>' +
           '<td style="white-space:nowrap">' +
+            (isTrailing ? '<span title="Trailing stop active — exit_manager protecting profit" style="display:inline-block;margin-right:4px;padding:1px 6px;border-radius:3px;background:#059669;color:#fff;font-size:.62rem;font-weight:700">🔒 TRAIL</span>' : isBE ? '<span title="Break-even stop applied" style="display:inline-block;margin-right:4px;padding:1px 6px;border-radius:3px;background:#2563eb;color:#fff;font-size:.62rem;font-weight:700">BE</span>' : '') +
             '<button class="btn-exit" onclick="confirmExit(\'' + (p.symbol || p.option_symbol) + '\', \'' + sym + '\', ' + (ltp || entry) + ')" title="Exit at market">&#10005; Exit</button>' +
             ' <button class="btn-rev" id="rev-' + (p.order_id||'').replace(/[^A-Za-z0-9]/g,'') + '" onclick="placeReverse(this, \'' + (p.symbol || p.option_symbol).replace(/'/g, "\\'") + '\', \'' + (p.underlying||'').replace(/'/g, "\\'") + '\', \'' + dir + '\', ' + qty + ', ' + (ltp || entry) + ', \'' + (p.option_type||'') + '\', ' + (p.strike||0) + ', \'' + (p.expiry||'') + '\', ' + (p.lots||1) + ', ' + (p.is_option?'true':'false') + ')" title="Reverse: flip PE↔CE, same strike & lots" style="background:#6366f1;color:#fff;border:none;border-radius:4px;padding:2px 8px;font-weight:700;font-size:.75rem;cursor:pointer">Reverse</button>' +
+            (p.is_option ? ' <button class="btn-addlot" id="addlot-' + (p.order_id||'').replace(/[^A-Za-z0-9]/g,'') + '" onclick="placeAddLot(this, \'' + (p.symbol || p.option_symbol).replace(/'/g, "\\'") + '\')" title="Add 1 lot at LTP — strengthens same strike/PE-CE" style="background:#059669;color:#fff;border:none;border-radius:4px;padding:2px 8px;font-weight:700;font-size:.75rem;cursor:pointer">+1</button>' : '') +
           '</td>' +
           '</tr>';
       }).join('');
@@ -1628,7 +1663,13 @@ async function loadDayTrades(dateStr) {
     const sym = (t.underlying || t.symbol || '').replace('NSE:','').replace('MCX:','');
     const _isMcx2 = (t.underlying||t.symbol||'').startsWith('MCX:') || (t.extra&&t.extra.exchange==='MCX');
     const pnl = t.total_pnl || 0;
-    const result = t.final_result || 'OPEN';
+    let result = t.final_result || 'OPEN';
+    // Relabel: PROFIT_TARGET_EXIT on a losing leg is misleading — it's
+    // the portfolio-wide kill-all sweep, not a per-leg profit. Rewrite
+    // so the badge honestly reflects "closed in a portfolio sweep while red".
+    if (result === 'PROFIT_TARGET_EXIT' && pnl < 0) {
+      result = 'PT_KILL_ALL';
+    }
 
     // ── ML Metrics for trade history ──
     const tMovProb = t.ml_move_prob || t.gate_prob || 0;
@@ -1984,6 +2025,9 @@ async function patchLivePnl() {
       const entry = +tr.getAttribute('data-entry') || 0;
       const qty = +tr.getAttribute('data-qty') || 0;
       const dir = tr.getAttribute('data-dir') || 'BUY';
+      // SIDE-based P&L (actual transaction direction) — matches bot's authoritative formula.
+      // Falls back to data-dir for backwards-compat with older rendered rows.
+      const side = (tr.getAttribute('data-side') || ((dir === 'BUY' || dir === 'LONG') ? 'BUY' : 'SELL')).toUpperCase();
       const isSpread = (tr.getAttribute('data-spread') || '0') === '1';
 
       const rawLtp = +info.ltp || 0;
@@ -2002,7 +2046,7 @@ async function patchLivePnl() {
       if (isSpread) {
         upnl = +info.upnl || 0;
       } else if (entry > 0 && qty > 0 && sLtp > 0) {
-        upnl = (dir === 'SELL' || dir === 'SHORT') ? (entry - sLtp) * qty : (sLtp - entry) * qty;
+        upnl = (side === 'SELL' || side === 'SHORT') ? (entry - sLtp) * qty : (sLtp - entry) * qty;
       } else {
         upnl = +info.upnl || 0;
       }
@@ -2515,9 +2559,12 @@ function placeReverse(btn, symbol, underlying, dir, qty, ltp, optType, strike, e
     if(d.ok) {
       btn.textContent = '\u2713';
       // Immediately refresh positions so the user sees the flipped position with correct symbol/SL/target
-      // (prevents stale row where clicking Reverse again would target the already-exited symbol)
-      setTimeout(() => { try { loadPositions(); } catch(e){} }, 400);
-      setTimeout(() => { try { loadPositions(); } catch(e){} }, 1800);  // second pass picks up live PnL after bot tick
+      // (prevents stale row where clicking Reverse again would target the already-exited symbol).
+      // First loadPositions renders the new row with data-entry=market_ltp and invokes patchLivePnl,
+      // which now always fetches fresh Kite LTP — so PnL is live against the reverse entry instantly.
+      setTimeout(() => { try { loadPositions(); } catch(e){} }, 300);
+      setTimeout(() => { try { patchLivePnl(); } catch(e){} }, 900);   // force a second live-LTP patch ~900ms in
+      setTimeout(() => { try { loadPositions(); } catch(e){} }, 1800);  // third pass picks up bot-written snapshot
       setTimeout(() => { btn.textContent = 'Reverse'; }, 1500);
     } else {
       btn.textContent = '\u2717';
@@ -2530,7 +2577,158 @@ function placeReverse(btn, symbol, underlying, dir, qty, ltp, optType, strike, e
   });
 }
 
-// =========== EXIT POSITION LOGIC ===========
+// =========== +1 ADD LOT LOGIC (strengthen same PE/CE at LTP) ===========
+function placeAddLot(btn, symbol) {
+  btn.disabled = true;
+  btn.style.opacity = '0.4';
+  const orig = btn.textContent;
+  btn.textContent = '…';
+  fetch('/api/add_lot', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({symbol: symbol})
+  }).then(r => r.json()).then(d => {
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    if (d.ok) {
+      btn.textContent = '\u2713';
+      if (typeof showToast === 'function') { try { showToast(d.msg || 'Lot added', 'success'); } catch(e){} }
+      setTimeout(() => { try { loadPositions(); } catch(e){} }, 300);
+      setTimeout(() => { try { patchLivePnl(); } catch(e){} }, 900);
+      setTimeout(() => { try { loadPositions(); } catch(e){} }, 1800);
+      setTimeout(() => { btn.textContent = orig; }, 1500);
+    } else {
+      btn.textContent = '\u2717';
+      if (typeof showToast === 'function') { try { showToast(d.msg || 'Add-lot failed', 'error'); } catch(e){} }
+      else { alert(d.msg || 'Add-lot failed'); }
+      setTimeout(() => { btn.textContent = orig; }, 2000);
+    }
+  }).catch(() => {
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.textContent = orig;
+  });
+}
+
+// =========== AUTO-PILOT TOGGLE ===========
+window._apBySym = {};  // {sym: {adds, reverses, vetoed, last:{action,outcome,ts,reason,pnl_pct}}}
+async function refreshAutoPilot() {
+  try {
+    const r = await fetch('/api/auto_pilot', { cache: 'no-store' });
+    const d = await r.json();
+    if (!d || !d.ok) return;
+    const el = document.getElementById('autopilot-state');
+    const btn = document.getElementById('btn-autopilot');
+    if (!el || !btn) return;
+    if (d.enabled) {
+      el.textContent = 'ON';
+      btn.style.background = '#059669';
+      const counters = d.counters || {};
+      const syms = Object.keys(counters);
+      const totRev = syms.reduce((a, s) => a + (counters[s].reverses || 0), 0);
+      const totAdd = syms.reduce((a, s) => a + (counters[s].adds || 0), 0);
+      btn.title = `Auto-Pilot ON (NAKED options, aggressive, gpt-5.2)\nToday: ${totRev} reverses, ${totAdd} adds across ${syms.length} symbols\nLimits: 7 rev / 3 add per symbol`;
+    } else {
+      el.textContent = 'OFF';
+      btn.style.background = '#475569';
+      btn.title = 'Auto-Pilot OFF — click to enable';
+    }
+
+    // Build per-symbol aggregate from recent_decisions
+    const bySym = {};
+    const decs = Array.isArray(d.recent_decisions) ? d.recent_decisions : [];
+    for (const dec of decs) {
+      // For REVERSE EXECUTED, server attaches flipped_symbol so the badge
+      // follows the new (post-flip) position row as well as the original.
+      // Otherwise multi-flip sequences would leave subsequent rows un-tagged.
+      const keys = [];
+      if (dec.symbol)         keys.push(dec.symbol);
+      if (dec.flipped_symbol) keys.push(dec.flipped_symbol);
+      if (!keys.length) continue;
+      for (const s of keys) {
+        if (!bySym[s]) bySym[s] = { adds: 0, reverses: 0, vetoed: 0, executed: 0, failed: 0, last: null };
+        const b = bySym[s];
+        if (dec.outcome === 'EXECUTED') {
+          b.executed++;
+          if (dec.action === 'ADD_LOT') b.adds++;
+          if (dec.action === 'REVERSE') b.reverses++;
+        } else if (dec.outcome === 'VETOED_BY_LLM') {
+          b.vetoed++;
+        } else if (dec.outcome === 'EXECUTION_FAILED') {
+          b.failed++;
+        }
+        b.last = dec;
+      }
+    }
+    window._apBySym = bySym;
+
+    // Render activity panel in Positions tab
+    const panel = document.getElementById('autopilot-activity');
+    const listEl = document.getElementById('ap-activity-list');
+    const sumEl  = document.getElementById('ap-activity-summary');
+    if (panel && listEl && sumEl) {
+      if (!d.enabled && decs.length === 0) {
+        panel.style.display = 'none';
+      } else {
+        panel.style.display = 'block';
+        const execCount  = decs.filter(x => x.outcome === 'EXECUTED').length;
+        const vetoCount  = decs.filter(x => x.outcome === 'VETOED_BY_LLM').length;
+        const failCount  = decs.filter(x => x.outcome === 'EXECUTION_FAILED').length;
+        sumEl.innerHTML = `<span style="color:#059669">✓ ${execCount} executed</span> · `
+                        + `<span style="color:#d97706">⚑ ${vetoCount} vetoed</span> · `
+                        + (failCount ? `<span style="color:#dc2626">✗ ${failCount} failed</span> · ` : '')
+                        + `<span style="color:var(--txt3)">last ${decs.length} decisions</span>`;
+        const rows = decs.slice().reverse().slice(0, 20).map(dec => {
+          const sym = (dec.symbol || '').replace('NFO:','').replace('NSE:','');
+          const ts = (dec.ts || '').split('T')[1] || dec.ts || '';
+          const pnl = (typeof dec.pnl_pct === 'number') ? (dec.pnl_pct >= 0 ? '+' : '') + dec.pnl_pct.toFixed(2) + '%' : '—';
+          let badge, color;
+          if (dec.outcome === 'EXECUTED') {
+            badge = dec.action === 'REVERSE' ? '↻ REV' : '+ ADD';
+            color = dec.action === 'REVERSE' ? '#6366f1' : '#059669';
+          } else if (dec.outcome === 'VETOED_BY_LLM') {
+            badge = '⚑ VETO ' + (dec.action === 'REVERSE' ? 'REV' : 'ADD');
+            color = '#d97706';
+          } else if (dec.outcome === 'EXECUTION_FAILED') {
+            badge = '✗ FAIL ' + dec.action;
+            color = '#dc2626';
+          } else {
+            badge = dec.outcome || '?';
+            color = '#8b929e';
+          }
+          const reason = (dec.reason || '').replace(/"/g, '&quot;').replace(/</g,'&lt;');
+          return `<div style="padding:3px 0;border-bottom:1px dashed var(--border)">
+            <span style="color:var(--txt3)">${ts}</span>
+            <span style="display:inline-block;min-width:70px;color:${color};font-weight:700;margin:0 6px">${badge}</span>
+            <span style="font-weight:600">${sym}</span>
+            <span style="color:var(--txt2);margin-left:6px">pnl ${pnl}</span>
+            <div style="color:var(--txt3);font-size:.67rem;padding-left:10px">${reason}</div>
+          </div>`;
+        }).join('');
+        listEl.innerHTML = rows || '<div style="color:var(--txt3);padding:6px">No decisions yet — agent is watching ticks.</div>';
+      }
+    }
+  } catch (e) {}
+}
+async function toggleAutoPilot() {
+  const el = document.getElementById('autopilot-state');
+  const next = (el && el.textContent === 'ON') ? false : true;
+  if (next) {
+    if (!confirm('Enable Auto-Pilot?\n\nThe agent will read real-time tick flow and automatically REVERSE or ADD +1 LOT on your NAKED option positions. Limits: 7 reverses, 3 adds per symbol per day.\n\nProceed?')) return;
+  }
+  try {
+    const r = await fetch('/api/auto_pilot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: next})
+    });
+    const d = await r.json();
+    if (d && d.ok) refreshAutoPilot();
+  } catch (e) {}
+}
+// Poll state every 10s so counters stay current
+setInterval(refreshAutoPilot, 10000);
+document.addEventListener('DOMContentLoaded', () => { try { refreshAutoPilot(); } catch(e){} });
 let _exitSymbol = '';
 let _exitDisplay = '';
 

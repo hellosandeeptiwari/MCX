@@ -1,0 +1,150 @@
+{
+  "config": {
+    "input_dim": 84,
+    "latent_dim": 16,
+    "hidden_dims": [
+      64,
+      32
+    ],
+    "dropout": 0.2,
+    "vae_epochs": 120,
+    "vae_batch_size": 512,
+    "vae_lr": 0.002,
+    "vae_kl_weight": 0.5,
+    "vae_kl_warmup_frac": 0.3,
+    "vae_patience": 15,
+    "gmm_n_components": 6,
+    "gmm_covariance_type": "tied",
+    "gmm_max_iter": 300,
+    "calibrator_n_estimators": 200,
+    "calibrator_max_depth": 3,
+    "calibrator_lr": 0.05,
+    "calibrator_l2_reg": 0.1,
+    "calibrator_val_split": 0.6,
+    "down_lookahead": 8,
+    "down_atr_factor": 3.0,
+    "down_fixed_pct": 0.5,
+    "up_atr_factor": 3.0,
+    "target_flag_rate": 0.15,
+    "min_lift": 1.05,
+    "test_days": 20,
+    "val_days": 30,
+    "use_cosine_lr": true,
+    "use_swa": true,
+    "swa_start_frac": 0.7,
+    "vae_weight_decay": 5e-05
+  },
+  "n_total": 3425174,
+  "n_features": 107,
+  "UP_metrics": {
+    "vae": {
+      "best_val_loss": 2.4732532501220703,
+      "final_epoch": 54,
+      "train_loss_final": 0.7136665176426421,
+      "used_swa": false
+    },
+    "threshold": 0.32359966571385224,
+    "base_down_rate": 0.23141752577319588,
+    "val_auroc": 0.6858,
+    "val_avg_precision": 0.4087,
+    "val_flag_rate": 0.1471,
+    "val_down_if_flagged": 0.4433,
+    "val_down_if_not_flagged": 0.188,
+    "val_lift": 1.97,
+    "val_risk_reduction_pct": 16.7,
+    "val_decile_down_rates": [
+      0.0697938144329897,
+      0.11319587628865979,
+      0.13690721649484536,
+      0.16752577319587628,
+      0.1924742268041237,
+      0.20938144329896907,
+      0.25288659793814433,
+      0.28845360824742267,
+      0.33484536082474226,
+      0.4897938144329897
+    ]
+  },
+  "DOWN_metrics": {
+    "vae": {
+      "best_val_loss": 2.329237222671509,
+      "final_epoch": 74,
+      "train_loss_final": 0.7237018915168344,
+      "used_swa": false
+    },
+    "threshold": 0.33820187395009466,
+    "base_down_rate": 0.17930320800275956,
+    "val_auroc": 0.6681,
+    "val_avg_precision": 0.3345,
+    "val_flag_rate": 0.1231,
+    "val_down_if_flagged": 0.3815,
+    "val_down_if_not_flagged": 0.1787,
+    "val_lift": 1.87,
+    "val_risk_reduction_pct": 12.3,
+    "val_decile_down_rates": [
+      0.08388520971302428,
+      0.09686766938043329,
+      0.12032565199392853,
+      0.14074789568097143,
+      0.17508278145695363,
+      0.2057403063336553,
+      0.23830550572650752,
+      0.27252656271560644,
+      0.30978335863115775,
+      0.39376379690949226
+    ]
+  },
+  "test": {
+    "UP": {
+      "test_up_auroc": 0.5412,
+      "test_up_avg_precision": 0.2059,
+      "test_up_flag_rate": 0.0267,
+      "test_up_down_if_flagged": 0.1407,
+      "test_up_down_if_not_flagged": 0.1997,
+      "test_up_lift": 0.71,
+      "test_up_risk_reduction_pct": -0.8,
+      "test_up_decile_down_rates": [
+        0.10972809667673716,
+        0.17101764563693497,
+        0.18259818731117824,
+        0.20195794053662075,
+        0.22634441087613294,
+        0.22939328015470148,
+        0.23072274595117234,
+        0.22598187311178247,
+        0.2330190959632584,
+        0.1708761329305136
+      ]
+    },
+    "up_flag_rate": 0.0267,
+    "up_down_if_flagged": 0.1407,
+    "up_down_if_clean": 0.1997,
+    "up_lift": 0.71,
+    "DOWN": {
+      "test_down_auroc": 0.6077,
+      "test_down_avg_precision": 0.2737,
+      "test_down_flag_rate": 0.084,
+      "test_down_down_if_flagged": 0.3403,
+      "test_down_down_if_not_flagged": 0.1867,
+      "test_down_lift": 1.7,
+      "test_down_risk_reduction_pct": 6.5,
+      "test_down_decile_down_rates": [
+        0.1225114854517611,
+        0.15318627450980393,
+        0.16355283307810106,
+        0.15625,
+        0.1660030627871363,
+        0.15931372549019607,
+        0.20592728383745798,
+        0.24293611793611794,
+        0.28982843137254904,
+        0.33629402756508425
+      ]
+    },
+    "down_flag_rate": 0.084,
+    "down_up_if_flagged": 0.3403,
+    "down_up_if_clean": 0.1867,
+    "down_lift": 1.7
+  },
+  "training_time_sec": 2775.7
+}

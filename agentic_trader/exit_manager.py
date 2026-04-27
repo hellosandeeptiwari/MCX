@@ -88,6 +88,7 @@ class TradeState:
     underlying_entry_ltp: float = 0.0  # Underlying spot price at entry (for IV crush detection)
     premium_history: list = field(default_factory=list)      # Premium at each candle boundary (trajectory tracking)
     underlying_history: list = field(default_factory=list)   # Underlying LTP at each candle boundary
+    is_manual: bool = False          # True for dashboard MANUAL_REVERSE / manual entries — skip trailing & target-extension
     _cached_greeks: object = None    # Last full GreeksSnapshot (not serialised)
     
     def to_dict(self) -> Dict:
@@ -142,10 +143,10 @@ class ExitManager:
         self.breakeven_trigger_r = 1.0  # Move SL to entry at 1.0R (was 0.8R — too early)
         
         # === PHASED TRAILING: Build → Run → Harvest ===
-        # Build zone (0 → 0.65R): No trailing, let trade establish
-        # Run zone (0.65R → 2.0R): Moderate trail, balance room vs profit lock
+        # Build zone (0 → 0.5R): No trailing, let trade establish
+        # Run zone (0.5R → 2.0R): Moderate trail, balance room vs profit lock
         # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
-        self.trailing_start_r = 0.65   # Trail from 0.65R (was 0.6R)
+        self.trailing_start_r = 0.5    # Trail from 0.5R (was 0.65R — tightened to lock profits sooner)
         self.trailing_run_pct = 0.65   # Run zone: retain 65% of peak (give back 35%) — was 0.60
         self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
         self.trailing_harvest_pct = 0.80  # Harvest zone: retain 80% of peak (give back 20%) — was 0.75
@@ -493,7 +494,8 @@ class ExitManager:
         progress_pct = current_progress / target_distance  # 0.0 to 1.0+
         
         # Check if price is in the extension trigger zone (90%+ of target)
-        if ext_enabled and state.is_option and not state.is_credit_spread and not state.is_debit_spread:
+        # Skip extension entirely for manual setups — let target hit hard.
+        if ext_enabled and state.is_option and not state.is_credit_spread and not state.is_debit_spread and not getattr(state, 'is_manual', False):
             if progress_pct >= ext_trigger:
                 # Activate extension mode — skip hard exit, let trailing manage
                 state.target_extended = True
@@ -1234,6 +1236,11 @@ class ExitManager:
         Extension zone (target_extended): Tightest trail retaining 65% of peak (35% giveback).
             Winners running past target — lock maximum profit while letting them fly.
         """
+        # Manual setups (dashboard reverse / manual entry): NEVER auto-trail.
+        # User wants the original hard SL/target only — trailing-then-retrace
+        # was the cause of profitable trades exiting as SL_HIT.
+        if getattr(state, 'is_manual', False):
+            return
         if r_multiple < self.trailing_start_r and not state.target_extended:
             return
         

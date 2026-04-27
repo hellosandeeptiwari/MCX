@@ -308,8 +308,8 @@ class AutonomousTrader:
         # Only enter when >= _oi_min_confirmations factors align.
         self._oi_min_confirmations = 4                     # Minimum confirming factors to entry (out of 12)
         self._oi_pending_confirm = {}                      # LEGACY — kept for OI_AGGR path
-        self._oi_confirm_seconds = 45                      # Apr 20: tightened 35→35s
-        self._oi_confirm_expiry = 300                      # purge pending entries older than 5 min
+        self._oi_confirm_seconds = 300                     # Apr 27: 45→300s give grind days more room
+        self._oi_confirm_expiry = 600                      # Apr 27: 300→600s match longer hold window
         self._oi_confirm_min_price_delta = 0.20            # Apr 20: tightened 0.15→0.15% (adaptive gate applies multipliers)
 
         # OI_WATCHER AGGRESSIVE SCANNER — independent OI buildup detection loop
@@ -351,9 +351,7 @@ class AutonomousTrader:
         self._model_tracker_trades_today = 0
         self._model_tracker_date = datetime.now().date()
         self._model_tracker_symbols = set()
-        # === GMM Data Collector: background calibration data for UPDR/DownDR sweet-spot ===
-        from gmm_data_collector import GMMDataCollector
-        self._gmm_collector = GMMDataCollector()
+        # === GMM Data Collector: REMOVED per user request (no calibration data saving) ===
         # GMM Sniper state: 1 high-conviction trade per scan cycle
         from config import GMM_SNIPER
         self._gmm_sniper_cfg = GMM_SNIPER
@@ -2024,10 +2022,13 @@ class AutonomousTrader:
             # ================================================================
             _drain_oi_results = dict(_prefetched_oi)  # Start with Layer 1 pre-fetched OI
             if _oi_futures:
+                _oi_total = len(_oi_futures)
+                _oi_done = 0
                 try:
-                    # Apr 21: 30s→45s — tolerate Kite congestion during OI_AGGR window
-                    for _fut in _as_done(_oi_futures, timeout=45):
+                    # Apr 27: 45s→60s — tolerate cold Kite NFO instrument cache + slow chains
+                    for _fut in _as_done(_oi_futures, timeout=60):
                         _oi_sym = _oi_futures[_fut]
+                        _oi_done += 1
                         try:
                             _oi_result = _fut.result()
                             if _oi_result:
@@ -2047,7 +2048,7 @@ class AutonomousTrader:
                         except Exception as e:
                             print(f"⚠️ FALLBACK [trader/watcher_oi_drain_result]: {e}")
                 except Exception:
-                    self._wlog("⚠️ OI background timeout — proceeding with partial OI data")
+                    self._wlog(f"⚠️ OI background timeout — {_oi_done}/{_oi_total} fetched, proceeding with partial OI data")
                 if _oi_executor:
                     _oi_executor.shutdown(wait=False)
             self._watcher_drain_oi = _drain_oi_results
@@ -2498,18 +2499,37 @@ class AutonomousTrader:
 
                 # -- Gate: WATCHER BREADTH CONFLICT (Apr 20) --
                 # Don't buy CEs in BEARISH market, don't buy PEs in BULLISH market
+                # Apr 27: smart bypass — strong individual stock OI counter to breadth
+                # is allowed (e.g. SELL on a stock with bearish OI even if breadth is bullish)
                 if _market_breadth in ('BULLISH', 'BEARISH'):
                     _watcher_breadth_conflict = (
                         (direction == 'SELL' and _market_breadth == 'BULLISH') or
                         (direction == 'BUY' and _market_breadth == 'BEARISH')
                     )
                     if _watcher_breadth_conflict:
-                        self._wlog(f"  BLOCKED(BREADTH): {_stock_name} {direction} conflicts with {_market_breadth} market")
-                        self._watcher_total_gate_blocked += 1
-                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_BREADTH_CONFLICT',
-                                          reason=f'{direction} trade vs {_market_breadth} market breadth',
-                                          direction=direction)
-                        continue
+                        # Smart bypass: stock-specific OI strongly opposes breadth
+                        # AND score is solid — individually-weak stocks should still trade
+                        # SELL inside a BULLISH market (and vice-versa).
+                        _smart_bypass = (
+                            _final_score >= 60
+                            and _oi_dir_here is not None
+                            and _oi_dir_here == direction
+                            and _oi_str_here >= 0.55
+                        )
+                        if _smart_bypass:
+                            self._wlog(
+                                f"  🔓 BREADTH BYPASS: {_stock_name} {direction} "
+                                f"allowed in {_market_breadth} market — "
+                                f"score={_final_score:.0f}≥65 OI={_oi_sig_here} "
+                                f"str={_oi_str_here:.2f}≥0.55 (stock-specific contradiction)"
+                            )
+                        else:
+                            self._wlog(f"  BLOCKED(BREADTH): {_stock_name} {direction} conflicts with {_market_breadth} market")
+                            self._watcher_total_gate_blocked += 1
+                            self._log_decision(_ts, _sym, _final_score, 'WATCHER_BREADTH_CONFLICT',
+                                              reason=f'{direction} trade vs {_market_breadth} market breadth',
+                                              direction=direction)
+                            continue
                 # ── Direction-aware VIX penalty ──
                 # High VIX + SELL direction on bearish day = PE buying = VIX helps → no penalty
                 # High VIX + BUY direction on bearish day = CE buying = VIX hurts → full penalty
@@ -2866,12 +2886,32 @@ class AutonomousTrader:
                     _grind_mf_H = _grind_oi_data.get('_mf_H', False)
                     _grind_mf_K = _grind_oi_data.get('_mf_K', False)
                     _grind_mf_N = _grind_oi_data.get('_mf_N', False)
-                    _grind_anchor_count = sum([_grind_mf_F, _grind_mf_H, _grind_mf_K, _grind_mf_N])
                     # Apr 15 RCA: Check how many factors had data to evaluate
                     _grind_eval_F = _grind_oi_data.get('_mf_F_eval', False)
                     _grind_eval_H = _grind_oi_data.get('_mf_H_eval', False)
                     _grind_eval_K = _grind_oi_data.get('_mf_K_eval', False)
                     _grind_eval_N = _grind_oi_data.get('_mf_N_eval', False)
+                    # Apr 27 FIX: Parquet fallback for F when OI overlay didn't run for this
+                    # symbol (e.g. trimmed by top-30 candidate filter). Read futures OI buildup
+                    # directly from in-memory parquet — free, no API calls. Only fills gaps;
+                    # never overrides an already-evaluated F.
+                    if not _grind_eval_F:
+                        try:
+                            _grind_foi = getattr(self, '_futures_oi_data', None) or {}
+                            _grind_foi_df = _grind_foi.get(_sym) or _grind_foi.get(_sym.replace('NSE:', ''))
+                            if _grind_foi_df is not None and len(_grind_foi_df) > 0:
+                                _grind_fut_buildup = float(_grind_foi_df.iloc[-1].get('fut_oi_buildup', 0))
+                                _grind_eval_F = True
+                                if _grind_fut_buildup:
+                                    _grind_fut_agrees = (
+                                        (direction == 'BUY' and _grind_fut_buildup > 0) or
+                                        (direction == 'SELL' and _grind_fut_buildup < 0)
+                                    )
+                                    if _grind_fut_agrees:
+                                        _grind_mf_F = True
+                        except Exception:
+                            pass
+                    _grind_anchor_count = sum([_grind_mf_F, _grind_mf_H, _grind_mf_K, _grind_mf_N])
                     _grind_evaluable = sum([_grind_eval_F, _grind_eval_H, _grind_eval_K, _grind_eval_N])
                     _grind_anchor_detail = (f'F(FutOI)={"✓" if _grind_mf_F else "?" if not _grind_eval_F else "✗"} '
                                             f'H(ATM)={"✓" if _grind_mf_H else "?" if not _grind_eval_H else "✗"} '
@@ -6714,6 +6754,16 @@ class AutonomousTrader:
                     target=target,
                     quantity=qty
                 )
+                # Manual setups (dashboard reverse / manual entry): keep the
+                # original hard SL & target but skip partial-profit / trail-to-
+                # breakeven logic so a brief +25% spike that retraces does NOT
+                # cause SL_HIT at entry price. User stays in charge of exits.
+                if trade.get('manual_setup') or trade.get('trigger_type') == 'MANUAL_REVERSE':
+                    _ms_state = self.exit_manager.trade_states.get(symbol)
+                    if _ms_state:
+                        _ms_state.partial_booked = True   # blocks BE-trail in _check_partial_profit
+                        _ms_state.breakeven_applied = True
+                        _ms_state.is_manual = True        # blocks _apply_trailing_stop & target-extension
                 # Mark credit spread fields on the trade state
                 if trade.get('is_credit_spread'):
                     state = self.exit_manager.trade_states.get(symbol)
@@ -7842,11 +7892,21 @@ class AutonomousTrader:
         try:
             with open(self.MANUAL_EXIT_FILE, 'r') as f:
                 requests = json.load(f)
-            
-            if not requests:
+
+            # CRITICAL: Delete the signal file BEFORE processing.
+            # Otherwise the inner _save_active_trades() below calls
+            # zerodha_tools._consume_manual_exit_signals() which would
+            # read the same file and orphan-credit pnl a SECOND time,
+            # causing realized_pnl in state_db to be exactly 2× the
+            # true value (trade history ledger stays correct).
+            try:
                 os.remove(self.MANUAL_EXIT_FILE)
+            except Exception:
+                pass
+
+            if not requests:
                 return
-            
+
             print(f"\n   🖐️ MANUAL EXIT: Processing {len(requests)} dashboard exit request(s)...")
             
             processed = []
@@ -7898,12 +7958,9 @@ class AutonomousTrader:
                 # Save updated state
                 self.tools._save_active_trades()
             
-            # Clear signal file
-            try:
-                os.remove(self.MANUAL_EXIT_FILE)
-            except Exception:
-                pass
-            
+            # Signal file already removed at top of method (before loop)
+            # to prevent _consume_manual_exit_signals from double-crediting.
+
             print(f"   🖐️ Manual exit complete: {len(processed)} processed ✅")
             
         except json.JSONDecodeError:
@@ -10315,21 +10372,7 @@ class AutonomousTrader:
                 except Exception as _dr_err:
                     print(f"   ⚠️ Down-risk soft scoring error (non-fatal): {_dr_err}")
 
-                # === GMM CALIBRATION DATA COLLECTION (background, non-blocking) ===
-                try:
-                    _cd_for_collector = getattr(self.tools, '_cached_cycle_decisions', {})
-                    # Pass _ml_predictions (ALL ML outputs) not _ml_results (only non-UNKNOWN)
-                    # so collector records 50+ stocks per cycle instead of ~28.
-                    self._gmm_collector.record_scan(
-                        _ml_predictions, _pre_scores, market_data,
-                        datetime.now().strftime('%H:%M:%S'), _cd_for_collector
-                    )
-                    self._gmm_collector.update_forward_prices(market_data)
-                    _gc_stats = self._gmm_collector.get_stats()
-                    if _gc_stats['pending_tracks'] > 0 or _gc_stats['completed_records'] > 0:
-                        print(f"   📊 GMMCollector: {_gc_stats['pending_tracks']} pending, {_gc_stats['completed_records']} completed")
-                except Exception as _gc_err:
-                    print(f"   ⚠️ GMMCollector error (non-fatal): {_gc_err}")
+                # === GMM CALIBRATION DATA COLLECTION: REMOVED per user request ===
 
                 # === MODEL-TRACKER TRADES: Place up to 7 smart-selected model-only trades ===
                 # Independent of main workflow — purely for evaluating down-risk model.
@@ -12574,6 +12617,17 @@ RULES: F&O → place_option_order() | Cash → place_order() | Max {_dynamic_max
         
         # Start real-time position monitor
         self.start_realtime_monitor()
+
+        # ── Start Auto-Pilot agent (reverse/+1 micro-adjuster) ──
+        # Off by default; user toggles via dashboard. Thread is cheap (1s loop)
+        # and is a no-op until enabled and inside the trading window.
+        try:
+            from auto_pilot import get_auto_pilot
+            _ap = get_auto_pilot(self.tools)
+            if _ap:
+                _ap.start()
+        except Exception as _e:
+            print(f"⚠️ AutoPilot thread init failed: {_e}")
         
         # Track whether we've switched from early to normal mode
         self._switched_to_normal = not _is_early

@@ -192,6 +192,8 @@ class ZerodhaTools:
         self.paper_pnl = 0
         self._positions_lock = threading.RLock()  # Thread safety for paper_positions (reentrant)
         self._scorer_rejected_symbols = set()  # Track scorer rejections for retry filtering
+        self._scorer_reject_ts = {}            # Apr 27: per-symbol last-rejection timestamp for cooldown gate
+        self._scorer_reject_cooldown = 120     # Apr 27: 53s→120s cooldown after scorer reject (was retrying every cycle)
         self._exit_cooldowns: dict = {}  # underlying -> datetime of last exit (20-min re-entry cooldown)
         self._exited_symbols_today: set = set()  # Safety net: all symbols closed from paper_positions today
         
@@ -390,6 +392,8 @@ class ZerodhaTools:
     MANUAL_EXIT_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_exit_requests.json')
     # Path to signal file for dashboard manual entries (news buy button)
     MANUAL_ENTRY_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_entry_requests.json')
+    # Path to signal file for dashboard +1 add-lot requests
+    MANUAL_ADD_LOT_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_add_lot_requests.json')
 
     def _save_active_trades(self):
         """Save active trades to SQLite (caller must hold _positions_lock).
@@ -399,9 +403,10 @@ class ZerodhaTools:
         overwrites the dashboard's state_db changes with stale in-memory
         state that still includes the manually exited position.
         """
-        # ── Consume manual entry/exit signals BEFORE saving ──
+        # ── Consume manual entry/exit/add-lot signals BEFORE saving ──
         self._consume_manual_entry_signals()
         self._consume_manual_exit_signals()
+        self._consume_manual_add_lot_signals()
         
         try:
             get_state_db().save_active_trades(
@@ -436,6 +441,7 @@ class ZerodhaTools:
             
             # Process each exit request
             consumed = []
+            orphan_pnl_total = 0.0
             for req in requests:
                 symbol = req.get('symbol', '')
                 pnl = req.get('pnl', 0)
@@ -466,6 +472,17 @@ class ZerodhaTools:
                         removed = True
                         print(f"   🖐️ Manual exit synced: {symbol} | P&L: ₹{pnl:+,.2f} | exit@{exit_price}")
                         break
+                
+                # ── Orphan P&L guard ──
+                # If the symbol isn't in paper_positions (e.g. rapid reverse clicks
+                # where dashboard already popped it before the bot's save cycle ran),
+                # we STILL credit the P&L to paper_pnl. Otherwise the dashboard's
+                # realized_pnl write gets silently overwritten by bot's stale total
+                # on the next save, making reverse P&L appear to "not count".
+                if not removed and pnl:
+                    self.paper_pnl += pnl
+                    orphan_pnl_total += pnl
+                    print(f"   🖐️ Manual exit ORPHAN P&L credited: {symbol} | P&L: ₹{pnl:+,.2f} (symbol not in memory)")
                 
                 consumed.append(symbol)
             
@@ -525,6 +542,15 @@ class ZerodhaTools:
                 added.append(sym)
                 print(f"   📰 Manual entry INJECTED: {sym} qty={pos.get('quantity')} @ ₹{pos.get('avg_price', 0):.2f}")
 
+                # Log ENTRY to trade_ledger so Trade History can pair it with
+                # the eventual EXIT. Skip if dashboard already logged (reverse
+                # trades set _ledger_logged=True to prevent duplicate rows).
+                if not pos.get('_ledger_logged'):
+                    try:
+                        self._log_entry_to_ledger(pos)
+                    except Exception as _e:
+                        print(f"   ⚠️ Manual entry ledger log failed for {sym}: {_e}")
+
             os.remove(self.MANUAL_ENTRY_SIGNAL)
 
             if added:
@@ -537,6 +563,70 @@ class ZerodhaTools:
                 pass
         except Exception as e:
             print(f"   ⚠️ Manual entry signal consumption error: {e}")
+
+    def _consume_manual_add_lot_signals(self):
+        """Consume pending +1 add-lot signals from the dashboard.
+
+        Merges the added lot into the existing paper_position using
+        weighted-average entry price so a single row represents the
+        strengthened position. On eventual EXIT, P&L naturally reflects
+        the full merged cost basis.
+        """
+        if not os.path.exists(self.MANUAL_ADD_LOT_SIGNAL):
+            return
+        try:
+            with open(self.MANUAL_ADD_LOT_SIGNAL, 'r') as f:
+                raw = f.read().strip()
+            if not raw:
+                os.remove(self.MANUAL_ADD_LOT_SIGNAL)
+                return
+            reqs = json.loads(raw)
+            if not isinstance(reqs, list) or not reqs:
+                os.remove(self.MANUAL_ADD_LOT_SIGNAL)
+                return
+
+            merged_syms = []
+            for req in reqs:
+                sym = req.get('symbol', '')
+                if not sym:
+                    continue
+                found = False
+                for t in self.paper_positions:
+                    if t.get('symbol') == sym and t.get('status', 'OPEN') == 'OPEN':
+                        t['quantity'] = int(req.get('new_qty', t.get('quantity', 0)))
+                        t['lots'] = int(req.get('new_lots', t.get('lots', 1)))
+                        t['avg_price'] = float(req.get('new_avg', t.get('avg_price', 0)))
+                        t['entry_price'] = t['avg_price']
+                        t['stop_loss'] = float(req.get('new_stop_loss', t.get('stop_loss', 0)))
+                        t['target'] = float(req.get('new_target', t.get('target', 0)))
+                        t['total_premium'] = float(req.get('new_total_premium', t.get('total_premium', 0)))
+                        t['max_loss'] = float(req.get('new_max_loss', t.get('max_loss', 0)))
+                        adds = list(t.get('add_lot_history') or [])
+                        adds.append({
+                            'time': req.get('time'),
+                            'ltp': req.get('add_price'),
+                            'qty_added': req.get('add_qty'),
+                            'lots_added': req.get('add_lots'),
+                            'new_avg': req.get('new_avg'),
+                        })
+                        t['add_lot_history'] = adds
+                        merged_syms.append(sym)
+                        found = True
+                        print(f"   ➕ Manual ADD-LOT merged: {sym} → qty={t['quantity']} lots={t['lots']} avg=₹{t['avg_price']:.2f}")
+                        break
+                if not found:
+                    print(f"   ⚠️ Manual ADD-LOT skip (no open position): {sym}")
+
+            os.remove(self.MANUAL_ADD_LOT_SIGNAL)
+            if merged_syms:
+                print(f"   ➕ _save_active_trades: merged {len(merged_syms)} add-lot(s): {merged_syms}")
+        except json.JSONDecodeError:
+            try:
+                os.remove(self.MANUAL_ADD_LOT_SIGNAL)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"   ⚠️ Manual add-lot signal consumption error: {e}")
 
     # =================================================================
     # AUTOSLICE — Freeze Quantity Protection
@@ -4131,6 +4221,25 @@ class ZerodhaTools:
                 "error": f"{underlying} is not F&O eligible",
                 "action": "Use equity order instead"
             }
+
+        # === SCORER REJECTION COOLDOWN (Apr 27) ===
+        # Same symbol was being re-evaluated every cycle (~30-50s) after a scorer
+        # rejection — wasting compute and producing noisy logs (COCHINSHIP ×7 in 30min).
+        # Block re-evaluation for `_scorer_reject_cooldown` seconds after a fail.
+        _sym_clean = underlying.replace('NSE:', '')
+        _last_rej_ts = self._scorer_reject_ts.get(_sym_clean)
+        if _last_rej_ts is not None:
+            _elapsed_rej = (datetime.now() - _last_rej_ts).total_seconds()
+            if _elapsed_rej < self._scorer_reject_cooldown:
+                return {
+                    "success": False,
+                    "error": f"SCORER COOLDOWN: {underlying} rejected {_elapsed_rej:.0f}s ago "
+                             f"(wait {self._scorer_reject_cooldown - _elapsed_rej:.0f}s more)",
+                    "reason": "Recent scorer rejection — cooldown active to avoid retry spam.",
+                    "action": "SKIP - scorer cooldown"
+                }
+            # Cooldown expired — clean up
+            self._scorer_reject_ts.pop(_sym_clean, None)
         
         # === SHARED SAFETY GATES (same as place_order) ===
         # 1. Trading hours check
@@ -4548,6 +4657,7 @@ class ZerodhaTools:
                             # print(f"   ⚠️ Iron Condor attempt failed: {e}")
                             pass
             
+            self._scorer_reject_ts[underlying.replace('NSE:', '')] = datetime.now()
             return {
                 "success": False,
                 "error": f"Intraday scorer REJECTED {underlying} - score below threshold. Do NOT retry this symbol.",

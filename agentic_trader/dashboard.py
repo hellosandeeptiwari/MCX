@@ -450,6 +450,83 @@ def bot_restart():
         return jsonify({'ok': False, 'action': 'restart', 'msg': str(e)}), 500
 
 
+# ── Auto-Pilot control (toggle the bot's micro-adjuster thread) ─────
+
+AUTOPILOT_STATE_PATH = os.path.join(os.path.dirname(__file__), 'auto_pilot_state.json')
+AUTOPILOT_DISABLE_FLAG = os.path.join(os.path.dirname(__file__), 'auto_pilot_disabled.flag')
+
+
+def _autopilot_read():
+    try:
+        if os.path.exists(AUTOPILOT_STATE_PATH):
+            with open(AUTOPILOT_STATE_PATH, 'r') as f:
+                return json.load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _autopilot_write(state):
+    try:
+        tmp = AUTOPILOT_STATE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+        os.replace(tmp, AUTOPILOT_STATE_PATH)
+        return True
+    except Exception as e:
+        print(f"⚠️ autopilot write failed: {e}")
+        return False
+
+
+@app.route('/api/auto_pilot', methods=['GET', 'POST'])
+def auto_pilot():
+    """Read or toggle the auto-pilot agent running in titan-bot.
+
+    POST body: {"enabled": true|false}
+    Response: current state incl. daily counters and recent decisions.
+    """
+    state = _autopilot_read()
+    today = _today()
+    # Day-rollover: reset counters if file is from yesterday
+    if state.get('date') != today:
+        state['date'] = today
+        state['counters'] = {}
+        state['last_action_ts'] = {}
+
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        on = bool(data.get('enabled'))
+        state['enabled'] = on
+        # Also toggle the physical kill flag so a crashed/restarting bot
+        # honors the setting at boot.
+        try:
+            if on and os.path.exists(AUTOPILOT_DISABLE_FLAG):
+                os.remove(AUTOPILOT_DISABLE_FLAG)
+            elif not on:
+                with open(AUTOPILOT_DISABLE_FLAG, 'w') as f:
+                    f.write(datetime.now().isoformat())
+        except Exception:
+            pass
+        _autopilot_write(state)
+
+    # Always normalize counters for display
+    counters = state.get('counters', {}) or {}
+    return jsonify({
+        'ok': True,
+        'enabled': bool(state.get('enabled', False)) and not os.path.exists(AUTOPILOT_DISABLE_FLAG),
+        'date': state.get('date'),
+        'counters': counters,
+        'limits': {
+            'max_reverses_per_symbol': 7,
+            'max_adds_per_symbol': 3,
+        },
+        'recent_decisions': (state.get('last_decision') or [])[-15:],
+        'scope': 'NAKED_OPTION only',
+        'aggression': 'Aggressive',
+        'llm': 'gpt-5.2',
+    })
+
+
 # ── Reverse trade: EXIT current position + OPEN opposite ───────
 
 @app.route('/api/reverse_trade', methods=['POST'])
@@ -472,6 +549,49 @@ def reverse_trade():
         if not symbol or not direction or quantity <= 0:
             return jsonify({'ok': False, 'msg': 'Missing required fields'}), 400
 
+        # ── THROTTLE: reject rapid repeat clicks on the same symbol ──
+        # Rationale: bot consumes manual_entry/exit signal files on its next
+        # save cycle (~2-5s). Stacking multiple reverse pairs faster than that
+        # causes symbol-matched signal consumption to drop positions (see
+        # _consume_manual_exit_signals symbol-only matching).
+        global _REVERSE_LOCKS, _REVERSE_LAST_TS
+        try:
+            _REVERSE_LOCKS
+        except NameError:
+            import threading as _th
+            _REVERSE_LOCKS = {}   # {symbol: threading.Lock}
+            _REVERSE_LAST_TS = {} # {symbol: epoch_seconds of last accepted click}
+        import threading as _th
+        _now = time.time()
+        _COOLDOWN = 5.0  # seconds between accepted reverse clicks per symbol
+        _last = _REVERSE_LAST_TS.get(symbol, 0.0)
+        if _now - _last < _COOLDOWN:
+            _wait = round(_COOLDOWN - (_now - _last), 1)
+            return jsonify({
+                'ok': False,
+                'msg': f'Too fast — wait {_wait}s before reversing {symbol} again (bot is still syncing the last flip).'
+            }), 429
+        _lock = _REVERSE_LOCKS.setdefault(symbol, _th.Lock())
+        if not _lock.acquire(blocking=False):
+            return jsonify({
+                'ok': False,
+                'msg': f'Reverse for {symbol} already in flight — please wait.'
+            }), 429
+        _REVERSE_LAST_TS[symbol] = _now
+        try:
+            return _reverse_trade_impl(data, symbol, underlying, direction, quantity,
+                                       is_option, option_type, strike, expiry, lots)
+        finally:
+            _lock.release()
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'Reverse trade failed: {str(e)}'}), 500
+
+
+def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
+                        is_option, option_type, strike, expiry, lots):
+    """Actual reverse logic — called under per-symbol lock from reverse_trade()."""
+    import re, random
+    try:
         db = get_state_db()
         today = _today()
 
@@ -534,6 +654,8 @@ def reverse_trade():
                 'direction': side,
                 'quantity': exit_qty,
                 'entry_price': round(entry_price, 2),
+                'order_id': target_pos.get('order_id', ''),
+                'trade_id': target_pos.get('trade_id', ''),
                 'trade': target_pos,
                 'live_exit_placed': False,
             }
@@ -559,15 +681,30 @@ def reverse_trade():
                     _hold_mins = int((datetime.now() - _dp(target_pos.get('timestamp', ''))).total_seconds() / 60)
                 except Exception:
                     pass
+                _entry_price = float(target_pos.get('avg_price') or target_pos.get('entry_price') or 0)
+                _exit_qty_log = abs(int(target_pos.get('quantity', 0) or 0))
+                _pnl_pct = (round(exit_pnl, 2) / (_entry_price * _exit_qty_log) * 100) if _entry_price > 0 and _exit_qty_log > 0 else 0
                 ledger.log_exit(
                     symbol=symbol,
                     underlying=_underlying,
-                    exit_price=round(exit_price, 2),
-                    exit_time=datetime.now().isoformat(),
+                    direction=target_pos.get('direction') or target_pos.get('side') or 'BUY',
+                    source=target_pos.get('setup_type', target_pos.get('strategy_type', '')),
+                    sector=target_pos.get('sector', ''),
                     exit_type='MANUAL_REVERSE_EXIT',
+                    entry_price=_entry_price,
+                    exit_price=round(exit_price, 2),
+                    quantity=_exit_qty_log,
                     pnl=round(exit_pnl, 2),
-                    hold_time_minutes=_hold_mins,
-                    entry_data=target_pos,
+                    pnl_pct=round(_pnl_pct, 2),
+                    smart_score=float(target_pos.get('smart_score', 0) or 0),
+                    final_score=float(target_pos.get('entry_score', 0) or 0),
+                    dr_score=float(target_pos.get('dr_score', 0) or 0),
+                    strategy_type=target_pos.get('strategy_type', ''),
+                    exit_reason='Reverse trade exit from dashboard UI',
+                    hold_minutes=_hold_mins,
+                    entry_time=target_pos.get('timestamp', ''),
+                    order_id=target_pos.get('order_id', ''),
+                    trade_id=target_pos.get('trade_id', ''),
                 )
             except Exception:
                 pass
@@ -605,6 +742,14 @@ def reverse_trade():
 
         stoploss_premium = round(market_ltp * 0.72, 2)
         target_premium = round(market_ltp * 1.60, 2)
+        # Tick-noise floor: for cheap options (premium < ₹5), the 28% relative
+        # SL collapses to 1-3 ticks (e.g. ₹0.05 entry → ₹0.036 SL). Enforce a
+        # minimum SL distance of ₹0.50 OR 28%, whichever is wider, so normal
+        # bid/ask noise can't trigger SL_HIT immediately. Cap target at 60%
+        # symmetrically to keep R-multiple math sensible.
+        _min_sl_dist = 0.50
+        if (market_ltp - stoploss_premium) < _min_sl_dist:
+            stoploss_premium = round(max(0.05, market_ltp - _min_sl_dist), 2)
         total_premium = round(market_ltp * quantity, 2)
         max_loss = round((market_ltp - stoploss_premium) * quantity, 2)
 
@@ -642,7 +787,48 @@ def reverse_trade():
             'trigger_type': 'MANUAL_REVERSE',
             'is_sniper': False,
             'delta': 0, 'theta': 0, 'iv': 0,
+            # Manual setup flag: tells exit_manager to skip partial-profit /
+            # trail-to-breakeven logic so the position rides on its original
+            # hard SL until target / SL / manual exit. Without this, a brief
+            # +25% spike that retraces will trigger SL_HIT at entry price.
+            'manual_setup': True,
         }
+
+        # ── Log ENTRY for the new reverse position to trade_ledger FIRST ──
+        # Done before writing the signal file so new_pos carries the
+        # _ledger_logged flag; bot's consumer uses that flag to skip
+        # re-logging and avoid duplicate ENTRY rows in Trade History.
+        try:
+            _ledger = get_trade_ledger()
+            _rev_underlying = new_pos.get('underlying') or symbol
+            if not _rev_underlying.startswith('NSE:') and not _rev_underlying.startswith('NFO:'):
+                _m = re.match(r'(?:NFO:)?([A-Z]+)\d', rev_symbol.replace('NFO:', ''))
+                _rev_underlying = f"NSE:{_m.group(1)}" if _m else rev_symbol
+            _ledger.log_entry(
+                symbol=rev_symbol,
+                underlying=_rev_underlying,
+                direction=direction or 'BUY',
+                source='MANUAL_REVERSE',
+                strategy_type='NAKED_OPTION',
+                score_tier='manual',
+                option_symbol=rev_symbol if is_option else '',
+                strike=strike if is_option else 0,
+                option_type=option_type if is_option else '',
+                expiry=expiry if is_option else '',
+                entry_price=round(market_ltp, 2),
+                quantity=quantity,
+                lots=lots,
+                lot_multiplier=1.0,
+                stop_loss=stoploss_premium,
+                target=target_premium,
+                total_premium=total_premium,
+                rationale=new_pos.get('rationale', f'Reverse of {symbol}'),
+                order_id=paper_id,
+                trade_id=trade_id,
+            )
+            new_pos['_ledger_logged'] = True
+        except Exception as _e:
+            print(f"⚠️ reverse_trade log_entry failed: {_e}")
 
         # Write entry signal for bot (in-memory injection)
         signal_file = os.path.join(os.path.dirname(__file__), 'manual_entry_requests.json')
@@ -660,6 +846,8 @@ def reverse_trade():
         # Save to state_db: remaining (without exited) + new reverse position
         remaining.append(new_pos)
         db.save_active_trades(remaining, realized_pnl, paper_capital)
+
+        # Seed live_pnl IMMEDIATELY so the dashboard renders the flipped
 
         # Seed live_pnl IMMEDIATELY so the dashboard renders the flipped
         # position with its correct entry LTP instead of the old symbol's
@@ -698,6 +886,170 @@ def reverse_trade():
 
     except Exception as e:
         return jsonify({'ok': False, 'msg': f'Reverse trade failed: {str(e)}'}), 500
+
+
+# ── Add-lot (+1): strengthen existing position with one more lot at LTP ─
+
+_ADD_LOT_LOCKS = {}
+_ADD_LOT_LAST_TS = {}
+
+@app.route('/api/add_lot', methods=['POST'])
+def add_lot():
+    """Strengthen an existing option position by buying one more lot of the
+    SAME strike / SAME option type at current LTP.
+
+    Merges the new lot into the existing position using weighted-average
+    entry price. Keeps a single row in active_trades (and one ENTRY record
+    in trade_ledger) so the eventual EXIT pairs cleanly with the merged
+    position and P&L reflects the full averaged cost basis.
+    """
+    try:
+        import re as _re, random as _rand, threading as _th
+        data = request.get_json(force=True, silent=True) or {}
+        symbol = (data.get('symbol') or '').strip()
+        if not symbol:
+            return jsonify({'ok': False, 'msg': 'symbol required'}), 400
+
+        # Per-symbol cooldown + in-flight lock (mirrors reverse_trade policy)
+        _now = time.time()
+        _COOLDOWN = 3.0
+        _last = _ADD_LOT_LAST_TS.get(symbol, 0.0)
+        if _now - _last < _COOLDOWN:
+            _wait = round(_COOLDOWN - (_now - _last), 1)
+            return jsonify({
+                'ok': False,
+                'msg': f'Too fast — wait {_wait}s before adding another lot to {symbol}.'
+            }), 429
+        _lock = _ADD_LOT_LOCKS.setdefault(symbol, _th.Lock())
+        if not _lock.acquire(blocking=False):
+            return jsonify({'ok': False, 'msg': f'Add-lot for {symbol} already in flight.'}), 429
+        _ADD_LOT_LAST_TS[symbol] = _now
+        try:
+            db = get_state_db()
+            today = _today()
+            positions, realized_pnl, paper_capital = db.load_active_trades(today)
+
+            target_pos = None
+            remaining = []
+            for pos in positions:
+                pos_sym = pos.get('symbol') or pos.get('option_symbol') or ''
+                if pos_sym == symbol and pos.get('status', 'OPEN') == 'OPEN' and target_pos is None:
+                    target_pos = pos
+                else:
+                    remaining.append(pos)
+
+            if target_pos is None:
+                return jsonify({
+                    'ok': False,
+                    'msg': f'Position {symbol} not open — cannot add lot. Refresh and try again.'
+                }), 409
+
+            old_qty = int(target_pos.get('quantity', 0) or 0)
+            old_lots = int(target_pos.get('lots', 1) or 1)
+            old_avg = float(target_pos.get('avg_price') or target_pos.get('entry_price') or 0)
+            if old_qty <= 0 or old_lots <= 0 or old_avg <= 0:
+                return jsonify({'ok': False, 'msg': f'{symbol} has invalid size/price — cannot add lot.'}), 400
+
+            lot_size = max(1, int(round(old_qty / old_lots)))
+
+            # Fetch live LTP via Kite
+            kite = _get_dashboard_kite()
+            if not kite:
+                return jsonify({'ok': False, 'msg': 'Kite API unavailable for add-lot'}), 503
+            nfo_symbol = f'NFO:{symbol}' if not symbol.startswith('NFO:') else symbol
+            market_ltp = 0
+            try:
+                ltp_data = kite.ltp([nfo_symbol])
+                if nfo_symbol in ltp_data:
+                    market_ltp = float(ltp_data[nfo_symbol].get('last_price', 0) or 0)
+            except Exception as e:
+                print(f"⚠️ Add-lot LTP fetch failed for {nfo_symbol}: {e}")
+
+            if market_ltp <= 0:
+                return jsonify({'ok': False, 'msg': f'Could not fetch LTP for {symbol}'}), 400
+
+            add_qty = lot_size
+            add_lots = 1
+            new_qty = old_qty + add_qty
+            new_lots = old_lots + add_lots
+            new_avg = round(((old_avg * old_qty) + (market_ltp * add_qty)) / new_qty, 2)
+
+            # Recompute SL/target on merged avg using the same 72%/160% bands
+            new_sl = round(new_avg * 0.72, 2)
+            new_tgt = round(new_avg * 1.60, 2)
+            new_total_premium = round(new_avg * new_qty, 2)
+            new_max_loss = round((new_avg - new_sl) * new_qty, 2)
+
+            merged = dict(target_pos)
+            merged.update({
+                'quantity': new_qty,
+                'lots': new_lots,
+                'avg_price': new_avg,
+                'entry_price': new_avg,
+                'stop_loss': new_sl,
+                'target': new_tgt,
+                'total_premium': new_total_premium,
+                'max_loss': new_max_loss,
+                'status': 'OPEN',
+            })
+            # Track adds for audit
+            adds = list(merged.get('add_lot_history') or [])
+            adds.append({
+                'time': datetime.now().isoformat(),
+                'ltp': round(market_ltp, 2),
+                'qty_added': add_qty,
+                'lots_added': add_lots,
+                'new_avg': new_avg,
+            })
+            merged['add_lot_history'] = adds
+
+            # Signal the bot to merge its in-memory paper_position
+            signal_file = os.path.join(os.path.dirname(__file__), 'manual_add_lot_requests.json')
+            pending = []
+            if os.path.exists(signal_file):
+                try:
+                    with open(signal_file, 'r') as sf:
+                        pending = json.loads(sf.read().strip() or '[]')
+                except Exception:
+                    pending = []
+            pending.append({
+                'symbol': symbol,
+                'add_qty': add_qty,
+                'add_lots': add_lots,
+                'add_price': round(market_ltp, 2),
+                'new_qty': new_qty,
+                'new_lots': new_lots,
+                'new_avg': new_avg,
+                'new_stop_loss': new_sl,
+                'new_target': new_tgt,
+                'new_total_premium': new_total_premium,
+                'new_max_loss': new_max_loss,
+                'time': datetime.now().isoformat(),
+            })
+            with open(signal_file, 'w') as sf:
+                json.dump(pending, sf)
+
+            # Persist merged position to DB immediately
+            remaining.append(merged)
+            db.save_active_trades(remaining, realized_pnl, paper_capital)
+
+            return jsonify({
+                'ok': True,
+                'msg': (f'Added 1 lot to {symbol} @ ₹{market_ltp:.2f} | '
+                        f'Qty {old_qty}→{new_qty} | Lots {old_lots}→{new_lots} | '
+                        f'Avg ₹{old_avg:.2f}→₹{new_avg:.2f} | '
+                        f'SL ₹{new_sl:.2f} | TGT ₹{new_tgt:.2f}'),
+                'ltp': market_ltp,
+                'new_qty': new_qty,
+                'new_lots': new_lots,
+                'new_avg': new_avg,
+                'new_stop_loss': new_sl,
+                'new_target': new_tgt,
+            })
+        finally:
+            _lock.release()
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': f'Add-lot failed: {str(e)}'}), 500
 
 
 # ── Candles endpoint: lightweight chart data from Kite historical API ──
@@ -1312,6 +1664,12 @@ def _enrich_positions(positions: list, db) -> list:
 
     # Primary source: live_pnl table (updated every scan cycle by the bot)
     live = db.load_live_pnl() or {}
+    # Exit-manager state (trailing SL, breakeven, current SL). Merged in-line
+    # so the UI doesn't depend on a separate /api/exits round-trip succeeding.
+    try:
+        exit_states = db.load_exit_states() or {}
+    except Exception:
+        exit_states = {}
 
     for pos in positions:
         sym = pos.get('symbol') or pos.get('option_symbol') or ''
@@ -1331,6 +1689,20 @@ def _enrich_positions(positions: list, db) -> list:
             pos['ltp_updated'] = lp.get('last_updated', '')
         elif isinstance(lp, (int, float)):
             pos['ltp'] = float(lp)
+
+        # Merge exit-manager trailing state inline. UI prefers these fields
+        # over a separate /api/exits lookup so trailing pill / row tint render
+        # even if the second API call fails or is cached stale.
+        es = exit_states.get(sym) or exit_states.get(sym.replace('NFO:', ''))
+        if isinstance(es, dict):
+            cs = es.get('current_sl')
+            if cs is not None:
+                pos['current_sl'] = cs
+            pos['trailing_active'] = bool(es.get('trailing_active', False))
+            pos['breakeven_applied'] = bool(es.get('breakeven_applied', False))
+            hp = es.get('highest_price')
+            if hp is not None:
+                pos['highest_price'] = hp
     return positions
 
 
@@ -1608,6 +1980,9 @@ def get_status():
     today = _today()
 
     positions, realized_pnl, paper_capital = db.load_active_trades(today)
+    # Drop already-closed rows (e.g. SYNC_MISSING_FROM_DB) so the UI never
+    # shows ghost rows whose Exit/Reverse buttons would 404.
+    positions = [p for p in positions if (p.get('status') or 'OPEN') == 'OPEN']
     positions = _enrich_positions(positions, db)
 
     total_unrealized = sum(p.get('unrealized_pnl', 0) for p in positions)
@@ -1671,6 +2046,8 @@ def pnl_live():
         db = get_state_db()
         today = _today()
         positions, realized_pnl, _cap = db.load_active_trades(today)
+        # Only stream live P&L for still-open rows; closed rows must not appear.
+        positions = [p for p in (positions or []) if (p.get('status') or 'OPEN') == 'OPEN']
         live = db.load_live_pnl() or {}
 
         import time as _t
@@ -1694,7 +2071,13 @@ def pnl_live():
 
         fresh_ltps = {}
         kite_err = None
-        if stale and pos_syms:
+        # Always attempt fresh Kite LTP for every open position symbol
+        # (bounded by the 800ms _LTP_CACHE below). This guarantees that
+        # immediately after a manual Reverse / +1 / news-buy the dashboard
+        # shows real-time market price instead of the bot's last-cycle
+        # snapshot (which can be up to 3-5s stale and may even be missing
+        # the freshly-added symbol until the bot's next save cycle).
+        if pos_syms:
             try:
                 to_fetch = []
                 for s in pos_syms:
@@ -1741,6 +2124,9 @@ def pnl_live():
                 continue
             entry = p.get('avg_price') or p.get('entry_price') or p.get('net_premium', 0) or 0
             qty = abs(p.get('quantity', 0) or 0)
+            # P&L uses SIDE (actual transaction) not DIRECTION (market view).
+            # For bearish-via-long-put trades: side='BUY', direction='SELL' — using direction would flip the sign.
+            s = (p.get('side') or ('BUY' if p.get('direction') in ('BUY', 'LONG') else 'SELL')).upper()
             d = p.get('direction') or ('LONG' if p.get('side') == 'BUY' else 'SHORT')
             spread = p.get('is_debit_spread') or p.get('is_credit_spread') or p.get('is_iron_condor')
 
@@ -1769,11 +2155,11 @@ def pnl_live():
             if ltp > 0 and sym in fresh_ltps:
                 _LAST_GOOD_LTP[sym] = (now_wall, ltp)  # only remember fresh fetches
 
-            # Compute unrealized
+            # Compute unrealized (SIDE-based to match bot's authoritative formula)
             if spread and isinstance(db_lp, dict):
                 unreal = float(db_lp.get('unrealized_pnl') or 0)
             elif ltp > 0 and entry > 0 and qty > 0:
-                if d in ('BUY', 'LONG'):
+                if s == 'BUY':
                     unreal = (ltp - entry) * qty
                 else:
                     unreal = (entry - ltp) * qty
@@ -1821,6 +2207,8 @@ def trade_summary():
         entry = p.get('avg_price') or p.get('entry_price') or p.get('net_premium', 0)
         qty = abs(p.get('quantity', 0))
         d = p.get('direction', '')
+        # SIDE-based P&L (direction-based would flip sign for bearish-via-long-put trades)
+        s = (p.get('side') or ('BUY' if d in ('BUY', 'LONG') else 'SELL')).upper()
         spread = p.get('is_debit_spread') or p.get('is_credit_spread') or p.get('is_iron_condor')
 
         lp = live.get(sym) or live.get(sym.replace('NFO:', ''))
@@ -1833,7 +2221,7 @@ def trade_summary():
             ltp = float(lp)
 
         if unreal == 0 and ltp > 0 and entry > 0 and not spread:
-            if d in ('BUY', 'LONG'):
+            if s == 'BUY':
                 unreal = (ltp - entry) * qty
             else:
                 unreal = (entry - ltp) * qty

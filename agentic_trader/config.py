@@ -1257,9 +1257,9 @@ THETA_ENTRY_GATE = {
     # Daily |theta| as % of premium. If theta eats >5% per day, stock needs >5% move just to break even.
     "max_theta_pct_of_premium": 25.0,   # Block if |daily theta| > 25% of option LTP (raised Mar 30 — 10% blocks all 0DTE)
     # --- DTE Floor for Naked Buys (non-expiry days) ---
-    # On non-expiry days, avoid buying options with <3 DTE — theta curve steepens quadratically.
+    # On non-expiry days, avoid buying options with <2 DTE — theta curve steepens quadratically.
     # On expiry day, expiry_shield handles 0DTE separately.
-    "min_dte_naked_buy": 3,             # Don't buy naked options with DTE < 3
+    "min_dte_naked_buy": 2,             # Don't buy naked options with DTE < 2 (Apr 27: 3→2)
     # --- Afternoon Theta Multiplier (EXPIRY DAY ONLY) ---
     # After 1PM on expiry day, theta accelerates sharply for near-month options.
     # Require 1.5× the normal score threshold to enter naked buys in afternoon.

@@ -1,0 +1,34 @@
+﻿node.exe : Config contains 
+unrecognized setting 
+"reportSyntaxErrors".
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" 
+"C:\Program Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpeci 
+   fied: (Config contains...tSyntaxEr  
+  rors".:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCo 
+   mmandError
+ 
+c:\Users\SandeepTiwari\MCX\agentic_trader\autonomous_trader.py
+  c:\Users\SandeepTiwari\MCX\agentic_trader\autonomous_trader.py:645:54 - error: Argument of type "Unknown | Any | Series" cannot be assigned to parameter "ts_input" of type "integer[Any] | float | str | date | datetime | datetime64[date | int | None]" in function "__new__"
+  ┬á┬áType "Unknown | Any | Series" is not assignable to type "integer[Any] | float | str | date | datetime | datetime64[date | int | None]"
+  ┬á┬á┬á┬áType "Series" is not assignable to type "integer[Any] | float | str | date | datetime | datetime64[date | int | None]"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "integer[Any]"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "float"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "str"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "date"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "datetime"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "datetime64[date | int | None]" (reportArgumentType)
+  c:\Users\SandeepTiwari\MCX\agentic_trader\autonomous_trader.py:660:59 - error: Argument of type "Unknown | Any | Series" cannot be assigned to parameter "ts_input" of type "integer[Any] | float | str | date | datetime | datetime64[date | int | None]" in function "__new__"
+  ┬á┬áType "Unknown | Any | Series" is not assignable to type "integer[Any] | float | str | date | datetime | datetime64[date | int | None]"
+  ┬á┬á┬á┬áType "Series" is not assignable to type "integer[Any] | float | str | date | datetime | datetime64[date | int | None]"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "integer[Any]"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "float"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "str"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "date"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "datetime"
+  ┬á┬á┬á┬á┬á┬á"Series" is not assignable to "datetime64[date | int | None]" (reportArgumentType)
+2 errors, 0 warnings, 0 informations
