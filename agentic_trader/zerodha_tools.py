@@ -178,7 +178,17 @@ class ZerodhaTools:
     # Trade logging is handled by centralized TradeLedger (trade_ledger.py)
     
     def __init__(self, paper_mode: bool = True, paper_capital: float | None = None):
-        self.kite = KiteConnect(api_key=ZERODHA_API_KEY, timeout=15)
+        # May 4: enlarge urllib3 connection pool. Default HTTPAdapter caps at
+        # 10 conns; with OI_AGGR's 8 worker threads + ticker + exit_manager +
+        # AP all hammering kite.quote()/ltp() concurrently, threads queued at
+        # the connection-acquisition layer (silent block, no exception) and
+        # 60% of OI_AGGR scans aged out at the 120s wall. 32/32 gives every
+        # OI worker its own conn plus headroom for ticker + AP.
+        self.kite = KiteConnect(
+            api_key=ZERODHA_API_KEY,
+            timeout=15,
+            pool={'pool_connections': 32, 'pool_maxsize': 32, 'pool_block': False},
+        )
         self.access_token = None
         self.start_of_day_equity = None
         self.last_api_call = 0
@@ -193,7 +203,7 @@ class ZerodhaTools:
         self._positions_lock = threading.RLock()  # Thread safety for paper_positions (reentrant)
         self._scorer_rejected_symbols = set()  # Track scorer rejections for retry filtering
         self._scorer_reject_ts = {}            # Apr 27: per-symbol last-rejection timestamp for cooldown gate
-        self._scorer_reject_cooldown = 120     # Apr 27: 53s→120s cooldown after scorer reject (was retrying every cycle)
+        self._scorer_reject_cooldown = 600     # Apr 28: 120→600s — structural rejections (theta/liquidity/DTE) are deterministic option-chain properties; scan cycle is 5min so 120s expired before next scan and same symbols re-fired every cycle.
         self._exit_cooldowns: dict = {}  # underlying -> datetime of last exit (20-min re-entry cooldown)
         self._exited_symbols_today: set = set()  # Safety net: all symbols closed from paper_positions today
         
@@ -347,6 +357,28 @@ class ZerodhaTools:
             ltp_data = self.kite.ltp(symbols)
         except Exception:
             return
+        # Also seed the ticker LTP cache so subsequent get_ltp_batch() calls
+        # do not return None / fall through to per-cycle REST hits (which
+        # can fail silently for one symbol while others succeed, leaving the
+        # dashboard's LTP frozen at the seed value for many minutes).
+        try:
+            if self.ticker is not None:
+                import time as _t_seed
+                _now_ts = _t_seed.time()
+                for _sym, _info in (ltp_data or {}).items():
+                    if not isinstance(_info, dict):
+                        continue
+                    _lp = _info.get('last_price')
+                    if not _lp:
+                        continue
+                    _tok = (self.ticker._symbol_to_token.get(_sym)
+                            or self.ticker._resolve_token(_sym))
+                    if _tok:
+                        with self.ticker._lock:
+                            self.ticker._ltp_cache[_tok] = _lp
+                            self.ticker._last_update[_tok] = _now_ts
+        except Exception:
+            pass
         live_snaps = []
         total_upnl = 0.0
         with self._positions_lock:
@@ -387,6 +419,60 @@ class ZerodhaTools:
                 get_state_db().save_live_pnl(live_snaps, round(total_upnl, 2))
             except Exception:
                 pass
+
+    def _seed_live_pnl_at_zero(self, sym_to_ltp: dict):
+        """Seed live_pnl rows with unrealized_pnl = 0 by using the SAME LTP
+        as the just-rebased entry. Avoids the off-by-one-tick non-zero P&L
+        that appeared on REVERSE clicks because two separate kite.ltp calls
+        (rebase + seed) saw two different prices.
+
+        Also primes the ticker cache to the rebase LTP so the first WS tick
+        is the one that moves PnL off zero.
+        """
+        if not sym_to_ltp:
+            return
+        # Prime ticker cache to the same LTP as entry.
+        try:
+            if self.ticker is not None:
+                import time as _t_seed
+                _now_ts = _t_seed.time()
+                for _sym, _lp in sym_to_ltp.items():
+                    if not _lp:
+                        continue
+                    _tok = (self.ticker._symbol_to_token.get(_sym)
+                            or self.ticker._resolve_token(_sym))
+                    if _tok:
+                        with self.ticker._lock:
+                            self.ticker._ltp_cache[_tok] = _lp
+                            self.ticker._last_update[_tok] = _now_ts
+        except Exception:
+            pass
+        # Build live_pnl snapshot — keep existing rows, replace/insert these
+        # at unrealized_pnl=0 (entry == ltp by construction).
+        try:
+            db = get_state_db()
+            existing = db.load_live_pnl() or {}
+            snaps = []
+            total = 0.0
+            seeded = set()
+            for _k, _v in (existing or {}).items():
+                if _k.startswith('_') or not isinstance(_v, dict):
+                    continue
+                if _k in sym_to_ltp:
+                    snaps.append({'symbol': _k, 'ltp': round(sym_to_ltp[_k], 2),
+                                  'unrealized_pnl': 0.0})
+                    seeded.add(_k)
+                else:
+                    snaps.append({'symbol': _k, 'ltp': _v.get('ltp', 0),
+                                  'unrealized_pnl': _v.get('unrealized_pnl', 0)})
+                    total += _v.get('unrealized_pnl', 0) or 0
+            for _sym, _lp in sym_to_ltp.items():
+                if _sym not in seeded:
+                    snaps.append({'symbol': _sym, 'ltp': round(_lp, 2),
+                                  'unrealized_pnl': 0.0})
+            db.save_live_pnl(snaps, round(total, 2))
+        except Exception:
+            pass
 
     # Path to signal file for dashboard manual exits
     MANUAL_EXIT_SIGNAL = os.path.join(os.path.dirname(__file__), 'manual_exit_requests.json')
@@ -528,6 +614,17 @@ class ZerodhaTools:
             added = []
             for pos in entries:
                 sym = pos.get('symbol', '')
+                # Normalize option symbol to NFO:-prefixed form. Dashboard's
+                # reverse_trade emits bare symbols (e.g. BANKNIFTY26APR55000PE)
+                # but `_subscribe_position_symbols`, `get_ltp_batch` and Kite's
+                # `kite.ltp(...)` all expect "NFO:SYMBOL". Without this, the
+                # newly-injected reverse position never subscribes to the WS,
+                # the safety-net REST fetch fails silently, and the dashboard
+                # shows LTP=0 / massive negative unrealized PnL until the user
+                # refreshes.
+                if pos.get('is_option') and sym and ':' not in sym:
+                    sym = f'NFO:{sym}'
+                    pos['symbol'] = sym
                 # Deduplicate: skip if we already have this symbol open
                 already = any(
                     t.get('symbol') == sym and t.get('status', 'OPEN') == 'OPEN'
@@ -555,6 +652,69 @@ class ZerodhaTools:
 
             if added:
                 print(f"   📰 _save_active_trades: injected {len(added)} manual entry(ies): {added}")
+                # Rebase AUTOPILOT_REVERSE positions to the just-observed LTP so
+                # PnL starts at 0. Dashboard captured market_ltp at click time;
+                # by the time we inject here the price has drifted (1-3s gap).
+                # This rebase fires ONLY at injection (not at startup).
+                # Accepts legacy 'MANUAL_REVERSE' tag for in-flight positions
+                # carried across the rename deploy (2026-05-04).
+                try:
+                    _rb_syms = [s if s.startswith('NFO:') else f'NFO:{s}' for s in added]
+                    _ltp_now = self.kite.ltp(_rb_syms) or {}
+                    _rebased_ltps = {}  # sym -> new_ltp captured here, reused for seed
+                    with self._positions_lock:
+                        for _t in self.paper_positions:
+                            _sym = _t.get('symbol', '')
+                            if _sym not in added:
+                                continue
+                            if _t.get('trigger_type') not in ('AUTOPILOT_REVERSE', 'MANUAL_REVERSE'):
+                                continue
+                            _info = _ltp_now.get(_sym) or {}
+                            _new_ltp = float(_info.get('last_price') or 0)
+                            if _new_ltp <= 0:
+                                continue
+                            _old_entry = float(_t.get('avg_price') or 0)
+                            if _old_entry <= 0:
+                                continue
+                            _qty = int(_t.get('quantity') or 0)
+                            _sl_ratio = float(_t.get('stop_loss') or 0) / _old_entry
+                            _tg_ratio = float(_t.get('target') or 0) / _old_entry
+                            _t['avg_price'] = _new_ltp
+                            _t['entry_price'] = _new_ltp
+                            if _sl_ratio > 0:
+                                _t['stop_loss'] = round(_new_ltp * _sl_ratio, 2)
+                            if _tg_ratio > 0:
+                                _t['target'] = round(_new_ltp * _tg_ratio, 2)
+                            _t['total_premium'] = round(_new_ltp * _qty, 2)
+                            _t['max_loss'] = round((_new_ltp - _t.get('stop_loss', 0)) * _qty, 2)
+                            _t['_entry_rebased'] = True
+                            _rebased_ltps[_sym] = _new_ltp
+                            _drift = ((_new_ltp - _old_entry) / _old_entry * 100) if _old_entry > 0 else 0
+                            print(f"   🔄 AUTOPILOT_REVERSE rebased {_sym}: ₹{_old_entry:.2f} → ₹{_new_ltp:.2f} ({_drift:+.2f}%)")
+                except Exception as _rb_err:
+                    print(f"   ⚠️ AUTOPILOT_REVERSE rebase failed: {_rb_err}")
+                    _rebased_ltps = {}
+                # Seed ticker LTP cache + subscribe so the very next live-pnl
+                # persist cycle sees a correct LTP for the newly-injected
+                # symbol(s). Without this, freshly-reversed positions display
+                # LTP=0 / entry_price for several seconds until the WS catches
+                # up — user-visible "wrong LTP that slowly adjusts" bug.
+                try:
+                    if self.ticker is not None:
+                        nfo_syms = [s if s.startswith('NFO:') else f'NFO:{s}' for s in added]
+                        try:
+                            self.ticker.subscribe_symbols(nfo_syms, mode='quote')
+                        except Exception:
+                            pass
+                    # Seed live_pnl using the SAME rebase LTP as entry so the
+                    # initial P&L is exactly 0 (was non-zero because seed did
+                    # a second kite.ltp call and prices ticked between fetches).
+                    if _rebased_ltps:
+                        self._seed_live_pnl_at_zero(_rebased_ltps)
+                    else:
+                        self._seed_live_pnl_for_new_positions(added)
+                except Exception as _seed_err:
+                    print(f"   ⚠️ Manual entry seed-LTP failed: {_seed_err}")
 
         except json.JSONDecodeError:
             try:
@@ -620,6 +780,15 @@ class ZerodhaTools:
             os.remove(self.MANUAL_ADD_LOT_SIGNAL)
             if merged_syms:
                 print(f"   ➕ _save_active_trades: merged {len(merged_syms)} add-lot(s): {merged_syms}")
+                # Refresh live_pnl with NEW cost basis. Without this, the
+                # dashboard's unrealized-PnL row stays "stuck" — it keeps
+                # rendering old_qty × (ltp - old_avg) — until the bot's next
+                # _persist_live_pnl_snapshot fires (~2-5s). Seeding here
+                # forces an immediate recomputation using new qty + new avg.
+                try:
+                    self._seed_live_pnl_for_new_positions(merged_syms)
+                except Exception as _seed_err:
+                    print(f"   ⚠️ Add-lot live_pnl seed failed: {_seed_err}")
         except json.JSONDecodeError:
             try:
                 os.remove(self.MANUAL_ADD_LOT_SIGNAL)
@@ -1435,14 +1604,29 @@ class ZerodhaTools:
             return updates
         
         try:
-            # Try WebSocket cache first (zero API calls), fallback to REST
-            if self.ticker and self.ticker.connected:
-                quotes = {}
-                ltp_batch = self.ticker.get_ltp_batch(symbols)
-                for sym, ltp in ltp_batch.items():
+            # Always go through ticker.get_ltp_batch — it handles both
+            # WS-cache and REST-fallback while filtering out zero/None
+            # last_price (newly-listed options without trades, illiquid
+            # instruments). The raw `self.kite.ltp(symbols)` path used
+            # to return last_price=0 for fresh options, which compared
+            # against penny-option SLs (e.g. ₹0.05) trivially fired
+            # STOPLOSS_HIT — root cause of bogus exits on manual reverses.
+            quotes = {}
+            ltp_batch = self.ticker.get_ltp_batch(symbols) if self.ticker else {}
+            for sym, ltp in ltp_batch.items():
+                if ltp and ltp > 0:
                     quotes[sym] = {'last_price': ltp}
-            else:
-                quotes = self.kite.ltp(symbols)
+            # If ticker entirely unavailable, fall back to direct REST but
+            # still filter zeros at the source (same semantics as get_ltp_batch).
+            if not quotes and not self.ticker:
+                try:
+                    raw = self.kite.ltp(symbols) or {}
+                    for sym, d in raw.items():
+                        lp = (d or {}).get('last_price', 0)
+                        if lp and lp > 0:
+                            quotes[sym] = {'last_price': lp}
+                except Exception:
+                    pass
             
             with self._positions_lock:
                 for trade in self.paper_positions[:]:  # Copy list to avoid modification during iteration
@@ -1451,6 +1635,13 @@ class ZerodhaTools:
                     
                     # Skip iron condors — they have dedicated monitoring in autonomous_trader
                     if trade.get('is_iron_condor', False):
+                        continue
+                    
+                    # Skip MANUAL trades (user-initiated entries / reverses).
+                    # User explicitly chose these — only MANUAL_EXIT from the
+                    # dashboard should close them. Prevents penny-option SL_HIT
+                    # from tick noise within seconds of a manual reverse.
+                    if trade.get('manual_setup') or trade.get('trigger_type') in ('AUTOPILOT_REVERSE', 'MANUAL_REVERSE'):
                         continue
                     
                     symbol = trade['symbol']
@@ -4814,6 +5005,10 @@ class ZerodhaTools:
                     if _theta_pct > _max_theta_pct:
                         # print(f"   🕐 THETA GATE BLOCKED: {plan.contract.symbol} — daily θ=₹{_opt_theta:.2f} "
                         #       f"= {_theta_pct:.1f}% of LTP ₹{_opt_ltp:.2f} (max {_max_theta_pct}%)")
+                        # Record cooldown so the same symbol isn't re-evaluated
+                        # every watcher cycle — theta/premium is a deterministic
+                        # property of the chosen contract, not a market signal.
+                        self._scorer_reject_ts[underlying.replace('NSE:', '')] = datetime.now()
                         return {
                             "success": False,
                             "error": f"THETA GATE: Daily theta ₹{_opt_theta:.2f} = {_theta_pct:.1f}% of premium (>{_max_theta_pct}%). "
@@ -4829,6 +5024,7 @@ class ZerodhaTools:
                 if _dte >= 0 and _dte < _min_dte and not _is_expiry_day:
                     # print(f"   🕐 DTE FLOOR BLOCKED: {plan.contract.symbol} — DTE={_dte} < min {_min_dte} "
                     #       f"(theta curve steepens quadratically near expiry)")
+                    self._scorer_reject_ts[underlying.replace('NSE:', '')] = datetime.now()
                     return {
                         "success": False,
                         "error": f"DTE FLOOR: Option expires in {_dte} day(s), min DTE for naked buy is {_min_dte}. "
@@ -4856,6 +5052,7 @@ class ZerodhaTools:
                         if _entry_score < _raised_threshold:
                             # print(f"   🕐 EXPIRY PM GATE: {plan.contract.symbol} — Score {_entry_score:.0f} < "
                             #       f"{_raised_threshold:.0f} (normal {_normal_threshold}×{_score_mult} after {_pm_after} on expiry day)")
+                            self._scorer_reject_ts[underlying.replace('NSE:', '')] = datetime.now()
                             return {
                                 "success": False,
                                 "error": f"EXPIRY PM GATE: Score {_entry_score:.0f} < {_raised_threshold:.0f} "

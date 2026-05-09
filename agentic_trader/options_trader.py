@@ -3167,7 +3167,14 @@ class OptionChainFetcher:
     """
     
     CACHE_FILE = os.path.join(os.path.dirname(__file__), 'option_chain_cache.json')
-    CACHE_TTL_SECONDS = 60  # Refresh every 60 seconds
+    # May 4: 60→180s. OI_AGGR scan cadence is ~120s; with TTL=60 every scan
+    # always cache-missed and slammed kite.quote() with full chains for 33
+    # symbols, saturating urllib3's 10-conn pool and timing out 60% of scans.
+    # 180s lets the next scan reuse the prior chain when a symbol completed,
+    # roughly doubling effective coverage with zero downside (chain shape is
+    # stable on this scale; the freshness cost is one extra cycle for the
+    # symbols that did finish).
+    CACHE_TTL_SECONDS = 180  # Refresh every 180 seconds
     
     def __init__(self, kite=None):
         self.kite = kite
@@ -3250,21 +3257,25 @@ class OptionChainFetcher:
                     return (False, f"No ATM contracts for {symbol} at strike {atm_strike}")
                 
                 # Check at least one side has adequate liquidity
+                _fail_reasons = []
                 for label, contract in [("CE", ce_contract), ("PE", pe_contract)]:
                     if contract is None:
+                        _fail_reasons.append(f"{label}=missing")
                         continue
                     if contract.oi < min_oi:
+                        _fail_reasons.append(f"{label} OI={contract.oi}<{min_oi}")
                         continue
                     if contract.ltp > 0 and contract.bid > 0 and contract.ask > 0:
                         bid_ask_spread_pct = ((contract.ask - contract.bid) / contract.ltp) * 100
                         if bid_ask_spread_pct > max_bid_ask_pct:
+                            _fail_reasons.append(f"{label} spread={bid_ask_spread_pct:.1f}%>{max_bid_ask_pct}%")
                             continue
                     # This side is liquid enough
                     return (True, f"ATM {label} @{atm_strike}: OI={contract.oi:,}, LTP=₹{contract.ltp:.2f}")
                 
                 ce_oi = ce_contract.oi if ce_contract else 0
                 pe_oi = pe_contract.oi if pe_contract else 0
-                return (False, f"Low liquidity: ATM {atm_strike} CE_OI={ce_oi} PE_OI={pe_oi} (need ≥{min_oi})")
+                return (False, f"Liquidity fail @ATM {atm_strike} (CE_OI={ce_oi} PE_OI={pe_oi}, OI_min={min_oi}, spread_max={max_bid_ask_pct}%): {'; '.join(_fail_reasons) or 'unknown'}")
             
             # === LAYER 2: No cache — use FREE NFO instrument check (ZERO API calls) ===
             # Just verify the stock has enough option strikes listed on NFO
@@ -3934,12 +3945,27 @@ class OptionsTrader:
             return ('PASS', 1.0)
         
         # Per-setup overrides (e.g., TEST_XGB uses tighter IV/RV thresholds)
+        # [Apr 29 RCA] Lookup chain: exact setup_type → group base (WATCHER/ORB_BREAKOUT)
+        # Bug fix: WATCHER_PRICE_SPIKE_UP etc. never matched plain `WATCHER` config,
+        # so all watcher trades silently hit the global 65% cap.  Now the base
+        # group is consulted as a fallback before global cfg.
         _setup_overrides = {}
         if setup_type:
             try:
                 import config as _cfg_mod
+                # 1) Exact match (e.g. TEST_XGB, GMM_SNIPER, WATCHER_PRICE_SPIKE_UP)
                 _setup_cfg = getattr(_cfg_mod, setup_type, {})
                 _setup_overrides = _setup_cfg.get('iv_crush_overrides', {}) if isinstance(_setup_cfg, dict) else {}
+                # 2) Group fallback when exact miss: WATCHER_* → WATCHER, ORB_* → ORB_BREAKOUT
+                if not _setup_overrides:
+                    _group = None
+                    if setup_type.startswith('WATCHER_') or setup_type == 'WATCHER':
+                        _group = 'WATCHER'
+                    elif setup_type.startswith('ORB_'):
+                        _group = 'ORB_BREAKOUT'
+                    if _group:
+                        _grp_cfg = getattr(_cfg_mod, _group, {})
+                        _setup_overrides = _grp_cfg.get('iv_crush_overrides', {}) if isinstance(_grp_cfg, dict) else {}
             except Exception as e:
                 print(f"⚠️ FALLBACK [options/setup_iv_overrides]: {e}")
         
@@ -5285,16 +5311,27 @@ class OptionsTrader:
             # print(f"   📏 ATR: ₹{atr_14:.1f} | Expected remaining move: ₹{expected_remaining_move:.1f} | Min strike distance: ₹{min_strike_distance:.1f}")
             
             # === IV ANALYSIS — Check if IV is worth selling ===
+            # NOTE: BlackScholes.implied_volatility returns IV as a FRACTION (0.18 = 18%).
+            # The IC config thresholds (min_iv_for_ic=15, max_iv_skew_pct=30) are in PERCENT.
+            # Scale fraction → percent for all comparisons & display below.
             atm_ce = chain.get_contract(atm_strike, OptionType.CE, expiry)
             atm_pe = chain.get_contract(atm_strike, OptionType.PE, expiry)
             avg_atm_iv = 0
             if atm_ce and atm_pe:
-                iv_ce = atm_ce.iv or 0
-                iv_pe = atm_pe.iv or 0
+                iv_ce_frac = atm_ce.iv or 0
+                iv_pe_frac = atm_pe.iv or 0
+                # Convert fraction to percentage for human-scale comparisons
+                iv_ce = iv_ce_frac * 100.0
+                iv_pe = iv_pe_frac * 100.0
                 avg_atm_iv = (iv_ce + iv_pe) / 2 if iv_ce > 0 and iv_pe > 0 else max(iv_ce, iv_pe)
                 
                 min_iv = IRON_CONDOR_CONFIG.get('min_iv_for_ic', 15)
-                if avg_atm_iv > 0 and avg_atm_iv < min_iv:
+                # 0DTE BYPASS: Black-Scholes IV solver collapses to ~0 as T→0 because
+                # extrinsic value vanishes — the IV reading is a numerical artifact, not real
+                # vol. Skip the min-IV gate on expiry day; rely on credit/risk gates instead.
+                if dte == 0:
+                    print(f"   ℹ️ IC: 0DTE — skipping IV gate (BS solver artifact on expiry day, raw avg_atm_iv={avg_atm_iv:.2f}%)")
+                elif avg_atm_iv > 0 and avg_atm_iv < min_iv:
                     print(f"   ⚠️ IC REJECTED: ATM IV {avg_atm_iv:.1f}% < {min_iv}% — premium too cheap to sell")
                     return None
                 
@@ -5323,8 +5360,15 @@ class OptionsTrader:
             wing_width = IRON_CONDOR_CONFIG.get('wing_width_strikes', 2)
             
             # Target delta for sold strikes: 0.15-0.30 (probability of being ITM)
-            target_sold_delta = IRON_CONDOR_CONFIG.get('target_sold_delta', 0.25)
-            max_sold_delta = IRON_CONDOR_CONFIG.get('max_sold_delta', 0.35)
+            # 0DTE override: on expiry day, BS extrinsic is tiny so 0.25-delta strikes are too far
+            # OTM and pay almost no credit. Move closer to spot (higher delta) to collect real premium.
+            if dte == 0:
+                target_sold_delta = IRON_CONDOR_CONFIG.get('target_sold_delta_0dte', 0.30)
+                max_sold_delta = IRON_CONDOR_CONFIG.get('max_sold_delta_0dte', 0.45)
+                print(f"   🦅 IC 0DTE: using target_sold_delta={target_sold_delta} max={max_sold_delta} (closer to spot for credit)")
+            else:
+                target_sold_delta = IRON_CONDOR_CONFIG.get('target_sold_delta', 0.25)
+                max_sold_delta = IRON_CONDOR_CONFIG.get('max_sold_delta', 0.35)
             
             # === SELECT SOLD CE STRIKE ===
             # Find CE strike that is ≥ min_strike_distance above spot AND has delta ≤ target

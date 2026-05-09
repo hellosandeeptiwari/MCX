@@ -649,6 +649,16 @@ class TitanTicker:
         if not hasattr(self, '_futures_tokens'):
             return None
 
+        # Index aliases — callers may pass spot index symbols, but futures are
+        # stored under the underlying alias ("NSE:NIFTY", not "NSE:NIFTY 50").
+        _index_alias = {
+            'NSE:NIFTY 50': 'NSE:NIFTY',
+            'NSE:NIFTY BANK': 'NSE:BANKNIFTY',
+            'NSE:NIFTY FIN SERVICE': 'NSE:FINNIFTY',
+            'NSE:NIFTY MID SELECT': 'NSE:MIDCPNIFTY',
+        }
+        equity_symbol = _index_alias.get(equity_symbol, equity_symbol)
+
         token = self._futures_tokens.get(equity_symbol)
         if not token:
             # [Apr 17 DIAG] Log first 3 misses to diagnose K factor
@@ -1505,18 +1515,36 @@ class BreakoutWatcher:
                     _recheck = self._sustain_recheck_pct
                 # Early market hardening: require larger sustained move before 09:55
                 # NOTE: Earlybird triggers SKIP early market hardening (they ARE early market)
-                if 'EARLYBIRD' not in _ttype:
+                # [Apr 29 RCA] NEW_DAY_HIGH/LOW triggers ALSO skip the 1.0% blanket cap —
+                # they already passed `day_extreme_min_move_pct` (0.35%) AND broke a daily
+                # extreme, which is independent confirmation.  4 NEW_DAY_HIGH detections
+                # today were killed at 0.8-0.9% sustain — exactly the legit breakouts.
+                if 'EARLYBIRD' not in _ttype and _ttype not in ('NEW_DAY_HIGH', 'NEW_DAY_LOW'):
                     _em_end = self._config.get('early_market_end', '09:55')
                     _em_h, _em_m = int(_em_end.split(':')[0]), int(_em_end.split(':')[1])
                     _now_dt = datetime.now()
                     if _now_dt.hour < _em_h or (_now_dt.hour == _em_h and _now_dt.minute < _em_m):
                         _em_min_sustain = self._config.get('early_market_min_sustain_pct', 1.0)
                         _recheck = max(_recheck, _em_min_sustain)
+                elif _ttype in ('NEW_DAY_HIGH', 'NEW_DAY_LOW'):
+                    # Day-extreme triggers: apply lighter early-market floor (0.6%)
+                    # Day-extreme break itself is the proof; require minimal hold.
+                    _em_end = self._config.get('early_market_end', '09:55')
+                    _em_h, _em_m = int(_em_end.split(':')[0]), int(_em_end.split(':')[1])
+                    _now_dt = datetime.now()
+                    if _now_dt.hour < _em_h or (_now_dt.hour == _em_h and _now_dt.minute < _em_m):
+                        _recheck = max(_recheck, self._config.get('day_extreme_em_min_sustain_pct', 0.6))
                 _peak_move = pending.get('_peak_move_pct', move_pct)
                 # Anti-retrace: if price retraced >70% of its peak move, the move is truly fading.
                 # Allow 70%+ retraces because small spikes/craters within the grind are fine.
                 # Overall slope direction (still UP/DOWN) is what matters most.
-                _retrace_max = self._config.get('sustain_retrace_max_pct', 70.0)
+                # [Apr 29 RCA] EARLYBIRD trades retest VWAP after spike — 50% retrace
+                # cap killed BHEL/BANDHANBNK at 59-69% peak retrace.  Use 65% for
+                # EARLYBIRD family (still filters genuine fakeouts at >65%).
+                if 'EARLYBIRD' in _ttype:
+                    _retrace_max = self._config.get('earlybird_retrace_max_pct', 65.0)
+                else:
+                    _retrace_max = self._config.get('sustain_retrace_max_pct', 70.0)
                 _retraced_pct = ((1 - move_pct / _peak_move) * 100) if _peak_move > 0 else 0
                 _retrace_fail = _peak_move > 0 and _retraced_pct > _retrace_max
 

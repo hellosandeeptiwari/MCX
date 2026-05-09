@@ -195,6 +195,8 @@ BREAKOUT_WATCHER = {
     "sustain_recheck_pct_spike_up": 0.35,   # Spike UP: slightly relaxed (was shared 0.4)
     "sustain_recheck_pct_volume": 0.5,# Volume surge: price must still be ≥0.5% from baseline (was 0.4 — 0.3% moves too weak)
     "sustain_retrace_max_pct": 50.0,  # Fail sustain if price retraces >50% from peak move during window
+    "earlybird_retrace_max_pct": 65.0,  # [Apr 29] Earlybird family retests VWAP — 65% retrace tolerated
+    "day_extreme_em_min_sustain_pct": 0.6,  # [Apr 29] NEW_DAY_HIGH/LOW pre-09:55: 0.6% (was 1.0% blanket)
     "volume_surge_min_move_pct": 0.5, # VOLUME_SURGE must show ≥0.5% price move to enter sustain (was 0.3 — too noisy)
     # --- Slow Grind Detection ---
     "slow_grind_pct": 0.94,             # 0.94%+ move triggers SLOW_GRIND_DOWN (was 1.0 — tightened for earlier detection)
@@ -446,6 +448,32 @@ WATCHER = {
         "reduce_atm_iv_pct": 52,           # Global=45 → watcher=52 (raised Mar 30, was 42)
     },
 }
+
+# === SPIKE/EXTREME-EVENT IV OVERRIDES (Apr 29 RCA) ===
+# RCA: 14 PRICE_SPIKE_UP detections today, 0 placed — all blocked at 65% IV cap.
+# Stock options on news/spike days routinely have ATM IV 80–120% (the spike IS
+# the volatility event by definition).  The IV/RV ratio gate (2.2× hard block)
+# remains the primary protection: if IV blows up but RV doesn't, ratio fires.
+# Absolute cap only catches catastrophically mispriced contracts.
+# These configs are looked up by exact setup_type match in options_trader.py.
+WATCHER_PRICE_SPIKE_UP = {
+    "iv_crush_overrides": {
+        "iv_rv_ratio_hard_block": 2.5,     # Spike events: RV will catch up, allow more IV/RV gap
+        "iv_rv_ratio_reduce_lots": 1.8,
+        "max_atm_iv_pct": 120,             # Stock spikes: 100%+ IV is normal — let ratio gate decide
+        "reduce_atm_iv_pct": 90,           # Halve lots above 90% (still tradeable, just sized down)
+    },
+}
+WATCHER_PRICE_SPIKE_DOWN = WATCHER_PRICE_SPIKE_UP  # Symmetric — panics also have elevated IV
+WATCHER_NEW_DAY_HIGH = {
+    "iv_crush_overrides": {
+        "iv_rv_ratio_hard_block": 2.4,
+        "iv_rv_ratio_reduce_lots": 1.6,
+        "max_atm_iv_pct": 90,              # Day-high breaks: moderate IV elevation expected
+        "reduce_atm_iv_pct": 70,
+    },
+}
+WATCHER_NEW_DAY_LOW = WATCHER_NEW_DAY_HIGH
 
 ORB_BREAKOUT = {
     "iv_crush_overrides": {
@@ -1446,6 +1474,8 @@ IRON_CONDOR_CONFIG = {
     "min_atr_distance": 1.0,         # Sold strikes ≥ 1× ATR expected move from spot
     "target_sold_delta": 0.25,       # Ideal delta for sold strikes
     "max_sold_delta": 0.35,          # Max delta for sold strikes
+    "target_sold_delta_0dte": 0.30,  # 0DTE: closer to spot — BS extrinsic is tiny on expiry day, need higher delta to collect real credit
+    "max_sold_delta_0dte": 0.45,     # 0DTE: allow up to 0.45 delta for credit
     "max_delta_imbalance": 0.15,     # Max delta diff between sold CE and PE
     # --- IV Analysis ---
     "min_iv_for_ic": 15,             # Min ATM IV% to bother selling premium

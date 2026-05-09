@@ -1310,6 +1310,14 @@ class WatcherPipeline:
                     _ei_threshold += 15  # Strong conviction → very permissive
                 elif _final_score >= 55:
                     _ei_threshold += 10  # Solid conviction → moderately permissive
+                # [May 8] SPIKE/GRIND fast-onboard: ticker already pre-validated
+                # 60s sustained move — relax EI by +10 so genuine momentum entries
+                # are not blocked when ML composite is borderline.
+                _ei_watcher_boost = 0
+                if _trigger_type in ('PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN',
+                                     'SLOW_GRIND_UP', 'SLOW_GRIND_DOWN'):
+                    _ei_watcher_boost = 10
+                    _ei_threshold += _ei_watcher_boost
                 _ei_boost_note = []
                 if _breadth_confirms_ei:
                     _ei_boost_note.append(f"regime+15")
@@ -1317,6 +1325,8 @@ class WatcherPipeline:
                     _ei_boost_note.append(f"score({_final_score})+15")
                 elif _final_score >= 55:
                     _ei_boost_note.append(f"score({_final_score})+10")
+                if _ei_watcher_boost:
+                    _ei_boost_note.append(f"watcher({_trigger_type})+{_ei_watcher_boost}")
                 _ei_boost_str = f" (boosted to {_ei_threshold}: {','.join(_ei_boost_note)})" if _ei_boost_note else ""
                 if _ei > _ei_threshold:
                     t._wlog(f"  BLOCKED(G2d-EXHAUST): {_stock_name} {_ei_detail}{_ei_boost_str}")
@@ -1462,8 +1472,12 @@ class WatcherPipeline:
                 else:
                     _setup_type = f'WATCHER_{_trigger_type}' if _trigger_type else 'WATCHER'
                 
-                # --- GATE I: ORB-specific tightening (higher bar for SPIKE/DAY triggers) ---
-                if 'DAY' in _trigger_type or 'SPIKE' in _trigger_type:
+                # --- GATE I: ORB-specific tightening (higher bar for DAY triggers only) ---
+                # [May 8] SPIKE bypassed — ticker already confirmed sustained move,
+                # GATE A (min_score) + G3 (P(move) >= 0.35) are sufficient. Removing
+                # SPIKE from this gate yields ~2x more SPIKE entries with no real
+                # safety loss (G2c-RSI + G2d-EI + F2 SPIKE_REVERSAL still active).
+                if 'DAY' in _trigger_type:
                     _orb_min_score = BREAKOUT_WATCHER.get('orb_min_score', 45)
                     _orb_min_move_base = BREAKOUT_WATCHER.get('orb_min_move_prob', 0.65)
                     # Relax ORB P(move) when breadth confirms direction
@@ -1484,9 +1498,29 @@ class WatcherPipeline:
                                           direction=direction)
                         continue
 
-                # --- GATE I-W: WATCHER P(move) floor (all non-SPIKE/DAY watcher triggers) ---
+                # --- GATE I-W: WATCHER P(move) floor (all non-DAY watcher triggers) ---
                 elif _setup_type.startswith('WATCHER'):
                     _w_min_move = BREAKOUT_WATCHER.get('watcher_min_move_prob', 0.57)
+                    
+                    # [May 8] Strong-GRIND bypass: ticker already proved 60s sustained
+                    # drift with ADX>=30 AND vol_confirmed — that IS the trend.
+                    # Demanding P(move)>=0.57 on top of an already-validated move
+                    # delays entries that the price action confirms.
+                    _is_strong_grind = (
+                        _trigger_type in ('SLOW_GRIND_UP', 'SLOW_GRIND_DOWN')
+                        and _data.get('adx', 0) >= 30
+                        and _trigger.get('vol_confirmed', False)
+                    )
+                    if _is_strong_grind:
+                        _w_min_move = 0.35  # match G3 floor — trust the ticker
+                    
+                    # SPIKE fast-onboard: same logic — sustained spike with vol confirmation
+                    _is_strong_spike = (
+                        _trigger_type in ('PRICE_SPIKE_UP', 'PRICE_SPIKE_DOWN')
+                        and _trigger.get('vol_confirmed', False)
+                    )
+                    if _is_strong_spike:
+                        _w_min_move = 0.40  # slight floor above G3 — spikes need a touch more
                     
                     # VOLUME_SURGE relaxation: institutional volume bursts may have moderate
                     # ML scores because XGB wasn't trained on volume-surge patterns.

@@ -3381,22 +3381,54 @@ class AutonomousTrader:
                     
                     # [FIX Apr 9] VOLUME_SURGE tightened: require depth_imbalance ≥0.15
                     # and raise P(move) floors (0.40→0.45, 0.48→0.50) to filter noise.
+                    # [Apr 29 RCA] Institutional-grade override: huge surge with EXPLOSIVE/HIGH
+                    # vol + strong ADX is itself the conviction signal.  ML often misses these
+                    # (training set bias toward grinds).  Apr 29: 8 VS detected, 0 placed —
+                    # CROMPTON sr=3.9 score=73 EXPLOSIVE P=0.32 blocked; FEDERALBNK sr=10.1
+                    # score=75 blocked by depth=0 (Kite L2 unavailable, not adversarial).
                     if _trigger_type == 'VOLUME_SURGE':
                         _vs_surge = _trigger.get('surge_ratio', 0)
                         _vs_depth = abs(_trigger.get('depth_imbalance', 0))
-                        # Hard gate: must have some order-book imbalance to confirm intent
+                        _vs_vol_class = (_ml_data.get('volume_class') or _ml_data.get('vol_class') or '').upper()
+                        _vs_adx = float(_ml_data.get('adx', 0) or 0)
+                        # --- Depth gate with L2-unavailable bypass ---
+                        # depth=0 typically means L2 quote not available, not "no buyers".
+                        # Allow bypass when surge is overwhelming AND vol class confirms.
                         if _vs_depth < 0.15:
-                            self._wlog(f"  BLOCKED(I-W_VSDEPTH): {_stock_name} VolSurge depth={_vs_depth:.2f} < 0.15 — no book imbalance")
-                            self._watcher_total_gate_blocked += 1
-                            self._log_decision(_ts, _sym, _final_score, 'WATCHER_VOLSURGE_NO_DEPTH',
-                                              reason=f'VolSurge depth_imbalance={_vs_depth:.2f} < 0.15',
-                                              direction=direction)
-                            continue
-                        if _vs_surge >= 5.0 or (_vs_surge >= 4.0 and _vs_depth >= 0.25):
+                            _depth_bypass = (
+                                _vs_depth == 0.0
+                                and _vs_surge >= 8.0
+                                and _vs_vol_class in ('EXPLOSIVE', 'HIGH')
+                            )
+                            if not _depth_bypass:
+                                self._wlog(f"  BLOCKED(I-W_VSDEPTH): {_stock_name} VolSurge depth={_vs_depth:.2f} < 0.15 — no book imbalance")
+                                self._watcher_total_gate_blocked += 1
+                                self._log_decision(_ts, _sym, _final_score, 'WATCHER_VOLSURGE_NO_DEPTH',
+                                                  reason=f'VolSurge depth_imbalance={_vs_depth:.2f} < 0.15',
+                                                  direction=direction)
+                                continue
+                            else:
+                                self._wlog(f"  ⚡ VS-DEPTH-BYPASS: {_stock_name} depth=0(L2 N/A) surge={_vs_surge:.1f}× vol={_vs_vol_class} — accepted on flow alone")
+                        # --- P(move) floor scaling by surge strength ---
+                        # Strong institutional surge: 0.45.  Overwhelming surge with
+                        # EXPLOSIVE/HIGH + ADX≥30 = 0.35 (Apr 29: would unlock CROMPTON).
+                        if _vs_surge >= 6.0 and _vs_vol_class in ('EXPLOSIVE', 'HIGH') and _vs_adx >= 30:
+                            _w_min_move = 0.35  # Overwhelming institutional flow
+                        elif _vs_surge >= 5.0 or (_vs_surge >= 4.0 and _vs_depth >= 0.25):
                             _w_min_move = 0.45  # Strong institutional signal
                         elif _vs_surge >= 3.5:
                             _w_min_move = 0.50  # Moderate surge — no relaxation, standard floor
                     
+                    # [Apr 29] HIGH-conviction relax: when B2 momentum confirms
+                    # all 4/4 (fresh + OI + vol + vwap), relax P(move) floor by
+                    # 0.05. Apr 29 logs showed CROMPTON (4/4 EXPLOSIVE) and VEDL
+                    # (4/4 conviction 100%) blocked at 0.27/0.35 despite every
+                    # other gate passing — these are exactly the signals to take.
+                    try:
+                        if _b2_confirms >= 4 and _w_min_move > 0.30:
+                            _w_min_move = round(_w_min_move - 0.05, 2)
+                    except NameError:
+                        pass
                     _w_mp = _ml_results.get(_sym, {}).get('ml_move_prob', 0)
                     if _w_mp > 0 and _w_mp < _w_min_move:
                         self._wlog(f"  BLOCKED(I-W_MOVE): {_stock_name} WATCHER P(move)={_w_mp:.2f} < {_w_min_move}")
@@ -6758,7 +6790,7 @@ class AutonomousTrader:
                 # original hard SL & target but skip partial-profit / trail-to-
                 # breakeven logic so a brief +25% spike that retraces does NOT
                 # cause SL_HIT at entry price. User stays in charge of exits.
-                if trade.get('manual_setup') or trade.get('trigger_type') == 'MANUAL_REVERSE':
+                if trade.get('manual_setup') or trade.get('trigger_type') in ('AUTOPILOT_REVERSE', 'MANUAL_REVERSE'):
                     _ms_state = self.exit_manager.trade_states.get(symbol)
                     if _ms_state:
                         _ms_state.partial_booked = True   # blocks BE-trail in _check_partial_profit
@@ -6836,120 +6868,12 @@ class AutonomousTrader:
             self.monitor_thread.join(timeout=5)
         # print("⚡ Real-time monitor stopped")
     
-    def _proactive_loss_hedge_check(self):
-        """Proactive loss-based hedge: every 60s check open naked options.
-        If any is down >= loss_trigger_pct, convert to debit spread immediately.
-        Runs in the realtime monitor thread (not tied to scan cycle).
-        """
-        from config import PROACTIVE_HEDGE_CONFIG as _plh_cfg
-        if not _plh_cfg.get('enabled', False):
-            return
-
-        loss_trigger = _plh_cfg.get('loss_trigger_pct', 8)
-        max_loss = _plh_cfg.get('max_hedge_loss_pct', 20)
-        cooldown = _plh_cfg.get('cooldown_seconds', 300)
-        log_checks = _plh_cfg.get('log_checks', False)
-
-        # Snapshot open naked options
-        with self.tools._positions_lock:
-            all_open = [t.copy() for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
-        naked_opts = [
-            t for t in all_open
-            if t.get('is_option', False)
-            and not t.get('is_debit_spread', False)
-            and not t.get('is_credit_spread', False)
-            and not t.get('is_iron_condor', False)
-            and not t.get('hedged_from_tie', False)
-        ]
-        if not naked_opts:
-            return
-
-        # Cooldown tracking (per-underlying)
-        if not hasattr(self, '_proactive_hedge_cooldowns'):
-            self._proactive_hedge_cooldowns = {}
-        _now_ts = time.time()
-
-        # Fetch LTPs
-        symbols = [t['symbol'] for t in naked_opts]
-        try:
-            if self.tools.ticker and self.tools.ticker.connected:
-                ltp_data = self.tools.ticker.get_ltp_batch(symbols)
-                quotes = {sym: ltp for sym, ltp in ltp_data.items()}
-                missing = [s for s in symbols if s not in quotes]
-                if missing:
-                    rest = self.tools.kite.ltp(missing)
-                    for s, v in rest.items():
-                        quotes[s] = v.get('last_price', 0) if isinstance(v, dict) else 0
-            else:
-                raw = self.tools.kite.ltp(symbols)
-                quotes = {s: v.get('last_price', 0) if isinstance(v, dict) else 0 for s, v in raw.items()}
-        except Exception as e:
-            if log_checks:
-                print(f"   [PLH] Price fetch error: {e}")
-            return
-
-        hedged_this_cycle = []
-        for trade in naked_opts:
-            symbol = trade['symbol']
-            entry = trade.get('avg_price', 0)
-            ltp = quotes.get(symbol, 0)
-            if entry <= 0 or ltp <= 0:
-                continue
-
-            loss_pct = ((entry - ltp) / entry) * 100  # +ve = loss
-            underlying = trade.get('underlying', '')
-
-            # Cooldown check
-            if underlying in self._proactive_hedge_cooldowns:
-                if _now_ts - self._proactive_hedge_cooldowns[underlying] < cooldown:
-                    continue
-
-            if loss_pct >= loss_trigger:
-                if loss_pct > max_loss:
-                    print(f"\n   [PLH] {symbol} loss {loss_pct:.1f}% > {max_loss}% cap -- too deep, skipping")
-                    continue
-
-                print(f"\n🛡️ PROACTIVE HEDGE: {symbol} down {loss_pct:.1f}% (trigger {loss_trigger}%) -- converting to spread")
-                try:
-                    hedge_result = self.tools.convert_naked_to_spread(trade, tie_check="PROACTIVE_LOSS_HEDGE")
-                    if hedge_result.get('success'):
-                        # Update ExitManager
-                        em_state = self.exit_manager.get_trade_state(symbol)
-                        if em_state:
-                            new_symbol = hedge_result['symbol']
-                            em_state.symbol = new_symbol
-                            em_state.is_debit_spread = True
-                            em_state.hedged_from_tie = True
-                            em_state.net_debit = hedge_result['net_debit']
-                            em_state.spread_width = hedge_result['spread_width']
-                            em_state.current_sl = hedge_result['hedged_sl']
-                            em_state.target = hedge_result['hedged_target']
-                            em_state.initial_sl = hedge_result['hedged_sl']
-                            em_state.highest_price = hedge_result['net_debit']
-                            em_state.trailing_active = False
-                            em_state.breakeven_applied = False
-                            em_state.candles_since_entry = 0  # Fresh window
-                            if new_symbol != symbol:
-                                self.exit_manager.trade_states[new_symbol] = em_state
-                                if symbol in self.exit_manager.trade_states:
-                                    del self.exit_manager.trade_states[symbol]
-                            self.exit_manager._persist_state()
-                        print(f"   ✅ PLH: {symbol} hedged -> {hedge_result['symbol']}")
-                        print(f"      Sell: {hedge_result['sell_symbol']} @ Rs{hedge_result['sell_premium']:.2f}")
-                        print(f"      Net debit: Rs{hedge_result['net_debit']:.2f} | Width: {hedge_result['spread_width']}")
-                        hedged_this_cycle.append(symbol)
-                        # Set cooldown for this underlying
-                        self._proactive_hedge_cooldowns[underlying] = _now_ts
-                    else:
-                        print(f"   ⚠️ PLH hedge failed: {hedge_result.get('error', 'unknown')}")
-                except Exception as e:
-                    print(f"   ⚠️ PLH exception: {e}")
-            elif log_checks and loss_pct > 3:  # Log positions approaching trigger
-                # print(f"   [PLH] {symbol} loss {loss_pct:.1f}% (trigger at {loss_trigger}%)")
-                pass
-
-        if hedged_this_cycle:
-            print(f"\n🛡️ PROACTIVE HEDGE CYCLE: converted {len(hedged_this_cycle)} positions")
+    # [REMOVED May 4] _proactive_loss_hedge_check + naked→debit-spread
+    # conversion paths (PLH / THP TIE / THP TIME_STOP / THP SL_HIT) removed.
+    # The hedging strategy systematically locked in loss-bearing positions
+    # and prevented clean exits. Naked options now exit on TIE / TIME_STOP /
+    # SL_HIT directly. Helper convert_naked_to_spread() in zerodha_tools.py
+    # is left in place but unreferenced (harmless dead code).
 
     def _sync_positions_from_db(self):
         """Bring bot's in-memory paper_positions into alignment with SQLite.
@@ -6983,7 +6907,20 @@ class AutonomousTrader:
                 # ADD: SQLite-only → memory
                 for sym, pos in db_open.items():
                     if sym not in mem_open_syms:
-                        self.tools.paper_positions.append(dict(pos))
+                        _new_pos = dict(pos)
+                        # Log ENTRY to trade_ledger if not already logged.
+                        # Defensive net for dashboard endpoints that write
+                        # directly to active_trades without log_entry — without
+                        # this, the eventual EXIT becomes an orphan and the
+                        # trade silently disappears from Trade History.
+                        if not _new_pos.get('_ledger_logged'):
+                            try:
+                                self.tools._log_entry_to_ledger(_new_pos)
+                                _new_pos['_ledger_logged'] = True
+                                print(f"   📒 SYNC ledger backfill: ENTRY logged for {sym}")
+                            except Exception as _le:
+                                print(f"   ⚠️ SYNC ledger backfill failed for {sym}: {_le}")
+                        self.tools.paper_positions.append(_new_pos)
                         added.append(sym)
                 # REMOVE: memory-only → debounce 2 ticks, then mark CLOSED
                 if not hasattr(self, '_sync_missing_counter'):
@@ -7055,17 +6992,9 @@ class AutonomousTrader:
                         except Exception as _pt_err:
                             print(f"   \u26a0\ufe0f Profit target check error: {_pt_err}")
                     
-                    # === PROACTIVE LOSS HEDGE (every 60s) ===
-                    _proactive_hedge_timer += self.monitor_interval
-                    from config import PROACTIVE_HEDGE_CONFIG as _plh_interval_cfg
-                    _plh_check_s = _plh_interval_cfg.get('check_interval_seconds', 60)
-                    if _proactive_hedge_timer >= _plh_check_s:
-                        _proactive_hedge_timer = 0
-                        try:
-                            self._proactive_loss_hedge_check()
-                        except Exception as _plh_err:
-                            print(f"   ⚠️ Proactive hedge check error: {_plh_err}")
-                    
+                    # [REMOVED May 4] Proactive loss hedge scheduler removed
+                    # along with naked→debit-spread conversion logic.
+
                     # === GCR: GMM Conviction Recheck (every 3 min) ===
                     _gcr_timer += self.monitor_interval
                     if _gcr_timer >= 180:
@@ -7091,15 +7020,29 @@ class AutonomousTrader:
                             print(f"   ⚠️ WME error (non-fatal): {_wme_err}")
 
                     # === OI_WATCHER AGGRESSIVE SCANNER (every 90s) ===
+                    # CRITICAL: Run in a background thread, NOT inline. The aggressive
+                    # OI scan blocks for 60-120s waiting on Dhan/Kite OI futures, and
+                    # while it runs the entire monitor loop is frozen — meaning
+                    # _check_positions_realtime stops, live_pnl is never refreshed,
+                    # and the dashboard shows stale LTPs / ₹0 P&L for minutes
+                    # (user-visible "DALBHARAT stuck at ₹0 P&L while stock moves" bug).
                     if not hasattr(self, '_oi_aggr_timer'):
                         self._oi_aggr_timer = 0
+                    if not hasattr(self, '_oi_aggr_running'):
+                        self._oi_aggr_running = False
                     self._oi_aggr_timer += self.monitor_interval
-                    if self._oi_aggr_timer >= self._oi_aggr_scan_interval:
+                    if self._oi_aggr_timer >= self._oi_aggr_scan_interval and not self._oi_aggr_running:
                         self._oi_aggr_timer = 0
-                        try:
-                            self._aggressive_oi_buildup_scan()
-                        except Exception as _oiag_err:
-                            print(f"   ⚠️ OI Aggressive scan error (non-fatal): {_oiag_err}")
+                        self._oi_aggr_running = True
+                        def _oi_aggr_worker():
+                            try:
+                                self._aggressive_oi_buildup_scan()
+                            except Exception as _oiag_err:
+                                print(f"   ⚠️ OI Aggressive scan error (non-fatal): {_oiag_err}")
+                            finally:
+                                self._oi_aggr_running = False
+                        threading.Thread(target=_oi_aggr_worker, daemon=True,
+                                         name="oi-aggr-scan").start()
 
                     # Increment candle counter every ~5 minutes (300s / monitor_interval)
                     candle_timer += self.monitor_interval
@@ -8401,12 +8344,14 @@ class AutonomousTrader:
                     if trade.get('status', 'OPEN') != 'OPEN':
                         continue
                     
-                    # ═══════════════════════════════════════════════════════
-                    # THESIS HEDGE PROTOCOL (THP) — INTERCEPT TIE SIGNALS
-                    # If TIE fires a hedgeable check on a naked option,
-                    # convert to debit spread instead of exiting.
-                    # ═══════════════════════════════════════════════════════
-                    if signal.exit_type.startswith('THESIS_INVALID_'):
+                    # [REMOVED May 4] Three Thesis-Hedge-Protocol intercepts
+                    # (THESIS_INVALID_*, TIME_STOP, SL_HIT) that converted
+                    # naked options into debit spreads on adverse signals.
+                    # The hedging strategy locked in losses by adding a short
+                    # leg at deteriorated prices and prevented clean exits.
+                    # Naked options now flow straight through to PARTIAL_PROFIT
+                    # / TIME_STOP / SL_HIT / TIE exits below.
+                    if False and signal.exit_type.startswith('THESIS_INVALID_'):
                         tie_check_name = signal.exit_type.replace('THESIS_INVALID_', '')
                         is_naked_option = (
                             trade.get('is_option', False) and
@@ -8479,12 +8424,8 @@ class AutonomousTrader:
                             else:
                                 print(f"   🔴 THP: {tie_check_name} is non-hedgeable — immediate exit")
                     
-                    # ═══════════════════════════════════════════════════════
-                    # THP — INTERCEPT TIME_STOP ON NAKED OPTIONS
-                    # Dead trade at candle 10 with moderate loss? Convert to
-                    # spread so if momentum resumes (candle 11-20) we capture it.
-                    # ═══════════════════════════════════════════════════════
-                    if signal.exit_type == 'TIME_STOP':
+                    # [REMOVED May 4] THP TIME_STOP intercept removed.
+                    if False and signal.exit_type == 'TIME_STOP':
                         from config import THESIS_HEDGE_CONFIG as _thp_cfg
                         _is_naked_opt = (
                             trade.get('is_option', False) and
@@ -8544,13 +8485,8 @@ class AutonomousTrader:
                             else:
                                 print(f"   📉 THP: TIME_STOP loss {_ts_loss_pct:.1f}% > {_max_loss_for_hedge}% cap — too deep to hedge, exiting")
                     
-                    # ═══════════════════════════════════════════════════════
-                    # THP — INTERCEPT SL_HIT ON NAKED OPTIONS
-                    # When hard SL fires on a naked option (e.g. 8-20% loss),
-                    # convert to debit spread instead of closing outright.
-                    # Caps max loss and gives the trade a second chance.
-                    # ═══════════════════════════════════════════════════════
-                    if signal.exit_type == 'SL_HIT':
+                    # [REMOVED May 4] THP SL_HIT intercept removed.
+                    if False and signal.exit_type == 'SL_HIT':
                         from config import THESIS_HEDGE_CONFIG as _thp_sl_cfg
                         _is_naked_opt_sl = (
                             trade.get('is_option', False) and
@@ -9212,6 +9148,16 @@ class AutonomousTrader:
         """
         live_snaps = []
         _total_upnl = 0.0
+        # Build last-known-good map from previous live_pnl snapshot so a single
+        # bad cycle (WS warmup / REST hiccup / penny option zero quote) does not
+        # clobber a valid LTP back to ₹0 on the dashboard.
+        try:
+            _prev_map = get_state_db().load_live_pnl() or {}
+            _prev_ltp = {k: float((v or {}).get('ltp') or 0)
+                         for k, v in _prev_map.items()
+                         if k and not k.startswith('_') and isinstance(v, dict)}
+        except Exception:
+            _prev_ltp = {}
         for t in active_trades:
             if t.get('status', 'OPEN') != 'OPEN':
                 continue
@@ -9243,6 +9189,44 @@ class AutonomousTrader:
                     upnl = (ltp - t.get('avg_price', 0)) * t.get('quantity', 0)
                 else:
                     upnl = (t.get('avg_price', 0) - ltp) * t.get('quantity', 0)
+            else:
+                ltp = 0
+            # ROBUSTNESS: For naked-option legs, if ltp came back 0 (WS warmup,
+            # REST hiccup, fresh manual reverse before subscription propagates),
+            # try a one-shot REST fetch, then fall back to last-known-good from
+            # the previous snapshot. This prevents the dashboard from displaying
+            # ₹0 LTP / massive negative upnl for the 5-15s warmup window after
+            # a manual reverse trade is created.
+            if (not t.get('is_credit_spread')) and (not t.get('is_debit_spread')) \
+                    and (not t.get('is_iron_condor')) and (not ltp or ltp <= 0):
+                try:
+                    _r = self.tools.kite.ltp([sym]) or {}
+                    _lp = (_r.get(sym, {}) or {}).get('last_price', 0)
+                    if _lp and float(_lp) > 0:
+                        ltp = float(_lp)
+                        # Refresh ticker cache so future cycles use it
+                        if self.tools.ticker is not None:
+                            try:
+                                import time as _t_lt
+                                _tok = (self.tools.ticker._symbol_to_token.get(sym)
+                                        or self.tools.ticker._resolve_token(sym))
+                                if _tok:
+                                    with self.tools.ticker._lock:
+                                        self.tools.ticker._ltp_cache[_tok] = ltp
+                                        self.tools.ticker._last_update[_tok] = _t_lt.time()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                # Still zero? Preserve previous valid LTP rather than regress to 0.
+                if (not ltp or ltp <= 0) and _prev_ltp.get(sym, 0) > 0:
+                    ltp = _prev_ltp[sym]
+                # Recompute upnl with whatever ltp we ended up with
+                if ltp and ltp > 0:
+                    if t.get('side') == 'BUY':
+                        upnl = (ltp - t.get('avg_price', 0)) * t.get('quantity', 0)
+                    else:
+                        upnl = (t.get('avg_price', 0) - ltp) * t.get('quantity', 0)
             _total_upnl += upnl
             live_snaps.append({'symbol': sym, 'ltp': round(ltp, 2), 'unrealized_pnl': round(upnl, 2)})
         if live_snaps:
@@ -9409,7 +9393,26 @@ class AutonomousTrader:
             return
         
         _scan_dbg("SCAN: passed is_trading_hours()")
-        
+
+        # === DASHBOARD PAUSE FLAG ===
+        # User can pause new-entry generation from the Overview tab.
+        # Existing positions continue to be managed (exit_manager / SL / TGT).
+        # Reverses (auto_pilot._tick) are gated separately at their own level.
+        try:
+            _pause_flag = os.path.join(os.path.dirname(__file__), 'trading_paused.flag')
+            if os.path.exists(_pause_flag):
+                if not getattr(self, '_pause_logged', False):
+                    print("⏸  Trading PAUSED via dashboard — skipping new entries (existing positions still managed)")
+                    self._pause_logged = True
+                _scan_dbg("SCAN: EXIT - dashboard pause flag active")
+                return
+            else:
+                if getattr(self, '_pause_logged', False):
+                    print("▶  Trading RESUMED via dashboard")
+                    self._pause_logged = False
+        except Exception:
+            pass
+
         if not self.check_daily_loss_limit():
             _scan_dbg("SCAN: EXIT - daily loss limit")
             return
@@ -11505,6 +11508,21 @@ class AutonomousTrader:
                         max_debit_entries = 3  # Max 3 proactive debit spreads per scan cycle (was 2)
                         for symbol, data, direction, priority in debit_candidates[:max_debit_entries]:
                             try:
+                                # Honor scorer-cooldown — prior LIQUIDITY/THETA/score
+                                # rejection on this symbol within cooldown window.
+                                try:
+                                    _sym_clean = symbol.replace('NSE:', '')
+                                    _last_rej = self.tools._scorer_reject_ts.get(_sym_clean)
+                                    if _last_rej is not None:
+                                        _cd = getattr(self.tools, '_scorer_reject_cooldown', 120)
+                                        _elapsed = (datetime.now() - _last_rej).total_seconds()
+                                        if _elapsed < _cd:
+                                            print(f"   ⏭️ SCORER COOLDOWN: {symbol} — {_cd - _elapsed:.0f}s remaining (skipping debit-spread re-eval)")
+                                            continue
+                                        else:
+                                            self.tools._scorer_reject_ts.pop(_sym_clean, None)
+                                except Exception:
+                                    pass
                                 print(f"\n   🎯 PROACTIVE DEBIT SPREAD: Trying {symbol} ({direction}) — Priority: {priority:.0f}")
                                 
                                 # === PRE-FLIGHT LIQUIDITY CHECK ===
@@ -11524,6 +11542,14 @@ class AutonomousTrader:
                                     )
                                     if not is_liquid:
                                         print(f"   ❌ LIQUIDITY PRE-CHECK FAILED for {symbol}: {liq_reason}")
+                                        # Record cooldown — option-chain liquidity is a deterministic
+                                        # property of the strikes available; rechecking every cycle
+                                        # produces noisy logs (e.g. ONGC retried 5+ times). Reuse
+                                        # scorer-cooldown plumbing.
+                                        try:
+                                            self.tools._scorer_reject_ts[symbol.replace('NSE:', '')] = datetime.now()
+                                        except Exception:
+                                            pass
                                         continue
                                     # print(f"   ✅ Liquidity OK: {liq_reason}")
                                 except Exception as liq_e:
@@ -11633,17 +11659,20 @@ class AutonomousTrader:
                             capital=getattr(self.tools, 'paper_capital', 500000),
                             paper_mode=getattr(self.tools, 'paper_mode', True)
                         )
+                        print(f"   🦅 IC SCAN WINDOW OPEN | idx_eligible={self._ic_idx_eligible} stk_eligible={self._ic_stk_eligible} time={now_time.strftime('%H:%M')}")
                         
                         # --- INDEX IC SCAN (primary — weekly expiry, best profit) ---
                         for idx_symbol in IC_INDEX_SYMBOLS:
                             try:
                                 if self.tools.is_symbol_in_active_trades(idx_symbol):
+                                    print(f"   🦅 IC SKIP {idx_symbol}: already in active trades")
                                     continue
                                 
                                 # Fetch index market data
                                 idx_data_raw = self.tools.get_market_data([idx_symbol])
                                 idx_data = idx_data_raw.get(idx_symbol, {})
                                 if not idx_data or not isinstance(idx_data, dict):
+                                    print(f"   🦅 IC SKIP {idx_symbol}: no market data (raw_keys={list(idx_data_raw.keys())[:5]})")
                                     continue
                                 
                                 # Check if index is range-bound
@@ -11653,7 +11682,7 @@ class AutonomousTrader:
                                 rsi_range = IRON_CONDOR_CONFIG.get('prefer_rsi_range', [38, 62])
                                 
                                 if idx_change > max_move:
-                                    # print(f"   🦅 IC SKIP {idx_symbol}: moved {idx_change:.1f}% (>{max_move}%)")
+                                    print(f"   🦅 IC SKIP {idx_symbol}: moved {idx_change:.2f}% > max {max_move}%")
                                     continue
                                 
                                 # Assign a synthetic "choppy" score for IC (lower = choppier = better for IC)

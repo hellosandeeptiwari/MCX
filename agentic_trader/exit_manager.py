@@ -143,10 +143,10 @@ class ExitManager:
         self.breakeven_trigger_r = 1.0  # Move SL to entry at 1.0R (was 0.8R — too early)
         
         # === PHASED TRAILING: Build → Run → Harvest ===
-        # Build zone (0 → 0.5R): No trailing, let trade establish
-        # Run zone (0.5R → 2.0R): Moderate trail, balance room vs profit lock
+        # Build zone (0 → 0.18R): No trailing, let trade establish
+        # Run zone (0.18R → 2.0R): Moderate trail, balance room vs profit lock
         # Harvest zone (2.0R+): Tighter trail, lock meaningful profit
-        self.trailing_start_r = 0.5    # Trail from 0.5R (was 0.65R — tightened to lock profits sooner)
+        self.trailing_start_r = 0.15    # 2026-05-07: 0.5→0.3→0.18→0.15 — engage trailing very early to lock small profits before whipsaw
         self.trailing_run_pct = 0.65   # Run zone: retain 65% of peak (give back 35%) — was 0.60
         self.trailing_harvest_r = 2.0  # Switch to harvest at 2.0R
         self.trailing_harvest_pct = 0.80  # Harvest zone: retain 80% of peak (give back 20%) — was 0.75
@@ -155,7 +155,19 @@ class ExitManager:
         # Scaled profit booking (options only)
         self.partial_profit_pct = 30.0       # Book 50% at +30% premium gain (was 15% — too early!)
         self.partial_exit_fraction = 0.5     # Exit 50% of position
-        
+
+        # === PEAK GIVE-BACK GUARD (DISABLED) ===
+        # Originally added to plug the +5%-+12% peak band that trailing
+        # (engages at +0.5R ≈ +12-25%) and partial-profit (+30%) leave
+        # unguarded. Disabled because option premiums routinely retrace
+        # 30-50% mid-move on the way to a bigger run, so a +7% peak →
+        # +3.5% exit floor would clip winners that would otherwise reach
+        # +20-30%. Keeping config so it can be re-enabled with a sustain
+        # requirement (Option B) once we have multi-day data.
+        self.peak_giveback_enabled = False
+        self.peak_giveback_trigger_pct = 5.0   # Peak must reach +5% to arm
+        self.peak_giveback_retain_pct = 0.50    # Exit when current_pct < peak * 0.50
+
         # VIX regime trailing adjustment (set by autonomous_trader each cycle)
         self.vix_trail_retain_reduce = 0.0   # Reduce retention by this amount in high VIX
         
@@ -278,6 +290,27 @@ class ExitManager:
         
         state = self.trade_states[symbol]
         
+        # MANUAL TRADE GUARD: User-initiated entries / reverses get a 60s
+        # noise-immunity grace window — exempt from ALL automated exits to
+        # prevent penny-option SL_HIT on tick noise right after entry. After
+        # 60s the position is treated like a normal trade: SL, target,
+        # trailing, partial-profit, BE-retrail all engage. The pre-set
+        # `partial_booked` / `breakeven_applied` sentinels (set at register
+        # time to suppress early BE-trail) are also cleared so trailing logic
+        # can run cleanly.
+        if getattr(state, 'is_manual', False):
+            try:
+                _age_s = (datetime.now() - state.entry_time).total_seconds()
+            except Exception:
+                _age_s = 0
+            MANUAL_GRACE_SEC = 60
+            if _age_s < MANUAL_GRACE_SEC:
+                return None
+            # Grace window expired — release the position to normal exit logic
+            state.is_manual = False
+            state.partial_booked = False
+            state.breakeven_applied = False
+        
         # === CREDIT SPREAD EXIT LOGIC (different from directional) ===
         if state.is_credit_spread and state.net_credit > 0:
             return self._update_credit_spread(state, current_price)
@@ -369,7 +402,12 @@ class ExitManager:
         exit_signal = self._check_target(state, current_price)
         if exit_signal:
             return exit_signal
-        
+
+        # 3.4 PEAK GIVE-BACK GUARD (lock 50% of small premium peaks ≥ +5%)
+        exit_signal = self._check_peak_giveback(state, current_price)
+        if exit_signal:
+            return exit_signal
+
         # 3.5 PARTIAL PROFIT BOOKING (options only, before trailing/breakeven)
         exit_signal = self._check_partial_profit(state, current_price)
         if exit_signal:
@@ -606,7 +644,65 @@ class ExitManager:
                 return None  # No exit signal, just tightened SL
         
         return None
-    
+
+    def _check_peak_giveback(self, state: TradeState, current_price: float) -> Optional[ExitSignal]:
+        """Lock half of any premium peak ≥ trigger_pct.
+
+        Failure mode this rule fixes (observed on 2026-05-04):
+          - Position runs to +5-25% premium gain.
+          - Existing guards have not engaged yet (trail @ +0.5R, BE @ +1R,
+            partial @ +30% — all need higher peaks to fire on options).
+          - Trade then bleeds back to -50% / -100% before any other guard
+            triggers, locking in a full-loss exit on what was a small winner.
+
+        Behaviour:
+          - Arms once max_premium_gain_pct >= peak_giveback_trigger_pct.
+          - Exits when current_premium_% drops below peak * retain_pct.
+          - Examples (retain_pct = 0.50):
+              peak +5%  -> exit at +2.5%
+              peak +8%  -> exit at +4.0%
+              peak +20% -> exit at +10%
+
+        Skips:
+          - Non-options (no concept of premium %).
+          - Credit/debit spreads (have their own machinery).
+          - SELL side (premium math is inverted; ledger has none today).
+          - Manual-grace positions (handled at update_trade entry guard).
+        """
+        if not getattr(self, 'peak_giveback_enabled', False):
+            return None
+        if not state.is_option:
+            return None
+        if state.is_credit_spread or state.is_debit_spread:
+            return None
+        if state.side != "BUY":
+            return None
+        if state.entry_price <= 0:
+            return None
+
+        peak_pct = state.max_premium_gain_pct
+        if peak_pct < self.peak_giveback_trigger_pct:
+            return None  # Peak not yet at arming threshold
+
+        current_pct = (current_price - state.entry_price) / state.entry_price * 100.0
+        lock_floor_pct = peak_pct * self.peak_giveback_retain_pct
+
+        if current_pct < lock_floor_pct:
+            print(f"\n🛡️  PEAK_GIVEBACK [{state.symbol}]: peak +{peak_pct:.1f}% "
+                  f"faded to +{current_pct:.1f}% (lock_floor +{lock_floor_pct:.1f}%) — exiting")
+            return ExitSignal(
+                symbol=state.symbol,
+                should_exit=True,
+                exit_type="PEAK_GIVEBACK",
+                exit_price=current_price,
+                reason=(f"Peak give-back: peak +{peak_pct:.1f}% faded to "
+                        f"+{current_pct:.1f}% (locked at "
+                        f"{self.peak_giveback_retain_pct:.0%} of peak = "
+                        f"+{lock_floor_pct:.1f}%)"),
+                urgency="IMMEDIATE",
+            )
+        return None
+
     def _get_lot_size_for_symbol(self, symbol: str) -> int:
         """Get lot size for a symbol from FNO_LOT_SIZES"""
         try:
@@ -1168,6 +1264,14 @@ class ExitManager:
         """
         from config import GREEKS_EXIT_CONFIG
         if not GREEKS_EXIT_CONFIG.get('enabled', False):
+            return None
+
+        # MANUAL setups (dashboard reverse / manual entry) — user explicitly
+        # chose this trade. Don't second-guess with greek-based exit. Greeks
+        # on a freshly-flipped option may look unfavorable for a few cycles
+        # (delta still adjusting, IV stale, theta high near expiry) and were
+        # closing reverse trades within minutes of placement.
+        if getattr(state, 'is_manual', False):
             return None
         
         # Need recently computed Greeks

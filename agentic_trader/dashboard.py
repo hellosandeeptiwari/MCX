@@ -450,7 +450,164 @@ def bot_restart():
         return jsonify({'ok': False, 'action': 'restart', 'msg': str(e)}), 500
 
 
-# ── Auto-Pilot control (toggle the bot's micro-adjuster thread) ─────
+# ── Trading mode toggle (PAPER ↔ LIVE via .env) ─────────────────────
+# We persist the mode in agentic_trader/.env (TRADING_MODE=PAPER|LIVE)
+# and require an explicit restart to flip — paper_mode is baked into
+# the trader stack at startup, so a runtime flip would leave the bot
+# in a half-state. The endpoint returns whether a restart is needed.
+
+_DOTENV_PATH = os.path.join(os.path.dirname(__file__), '.env')
+
+
+def _read_trading_mode_from_env():
+    """Return ('PAPER'|'LIVE', file_exists). Defaults to PAPER on any error."""
+    try:
+        if not os.path.exists(_DOTENV_PATH):
+            return 'PAPER', False
+        with open(_DOTENV_PATH, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('TRADING_MODE='):
+                    val = line.split('=', 1)[1].strip().strip('"').strip("'").upper()
+                    if val in ('PAPER', 'LIVE'):
+                        return val, True
+    except Exception:
+        pass
+    return 'PAPER', os.path.exists(_DOTENV_PATH)
+
+
+def _write_trading_mode_to_env(new_mode: str) -> bool:
+    """Atomically rewrite TRADING_MODE=<new_mode> in .env. Adds the line if
+    missing. Returns True on success."""
+    new_mode = (new_mode or '').upper()
+    if new_mode not in ('PAPER', 'LIVE'):
+        return False
+    try:
+        lines = []
+        if os.path.exists(_DOTENV_PATH):
+            with open(_DOTENV_PATH, 'r') as f:
+                lines = f.readlines()
+        replaced = False
+        for i, ln in enumerate(lines):
+            stripped = ln.strip()
+            if stripped.startswith('TRADING_MODE='):
+                lines[i] = f'TRADING_MODE={new_mode}\n'
+                replaced = True
+                break
+        if not replaced:
+            lines.append(f'TRADING_MODE={new_mode}\n')
+        tmp = _DOTENV_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            f.writelines(lines)
+        os.replace(tmp, _DOTENV_PATH)
+        return True
+    except Exception as e:
+        print(f"⚠️ .env write failed: {e}")
+        return False
+
+
+@app.route('/api/mode', methods=['GET'])
+def mode_get():
+    """Return current trading mode read from .env."""
+    mode, exists = _read_trading_mode_from_env()
+    return jsonify({'ok': True, 'mode': mode, 'env_present': exists})
+
+
+@app.route('/api/mode', methods=['POST'])
+def mode_set():
+    """Set TRADING_MODE in .env and (optionally) restart the bot.
+
+    Body:
+      {"mode": "LIVE"|"PAPER", "restart": true|false}
+
+    Returns:
+      {ok, prev, new, restarted, msg}
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        new_mode = (data.get('mode') or '').upper()
+        do_restart = bool(data.get('restart', True))
+        if new_mode not in ('PAPER', 'LIVE'):
+            return jsonify({'ok': False, 'msg': "mode must be 'PAPER' or 'LIVE'"}), 400
+        prev, _ = _read_trading_mode_from_env()
+        if prev == new_mode:
+            return jsonify({'ok': True, 'prev': prev, 'new': new_mode,
+                            'restarted': False, 'msg': f'Already in {new_mode} mode'})
+        if not _write_trading_mode_to_env(new_mode):
+            return jsonify({'ok': False, 'msg': '.env write failed'}), 500
+        restarted = False
+        msg = f'Mode changed: {prev} → {new_mode}. Restart required to take effect.'
+        if do_restart:
+            try:
+                r = subprocess.run(['sudo', 'systemctl', 'restart', 'titan-bot'],
+                                   capture_output=True, text=True, timeout=15)
+                restarted = (r.returncode == 0)
+                msg = (f'Mode changed: {prev} → {new_mode}. Bot restarted.'
+                       if restarted else
+                       f'Mode written but restart failed: {r.stderr.strip()}')
+            except Exception as e:
+                msg = f'Mode written but restart failed: {e}'
+        return jsonify({'ok': True, 'prev': prev, 'new': new_mode,
+                        'restarted': restarted, 'msg': msg})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+
+# ── Trading pause toggle (block new entries / reverses) ─────────────
+# Pause does NOT touch existing positions — exit_manager continues
+# managing trailing SL / target / EOD. Only NEW entries (scan_and_trade)
+# and auto_pilot reverses are blocked. Implemented as a flag file the
+# bot polls each tick, so toggle effect is near-instant (<1s).
+
+TRADING_PAUSE_FLAG = os.path.join(os.path.dirname(__file__), 'trading_paused.flag')
+
+
+@app.route('/api/pause', methods=['GET'])
+def pause_get():
+    paused = os.path.exists(TRADING_PAUSE_FLAG)
+    reason = ''
+    ts = ''
+    if paused:
+        try:
+            with open(TRADING_PAUSE_FLAG, 'r') as f:
+                d = json.load(f) or {}
+                reason = d.get('reason') or ''
+                ts = d.get('ts') or ''
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'paused': paused, 'reason': reason, 'ts': ts})
+
+
+@app.route('/api/pause', methods=['POST'])
+def pause_set():
+    """Body: {"paused": true|false, "reason": "optional note"}"""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        want = bool(data.get('paused'))
+        reason = (data.get('reason') or '').strip()[:200]
+        if want:
+            payload = {'reason': reason or 'Paused via dashboard',
+                       'ts': datetime.now().isoformat(timespec='seconds')}
+            tmp = TRADING_PAUSE_FLAG + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(payload, f)
+            os.replace(tmp, TRADING_PAUSE_FLAG)
+            return jsonify({'ok': True, 'paused': True,
+                            'msg': '⏸  New entries/reverses paused. Existing positions still managed.'})
+        else:
+            try:
+                if os.path.exists(TRADING_PAUSE_FLAG):
+                    os.remove(TRADING_PAUSE_FLAG)
+            except Exception:
+                pass
+            return jsonify({'ok': True, 'paused': False, 'msg': '▶  Trading resumed.'})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+
+
 
 AUTOPILOT_STATE_PATH = os.path.join(os.path.dirname(__file__), 'auto_pilot_state.json')
 AUTOPILOT_DISABLE_FLAG = os.path.join(os.path.dirname(__file__), 'auto_pilot_disabled.flag')
@@ -592,6 +749,10 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
     """Actual reverse logic — called under per-symbol lock from reverse_trade()."""
     import re, random
     try:
+        # Dashboard pause: block manual reverse when paused.
+        if os.path.exists(TRADING_PAUSE_FLAG):
+            return jsonify({'ok': False,
+                            'msg': '⏸  Trading is paused — resume from Overview to place orders.'}), 409
         db = get_state_db()
         today = _today()
 
@@ -650,7 +811,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 'exit_price': round(exit_price, 2),
                 'pnl': round(exit_pnl, 2),
                 'exit_time': datetime.now().isoformat(),
-                'exit_type': 'MANUAL_REVERSE_EXIT',
+                'exit_type': 'AUTOPILOT_REVERSE_EXIT',
                 'direction': side,
                 'quantity': exit_qty,
                 'entry_price': round(entry_price, 2),
@@ -690,7 +851,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                     direction=target_pos.get('direction') or target_pos.get('side') or 'BUY',
                     source=target_pos.get('setup_type', target_pos.get('strategy_type', '')),
                     sector=target_pos.get('sector', ''),
-                    exit_type='MANUAL_REVERSE_EXIT',
+                    exit_type='AUTOPILOT_REVERSE_EXIT',
                     entry_price=_entry_price,
                     exit_price=round(exit_price, 2),
                     quantity=_exit_qty_log,
@@ -740,6 +901,37 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 db.save_active_trades(remaining, realized_pnl, paper_capital)
             return jsonify({'ok': False, 'msg': f'{exit_msg}Could not fetch price for {rev_symbol}'}), 400
 
+        # ── Capital-matched sizing (Apr 30) ──
+        # Re-size the reverse leg so its premium-spend ≈ original leg's spend.
+        # Without this, flipping CE↔PE at very different premiums silently
+        # changes deployed capital (a ₹150 CE → ₹40 PE flip would deploy only
+        # 27% of original notional; the reverse case deploys 3.75×).
+        # Bounds: ≥1 lot, ≤ max(2 × original_lots, 10) — caps blow-ups when
+        # the opposite leg is dirt cheap.
+        try:
+            _orig_entry = float(target_pos.get('avg_price') or target_pos.get('entry_price') or 0) if target_pos else 0
+            _orig_qty = abs(int(target_pos.get('quantity', 0) or 0)) if target_pos else 0
+            _orig_lots = max(1, int(target_pos.get('lots', lots) or lots)) if target_pos else lots
+            _lot_size = max(1, int(_orig_qty / _orig_lots)) if (_orig_qty > 0 and _orig_lots > 0) else max(1, int(quantity / max(1, lots)))
+            _orig_capital = _orig_entry * _orig_qty
+            if _orig_capital > 0 and market_ltp > 0 and _lot_size > 0:
+                _ideal_lots = round(_orig_capital / (market_ltp * _lot_size))
+                _max_lots = max(_orig_lots * 2, 10)
+                _new_lots = max(1, min(int(_ideal_lots), _max_lots))
+                _new_qty = _lot_size * _new_lots
+                if _new_lots != lots or _new_qty != quantity:
+                    print(
+                        f"💰 REVERSE capital-match {symbol}→{rev_symbol}: "
+                        f"orig ₹{_orig_entry:.2f}×{_orig_qty}=₹{_orig_capital:,.0f} | "
+                        f"new ₹{market_ltp:.2f}×{_new_qty} ({_new_lots} lots vs orig {_orig_lots}) "
+                        f"=₹{market_ltp * _new_qty:,.0f}",
+                        flush=True,
+                    )
+                lots = _new_lots
+                quantity = _new_qty
+        except Exception as _ce:
+            print(f"⚠️ reverse capital-match sizing failed: {_ce}; falling back to {lots} lots", flush=True)
+
         stoploss_premium = round(market_ltp * 0.72, 2)
         target_premium = round(market_ltp * 1.60, 2)
         # Tick-noise floor: for cheap options (premium < ₹5), the 28% relative
@@ -784,7 +976,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
             'smart_score': 0,
             'lot_multiplier': 1.0,
             'sector': '',
-            'trigger_type': 'MANUAL_REVERSE',
+            'trigger_type': 'AUTOPILOT_REVERSE',
             'is_sniper': False,
             'delta': 0, 'theta': 0, 'iv': 0,
             # Manual setup flag: tells exit_manager to skip partial-profit /
@@ -808,7 +1000,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 symbol=rev_symbol,
                 underlying=_rev_underlying,
                 direction=direction or 'BUY',
-                source='MANUAL_REVERSE',
+                source='AUTOPILOT_REVERSE',
                 strategy_type='NAKED_OPTION',
                 score_tier='manual',
                 option_symbol=rev_symbol if is_option else '',
@@ -872,6 +1064,20 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
             # Add seed entry for the NEW reverse position
             _snaps.append({'symbol': rev_symbol, 'ltp': market_ltp, 'unrealized_pnl': 0.0})
             db.save_live_pnl(_snaps, round(_total, 2))
+        except Exception:
+            pass
+
+        # Freeze the displayed PnL at 0 for a short window so the row
+        # opens at exactly ₹0 and only starts moving once the bot has
+        # rebased avg_price to a fresh LTP. Key under both forms so the
+        # endpoint matches whichever symbol shape the active_trades row
+        # ends up persisted as.
+        try:
+            import time as _tt_rev
+            _freeze_until = _tt_rev.time() + _REVERSE_FREEZE_SECS
+            _bare_rev = rev_symbol.replace('NFO:', '')
+            _REVERSE_FREEZE_UNTIL[_bare_rev] = _freeze_until
+            _REVERSE_FREEZE_UNTIL[f'NFO:{_bare_rev}'] = _freeze_until
         except Exception:
             pass
 
@@ -952,6 +1158,37 @@ def add_lot():
 
             lot_size = max(1, int(round(old_qty / old_lots)))
 
+            # ── +1 sizing revamp (2026-05-05) ──
+            # Cap at TWO adds per position. Lot count per add scales with
+            # the *initial* size so big positions get meaningful adds.
+            #   target_total_lots = max(2 × initial, initial + 2)
+            #   total_to_add = target - initial
+            #   1st add = ceil(total_to_add / 2)
+            #   2nd add = total_to_add - 1st_add
+            # Examples:
+            #   initial 1 → 1, 1   (final 3)
+            #   initial 2 → 1, 1   (final 4)
+            #   initial 3 → 2, 1   (final 6)
+            #   initial 5 → 3, 2   (final 10)
+            prior_adds = list(target_pos.get('add_lot_history') or [])
+            prior_added_lots = sum(int(a.get('lots_added', 0) or 0) for a in prior_adds)
+            initial_lots = max(1, old_lots - prior_added_lots)
+            target_total_lots = max(2 * initial_lots, initial_lots + 2)
+            total_to_add = max(0, target_total_lots - initial_lots)
+            import math as _math
+            first_add_lots = max(1, _math.ceil(total_to_add / 2))
+            second_add_lots = max(1, total_to_add - first_add_lots)
+            adds_so_far = len(prior_adds)
+            if adds_so_far >= 2:
+                return jsonify({
+                    'ok': False,
+                    'msg': (f'{symbol} already has {adds_so_far} +1 adds (cap=2). '
+                            f'Initial={initial_lots}, current={old_lots} lots. '
+                            f'No further adds allowed for this position.')
+                }), 409
+            add_lots = first_add_lots if adds_so_far == 0 else second_add_lots
+            add_qty = add_lots * lot_size
+
             # Fetch live LTP via Kite
             kite = _get_dashboard_kite()
             if not kite:
@@ -968,8 +1205,6 @@ def add_lot():
             if market_ltp <= 0:
                 return jsonify({'ok': False, 'msg': f'Could not fetch LTP for {symbol}'}), 400
 
-            add_qty = lot_size
-            add_lots = 1
             new_qty = old_qty + add_qty
             new_lots = old_lots + add_lots
             new_avg = round(((old_avg * old_qty) + (market_ltp * add_qty)) / new_qty, 2)
@@ -1035,7 +1270,7 @@ def add_lot():
 
             return jsonify({
                 'ok': True,
-                'msg': (f'Added 1 lot to {symbol} @ ₹{market_ltp:.2f} | '
+                'msg': (f'Added {add_lots} lot(s) to {symbol} @ ₹{market_ltp:.2f} | '
                         f'Qty {old_qty}→{new_qty} | Lots {old_lots}→{new_lots} | '
                         f'Avg ₹{old_avg:.2f}→₹{new_avg:.2f} | '
                         f'SL ₹{new_sl:.2f} | TGT ₹{new_tgt:.2f}'),
@@ -1169,6 +1404,32 @@ def candles():
 # ── Live tick endpoint: <1s price feed for chart & position-less streaming ──
 _LTP_CACHE = {}  # {symbol: (ts, ltp)}
 _LTP_TTL = 0.8   # 800ms — many clients share same ping
+
+# Per-symbol "freeze PnL at 0" window after a manual Reverse click.
+# Without this, the live-PnL endpoint instantly recomputes
+# (fresh_kite_ltp - entry_price) * qty using a Kite LTP fetched
+# milliseconds after click — the market has already ticked, so PnL
+# is non-zero on the very first poll. Freezing for ~6s covers the
+# bot's rebase cycle (1–3s) plus a small safety margin, after which
+# avg_price has been re-anchored to the just-observed LTP and PnL
+# accumulates from real post-entry price moves.
+_REVERSE_FREEZE_UNTIL = {}  # {symbol_no_prefix: epoch_ts_until}
+_REVERSE_FREEZE_SECS = 6.0
+
+def _reverse_freeze_active(sym: str) -> bool:
+    if not sym:
+        return False
+    import time as _tt
+    _now = _tt.time()
+    bare = sym.replace('NFO:', '')
+    until = _REVERSE_FREEZE_UNTIL.get(bare) or _REVERSE_FREEZE_UNTIL.get(sym)
+    if until and until > _now:
+        return True
+    if until and until <= _now:
+        # Lazy cleanup
+        _REVERSE_FREEZE_UNTIL.pop(bare, None)
+        _REVERSE_FREEZE_UNTIL.pop(sym, None)
+    return False
 
 @app.route('/api/ltp', methods=['GET'])
 def live_ltp():
@@ -1844,8 +2105,6 @@ def place_news_trade():
 
         # Override lot_size from our known map if available
         lot_size = FNO_LOT_SIZES.get(symbol, lot_size)
-        lots = 1
-        quantity = lot_size * lots
 
         # â”€â”€ Get option LTP â”€â”€
         nfo_key = f'NFO:{tradingsymbol}'
@@ -1857,6 +2116,28 @@ def place_news_trade():
 
         if opt_ltp <= 0:
             return jsonify({'ok': False, 'msg': f'No market price for {tradingsymbol}'}), 400
+
+        # â”€â”€ Sizing: minimum â‚¹50k notional budget per manual news trade â”€â”€
+        # If single-lot premium < 50k, scale up lots; cap at 10 lots to avoid
+        # runaway sizing on ultra-cheap options. Caller may override via
+        # data['lots'] if explicitly provided.
+        _MIN_BUDGET = 50000.0
+        _MAX_LOTS = 10
+        _premium_per_lot = float(opt_ltp) * float(lot_size)
+        try:
+            _override_lots = int(data.get('lots') or 0)
+        except Exception:
+            _override_lots = 0
+        if _override_lots > 0:
+            lots = min(_override_lots, _MAX_LOTS)
+        elif _premium_per_lot <= 0:
+            lots = 1
+        else:
+            import math as _math
+            lots = int(_math.ceil(_MIN_BUDGET / _premium_per_lot))
+            lots = max(1, min(lots, _MAX_LOTS))
+        quantity = lot_size * lots
+        print(f"ðŸ“° NEWS MANUAL SIZING: {symbol} premium/lot=â‚¹{_premium_per_lot:.0f} â†’ {lots} lot(s) = â‚¹{_premium_per_lot*lots:.0f} notional")
 
         # â”€â”€ Place REAL Kite order (or paper if PAPER_MODE) â”€â”€
         fill_price = opt_ltp
@@ -1938,6 +2219,43 @@ def place_news_trade():
             'is_sniper': False,
             'delta': 0, 'theta': 0, 'iv': 0,
         }
+
+        # ── Log ENTRY to trade_ledger BEFORE writing the signal file ──
+        # CRITICAL: dashboard writes to state_db immediately; the bot's
+        # _sync_positions_from_db (3s tick) picks it up from DB before the
+        # signal consumer runs, dedupes the signal, and the ENTRY never
+        # gets logged. That orphans the eventual EXIT in Trade History.
+        # Log here directly and tag _ledger_logged=True so the bot won't
+        # double-log when it consumes the signal.
+        try:
+            from trade_ledger import get_trade_ledger as _gtl
+            _gtl().log_entry(
+                symbol=pos['symbol'],
+                underlying=nse_sym,
+                direction=direction,
+                source=pos['setup_type'],
+                strategy_type='NAKED_OPTION',
+                score_tier=pos['score_tier'],
+                smart_score=confidence,
+                final_score=confidence,
+                option_symbol=pos['symbol'],
+                strike=int(actual_strike),
+                option_type=option_type,
+                expiry=expiry_str,
+                entry_price=round(fill_price, 2),
+                quantity=quantity,
+                lots=lots,
+                lot_multiplier=1.5,
+                stop_loss=stoploss,
+                target=target,
+                total_premium=total_premium,
+                rationale=pos['rationale'],
+                order_id=order_id,
+                trade_id=trade_id,
+            )
+            pos['_ledger_logged'] = True
+        except Exception as _e:
+            print(f"⚠️ news_trade log_entry failed: {_e}")
 
         # ── Write to signal file so the bot injects into its in-memory positions ──
         signal_file = os.path.join(os.path.dirname(__file__), 'manual_entry_requests.json')
@@ -2164,6 +2482,14 @@ def pnl_live():
                 else:
                     unreal = (entry - ltp) * qty
 
+            # Reverse-click freeze: pin PnL to exactly 0 (and LTP=entry)
+            # for a brief window after the user clicks Reverse, so the
+            # row opens at ₹0 instead of showing the tick-drift between
+            # click-time LTP and the next Kite poll.
+            if _reverse_freeze_active(sym) and entry > 0:
+                ltp = float(entry)
+                unreal = 0.0
+
             premium = p.get('total_premium') or (entry * qty) or 0
             pnl_pct = (unreal / premium * 100) if premium > 0 else 0
             out[sym] = {
@@ -2225,6 +2551,11 @@ def trade_summary():
                 unreal = (ltp - entry) * qty
             else:
                 unreal = (entry - ltp) * qty
+
+        # Reverse-click freeze: pin to 0 for a brief post-click window.
+        if _reverse_freeze_active(sym) and entry > 0:
+            ltp = float(entry)
+            unreal = 0
 
         total_unreal += unreal
         pnl_pct = (unreal / (entry * qty) * 100) if entry > 0 and qty > 0 else 0
