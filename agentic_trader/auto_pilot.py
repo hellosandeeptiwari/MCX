@@ -699,6 +699,24 @@ class AutoPilot:
             "park_decoupled",
         }
 
+        # ── Failed-winner protection (2026-05-10) ─────────────────────
+        # Per-symbol peak P&L ratchet, used to refuse REVERSE on positions
+        # that previously showed real profit (≥+3%). Counterfactual on May
+        # 5-8 OI_WATCHER trades showed 5/15 "failed winner" exits came
+        # via AP REVERSE — trades that peaked +5% to +14% then reversed
+        # at -2.3% into the give-back, compounding losses. Hard SL /
+        # trailing SL handle these exits more cleanly than a flip.
+        # Format: {sym: (last_update_ts, peak_pnl_pct)}.
+        # TTL via timestamp — entries auto-stale after 5min inactivity
+        # (= position closed, no longer being tick-fed).
+        self._peak_pnl_by_sym: Dict[str, Tuple[float, float]] = {}
+        # 2026-05-14: per-symbol loss-sustain counter for the -2.3% reverse rule.
+        # Single bad ticks (bid-side prints, wide-spread option noise) used to
+        # trigger false reverses (ADANIENT 14:50 incident: one tick at ~₹90
+        # showed pnl%=-4.4% on a position truly at -1%). Now require 3
+        # consecutive ticks below threshold before firing.
+        self._loss_sustain_count: Dict[str, int] = {}
+
     # ── Public control ──────────────────────────────────────────────
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -1463,14 +1481,133 @@ class AutoPilot:
         REVERSE if pnl_pct <= -2.3%. Never reverse a positive trade.
         All other rules removed (profit-peak, stale-loss, bleed-override,
         chop-bypass, macro-drift, counter-slope, breakout-add, momentum-add, etc.).
+
+        2026-05-10 update: also refuse REVERSE if the position previously
+        peaked ≥+3% (failed-winner protection). Counterfactual on
+        May 5-8 OI_WATCHER trades: 5/15 of trades that peaked ≥+3%
+        were exited by AP REVERSE at -2.3%, compounding the give-back
+        instead of letting trailing SL / hard SL manage. Hard SL takes
+        these gracefully; AP REVERSE flips into the wrong direction.
         """
+        sym = pos.get("symbol", "") or ""
         pnl_pct_val = f.get("pnl_pct", 0.0) or 0.0
+
+        # Per-symbol peak P&L ratchet, with 5-min staleness TTL.
+        # On position close the symbol stops being tick-fed → entry goes
+        # stale → next-time peak resets to current pnl (correct for re-entry).
+        peak = pnl_pct_val
+        if sym:
+            now_ts = time.time()
+            prev = self._peak_pnl_by_sym.get(sym)
+            if prev is not None and now_ts - prev[0] <= 300:
+                peak = max(prev[1], pnl_pct_val)
+            self._peak_pnl_by_sym[sym] = (now_ts, peak)
+
+        # 2026-05-14: sustain check — reset counter on any tick above threshold.
+        # Must run BEFORE the rule body so transient bounces clear the count.
+        if pnl_pct_val > -2.3:
+            if sym in self._loss_sustain_count:
+                self._loss_sustain_count.pop(sym, None)
+
         if pnl_pct_val <= -2.3:
+            # Increment sustain counter — track CONSECUTIVE ticks below
+            # threshold. Single-tick spikes (e.g. ADANIENT 2026-05-14:
+            # one bid-side print at ₹90 on a position at ₹93) used to
+            # fire the rule. Now needs 3 ticks (≈3 sec) of sustained
+            # loss before reversing.
+            _sustain_cnt = self._loss_sustain_count.get(sym, 0) + 1
+            self._loss_sustain_count[sym] = _sustain_cnt
+            if _sustain_cnt < 3:
+                # Not yet sustained — log once per (sym, count) to avoid spam
+                _sk = f"__sustain_log__{sym}_{_sustain_cnt}"
+                if not self._state.get(_sk):
+                    self._state[_sk] = True
+                    try:
+                        print(f"⏳ AP loss-sustain: {sym} pnl%={pnl_pct_val:+.2f} "
+                              f"hit threshold ({_sustain_cnt}/3 consecutive) — waiting")
+                    except Exception:
+                        pass
+                return None
+
+            # MIN-HOLD ENFORCEMENT (2026-05-13 root-cause fix)
+            # Thresholds.MIN_HOLD_FOR_REVERSE was a dead constant — defined but
+            # never read after the May 7 simplification stripped the gates.
+            # Restoring the documented behavior: REVERSE needs ≥60s of tape
+            # so we don't flip on tick noise immediately after a fresh entry
+            # (e.g. NAM-INDIA 8s flip on 2026-05-13 was the canonical bug).
+            _hold_sec = int(f.get("hold_sec") or 0)
+            if _hold_sec < Thresholds.MIN_HOLD_FOR_REVERSE:
+                _log_key = f"__min_hold_skip__{sym}_{_hold_sec}"
+                if not self._state.get(_log_key):
+                    self._state[_log_key] = True
+                    try:
+                        print(f"⏸ AP min-hold skip: {sym} hold={_hold_sec}s "
+                              f"< {Thresholds.MIN_HOLD_FOR_REVERSE}s "
+                              f"(pnl={pnl_pct_val:+.2f}%) — too fresh to reverse")
+                    except Exception:
+                        pass
+                return None
+
+            # FAILED-WINNER PROTECTION v2 (2026-05-12 — dynamic threshold)
+            # Only protect if peak crossed the trailing engagement point.
+            # That's the "did this become a real winner" question. Brief
+            # +3% pokes that didn't arm trailing get the -2.3% reverse as
+            # the user designed.
+            #
+            # threshold = 0.18 * R_pct  (must match exit_manager.trailing_start_r)
+            # If exit_manager.trailing_start_r changes, update this too.
+            _sl_val = float(pos.get("stop_loss") or 0)
+            _entry_val = float(pos.get("avg_price") or pos.get("entry_price") or 0)
+            _fw_threshold = 999.0  # if SL/entry unreadable, protection effectively off
+            if _sl_val > 0 and _entry_val > 0:
+                _R_pct = abs(_entry_val - _sl_val) / _entry_val * 100.0
+                _fw_threshold = 0.18 * _R_pct  # trailing engage point in %
+            if peak >= _fw_threshold and _fw_threshold < 999.0:
+                _log_key = f"__fw_skip_logged__{sym}_{int(peak)}"
+                if not self._state.get(_log_key):
+                    self._state[_log_key] = True
+                    try:
+                        print(f"🛡️ AP failed-winner skip: {sym} "
+                              f"peak={peak:+.2f}% pnl={pnl_pct_val:+.2f}% "
+                              f"(trailing engage={_fw_threshold:.2f}%) "
+                              f"— letting trailing SL / hard SL handle exit")
+                    except Exception:
+                        pass
+                return None
             return {
                 "action": "REVERSE",
                 "rule": f"simple-loss-rev(pnl%={pnl_pct_val:.2f}≤-2.3)",
                 "boosters": ["simple_loss_rev"],
             }
+
+        # ── R-based ADD_LOT (2026-05-11, user directive) ──
+        # First +1 lot at 0.35R in profit. Second +1 lot at 0.70R.
+        # Max 2 adds per position (already enforced by MAX_ADDS_PER_DAY=2 in
+        # execute path). R = SL distance from entry, as %. Only fires when
+        # in profit; never adds to a losing position. Existing AP safety
+        # (drift-against veto, spread veto, LLM confirm) still applies.
+        if pnl_pct_val > 0 and sym:
+            sl_val = float(pos.get("stop_loss") or 0)
+            entry_val = float(pos.get("avg_price") or pos.get("entry_price") or 0)
+            if sl_val > 0 and entry_val > 0:
+                R_pct = abs(entry_val - sl_val) / entry_val * 100.0
+                if R_pct > 0:
+                    adds_done = (self._state.get("counters", {})
+                                 .get(sym, {}).get("adds", 0))
+                    if adds_done == 0 and pnl_pct_val >= 0.30 * R_pct:
+                        return {
+                            "action": "ADD_LOT",
+                            "rule": f"r-add-1st(0.30R={0.30*R_pct:.2f}%, "
+                                    f"pnl={pnl_pct_val:.2f}%)",
+                            "boosters": ["r_add_first"],
+                        }
+                    if adds_done == 1 and pnl_pct_val >= 0.70 * R_pct:
+                        return {
+                            "action": "ADD_LOT",
+                            "rule": f"r-add-2nd(0.70R={0.70*R_pct:.2f}%, "
+                                    f"pnl={pnl_pct_val:.2f}%)",
+                            "boosters": ["r_add_second"],
+                        }
         return None
 
     # ── Verdict handler (extracted Apr 27 for parallel-LLM refactor) ─
@@ -1827,6 +1964,7 @@ class AutoPilot:
                 "expiry": pos.get("expiry", ""),
                 "lots": int(pos.get("lots") or 1),
                 "is_option": True,
+                "source": "AUTOPILOT",  # 2026-05-13: distinguish AP from user clicks
             }
             return self._post("/api/reverse_trade", payload)
 

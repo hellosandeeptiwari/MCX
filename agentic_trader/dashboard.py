@@ -26,6 +26,13 @@ from config import (
 import config as _config_module
 from state_db import get_state_db
 from trade_ledger import get_trade_ledger
+# 2026-05-11: shared cross-process Kite order throttle (fixes 429 cascade from
+# burst-POSTs across gunicorn workers + titan-bot main process)
+try:
+    from zerodha_tools import kite_global_throttle as _kite_throttle
+except Exception:
+    def _kite_throttle():
+        pass
 
 # â”€â”€ Lightweight Kite instance for LIVE exit orders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _dashboard_kite = None
@@ -515,42 +522,145 @@ def mode_get():
     return jsonify({'ok': True, 'mode': mode, 'env_present': exists})
 
 
+# 2026-05-13: mode-flip robustness state
+_MODE_FLIP_STATE = {'last_ts': 0.0}
+_MODE_FLIP_COOLDOWN_S = 15.0
+
+
 @app.route('/api/mode', methods=['POST'])
 def mode_set():
-    """Set TRADING_MODE in .env and (optionally) restart the bot.
+    """Robust LIVE/PAPER mode switch.
 
-    Body:
-      {"mode": "LIVE"|"PAPER", "restart": true|false}
+    Body: {"mode": "LIVE"|"PAPER", "restart": true|false, "force": false}
 
-    Returns:
-      {ok, prev, new, restarted, msg}
+    Hardening (2026-05-13):
+      1. 15s cooldown — prevents double-click races
+      2. Open-position check — refuses flip if active trades exist
+         (override with force=true)
+      3. Pause flag auto-cleared — pause must not persist across flips
+      4. titan-bot restarted synchronously + verified active
+      5. titan-dashboard restarted asynchronously AFTER response is sent
+         (so client receives confirmation before its worker dies)
+      6. Auto-rollback: if titan-bot fails to come up, revert .env
     """
+    import time as _mt
     try:
         data = request.get_json(force=True, silent=True) or {}
         new_mode = (data.get('mode') or '').upper()
         do_restart = bool(data.get('restart', True))
+        force = bool(data.get('force', False))
         if new_mode not in ('PAPER', 'LIVE'):
             return jsonify({'ok': False, 'msg': "mode must be 'PAPER' or 'LIVE'"}), 400
+
+        # ── 1. COOLDOWN ──
+        now = _mt.time()
+        elapsed = now - _MODE_FLIP_STATE['last_ts']
+        if elapsed < _MODE_FLIP_COOLDOWN_S:
+            wait_s = _MODE_FLIP_COOLDOWN_S - elapsed
+            return jsonify({
+                'ok': False,
+                'msg': f'Mode just changed {elapsed:.0f}s ago — wait {wait_s:.0f}s before flipping again',
+            }), 429
+
         prev, _ = _read_trading_mode_from_env()
         if prev == new_mode:
             return jsonify({'ok': True, 'prev': prev, 'new': new_mode,
                             'restarted': False, 'msg': f'Already in {new_mode} mode'})
+
+        # ── 2. OPEN-POSITION CHECK ──
+        if not force:
+            try:
+                db = get_state_db()
+                positions, _, _ = db.load_active_trades(_today())
+                open_pos = [p for p in positions if (p.get('status') or 'OPEN') == 'OPEN']
+                if open_pos:
+                    return jsonify({
+                        'ok': False,
+                        'msg': (f'{len(open_pos)} open position(s) exist — flipping mode mid-session '
+                                f'risks phantom positions. Close them first, or pass force=true.'),
+                        'open_positions': len(open_pos),
+                        'symbols': [p.get('symbol') or p.get('option_symbol') for p in open_pos[:5]],
+                    }), 409
+            except Exception as _pe:
+                print(f"⚠️ mode_set: open-position check failed (continuing): {_pe}")
+
+        # ── 3. WRITE .env ──
         if not _write_trading_mode_to_env(new_mode):
             return jsonify({'ok': False, 'msg': '.env write failed'}), 500
-        restarted = False
-        msg = f'Mode changed: {prev} → {new_mode}. Restart required to take effect.'
-        if do_restart:
+
+        # ── 3b. CLEAR PAUSE FLAG (mode-independent state) ──
+        try:
+            if os.path.exists(TRADING_PAUSE_FLAG):
+                os.remove(TRADING_PAUSE_FLAG)
+                print(f"🧹 Mode flip {prev}→{new_mode}: cleared stale trading_paused.flag")
+        except Exception:
+            pass
+
+        # Record the flip ts BEFORE we restart (cooldown valid even on partial fail)
+        _MODE_FLIP_STATE['last_ts'] = now
+
+        if not do_restart:
+            return jsonify({'ok': True, 'prev': prev, 'new': new_mode,
+                            'restarted': False, 'paused_cleared': True,
+                            'msg': f'Mode written: {prev} → {new_mode}. Restart manually to apply.'})
+
+        # ── 4. RESTART titan-bot synchronously + verify ──
+        bot_ok = False
+        bot_err = ''
+        try:
+            r1 = subprocess.run(['sudo', 'systemctl', 'restart', 'titan-bot'],
+                                capture_output=True, text=True, timeout=20)
+            bot_ok = (r1.returncode == 0)
+            bot_err = (r1.stderr or '').strip()[:200]
+        except Exception as _be:
+            bot_err = str(_be)[:200]
+
+        if not bot_ok:
+            # ── 6. ROLLBACK on bot failure ──
             try:
-                r = subprocess.run(['sudo', 'systemctl', 'restart', 'titan-bot'],
-                                   capture_output=True, text=True, timeout=15)
-                restarted = (r.returncode == 0)
-                msg = (f'Mode changed: {prev} → {new_mode}. Bot restarted.'
-                       if restarted else
-                       f'Mode written but restart failed: {r.stderr.strip()}')
-            except Exception as e:
-                msg = f'Mode written but restart failed: {e}'
-        return jsonify({'ok': True, 'prev': prev, 'new': new_mode,
-                        'restarted': restarted, 'msg': msg})
+                _write_trading_mode_to_env(prev)
+                print(f"⚠️ titan-bot restart failed → reverted .env to {prev}")
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False, 'prev': prev, 'new': new_mode,
+                'msg': f'titan-bot restart FAILED ({bot_err}) — .env reverted to {prev}',
+                'restarted': False, 'rolled_back': True,
+            }), 500
+
+        # Verify titan-bot is actually running (5s grace for startup)
+        _mt.sleep(5)
+        try:
+            rs = subprocess.run(['sudo', 'systemctl', 'is-active', 'titan-bot'],
+                                capture_output=True, text=True, timeout=5)
+            bot_active = (rs.stdout.strip() == 'active')
+        except Exception:
+            bot_active = True  # don't block on verify failure
+
+        # ── 5. SCHEDULE titan-dashboard restart AFTER response is sent ──
+        # Self-killing a service from within its own handler would cut the response.
+        # Defer to a background thread so the client receives the JSON first.
+        def _deferred_dashboard_restart():
+            try:
+                _mt.sleep(2.5)  # give the response time to flush over the network
+                subprocess.run(['sudo', 'systemctl', 'restart', 'titan-dashboard'],
+                               capture_output=True, text=True, timeout=20)
+            except Exception as _de:
+                print(f"⚠️ deferred dashboard restart failed: {_de}")
+        import threading as _th
+        _th.Thread(target=_deferred_dashboard_restart, daemon=True).start()
+
+        return jsonify({
+            'ok': True,
+            'prev': prev,
+            'new': new_mode,
+            'restarted': True,
+            'bot_active': bot_active,
+            'paused_cleared': True,
+            'msg': (f'Mode changed: {prev} → {new_mode}. titan-bot restarted '
+                    f'({"active" if bot_active else "starting"}). '
+                    f'Dashboard restarting in ~3s — refresh the page after that.'),
+        })
     except Exception as e:
         return jsonify({'ok': False, 'msg': str(e)}), 500
 
@@ -748,16 +858,36 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                         is_option, option_type, strike, expiry, lots):
     """Actual reverse logic — called under per-symbol lock from reverse_trade()."""
     import re, random
+    import time as _rt
+    _rev_t0 = _rt.time()
+    def _rlog(msg):
+        try:
+            print(f"🔄 REV[{symbol}] +{_rt.time()-_rev_t0:.2f}s: {msg}", flush=True)
+        except Exception:
+            pass
+    _rlog("ENTER _reverse_trade_impl")
     try:
         # Dashboard pause: block manual reverse when paused.
         if os.path.exists(TRADING_PAUSE_FLAG):
+            _rlog("BLOCKED: trading paused")
             return jsonify({'ok': False,
                             'msg': '⏸  Trading is paused — resume from Overview to place orders.'}), 409
+        # 2026-05-13 root-cause fix: distinguish AP-driven from user-driven
+        # reverses in the exit label. AP includes source="AUTOPILOT" in its POST.
+        # User clicks from the dashboard UI omit it → labeled MANUAL.
+        _rev_source = (data.get('source') or '').upper()
+        _is_ap_reverse = (_rev_source == 'AUTOPILOT')
+        _exit_type_label = 'AUTOPILOT_REVERSE_EXIT' if _is_ap_reverse else 'MANUAL_REVERSE_EXIT'
+        _exit_reason_label = ('AP-driven reverse (-2.3% rule)' if _is_ap_reverse
+                              else 'Manual reverse from dashboard UI')
+        _rlog(f"STEP get_state_db (source={'AP' if _is_ap_reverse else 'USER'})")
         db = get_state_db()
         today = _today()
 
         # ── STEP 1: EXIT the current position ──
+        _rlog("STEP1 load_active_trades")
         positions, realized_pnl, paper_capital = db.load_active_trades(today)
+        _rlog(f"STEP1 loaded n_pos={len(positions)} realized={realized_pnl}")
         target_pos = None
         remaining = []
         for pos in positions:
@@ -777,6 +907,38 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 'ok': False,
                 'msg': f'Position {symbol} no longer open (already exited/flipped). Refresh and try again.'
             }), 409
+
+        # === PRE-EXIT SAFETY GATES (2026-05-14: must run BEFORE exit signal) ===
+        # If any of these fail, the original position stays open — no exit,
+        # no reverse. Building rev_symbol inline here so we can spread-check
+        # the destination leg before touching anything.
+        _pre_rev_symbol = symbol
+        if is_option and option_type in ('CE', 'PE'):
+            _other = 'PE' if option_type == 'CE' else 'CE'
+            _pre_rev_symbol = re.sub(rf'{_other}$', option_type, symbol)
+        _rlog(f"PRE-GATE rev_symbol={_pre_rev_symbol}")
+
+        # L3 SPIRAL CIRCUIT BREAKER (cheapest — in-mem dict)
+        try:
+            _spiral = _spiral_check_and_record(symbol)
+            if not _spiral.get('ok'):
+                _rlog(f"L3 SPIRAL BREAKER REJECTED: {_spiral.get('reason')}")
+                print(f"🚫 L3 REVERSE BLOCKED (spiral): {symbol} — {_spiral.get('reason')}", flush=True)
+                _u = _spiral.get('underlying', '')
+                return jsonify({
+                    'ok': False,
+                    'msg': (f'⛔ Reverse blocked — death-spiral protection. '
+                            f'{_u} has hit the reverse limit (max 2 per 10-min). '
+                            f'This usually means whipsaw conditions. '
+                            f'Exit cleanly or wait for clearer signal.'),
+                    'reason': _spiral.get('reason'),
+                }), 409
+        except Exception as _sp_e:
+            _rlog(f"L3 spiral check error (allowing): {_sp_e}")
+
+        # L2 round-trip spread gate REMOVED 2026-05-14 — was blocking the exit
+        # along with the entry. New semantics: exit always happens (user wants
+        # out), new leg is best-effort (checked separately on liquidity).
 
         exit_pnl = 0
         exit_price = 0
@@ -811,7 +973,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 'exit_price': round(exit_price, 2),
                 'pnl': round(exit_pnl, 2),
                 'exit_time': datetime.now().isoformat(),
-                'exit_type': 'AUTOPILOT_REVERSE_EXIT',
+                'exit_type': _exit_type_label,
                 'direction': side,
                 'quantity': exit_qty,
                 'entry_price': round(entry_price, 2),
@@ -851,7 +1013,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                     direction=target_pos.get('direction') or target_pos.get('side') or 'BUY',
                     source=target_pos.get('setup_type', target_pos.get('strategy_type', '')),
                     sector=target_pos.get('sector', ''),
-                    exit_type='AUTOPILOT_REVERSE_EXIT',
+                    exit_type=_exit_type_label,
                     entry_price=_entry_price,
                     exit_price=round(exit_price, 2),
                     quantity=_exit_qty_log,
@@ -861,7 +1023,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                     final_score=float(target_pos.get('entry_score', 0) or 0),
                     dr_score=float(target_pos.get('dr_score', 0) or 0),
                     strategy_type=target_pos.get('strategy_type', ''),
-                    exit_reason='Reverse trade exit from dashboard UI',
+                    exit_reason=_exit_reason_label,
                     hold_minutes=_hold_mins,
                     entry_time=target_pos.get('timestamp', ''),
                     order_id=target_pos.get('order_id', ''),
@@ -874,14 +1036,18 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
             exit_msg = f'Exited {symbol} P&L={exit_pnl:+,.0f} | '
 
         # ── STEP 2: BUILD reverse position (PE↔CE) ──
+        _rlog("STEP2 build reverse symbol")
         rev_symbol = symbol
         if is_option and option_type in ('CE', 'PE'):
             orig_type = 'PE' if option_type == 'CE' else 'CE'
             rev_symbol = re.sub(rf'{orig_type}$', option_type, symbol)
+        _rlog(f"STEP2 rev_symbol={rev_symbol}")
 
         # Fetch REAL market LTP via Kite API
         market_ltp = 0
+        _rlog("STEP2 _get_dashboard_kite")
         kite = _get_dashboard_kite()
+        _rlog(f"STEP2 kite={'OK' if kite else 'NONE'}")
         if not kite:
             # Still save the exit
             if target_pos:
@@ -889,11 +1055,14 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
             return jsonify({'ok': False, 'msg': f'{exit_msg}Kite API not available for reverse'}), 503
 
         nfo_symbol = f'NFO:{rev_symbol}' if not rev_symbol.startswith('NFO:') else rev_symbol
+        _rlog(f"STEP2 fetching LTP for {nfo_symbol}")
         try:
             ltp_data = kite.ltp([nfo_symbol])
             if nfo_symbol in ltp_data:
                 market_ltp = ltp_data[nfo_symbol]['last_price']
+            _rlog(f"STEP2 LTP={market_ltp}")
         except Exception as e:
+            _rlog(f"STEP2 LTP EXCEPTION: {e}")
             print(f"\u26a0\ufe0f Reverse trade LTP fetch failed for {nfo_symbol}: {e}")
 
         if market_ltp <= 0:
@@ -918,6 +1087,14 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 _ideal_lots = round(_orig_capital / (market_ltp * _lot_size))
                 _max_lots = max(_orig_lots * 2, 10)
                 _new_lots = max(1, min(int(_ideal_lots), _max_lots))
+                # === MAX_LOTS_PER_TRADE cap for reverse leg too (2026-05-14) ===
+                try:
+                    from config import HARD_RULES as _HR_rev_lots
+                    _rev_max_cap = int(_HR_rev_lots.get('MAX_LOTS_PER_TRADE', 1))
+                except Exception:
+                    _rev_max_cap = 1
+                if _rev_max_cap > 0:
+                    _new_lots = min(_new_lots, _rev_max_cap)
                 _new_qty = _lot_size * _new_lots
                 if _new_lots != lots or _new_qty != quantity:
                     print(
@@ -945,15 +1122,115 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
         total_premium = round(market_ltp * quantity, 2)
         max_loss = round((market_ltp - stoploss_premium) * quantity, 2)
 
-        paper_id = f'PAPER_REV_{random.randint(100000, 999999)}'
+        # 2026-05-13: in LIVE mode, place a REAL kite order for the new leg.
+        # Previously the reverse handler ALWAYS generated PAPER_REV_* and never
+        # called kite.place_order — meaning LIVE-mode reverses didn't actually
+        # open the opposite leg at broker. Now: PAPER → shadow as before;
+        # LIVE → place real order + use broker-returned order_id.
+        _is_paper_mode = bool(getattr(_config_module, 'PAPER_MODE', True))
+        order_id_for_pos = ''
         trade_id = f'REV_{datetime.now().strftime("%H%M%S")}_{random.randint(1000,9999)}'
 
+        # === NEW-LEG LIQUIDITY CHECK (2026-05-14 two-step Reverse) ===
+        # Exit has already happened above. Now decide whether to open the
+        # opposite leg. If liquidity is bad on the new leg, skip the entry
+        # and return partial-success — user is flat, can re-enter manually.
+        _new_leg_check = _check_new_leg_liquidity(kite, rev_symbol, quantity, ref_ltp=market_ltp)
+        # Snapshot bid for entry-slippage calc on the new leg (always defined,
+        # 0.0 fallback if depth fetch failed).
+        _rev_entry_bid_snap = float((_new_leg_check.get('details') or {}).get('bid') or 0)
+        if not _new_leg_check.get('ok'):
+            _nl_reason = _new_leg_check.get('reason', 'illiquid')
+            _nl_details = _new_leg_check.get('details', {})
+            _rlog(f"NEW-LEG (same strike) failed: {_nl_reason} — trying nearby strikes")
+            print(f"🔁 Reverse: {rev_symbol} failed L1 — scanning nearby strikes", flush=True)
+
+            # 2026-05-14 user request: scan nearby strikes for a liquid alternative
+            _fallback = None
+            try:
+                # Determine opposite type (we are placing the new leg)
+                _opp_type = 'PE' if option_type == 'CE' else 'CE'
+                # Build expiry string for instruments lookup
+                from dateutil.parser import parse as _dpx
+                try:
+                    _exp_date = _dpx(expiry).date() if isinstance(expiry, str) else expiry
+                except Exception:
+                    _exp_date = expiry
+                _fallback = _pick_best_reverse_strike(
+                    kite, underlying.replace('NSE:', '') if underlying else symbol.replace('NFO:', '').split('2')[0],
+                    _opp_type, str(_exp_date), float(strike or 0), int(quantity), max_candidates=5,
+                )
+            except Exception as _fb_e:
+                _rlog(f"strike-fallback error: {_fb_e}")
+
+            if _fallback:
+                # Switch new leg to the fallback strike
+                old_rev = rev_symbol
+                rev_symbol = f"NFO:{_fallback['tradingsymbol']}"
+                strike = _fallback['strike']
+                market_ltp = _fallback['ltp']
+                _rev_entry_bid_snap = float(_fallback.get('bid') or 0)
+                _rlog(f"FALLBACK STRIKE picked: {old_rev} → {rev_symbol} (strike {strike}, "
+                      f"spread {_fallback['spread_pct']}%, slip {_fallback['slip_pct']}%)")
+                print(f"✅ Reverse fallback: {old_rev} → {rev_symbol} "
+                      f"(spread {_fallback['spread_pct']}%, slip {_fallback['slip_pct']}%)", flush=True)
+                # Continue to placement with new rev_symbol/market_ltp
+            else:
+                _rlog(f"NEW-LEG SKIPPED (no liquid fallback): {_nl_reason}")
+                print(f"⚠️ Reverse: exit done, no liquid strike found for {underlying} {('PE' if option_type=='CE' else 'CE')}", flush=True)
+                return jsonify({
+                    'ok': True,
+                    'partial': True,
+                    'msg': (f'✅ {exit_msg.rstrip(" |")}'
+                            f'  ⚠️ No liquid {("PE" if option_type=="CE" else "CE")} strike found nearby. '
+                            f'Same strike: {_nl_reason}. You are now flat. Re-enter manually if needed.'),
+                    'exit_only': True,
+                    'reason': f'no_fallback({_nl_reason})',
+                    'details': _nl_details,
+                })
+
+        _rlog(f"STEP3 placing entry leg paper_mode={_is_paper_mode}")
+        if _is_paper_mode:
+            order_id_for_pos = f'PAPER_REV_{random.randint(100000, 999999)}'
+        else:
+            try:
+                _kite_throttle()  # cross-process Kite throttle
+                _tsym_kite = rev_symbol.replace('NFO:', '')
+                live_order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange='NFO',
+                    tradingsymbol=_tsym_kite,
+                    transaction_type=kite.TRANSACTION_TYPE_BUY,
+                    quantity=quantity,
+                    product=kite.PRODUCT_MIS,
+                    order_type=kite.ORDER_TYPE_MARKET,
+                    tag='TITAN_REV',
+                )
+                order_id_for_pos = str(live_order_id)
+                _rlog(f"STEP3 LIVE order placed: {order_id_for_pos}")
+            except Exception as _lerr:
+                _rlog(f"STEP3 LIVE order FAILED: {_lerr}")
+                # Persist the exit (already written to MANUAL_EXIT_FILE above)
+                # but surface the failure clearly so user knows new leg is NOT open.
+                if target_pos:
+                    db.save_active_trades(remaining, realized_pnl, paper_capital)
+                return jsonify({
+                    'ok': False,
+                    'msg': f'{exit_msg}LIVE reverse failed — exit done but new leg NOT placed: {str(_lerr)[:120]}',
+                }), 500
+
+        # Reverse entry slippage: paid ~market_ltp (ask side), could sell at _rev_entry_bid_snap
+        _rev_slip_inr = 0.0
+        if _rev_entry_bid_snap > 0 and market_ltp > 0 and quantity > 0:
+            _rev_slip_inr = round((market_ltp - _rev_entry_bid_snap) * quantity * -1, 2)
         new_pos = {
             'symbol': rev_symbol,
             'underlying': underlying or symbol,
             'quantity': quantity,
             'lots': lots,
             'avg_price': market_ltp,
+            'entry_bid_snap': _rev_entry_bid_snap,
+            'entry_slippage_inr': _rev_slip_inr,
             'side': 'BUY',
             'direction': direction,
             'option_type': option_type if is_option else '',
@@ -961,7 +1238,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
             'expiry': expiry if is_option else '',
             'stop_loss': stoploss_premium,
             'target': target_premium,
-            'order_id': paper_id,
+            'order_id': order_id_for_pos,
             'trade_id': trade_id,
             'timestamp': datetime.now().isoformat(),
             'status': 'OPEN',
@@ -1015,7 +1292,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
                 target=target_premium,
                 total_premium=total_premium,
                 rationale=new_pos.get('rationale', f'Reverse of {symbol}'),
-                order_id=paper_id,
+                order_id=order_id_for_pos,
                 trade_id=trade_id,
             )
             new_pos['_ledger_logged'] = True
@@ -1084,7 +1361,7 @@ def _reverse_trade_impl(data, symbol, underlying, direction, quantity,
         return jsonify({
             'ok': True,
             'msg': f'{exit_msg}Opened {rev_symbol} @ \u20b9{market_ltp:.2f} | SL \u20b9{stoploss_premium:.2f} | TGT \u20b9{target_premium:.2f}',
-            'order_id': paper_id,
+            'order_id': order_id_for_pos,
             'ltp': market_ltp,
             'stop_loss': stoploss_premium,
             'target': target_premium,
@@ -1402,7 +1679,362 @@ def candles():
 
 
 # ── Live tick endpoint: <1s price feed for chart & position-less streaming ──
-_LTP_CACHE = {}  # {symbol: (ts, ltp)}
+_LTP_CACHE = {}
+_DEPTH_CACHE = {}  # {sym: (ts, {"buy":[...], "sell":[...]})} — used by pnl_live for realizable exit price
+
+
+# === SPIRAL CIRCUIT BREAKER (L3, 2026-05-14 SAMMAANCAP fix) ========================
+# Per-underlying reverse history. {underlying: [ts1, ts2, ...]}
+_SPIRAL_REVERSES_BY_UNDERLYING: dict = {}
+# Underlyings BLOCKED for the rest of the session (rolling count exceeded).
+_SPIRAL_BLOCKED_UNDERLYINGS: dict = {}  # {underlying: (block_until_ts, reason)}
+
+SPIRAL_MAX_REVERSES = 2
+SPIRAL_WINDOW_SECS = 600        # 10 min rolling window
+SPIRAL_BLOCK_DURATION_SECS = 0   # 0 = rest-of-session
+
+def _underlying_from_option_symbol(sym: str) -> str:
+    """Extract underlying ticker from option symbol.
+    e.g. 'NFO:SAMMAANCAP26MAY145CE' -> 'SAMMAANCAP'
+    """
+    if not sym:
+        return ''
+    import re as _re
+    bare = sym.replace('NFO:', '').replace('NSE:', '')
+    m = _re.match(r'([A-Z]+)\d', bare)
+    return m.group(1) if m else bare
+
+def _spiral_check_and_record(symbol: str) -> dict:
+    """Check whether the underlying behind `symbol` is blocked, and if not,
+    record this reverse attempt. Returns {'ok': bool, 'reason': str, 'count': int}.
+    Caller should NOT proceed with the reverse if ok=False.
+    """
+    import time as _t
+    try:
+        from config import HARD_RULES as _HR
+        max_rev = int(_HR.get('SPIRAL_MAX_REVERSES', SPIRAL_MAX_REVERSES))
+        window = int(_HR.get('SPIRAL_WINDOW_SECS', SPIRAL_WINDOW_SECS))
+        block_dur = int(_HR.get('SPIRAL_BLOCK_DURATION_SECS', SPIRAL_BLOCK_DURATION_SECS))
+    except Exception:
+        max_rev, window, block_dur = SPIRAL_MAX_REVERSES, SPIRAL_WINDOW_SECS, SPIRAL_BLOCK_DURATION_SECS
+
+    underlying = _underlying_from_option_symbol(symbol)
+    if not underlying:
+        return {'ok': True, 'reason': '', 'count': 0, 'underlying': ''}
+    now = _t.time()
+
+    # Check existing block
+    blocked = _SPIRAL_BLOCKED_UNDERLYINGS.get(underlying)
+    if blocked:
+        block_until, reason = blocked
+        if block_until == 0 or now < block_until:
+            return {'ok': False, 'reason': f'underlying_blocked({reason})',
+                    'count': 0, 'underlying': underlying, 'block_until': block_until}
+        else:
+            _SPIRAL_BLOCKED_UNDERLYINGS.pop(underlying, None)
+
+    # Prune old entries from rolling window
+    history = _SPIRAL_REVERSES_BY_UNDERLYING.setdefault(underlying, [])
+    history[:] = [ts for ts in history if (now - ts) < window]
+
+    # Will adding this attempt exceed the cap?
+    if len(history) >= max_rev:
+        # Engage block
+        block_until = (now + block_dur) if block_dur > 0 else 0  # 0 = rest of session
+        reason = f'{len(history)}_reverses_in_{window//60}min'
+        _SPIRAL_BLOCKED_UNDERLYINGS[underlying] = (block_until, reason)
+        return {'ok': False, 'reason': f'spiral_circuit_breaker({reason})',
+                'count': len(history), 'underlying': underlying,
+                'block_until': block_until}
+
+    # Record this attempt
+    history.append(now)
+    return {'ok': True, 'reason': '', 'count': len(history), 'underlying': underlying}
+
+
+# === REVERSE SPREAD GATE (L2, 2026-05-14 SAMMAANCAP fix) ============================
+# Default thresholds — can be overridden via titan_settings.json.
+REV_GATE_MAX_SPREAD_PCT = 1.5   # avg spread% across legs must be < this
+REV_GATE_HARD_SPREAD_PCT = 4.0  # single-leg spread above this = always block
+
+_NFO_INSTRUMENTS_CACHE = {'data': None, 'ts': 0}
+
+def _get_nfo_instruments(kite):
+    """Cache kite.instruments('NFO') for 30 min — heavy call (~30K rows)."""
+    import time as _t
+    now = _t.time()
+    if _NFO_INSTRUMENTS_CACHE['data'] is None or (now - _NFO_INSTRUMENTS_CACHE['ts']) > 1800:
+        try:
+            _NFO_INSTRUMENTS_CACHE['data'] = kite.instruments('NFO')
+            _NFO_INSTRUMENTS_CACHE['ts'] = now
+        except Exception as _e:
+            return []
+    return _NFO_INSTRUMENTS_CACHE['data'] or []
+
+
+def _pick_best_reverse_strike(kite, underlying_name, option_type, expiry_str,
+                                preferred_strike, qty, max_candidates=5):
+    """Find the most liquid nearby-strike option of the requested type when
+    the preferred strike fails L1. Returns dict with tradingsymbol/strike/
+    lot_size/ltp/spread_pct/slip_pct on success, None if no candidate passes.
+
+    Selection rule: minimum slippage% wins; tiebreaker is distance to preferred.
+    """
+    insts = _get_nfo_instruments(kite)
+    if not insts:
+        return None
+
+    # Filter: same underlying name, option type, matching expiry
+    candidates = []
+    for inst in insts:
+        if inst.get('name') != underlying_name:
+            continue
+        if inst.get('instrument_type') != option_type:
+            continue
+        exp = inst.get('expiry')
+        if isinstance(exp, str):
+            from datetime import datetime as _dt
+            try:
+                exp = _dt.strptime(exp, '%Y-%m-%d').date()
+            except Exception:
+                continue
+        if str(exp) != str(expiry_str):
+            continue
+        candidates.append({
+            'tradingsymbol': inst.get('tradingsymbol'),
+            'strike': float(inst.get('strike', 0)),
+            'lot_size': int(inst.get('lot_size', 1)),
+        })
+
+    if not candidates:
+        return None
+
+    # Sort by distance to preferred strike, take top N
+    candidates.sort(key=lambda x: abs(x['strike'] - preferred_strike))
+    candidates = candidates[:max_candidates]
+
+    # Batch fetch quotes
+    syms = [f"NFO:{c['tradingsymbol']}" for c in candidates]
+    try:
+        quotes = kite.quote(syms) or {}
+    except Exception:
+        return None
+
+    # Load thresholds (same as _check_new_leg_liquidity)
+    try:
+        from config import HARD_RULES as _HR
+        max_spread = float(_HR.get('LIQ_GATE_MAX_SPREAD_PCT', 5.0))
+        min_depth = float(_HR.get('LIQ_GATE_MIN_TOP3_DEPTH_RATIO', 1.0))
+        max_slip = float(_HR.get('LIQ_GATE_MAX_SLIPPAGE_PCT', 5.0))
+    except Exception:
+        max_spread, min_depth, max_slip = 5.0, 1.0, 5.0
+
+    # Score each candidate
+    best = None
+    best_score = (float('inf'), float('inf'))  # (slip_pct, distance)
+    for c in candidates:
+        sym = f"NFO:{c['tradingsymbol']}"
+        q = quotes.get(sym)
+        if not isinstance(q, dict):
+            continue
+        depth = q.get('depth') or {}
+        asks = depth.get('sell') or []
+        bids = depth.get('buy') or []
+        ltp = float(q.get('last_price') or 0)
+        if not asks or not bids or ltp <= 0:
+            continue
+        bid = float(bids[0].get('price') or 0)
+        ask = float(asks[0].get('price') or 0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            continue
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
+        if spread_pct > max_spread:
+            continue
+        top3 = sum(int(lv.get('quantity') or 0) for lv in asks[:3])
+        if top3 < qty * min_depth:
+            continue
+        # Depth-walk slippage
+        remaining, weighted, filled = qty, 0.0, 0
+        for lv in asks:
+            lp = float(lv.get('price') or 0)
+            lq = int(lv.get('quantity') or 0)
+            if lp <= 0 or lq <= 0:
+                continue
+            take = min(remaining, lq)
+            weighted += lp * take
+            filled += take
+            remaining -= take
+            if remaining <= 0:
+                break
+        if filled < qty * 0.95:
+            continue
+        avg_fill = weighted / filled
+        slip_pct = (avg_fill - ltp) / ltp * 100.0 if ltp > 0 else 999.0
+        if slip_pct > max_slip:
+            continue
+        # Passed. Score by slip then distance.
+        score = (slip_pct, abs(c['strike'] - preferred_strike))
+        if score < best_score:
+            best = {
+                **c,
+                'ltp': ltp, 'bid': bid, 'ask': ask,
+                'spread_pct': round(spread_pct, 2),
+                'slip_pct': round(slip_pct, 2),
+            }
+            best_score = score
+    return best
+
+
+def _check_new_leg_liquidity(kite, new_symbol: str, qty: int, ref_ltp: float = 0) -> dict:
+    """L1-style liquidity check on the new leg of a Reverse.
+
+    Equivalent to ZerodhaTools._check_option_liquidity but inline for the
+    dashboard process. Checks (in order): spread cap, top-3 ask depth,
+    projected slippage via depth-walk.
+    Returns {'ok': bool, 'reason': str, 'details': dict}.
+    Fail-safe: returns ok=True on any error so transient Kite issues
+    don't silently break the workflow.
+    """
+    out = {'ok': True, 'reason': '', 'details': {}}
+    if not kite or not new_symbol or qty <= 0:
+        return out
+    try:
+        from config import HARD_RULES as _HR
+        max_spread = float(_HR.get('LIQ_GATE_MAX_SPREAD_PCT', 4.0))
+        min_depth = float(_HR.get('LIQ_GATE_MIN_TOP3_DEPTH_RATIO', 1.0))
+        max_slip = float(_HR.get('LIQ_GATE_MAX_SLIPPAGE_PCT', 2.5))
+    except Exception:
+        max_spread, min_depth, max_slip = 4.0, 1.0, 2.5
+
+    sym = new_symbol if ':' in new_symbol else f'NFO:{new_symbol}'
+    try:
+        q_data = kite.quote([sym]) or {}
+        q = q_data.get(sym)
+    except Exception as e:
+        out['details']['warn'] = f'quote fetch failed: {str(e)[:80]}'
+        return out
+    if not isinstance(q, dict):
+        out['details']['warn'] = 'no quote returned'
+        return out
+
+    depth = q.get('depth') or {}
+    bids = depth.get('buy') or []
+    asks = depth.get('sell') or []
+    ltp = float(q.get('last_price') or ref_ltp or 0)
+    bid = float(bids[0].get('price') or 0) if bids else 0
+    ask = float(asks[0].get('price') or 0) if asks else 0
+
+    if bid > 0 and ask > 0 and ask >= bid:
+        mid = (bid + ask) / 2.0
+        spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
+    else:
+        spread_pct = 999.0
+
+    if spread_pct > max_spread:
+        out['ok'] = False
+        out['reason'] = f'spread_too_wide({spread_pct:.2f}% > {max_spread:.1f}%)'
+        out['details'] = {'spread_pct': round(spread_pct, 2), 'bid': bid, 'ask': ask}
+        return out
+
+    if not asks:
+        out['ok'] = False
+        out['reason'] = 'empty_ask_book'
+        out['details'] = {'ltp': ltp}
+        return out
+
+    top3 = sum(int(lv.get('quantity') or 0) for lv in asks[:3])
+    if top3 < qty * min_depth:
+        out['ok'] = False
+        out['reason'] = f'thin_book(top3={top3} < {int(qty*min_depth)})'
+        out['details'] = {'top3_qty': top3, 'required': int(qty * min_depth)}
+        return out
+
+    # Depth-walk slippage projection
+    remaining, weighted, filled = qty, 0.0, 0
+    for lv in asks:
+        lp = float(lv.get('price') or 0); lq = int(lv.get('quantity') or 0)
+        if lp <= 0 or lq <= 0: continue
+        take = min(remaining, lq)
+        weighted += lp * take; filled += take; remaining -= take
+        if remaining <= 0: break
+    if filled >= qty * 0.95 and ltp > 0:
+        avg_fill = weighted / filled
+        slip_pct = ((avg_fill - ltp) / ltp) * 100.0
+        if slip_pct > max_slip:
+            out['ok'] = False
+            out['reason'] = f'projected_slippage({slip_pct:.2f}% > {max_slip:.1f}%)'
+            out['details'] = {'slip_pct': round(slip_pct, 2), 'avg_fill': round(avg_fill, 2), 'ltp': ltp}
+            return out
+
+    out['details'] = {'spread_pct': round(spread_pct, 2), 'top3_qty': top3, 'ltp': ltp}
+    return out
+
+
+def _check_reverse_spread(kite, old_symbol: str, new_symbol: str, qty: int) -> dict:
+    """Pre-flight spread check for a REVERSE. Refuse if round-trip cost (sum
+    of spread% on old + new leg) would dwarf the 2.3% SL threshold.
+
+    Returns {'ok': bool, 'reason': str, 'details': dict}.
+    Fail-safe: any error returns ok=True (don't silently block on transient
+    Kite issues — UI/log surfaces it).
+    """
+    out = {'ok': True, 'reason': '', 'details': {}}
+    try:
+        from config import HARD_RULES as _HR
+        max_avg = float(_HR.get('REV_GATE_MAX_SPREAD_PCT', REV_GATE_MAX_SPREAD_PCT))
+        hard_cap = float(_HR.get('REV_GATE_HARD_SPREAD_PCT', REV_GATE_HARD_SPREAD_PCT))
+    except Exception:
+        max_avg, hard_cap = REV_GATE_MAX_SPREAD_PCT, REV_GATE_HARD_SPREAD_PCT
+
+    if not kite or not old_symbol or not new_symbol:
+        return out
+    try:
+        syms = [s if ':' in s else f'NFO:{s}' for s in (old_symbol, new_symbol)]
+        q = kite.quote(syms) or {}
+    except Exception as e:
+        out['details']['warn'] = f'quote fetch failed: {str(e)[:80]}'
+        return out
+
+    def _spread_pct(sym: str) -> float:
+        v = q.get(sym) or {}
+        d = (v.get('depth') or {})
+        bids = d.get('buy') or []
+        asks = d.get('sell') or []
+        if not bids or not asks:
+            return 999.0
+        b = float(bids[0].get('price') or 0)
+        a = float(asks[0].get('price') or 0)
+        if a <= 0 or b <= 0 or a < b:
+            return 999.0
+        m = (a + b) / 2.0
+        return (a - b) / m * 100.0 if m > 0 else 999.0
+
+    old_sp = _spread_pct(syms[0])
+    new_sp = _spread_pct(syms[1])
+
+    # Hard cap: either leg with spread > 4% is always too risky to reverse.
+    if old_sp > hard_cap or new_sp > hard_cap:
+        out['ok'] = False
+        out['reason'] = f'spread_hard_cap(old={old_sp:.2f}% new={new_sp:.2f}% > {hard_cap:.1f}%)'
+        out['details'] = {'old_spread_pct': round(old_sp, 2), 'new_spread_pct': round(new_sp, 2),
+                          'hard_cap': hard_cap}
+        return out
+
+    # Soft cap: avg spread across both legs vs round-trip-cost-vs-SL.
+    avg_sp = (old_sp + new_sp) / 2.0
+    if avg_sp > max_avg:
+        out['ok'] = False
+        out['reason'] = (f'spread_roundtrip_too_high(avg={avg_sp:.2f}% > {max_avg:.1f}%; '
+                          f'round-trip cost ~{avg_sp*2:.1f}% vs SL 2.3%)')
+        out['details'] = {'old_spread_pct': round(old_sp, 2), 'new_spread_pct': round(new_sp, 2),
+                          'avg_spread_pct': round(avg_sp, 2), 'max_avg': max_avg}
+        return out
+
+    out['details'] = {'old_spread_pct': round(old_sp, 2), 'new_spread_pct': round(new_sp, 2),
+                      'avg_spread_pct': round(avg_sp, 2)}
+    return out
+  # {sym: (ts, {"buy":[...], "sell":[...]})} — used by pnl_live for realizable exit price  # {symbol: (ts, ltp)}
 _LTP_TTL = 0.8   # 800ms — many clients share same ping
 
 # Per-symbol "freeze PnL at 0" window after a manual Reverse click.
@@ -1430,6 +2062,146 @@ def _reverse_freeze_active(sym: str) -> bool:
         _REVERSE_FREEZE_UNTIL.pop(bare, None)
         _REVERSE_FREEZE_UNTIL.pop(sym, None)
     return False
+
+# ── Macro context endpoint (2026-05-11 — NIFTY+VIX header strip) ──
+_MACRO_CACHE = {'ts': 0.0, 'data': {}}
+_MACRO_CACHE_TTL = 5.0  # seconds
+
+# ── Broker state — single source of truth (2026-05-14) ──────────
+# Returns Kite's actual positions + margins. Used by dashboard's
+# top banner to show what's REALLY at broker, vs bot's tracking.
+# Today's LTM: bot said "exited -₹3,112" while Kite had position
+# open at +₹10,747. This endpoint gives ground truth.
+_BROKER_STATE_CACHE = {'ts': 0.0, 'data': {}}
+_BROKER_STATE_TTL = 5.0
+
+@app.route('/api/broker_state', methods=['GET'])
+def broker_state():
+    """Live broker positions + margins. Cached 5s."""
+    import time as _bt
+    try:
+        now = _bt.time()
+        if now - _BROKER_STATE_CACHE['ts'] < _BROKER_STATE_TTL and _BROKER_STATE_CACHE['data']:
+            return jsonify({'ok': True, 'cached': True, **_BROKER_STATE_CACHE['data']})
+        kite = _get_dashboard_kite()
+        if not kite:
+            return jsonify({'ok': False, 'msg': 'kite unavailable'}), 503
+        m = (kite.margins() or {}).get('equity', {})
+        ut = m.get('utilised', {})
+        pos_all = kite.positions().get('day', []) or []
+        pos_open = [p for p in pos_all if p.get('quantity', 0) != 0]
+        pos_closed = [p for p in pos_all if p.get('quantity', 0) == 0]
+        positions = []
+        for p in pos_open:
+            positions.append({
+                'tradingsymbol': p.get('tradingsymbol', ''),
+                'quantity': p.get('quantity', 0),
+                'avg_price': round(float(p.get('average_price', 0) or 0), 2),
+                'last_price': round(float(p.get('last_price', 0) or 0), 2),
+                'pnl': round(float(p.get('pnl', 0) or 0), 2),
+                'product': p.get('product', ''),
+            })
+        # Authoritative P&L truth: sum from positions.day. The
+        # margins.utilised.m2m_* fields are unreliable (often 0 even when
+        # day P&L is non-zero). 2026-05-14 broker-truth fix.
+        _real_truth = round(sum(float(p.get('pnl', 0) or 0) for p in pos_closed), 2)
+        _unreal_truth = round(sum(float(p.get('pnl', 0) or 0) for p in pos_open), 2)
+        data = {
+            'net_free':       round(float(m.get('net', 0) or 0), 2),
+            'used_margin':    round(float(ut.get('debits', 0) or 0), 2),
+            'realised_pnl':   _real_truth,
+            'unrealised_pnl': _unreal_truth,
+            'day_pnl':        round(_real_truth + _unreal_truth, 2),
+            'closed_count':   len(pos_closed),
+            'open_count':     len(positions),
+            'positions':      positions,
+            'closed_positions': [{
+                'tradingsymbol': p.get('tradingsymbol', ''),
+                'pnl': round(float(p.get('pnl', 0) or 0), 2),
+            } for p in pos_closed],
+            'ts':             now,
+        }
+        _BROKER_STATE_CACHE['ts'] = now
+        _BROKER_STATE_CACHE['data'] = data
+        return jsonify({'ok': True, 'cached': False, **data})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)[:200]}), 500
+
+
+@app.route('/api/macro', methods=['GET'])
+def macro_context():
+    """Live NIFTY 50 + INDIA VIX for the dashboard header strip.
+    Cached for 5s to keep load low.
+    Returns: {ok, ts, nifty_ltp, nifty_chg_pct, nifty_open, vix_ltp, vix_chg, vix_open}
+    """
+    import time as _t
+    try:
+        now = _t.time()
+        if now - _MACRO_CACHE['ts'] < _MACRO_CACHE_TTL and _MACRO_CACHE['data']:
+            return jsonify({'ok': True, **_MACRO_CACHE['data']})
+        kite = _get_dashboard_kite()
+        if not kite:
+            return jsonify({'ok': False, 'msg': 'kite unavailable'}), 503
+        syms = ['NSE:NIFTY 50', 'NSE:INDIA VIX']
+        q = kite.quote(syms) or {}
+        n = q.get('NSE:NIFTY 50', {}) or {}
+        v = q.get('NSE:INDIA VIX', {}) or {}
+        n_ltp = float(n.get('last_price') or 0)
+        n_ohlc = n.get('ohlc') or {}
+        n_close = float(n_ohlc.get('close') or 0)
+        n_chg_pct = ((n_ltp - n_close) / n_close * 100) if n_close > 0 else 0.0
+        v_ltp = float(v.get('last_price') or 0)
+        v_ohlc = v.get('ohlc') or {}
+        v_close = float(v_ohlc.get('close') or 0)
+        v_chg = (v_ltp - v_close) if (v_ltp > 0 and v_close > 0) else 0.0
+        data = {
+            'ts': now,
+            'nifty_ltp': round(n_ltp, 2),
+            'nifty_chg_pct': round(n_chg_pct, 2),
+            'nifty_open': round(float(n_ohlc.get('open') or 0), 2),
+            'vix_ltp': round(v_ltp, 2),
+            'vix_chg': round(v_chg, 2),
+            'vix_open': round(float(v_ohlc.get('open') or 0), 2),
+        }
+        _MACRO_CACHE['ts'] = now
+        _MACRO_CACHE['data'] = data
+        return jsonify({'ok': True, **data})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)[:120]}), 500
+
+
+# ── Tick volume split (2026-05-13) ──────────────────────────────
+# Returns per-minute uptick/downtick volume split for a symbol, built live
+# from WebSocket ticks. Used by the option chart's split-volume bars.
+_TSPLIT_DUMP_PATH = '/tmp/titan_tick_split.json'
+
+@app.route('/api/tick_volume_split', methods=['GET'])
+def tick_volume_split():
+    """Query: ?symbol=NFO:XXX&minutes=60
+    Returns: {ok, data: [{ts, green, red, total}, ...]}
+
+    Cross-process: bot writes to /tmp/titan_tick_split.json every ~2s,
+    we read from the file (dashboard is a separate gunicorn process so
+    cannot access bot's in-memory state directly)."""
+    try:
+        symbol = (request.args.get('symbol') or '').strip().upper()
+        minutes = max(1, min(120, int(request.args.get('minutes') or 60)))
+        if not symbol:
+            return jsonify({'ok': False, 'msg': 'symbol required'}), 400
+        if not os.path.exists(_TSPLIT_DUMP_PATH):
+            return jsonify({'ok': True, 'symbol': symbol, 'data': [],
+                            'msg': 'no tick split data yet'})
+        with open(_TSPLIT_DUMP_PATH) as f:
+            all_data = json.load(f)
+        rows = all_data.get(symbol, [])
+        if rows:
+            import time as _tt
+            cutoff = int(_tt.time() // 60) * 60 - (minutes * 60)
+            rows = [r for r in rows if r.get('ts', 0) >= cutoff]
+        return jsonify({'ok': True, 'symbol': symbol, 'data': rows})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)[:120]}), 500
+
 
 @app.route('/api/ltp', methods=['GET'])
 def live_ltp():
@@ -1598,6 +2370,7 @@ def exit_position():
                     for leg_sym, leg_action in legs:
                         exch, tsym = leg_sym.split(':')
                         tx = kite.TRANSACTION_TYPE_SELL if leg_action == 'SELL' else kite.TRANSACTION_TYPE_BUY
+                        _kite_throttle()  # 2026-05-11: cross-process throttle
                         order_id = kite.place_order(
                             variety=kite.VARIETY_REGULAR,
                             exchange=exch,
@@ -1814,6 +2587,7 @@ def exit_all_positions():
                     for leg_sym, leg_action in legs:
                         exch, tsym = leg_sym.split(':')
                         tx = kite.TRANSACTION_TYPE_SELL if leg_action == 'SELL' else kite.TRANSACTION_TYPE_BUY
+                        _kite_throttle()  # 2026-05-11: cross-process throttle
                         order_id = kite.place_order(
                             variety=kite.VARIETY_REGULAR,
                             exchange=exch,
@@ -2136,6 +2910,16 @@ def place_news_trade():
             import math as _math
             lots = int(_math.ceil(_MIN_BUDGET / _premium_per_lot))
             lots = max(1, min(lots, _MAX_LOTS))
+        # 2026-05-14: enforce MAX_LOTS_PER_TRADE user cap (default 1) on news manual
+        # entries too — was bypassing the place_option_order cap and sizing 3-10 lots.
+        try:
+            from config import HARD_RULES as _HR_news
+            _news_cap = int(_HR_news.get('MAX_LOTS_PER_TRADE', 1))
+        except Exception:
+            _news_cap = 1
+        if _news_cap > 0 and lots > _news_cap:
+            print(f'⏭️ NEWS MANUAL cap: {lots} -> {_news_cap} lots (MAX_LOTS_PER_TRADE)')
+            lots = _news_cap
         quantity = lot_size * lots
         print(f"ðŸ“° NEWS MANUAL SIZING: {symbol} premium/lot=â‚¹{_premium_per_lot:.0f} â†’ {lots} lot(s) = â‚¹{_premium_per_lot*lots:.0f} notional")
 
@@ -2150,6 +2934,7 @@ def place_news_trade():
         else:
             # REAL LIVE ORDER
             try:
+                _kite_throttle()  # 2026-05-11: cross-process throttle
                 order_id = kite.place_order(
                     variety=kite.VARIETY_REGULAR,
                     exchange='NFO',
@@ -2413,13 +3198,27 @@ def pnl_live():
                             k = s if ':' in s else ('NFO:' + s)
                             lookup.append(k)
                             key_map[k] = s
-                        data = kite.ltp(lookup) or {}
+                        # kite.quote() returns depth; same rate-class as ltp() but lets
+                        # us compute REALIZABLE exit price by walking the bid/ask book.
+                        # LTP is just the last printed trade (often a 1-lot tick) and
+                        # diverges sharply from fillable price for size in thin options.
+                        data = kite.quote(lookup) or {}
+                        # Pull qty map so we can walk depth for the exact position size.
+                        # Built from positions passed in below via closure; falls back to 0.
                         for k, v in data.items():
-                            lp = (v or {}).get('last_price')
+                            if not isinstance(v, dict):
+                                continue
+                            lp = v.get('last_price')
+                            orig = key_map.get(k, k)
                             if lp is not None:
-                                orig = key_map.get(k, k)
                                 _LTP_CACHE[orig] = (now_wall, float(lp))
                                 fresh_ltps[orig] = float(lp)
+                            # Store full depth on side channel for realizable calc below.
+                            dep = (v.get('depth') or {})
+                            _DEPTH_CACHE[orig] = (now_wall, {
+                                'buy': dep.get('buy') or [],   # bids (what we SELL into)
+                                'sell': dep.get('sell') or [], # asks (what we BUY into)
+                            })
                     else:
                         kite_err = 'no_kite'
             except Exception as _e:
@@ -2473,7 +3272,35 @@ def pnl_live():
             if ltp > 0 and sym in fresh_ltps:
                 _LAST_GOOD_LTP[sym] = (now_wall, ltp)  # only remember fresh fetches
 
-            # Compute unrealized (SIDE-based to match bot's authoritative formula)
+            # Realizable exit price via depth walk (fixes UI showing LTP-based
+            # phantom profit that vanishes when a large MARKET order eats the book).
+            realizable = ltp
+            dep_entry = _DEPTH_CACHE.get(sym)
+            if dep_entry and (now_wall - dep_entry[0]) < 5.0 and qty > 0:
+                dep = dep_entry[1]
+                # Holding BUY → exit is SELL → we cross the bids (depth.buy)
+                # Holding SELL → exit is BUY → we cross the asks (depth.sell)
+                book = dep.get('buy' if s == 'BUY' else 'sell') or []
+                remaining = qty
+                weighted = 0.0
+                filled = 0
+                for level in book:
+                    lp_ = float(level.get('price') or 0)
+                    lq_ = int(level.get('quantity') or 0)
+                    if lp_ <= 0 or lq_ <= 0:
+                        continue
+                    take = min(remaining, lq_)
+                    weighted += lp_ * take
+                    filled += take
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+                if filled >= qty * 0.95:  # depth covers ≥95% of our size
+                    realizable = weighted / filled
+
+            # 2026-05-14: Kite-app ground truth — P&L = (LTP - avg) × qty.
+            # Matches what Kite mobile shows in its Positions tab. User asked
+            # for simplicity over depth-walk realizable price.
             if spread and isinstance(db_lp, dict):
                 unreal = float(db_lp.get('unrealized_pnl') or 0)
             elif ltp > 0 and entry > 0 and qty > 0:
@@ -2496,6 +3323,7 @@ def pnl_live():
                 'ltp': round(ltp, 2),
                 'upnl': round(unreal, 2),
                 'pct': round(pnl_pct, 2),
+                'entry_slip_inr': round(float(p.get('entry_slippage_inr', 0) or 0), 2),
             }
             total_unreal += unreal
         return jsonify({

@@ -14,6 +14,144 @@ from kiteconnect import KiteConnect
 import pandas as pd
 import os
 
+# 2026-05-13: Monkey-patch KiteConnect.place_order to accept `market_protection`.
+# Kite's REST API requires it for MARKET/SL-M stock-option orders (server-side
+# enforcement: "MARKET orders are blocked for stock options due to illiquidity"),
+# but the SDK's public signature doesn't include the kwarg → TypeError.
+# Patch goes via the SDK's internal _post(); same path the SDK uses.
+# Applies to ALL KiteConnect instances (bot's kite + dashboard's _get_dashboard_kite()).
+_KITE_ORIGINAL_PLACE_ORDER = KiteConnect.place_order
+
+
+class KiteOrderRejected(Exception):
+    """Raised when Kite rejects an order within the post-place verification window.
+    Carries the order_id and rejection reason so callers can log/handle cleanly."""
+    def __init__(self, order_id, reason):
+        self.order_id = order_id
+        self.reason = reason
+        super().__init__(f"Order {order_id} REJECTED: {reason}")
+
+
+def _kite_place_order_patched(self, **kwargs):
+    """Drop-in replacement for KiteConnect.place_order.
+
+    Two extensions over the SDK version:
+      1. Accepts market_protection (and any future REST kwargs Kite adds)
+      2. Post-place verification: polls order_history for up to 3s and
+         raises KiteOrderRejected if Kite rejects the order in that window.
+         This eliminates phantom positions (bot thinks order filled, broker
+         actually rejected — caused +₹4,860 fake P&L on NMDC 2026-05-13).
+
+    Returns order_id (string) on success/pending. Raises on rejection."""
+    import time as _kpt_time
+    variety = kwargs.pop('variety', None)
+
+    # 2026-05-14: round any price/trigger to NFO option tick size (₹0.05)
+    # to prevent "trigger price not multiple of tick size" rejects.
+    # NSE equities use ₹0.05 too, so safe for both.
+    _exchange = str(kwargs.get('exchange', '')).upper()
+    if _exchange in ('NFO', 'BFO', 'NSE', 'BSE'):
+        for _pk in ('price', 'trigger_price'):
+            _pv = kwargs.get(_pk)
+            if _pv is not None and isinstance(_pv, (int, float)) and _pv > 0:
+                kwargs[_pk] = round(round(float(_pv) / 0.05) * 0.05, 2)
+
+    # 2026-05-14: AUTO-INJECT market_protection for MARKET/SL-M orders.
+    # Kite blocks these for stock options without market_protection
+    # ("MARKET orders are blocked for stock options due to illiquidity").
+    # Previously only zerodha_tools.place_order_with_retry injected this;
+    # dashboard's direct kite.place_order calls (reverse, news entry) bypassed
+    # → LTM reverse new leg failed today. Inject at monkey-patch level so
+    # EVERY place_order site is protected uniformly.
+    _ot = str(kwargs.get('order_type', '')).upper()
+    if 'MARKET' in _ot or 'SLM' in _ot or 'SL-M' in _ot:
+        _mp = kwargs.get('market_protection')
+        if _mp is None or (isinstance(_mp, (int, float)) and _mp <= 0):
+            kwargs['market_protection'] = 5
+
+    params = {k: v for k, v in kwargs.items() if v is not None}
+    order_id = self._post("order.place", url_args={"variety": variety}, params=params)["order_id"]
+
+    # Verify: poll order_history up to 6×0.5s = 3s for terminal status.
+    # Most rejections happen within ~1-2s (KYC, margin, contract validation).
+    for _attempt in range(6):
+        _kpt_time.sleep(0.5)
+        try:
+            history = self.order_history(order_id=order_id) or []
+        except Exception:
+            break  # network error during poll — don't block, return order_id
+        if not history:
+            continue
+        status = str((history[-1].get('status') or '')).upper()
+        if status == 'REJECTED':
+            msg = (history[-1].get('status_message') or 'rejected without message')[:200]
+            try:
+                print(f"❌ KITE REJECTED order_id={order_id}: {msg}")
+            except Exception:
+                pass
+            raise KiteOrderRejected(order_id, msg)
+        if status in ('COMPLETE', 'OPEN'):
+            return order_id  # filled or working
+        # PENDING / VALIDATION — keep polling
+    return order_id
+
+
+KiteConnect.place_order = _kite_place_order_patched
+
+# ── Cross-process Kite throttle (2026-05-11) ──────────────────────
+# Per-process self._last_order_ts only protects within one process.
+# Today's 429 storm: gunicorn dashboard has 2 workers × 4 threads,
+# each with its own kite client; plus titan-bot is a third process.
+# All 3 share the same Kite API key & compete for the same 10 req/sec
+# server-side limit but have NO shared throttle state. When AP fires
+# 3-4 reverses in a burst → cross-process burst → 429 cascade →
+# reverse executions fail → positions stay in the bleed.
+# Fix: filesystem-mutex (fcntl) shared throttle. All processes
+# serialize through it before any Kite order placement.
+try:
+    import fcntl as _fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False  # Windows dev box — no-op (prod is Linux)
+
+_KITE_THROTTLE_FILE = '/tmp/titan_kite_order_throttle'
+_KITE_THROTTLE_GAP_S = 0.40  # 400ms — 350ms + 50ms safety vs Kite's 10/sec
+
+
+def kite_global_throttle():
+    """Cross-process throttle for Kite order calls. Serializes via fcntl
+    on a shared file. Called by EVERY Kite order placement path. Idempotent
+    and fail-safe (never raises)."""
+    if not _HAS_FCNTL:
+        return  # Windows/dev — no-op
+    try:
+        with open(_KITE_THROTTLE_FILE, 'a+') as _f:
+            try:
+                _fcntl.flock(_f.fileno(), _fcntl.LOCK_EX)
+                _f.seek(0)
+                _content = _f.read().strip()
+                _last_ts = float(_content) if _content else 0.0
+                _now = time.time()
+                _gap = _now - _last_ts
+                if _gap < _KITE_THROTTLE_GAP_S:
+                    time.sleep(_KITE_THROTTLE_GAP_S - _gap)
+                    _now = time.time()
+                _f.seek(0)
+                _f.truncate()
+                _f.write(str(_now))
+                _f.flush()
+            finally:
+                try:
+                    _fcntl.flock(_f.fileno(), _fcntl.LOCK_UN)
+                except Exception:
+                    pass
+    except Exception as _e:
+        # Fail open — don't block trades if file lock breaks
+        try:
+            print(f"⚠️ FALLBACK [kite_global_throttle]: {_e}")
+        except Exception:
+            pass
+
 from config import (
     ZERODHA_API_KEY, ZERODHA_API_SECRET, 
     HARD_RULES, TRADING_HOURS, APPROVED_UNIVERSE, FNO_CONFIG
@@ -812,20 +950,27 @@ class ZerodhaTools:
         """
         import time as _time
         
-        # === MARKET PROTECTION (Kite mandate effective April 1 2026) ===
-        # market_protection=0 or missing is REJECTED for MARKET and SL-M orders
+        # 2026-05-13 v2 — Kite's REST API requires market_protection for
+        # MARKET/SL-M stock-option orders (server-side enforcement), but the
+        # kiteconnect Python SDK's place_order() signature doesn't include
+        # this kwarg. Solution: bypass the SDK signature by calling its
+        # internal _post() directly with our own params dict (which can
+        # include market_protection).
         ot = str(kwargs.get('order_type', '')).upper()
-        if 'MARKET' in ot or 'SLM' in ot or 'SL-M' in ot:
+        _needs_protection = ('MARKET' in ot or 'SLM' in ot or 'SL-M' in ot)
+        if _needs_protection:
             mp = kwargs.get('market_protection')
             if mp is None or (isinstance(mp, (int, float)) and mp <= 0):
                 kwargs['market_protection'] = 5
         
-        # === RATE LIMIT THROTTLE (350ms min gap between orders) ===
+        # === RATE LIMIT THROTTLE (350ms per-process + cross-process file mutex) ===
         if not hasattr(self, '_last_order_ts'):
             self._last_order_ts = 0.0
         elapsed = _time.time() - self._last_order_ts
         if elapsed < 0.35:
             _time.sleep(0.35 - elapsed)
+        # 2026-05-11: also serialize across processes (titan-bot + 2 gunicorn workers)
+        kite_global_throttle()
         
         # === AUTOSLICE ROUTE PATCH ===
         use_autoslice = AUTOSLICE_ENABLED and hasattr(self.kite, '_routes')
@@ -1509,18 +1654,38 @@ class ZerodhaTools:
                             # print(f"   ⏳ Cooldown: {_cooldown_underlying} blocked for {_cd_mins} min re-entry")
                         
                         # === LIVE MODE: Place real exit order on Zerodha ===
-                        if not self.paper_mode and status != 'STOPLOSS_HIT' and status != 'SL_HIT':
-                            # Don't place exit for SL_HIT — the SL-M order already triggered at broker
-                            self._execute_live_exit(trade)
-                        elif not self.paper_mode and status in ('STOPLOSS_HIT', 'SL_HIT'):
-                            # SL-M order already triggered at broker — fetch its actual fill
-                            _sl_oid = trade.get('sl_order_id')
-                            if _sl_oid and not str(_sl_oid).startswith('PAPER_') and '|' not in str(trade.get('symbol', '')):
+                        # Branch by whether a real broker-side SL-M order exists.
+                        # Post 2026-05-14 SPAN fix: options have sl_order_id=''
+                        # because broker-side SL-M was disabled (it was demanding
+                        # SPAN margin on the standing SELL). Bot's exit_manager
+                        # detects SL hit and fires market exit instead. Without
+                        # this branch fix, SL_HIT on options marked the position
+                        # closed internally but no SELL reached Kite — phantom
+                        # exit (ZYDUSLIFE 990CE on 2026-05-14).
+                        if not self.paper_mode:
+                            _sl_oid_real = trade.get('sl_order_id')
+                            _has_broker_sl = bool(_sl_oid_real) and not str(_sl_oid_real).startswith('PAPER_')
+                            _is_sl_exit = status in ('STOPLOSS_HIT', 'SL_HIT')
+                            _has_pipe = '|' in str(trade.get('symbol', ''))  # spread
+                            # Statuses that mean "already closed at broker — sync only,
+                            # do NOT place another order". Otherwise we'd try to short
+                            # against a non-existent position and Kite would demand
+                            # full SPAN margin (~₹40L+).
+                            _already_closed_statuses = ('BROKER_CLOSED', 'MANUAL_KITE_EXIT')
+                            if status in _already_closed_statuses:
+                                print(f"   📋 {symbol}: status={status} — broker already closed, skipping exit order")
+                            elif _is_sl_exit and _has_broker_sl and not _has_pipe:
+                                # Broker SL-M already fired — just record the actual fill
                                 try:
                                     trade.setdefault('exit_price_ltp', trade.get('exit_price'))
-                                    self._apply_broker_fill_to_trade(trade, _sl_oid)
+                                    self._apply_broker_fill_to_trade(trade, _sl_oid_real)
                                 except Exception as _e:
                                     print(f"   ⚠️ SL fill lookup failed: {_e}")
+                            else:
+                                # Any other case (target, manual, reverse, OR
+                                # SL_HIT without a broker SL-M): place a market
+                                # exit so Kite actually closes the position.
+                                self._execute_live_exit(trade)
 
                         # Use broker-confirmed pnl if _execute_live_exit updated it
                         _final_pnl = trade.get('pnl') if trade.get('pnl') is not None else (pnl or 0)
@@ -4361,6 +4526,139 @@ class ZerodhaTools:
                 "error": str(e)
             }
     
+    # =================================================================
+    # OPTION LIQUIDITY GATE (2026-05-14 — SAMMAANCAP death-spiral fix)
+    # =================================================================
+
+    # Thresholds are conservative. Tune via titan_settings.json if needed.
+    LIQ_GATE_MAX_SPREAD_PCT = 4.0     # reject if (ask-bid)/mid > 4%
+    LIQ_GATE_MIN_TOP3_DEPTH_RATIO = 1.0   # top-3 ask qty must >= 1.0 × order qty
+    LIQ_GATE_MAX_SLIPPAGE_PCT = 2.5   # reject if depth-walked avg > LTP × (1+2.5%)
+
+    def _check_option_liquidity(self, symbol: str, qty: int, side: str = 'BUY',
+                                  ref_ltp: float | None = None) -> dict:
+        """Check option depth/spread liquidity before order placement.
+
+        Returns dict with 'ok' (bool), 'reason' (str), 'details' (dict).
+        Failing fail-safe: any error → returns ok=True so we don\'t silently
+        block trades on transient quote fetch issues.
+        """
+        result = {'ok': True, 'reason': '', 'details': {}}
+        if not symbol or qty <= 0:
+            return result
+        # Only gate options
+        if 'NFO:' not in symbol:
+            return result
+        try:
+            from config import HARD_RULES as _HR
+            max_spread = float(_HR.get('LIQ_GATE_MAX_SPREAD_PCT', self.LIQ_GATE_MAX_SPREAD_PCT))
+            min_depth_ratio = float(_HR.get('LIQ_GATE_MIN_TOP3_DEPTH_RATIO', self.LIQ_GATE_MIN_TOP3_DEPTH_RATIO))
+            max_slip = float(_HR.get('LIQ_GATE_MAX_SLIPPAGE_PCT', self.LIQ_GATE_MAX_SLIPPAGE_PCT))
+        except Exception:
+            max_spread, min_depth_ratio, max_slip = (
+                self.LIQ_GATE_MAX_SPREAD_PCT,
+                self.LIQ_GATE_MIN_TOP3_DEPTH_RATIO,
+                self.LIQ_GATE_MAX_SLIPPAGE_PCT,
+            )
+
+        # Fetch fresh quote (Kite REST). Cached via _depth_gate_cache for 1s
+        # so back-to-back entry attempts on same symbol don\'t spam Kite.
+        import time as _t
+        if not hasattr(self, '_depth_gate_cache'):
+            self._depth_gate_cache = {}
+        now = _t.time()
+        cached = self._depth_gate_cache.get(symbol)
+        if cached and (now - cached[0]) < 1.0:
+            q = cached[1]
+        else:
+            try:
+                q_data = self.kite.quote([symbol]) or {}
+                q = q_data.get(symbol)
+                self._depth_gate_cache[symbol] = (now, q)
+            except Exception as e:
+                # Network/quote failure — allow trade rather than block on transient
+                result['details']['warn'] = f'quote fetch failed: {str(e)[:80]}'
+                return result
+        if not isinstance(q, dict):
+            result['details']['warn'] = 'no quote returned'
+            return result
+
+        depth = q.get('depth') or {}
+        bids = depth.get('buy') or []     # buyers (what SELL crosses)
+        asks = depth.get('sell') or []    # sellers (what BUY crosses)
+        ltp = float(q.get('last_price') or ref_ltp or 0)
+
+        bid = float(bids[0].get('price') or 0) if bids else 0
+        ask = float(asks[0].get('price') or 0) if asks else 0
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
+        else:
+            mid = ltp
+            spread_pct = 999.0  # no bid/ask = unsafe
+
+        # Check 1: spread cap
+        if spread_pct > max_spread:
+            result['ok'] = False
+            result['reason'] = f'spread_too_wide({spread_pct:.2f}% > {max_spread:.1f}%)'
+            result['details'] = {'spread_pct': round(spread_pct, 2), 'bid': bid, 'ask': ask, 'ltp': ltp, 'qty': qty}
+            return result
+
+        # For BUY orders we cross asks; for SELL we cross bids.
+        book = asks if side == 'BUY' else bids
+        if not book:
+            result['ok'] = False
+            result['reason'] = 'empty_book'
+            result['details'] = {'ltp': ltp, 'side': side, 'qty': qty}
+            return result
+
+        # Check 2: top-3 depth must cover at least min_depth_ratio × qty
+        top3_qty = sum(int(lv.get('quantity') or 0) for lv in book[:3])
+        if top3_qty < (qty * min_depth_ratio):
+            result['ok'] = False
+            result['reason'] = f'thin_book(top3={top3_qty} < {int(qty*min_depth_ratio)})'
+            result['details'] = {'top3_qty': top3_qty, 'required': int(qty * min_depth_ratio), 'qty': qty}
+            return result
+
+        # Check 3: projected slippage — depth-walk for the full qty
+        remaining = qty
+        weighted = 0.0
+        filled = 0
+        levels_crossed = 0
+        for lv in book:
+            lp = float(lv.get('price') or 0)
+            lq = int(lv.get('quantity') or 0)
+            if lp <= 0 or lq <= 0:
+                continue
+            levels_crossed += 1
+            take = min(remaining, lq)
+            weighted += lp * take
+            filled += take
+            remaining -= take
+            if remaining <= 0:
+                break
+        if filled >= qty * 0.95 and filled > 0:
+            avg_fill = weighted / filled
+            if ltp > 0:
+                slip_pct = ((avg_fill - ltp) / ltp) * 100.0 if side == 'BUY' else ((ltp - avg_fill) / ltp) * 100.0
+                if slip_pct > max_slip:
+                    result['ok'] = False
+                    result['reason'] = f'projected_slippage({slip_pct:.2f}% > {max_slip:.1f}%)'
+                    result['details'] = {'slip_pct': round(slip_pct, 2), 'avg_fill': round(avg_fill, 2), 'ltp': ltp, 'levels_crossed': levels_crossed, 'qty': qty}
+                    return result
+
+        # All checks passed
+        result['details'] = {
+            'spread_pct': round(spread_pct, 2),
+            'top3_qty': top3_qty,
+            'levels_to_cross': levels_crossed,
+            'qty': qty,
+            'bid': bid,
+            'ask': ask,
+            'ltp': ltp,
+        }
+        return result
+
     def place_option_order(self, underlying: str, direction: str, 
                           option_type: str | None = None, 
                           strike_selection: str = "ATM",
@@ -4398,14 +4696,30 @@ class ZerodhaTools:
             Dict with order result including Greeks and intraday decision
         """
         from options_trader import get_intraday_scorer, IntradaySignal
-        
+
+        # ── PAUSE GATE (2026-05-13) ────────────────────────────────────
+        # Central kill-switch enforcement. Pause flag was previously checked
+        # only in autonomous_trader scan loop / auto_pilot loop / dashboard
+        # reverse endpoint — but watcher_pipeline, OI_WATCHER, OI_AGGR,
+        # GMM_SNIPER all reach place_option_order via different code paths
+        # that bypassed the check. 7 trades fired during a 50-min pause today
+        # (10:30-11:21) before this fix. Now every entry path converges here.
+        _pause_flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         'trading_paused.flag')
+        if os.path.exists(_pause_flag_path):
+            return {
+                "success": False,
+                "error": f"TRADING PAUSED — {underlying} entry blocked by pause flag",
+                "action": "Resume trading from dashboard to allow new entries"
+            }
+
         # Check if symbol is F&O eligible
         options_trader = get_options_trader(
-            kite=self.kite, 
+            kite=self.kite,
             capital=getattr(self, 'paper_capital', 100000),
             paper_mode=self.paper_mode
         )
-        
+
         if not options_trader.should_use_options(underlying):
             return {
                 "success": False,
@@ -5068,7 +5382,11 @@ class ZerodhaTools:
                 print(f"   ⚠️ Theta entry gate check failed (proceeding): {_theta_err}")
         
         # Validate risk - max premium check
-        max_premium_per_trade = 150000  # ₹1.5 lakh per option trade
+        # 2026-05-13 v2: HARD_RULES["CAPITAL"] is the config.py default (500K)
+        # — JSON override + LIVE broker-sync update self.paper_capital but NOT
+        # HARD_RULES. Use the LIVE/synced capital directly.
+        active_capital = getattr(self, 'paper_capital', None) or HARD_RULES.get("CAPITAL", 500000)
+        max_premium_per_trade = active_capital * 0.30
         if plan.total_premium > max_premium_per_trade:
             return {
                 "success": False,
@@ -5132,6 +5450,23 @@ class ZerodhaTools:
                 # print(f"   ⚠️ Lot multiplier {lot_multiplier}x would exceed limits, keeping {original_lots} lots")
                 pass
 
+        # === MAX_LOTS_PER_TRADE CAP (2026-05-14 user directive) =================
+        # Hard cap on per-trade lots — applies to ALL entry paths regardless of
+        # conviction or lot_multiplier. Default 1 lot (minimum). Raised
+        # later via titan_settings.json (HARD_RULES.MAX_LOTS_PER_TRADE).
+        try:
+            from config import HARD_RULES as _HR_lots
+            _max_lots_cap = int(_HR_lots.get('MAX_LOTS_PER_TRADE', 1))
+        except Exception:
+            _max_lots_cap = 1
+        if _max_lots_cap > 0 and plan.quantity > _max_lots_cap:
+            _orig_lots_cap = plan.quantity
+            plan.quantity = _max_lots_cap
+            plan.total_premium = _max_lots_cap * plan.premium_per_lot
+            plan.max_loss = plan.total_premium
+            print(f"   📏 MAX_LOTS cap: {_orig_lots_cap} → {_max_lots_cap} lots "
+                  f"(₹{plan.total_premium:,.0f}) — user safety cap")
+
         # === VIX REGIME: WIDEN SL (high VIX = more noise, wider SL avoids premature stops) ===
         _vix_m = getattr(self, '_vix_multipliers', None)
         if _vix_m and _vix_m.get('sl_widen', 1.0) > 1.0:
@@ -5150,6 +5485,39 @@ class ZerodhaTools:
             _vix_val = _vix_m.get('vix', 14.0)
             print(f"   📐 VIX SL WIDEN [{_vix_regime}] VIX={_vix_val:.1f}: SL ₹{_old_sl:.2f} → ₹{plan.stoploss_premium:.2f} (×{_sl_widen:.2f})")
 
+        # === LIQUIDITY GATE (L1, 2026-05-14 SAMMAANCAP fix) ====================
+        # Refuse the order if the option's bid-ask spread + book depth would
+        # cause the position to enter deeply red on slippage alone. SAMMAANCAP
+        # 145CE had ~8% spread; bot ate 12 book levels with 60,200 qty and lost
+        # ~₹62K in the first cycle just from microstructure. This gate stops
+        # the bot from buying into options where the -2.3% reverse rule can
+        # never beat the round-trip spread cost.
+        _entry_bid_snap = 0.0
+        try:
+            _liq_check = self._check_option_liquidity(
+                plan.contract.symbol,
+                plan.quantity * plan.contract.lot_size,
+                side='BUY',
+                ref_ltp=plan.contract.ltp,
+            )
+            if not _liq_check.get('ok'):
+                _reason = _liq_check.get('reason', 'illiquid')
+                _details = _liq_check.get('details', {})
+                print(f"   🚫 LIQUIDITY GATE REJECTED {plan.contract.symbol}: {_reason}")
+                for _k, _v in _details.items():
+                    print(f"      • {_k}: {_v}")
+                return {
+                    "success": False,
+                    "error": f"LIQUIDITY_GATE: {_reason}",
+                    "details": _details,
+                    "symbol": plan.contract.symbol,
+                }
+            # Snapshot bid at order-placement time for entry-slippage calc
+            _entry_bid_snap = float((_liq_check.get('details') or {}).get('bid') or 0)
+        except Exception as _lq_e:
+            # Never let a gate failure block a trade silently — log and continue.
+            print(f"   ⚠️ Liquidity gate check error (allowing trade): {_lq_e}")
+
         # Execute the order
         result = options_trader.execute_option_order(plan)
         
@@ -5164,12 +5532,20 @@ class ZerodhaTools:
                 # Options are always BOUGHT (BUY CE for bullish, BUY PE for bearish)
                 # The direction (BUY/SELL) indicates the market view, not the option transaction
                 option_side = 'BUY'  # We always buy options (debit), never write/sell them
+                _paper_qty = plan.quantity * plan.contract.lot_size
+                _paper_slip_inr = 0.0
+                if _entry_bid_snap > 0 and plan.contract.ltp > 0:
+                    # In paper mode, simulate slippage as (ltp - bid) × qty since
+                    # we don't have a real fill price. ltp ≈ ask side after a BUY.
+                    _paper_slip_inr = round((plan.contract.ltp - _entry_bid_snap) * _paper_qty * -1, 2)
                 option_position = {
                     'symbol': plan.contract.symbol,
                     'underlying': plan.underlying,
-                    'quantity': plan.quantity * plan.contract.lot_size,
+                    'quantity': _paper_qty,
                     'lots': plan.quantity,
                     'avg_price': plan.contract.ltp,
+                    'entry_bid_snap': _entry_bid_snap,
+                    'entry_slippage_inr': _paper_slip_inr,
                     'side': option_side,
                     'direction': plan.direction,  # Final direction from scorer (may differ from LLM's original)
                     'option_type': plan.contract.option_type.value,
@@ -5233,12 +5609,20 @@ class ZerodhaTools:
                 except Exception:
                     fill_price = plan.contract.ltp
                 
+                _live_qty = plan.quantity * plan.contract.lot_size
+                _live_slip_inr = 0.0
+                if _entry_bid_snap > 0 and fill_price > 0:
+                    # Real slippage: paid fill_price, could have sold at entry-time bid.
+                    # For a BUY, slip = -(fill - bid) * qty (negative = cost).
+                    _live_slip_inr = round((fill_price - _entry_bid_snap) * _live_qty * -1, 2)
                 option_position = {
                     'symbol': plan.contract.symbol,
                     'underlying': plan.underlying,
-                    'quantity': plan.quantity * plan.contract.lot_size,
+                    'quantity': _live_qty,
                     'lots': plan.quantity,
                     'avg_price': fill_price,
+                    'entry_bid_snap': _entry_bid_snap,
+                    'entry_slippage_inr': _live_slip_inr,
                     'side': option_side,
                     'direction': plan.direction,
                     'option_type': plan.contract.option_type.value,
@@ -5284,26 +5668,22 @@ class ZerodhaTools:
                     'arbtr_meta': (ml_data or {}).get('arbtr_meta', {}),
                 }
                 
-                # Place SL-M order for the option
-                try:
-                    exchange, tradingsymbol = plan.contract.symbol.split(':')
-                    sl_trigger = plan.stoploss_premium * 0.999  # Slightly wider
-                    sl_order_id = self._place_order_autoslice(
-                        variety=self.kite.VARIETY_REGULAR,
-                        exchange=exchange,
-                        tradingsymbol=tradingsymbol,
-                        transaction_type=self.kite.TRANSACTION_TYPE_SELL,
-                        quantity=plan.quantity * plan.contract.lot_size,
-                        product=self.kite.PRODUCT_MIS,
-                        order_type=self.kite.ORDER_TYPE_SLM,
-                        trigger_price=sl_trigger,
-                        validity=self.kite.VALIDITY_DAY,
-                        tag='TITAN_OPT_SL'
-                    )
-                    option_position['sl_order_id'] = str(sl_order_id)
-                    print(f"      🛡️ Live SL order placed: trigger ₹{sl_trigger:.2f} (order: {sl_order_id})")
-                except Exception as e:
-                    print(f"      ⚠️ Failed to place SL order for option: {e}")
+                # 2026-05-14: BROKER-SIDE SL-M FOR OPTIONS DISABLED
+                # User directive: "Don't place any sell orders requiring high
+                # margins — we only Buy Put and Buy Call."
+                # The standing SELL SL-M order was triggering Kite's SPAN+exposure
+                # margin requirement (~₹13.8L) because it treats a hanging SELL as
+                # a potential short-write, even though it's actually intended to
+                # square-off an existing long. Result: today's first LIVE trade
+                # had 8+ rejected SL retries before the bot's internal exit_manager
+                # eventually fired a MARKET SELL (which IS a clean square-off).
+                # Drop the redundant broker-side SL. Bot's exit_manager monitors
+                # LTP every 3s and fires MARKET SELL on SL hit — square-off, no
+                # extra margin. Same protection, no margin block.
+                # GTT safety net below (placed via _place_gtt_safety_net) handles
+                # crash-recovery via OCO; it doesn't reserve margin at placement.
+                option_position['sl_order_id'] = ''  # no broker SL — bot handles via market exit
+                print(f"      ⚙️ Option SL handled by bot exit_manager (no broker SL-M to avoid SPAN margin block)")
                 
                 # Place GTT safety net for option
                 gtt_trigger_id = self._place_gtt_safety_net(

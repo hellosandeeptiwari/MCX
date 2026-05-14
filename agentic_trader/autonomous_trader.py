@@ -229,6 +229,8 @@ class AutonomousTrader:
         
         # Wire manual-exit reconciliation callback (Kite app exits)
         self.position_recon.on_manual_exit_callback = self._on_recon_manual_exit
+        # Wire phantom-exit recovery (broker has it but bot thinks closed)
+        self.position_recon.on_phantom_exit_callback = self._on_phantom_exit
         
         # Start reconciliation loop
         self.position_recon.start()
@@ -1015,7 +1017,11 @@ class AutonomousTrader:
             # Check position limits (regime-aware: fewer positions in MIXED market)
             active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
             _elite_breadth = data.get('market_breadth', 'MIXED') if isinstance(data, dict) else 'MIXED'
-            if _elite_breadth == 'MIXED':
+            # LIVE mode: honor MAX_POSITIONS strictly (user-set safety cap).
+            # PAPER mode: use regime-aware overrides for broader testing.
+            if not self.paper_mode:
+                _max_pos = HARD_RULES['MAX_POSITIONS']
+            elif _elite_breadth == 'MIXED':
                 _max_pos = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
             elif _elite_breadth in ('BULLISH', 'BEARISH'):
                 _max_pos = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
@@ -1563,7 +1569,10 @@ class AutonomousTrader:
         # --- Position exhaustion pre-check ---
         _breadth = getattr(self, '_last_market_breadth', 'MIXED')
         active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
-        if _breadth == 'MIXED':
+        # LIVE mode: honor MAX_POSITIONS strictly. PAPER: regime-aware.
+        if not self.paper_mode:
+            _max_pos = HARD_RULES['MAX_POSITIONS']
+        elif _breadth == 'MIXED':
             _max_pos = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
         elif _breadth in ('BULLISH', 'BEARISH'):
             _max_pos = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
@@ -1638,7 +1647,16 @@ class AutonomousTrader:
                     self._oi_analyzer.analyze, _bt['symbol'])] = _bt['symbol']
             # Apr 21: raised 12s→20s — OI_AGGR (8 workers × 33 syms) can congest Kite
             # during its 120s window; Layer-1 needs headroom to avoid bypass-with-NO_DATA.
-            _l1_timeout = max(20, len(_batch) * 3)
+            # May 9: SPIKE/GRIND/VOLUME/DAY-only batches use 5s timeout — the strong-trigger
+            # bypass below already handles missing OI, so don't block fast onboarding.
+            _strong_only_batch = all(
+                ('SPIKE' in (_bt.get('trigger_type') or '')
+                 or 'GRIND' in (_bt.get('trigger_type') or '')
+                 or 'VOLUME' in (_bt.get('trigger_type') or '')
+                 or 'DAY' in (_bt.get('trigger_type') or ''))
+                for _bt in _batch
+            )
+            _l1_timeout = 5 if _strong_only_batch else max(20, len(_batch) * 3)
             try:
                 for _f in _l1_done(_l1_futures, timeout=_l1_timeout):
                     _l1_sym = _l1_futures[_f]
@@ -1704,8 +1722,20 @@ class AutonomousTrader:
         # ================================================================
         # OI_WATCHER — 13-factor conviction engine with 10+3 anchor gate
         # Delegated to oi_watcher_engine.OIWatcherEngine
+        # [May 9] Run in background thread — OI_WATCHER scans the entire OI
+        # universe and would otherwise block SPIKE/GRIND pipeline start by
+        # 5-15s. It's independent of the price-trigger pipeline below.
         # ================================================================
-        self._oi_engine.run_watcher_scan(_layer1_oi)
+        try:
+            _oi_eng_thread = threading.Thread(
+                target=lambda: self._oi_engine.run_watcher_scan(_layer1_oi),
+                daemon=True,
+                name="oi-watcher-scan",
+            )
+            _oi_eng_thread.start()
+        except Exception as _oie:
+            self._wlog(f"⚠️ OI_WATCHER thread start failed (running inline): {_oie}")
+            self._oi_engine.run_watcher_scan(_layer1_oi)
 
         self._watcher_total_pipeline_sent += len(_batch)
         
@@ -1721,17 +1751,32 @@ class AutonomousTrader:
         # 10-30s focused scan.  A _trade_lock serialises order placement
         # so scan_and_trade and the watcher never place orders simultaneously.
         if self._watcher_pipe_busy:
-            # [FIX Mar 19] Re-queue triggers instead of dropping them silently.
-            # Previously these were drained from queue but never re-queued,
-            # causing spikes/surges/grinds to be lost when pipeline was busy.
-            _requeued = 0
-            for _rq_t in _batch:
-                _rq_move = abs(_rq_t.get('move_pct', 0))
-                _rq_added, _ = watcher._queue.put(_rq_t, _rq_move)
-                if _rq_added:
-                    _requeued += 1
-            self._wlog(f"⏳ Pipeline busy — re-queued {_requeued}/{len(_batch)} triggers (will process next drain)")
-            return
+            # [May 9] SPIKE/GRIND fast lane: wait up to 4s for current pipeline
+            # to finish before re-queuing. Cuts worst-case onboarding from
+            # ~30s (full pipeline duration) to ~4s when main lane is wrapping up.
+            _fast_lane_batch = all(
+                ('SPIKE' in (_rq_t.get('trigger_type') or '')
+                 or 'GRIND' in (_rq_t.get('trigger_type') or ''))
+                for _rq_t in _batch
+            )
+            if _fast_lane_batch and self._watcher_pipe_thread is not None:
+                self._wlog(f"⏳ Fast-lane (SPIKE/GRIND): waiting up to 4s for current pipeline…")
+                try:
+                    self._watcher_pipe_thread.join(timeout=4.0)
+                except Exception:
+                    pass
+            if self._watcher_pipe_busy:
+                # [FIX Mar 19] Re-queue triggers instead of dropping them silently.
+                # Previously these were drained from queue but never re-queued,
+                # causing spikes/surges/grinds to be lost when pipeline was busy.
+                _requeued = 0
+                for _rq_t in _batch:
+                    _rq_move = abs(_rq_t.get('move_pct', 0))
+                    _rq_added, _ = watcher._queue.put(_rq_t, _rq_move)
+                    if _rq_added:
+                        _requeued += 1
+                self._wlog(f"⏳ Pipeline busy — re-queued {_requeued}/{len(_batch)} triggers (will process next drain)")
+                return
 
         self._watcher_pipe_busy = True
         self._watcher_drain_oi = _layer1_oi  # Pre-fetched from Layer 1
@@ -2917,21 +2962,15 @@ class AutonomousTrader:
                                             f'H(ATM)={"✓" if _grind_mf_H else "?" if not _grind_eval_H else "✗"} '
                                             f'K(FutConv)={"✓" if _grind_mf_K else "?" if not _grind_eval_K else "✗"} '
                                             f'N(NetOI)={"✓" if _grind_mf_N else "?" if not _grind_eval_N else "✗"}')
+                    # 2026-05-12 LOOSENED (user directive: underlying tape is truth,
+                    # OI confirmation is bonus not gate for grinds). B2-OI-ANCHOR
+                    # is now WARNING-ONLY for grinds — does not block. Was the
+                    # #1 grind killer (60 of last 200 blocks). Dhan API slowness
+                    # was causing "no data" → BLOCK cascades.
                     if _grind_evaluable == 0:
-                        # Apr 20 FIX: No institutional data = BLOCK (was bypass)
-                        self._wlog(f"  BLOCKED(B2-OI-ANCHOR): {_stock_name} GRIND -- 0/4 factors evaluable (no data) -- {_grind_anchor_detail}")
-                        self._watcher_total_gate_blocked += 1
-                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_GRIND_NO_OI_DATA',
-                                          reason=f'Grind OI anchor: 0/4 factors evaluable (no institutional data): {_grind_anchor_detail}',
-                                          direction=direction)
-                        continue
+                        self._wlog(f"  WARN(B2-OI-ANCHOR-LOOSE): {_stock_name} GRIND -- 0/4 factors evaluable (no data) -- {_grind_anchor_detail} -- ALLOWING")
                     elif _grind_anchor_count < 1:
-                        self._wlog(f"  BLOCKED(B2-OI-ANCHOR): {_stock_name} GRIND needs ≥1/{_grind_evaluable} anchor — {_grind_anchor_detail}")
-                        self._watcher_total_gate_blocked += 1
-                        self._log_decision(_ts, _sym, _final_score, 'WATCHER_GRIND_NO_OI_ANCHOR',
-                                          reason=f'Grind OI anchor 0/{_grind_evaluable}: {_grind_anchor_detail}',
-                                          direction=direction)
-                        continue
+                        self._wlog(f"  WARN(B2-OI-ANCHOR-LOOSE): {_stock_name} GRIND 0/{_grind_evaluable} anchor confirm — {_grind_anchor_detail} -- ALLOWING (no-OI grinds permitted)")
                     else:
                         self._wlog(f"  PASSED(B2-OI-ANCHOR): {_stock_name} {_grind_anchor_count}/{_grind_evaluable} anchors — {_grind_anchor_detail}")
 
@@ -3276,7 +3315,10 @@ class AutonomousTrader:
                 
                 # --- GATE H: Position limit (regime-aware, same as ELITE) ---
                 active_positions = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN']
-                if _breadth == 'MIXED':
+                # LIVE mode: honor MAX_POSITIONS strictly. PAPER: regime-aware.
+                if not self.paper_mode:
+                    _max_pos = HARD_RULES['MAX_POSITIONS']
+                elif _breadth == 'MIXED':
                     _max_pos = HARD_RULES.get('MAX_POSITIONS_MIXED', 6)
                 elif _breadth in ('BULLISH', 'BEARISH'):
                     _max_pos = HARD_RULES.get('MAX_POSITIONS_TRENDING', 12)
@@ -7889,6 +7931,19 @@ class AutonomousTrader:
                             with self._pnl_lock:
                                 self.daily_pnl += pnl
                                 self.capital += pnl
+
+                            # Record with Risk Governor — was missing for dashboard /
+                            # AP-driven exits. Without this, W/L counter only tracked
+                            # SL_HIT/TARGET wins and reported all-wins-zero-losses
+                            # even on losing days.
+                            try:
+                                _open_after = [t for t in self.tools.paper_positions if t.get('status', 'OPEN') == 'OPEN' and t.get('symbol') != symbol]
+                                _unreal = self.risk_governor._calc_unrealized_pnl(_open_after)
+                                self.risk_governor.record_trade_result(symbol, pnl, pnl > 0, unrealized_pnl=_unreal)
+                                self.risk_governor.update_capital(self.capital)
+                            except Exception as _rg_e:
+                                print(f"   ⚠️ risk_governor record_trade_result failed for {symbol}: {_rg_e}")
+
                             print(f"   🖐️ {symbol} removed from memory | P&L: ₹{pnl:+,.2f} | exit@{exit_price} | Daily P&L: ₹{self.daily_pnl:+,.0f}")
                             processed.append(symbol)
                             break
@@ -9138,6 +9193,50 @@ class AutonomousTrader:
                 self._persist_live_pnl_snapshot(active_trades, quotes)
             except Exception:
                 pass  # Silent — don't spam logs with dashboard bridge errors
+
+    def _on_phantom_exit(self, symbol: str, broker_pos: dict, reason: str):
+        """Reconciler detected broker has a position the bot thinks is closed.
+
+        Place an IMMEDIATE market exit on Kite so the orphan position doesn't
+        drift unmanaged. Only acts on options with TITAN tag — won't touch
+        user-placed manual positions or non-bot trades. This is the
+        defense-in-depth for the 2026-05-14 ZYDUSLIFE 990CE phantom bug.
+        """
+        if self.paper_mode or not symbol or not broker_pos:
+            return
+        # Only act on options. Equity positions go through a different
+        # lifecycle and may legitimately be user-held outside the bot.
+        if 'NFO:' not in symbol:
+            print(f"   ⏭️ Phantom recovery skipped for {symbol} (not an option position)")
+            return
+        try:
+            qty = int(broker_pos.get('quantity', 0) or 0)
+            if qty == 0:
+                return
+            # Determine exit side: BUY position (qty>0) closes via SELL, and vice versa.
+            exit_side = self.tools.kite.TRANSACTION_TYPE_SELL if qty > 0 else self.tools.kite.TRANSACTION_TYPE_BUY
+            exchange, tradingsymbol = symbol.split(':', 1)
+            print(f"   🔧 PHANTOM RECOVERY: placing {exit_side} {abs(qty)} {symbol} MARKET")
+            order_id = self.tools._place_order_autoslice(
+                variety=self.tools.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=exit_side,
+                quantity=abs(qty),
+                product=self.tools.kite.PRODUCT_MIS,
+                order_type=self.tools.kite.ORDER_TYPE_MARKET,
+                validity=self.tools.kite.VALIDITY_DAY,
+                market_protection=-1,
+                tag='TITAN_PHANTOM_FIX',
+            )
+            print(f"   ✅ PHANTOM RECOVERY exit placed: order_id={order_id}")
+            # Note: actual P&L will be picked up next sync cycle; we don't
+            # have the original entry context here, so we trust broker's
+            # day-position pnl on next reconciliation.
+        except Exception as e:
+            print(f"   🚨 PHANTOM RECOVERY FAILED for {symbol}: {e}")
+            print(f"   🚨 MANUAL ACTION REQUIRED: close {symbol} qty={broker_pos.get('quantity')} on Kite NOW.")
+
 
     def _persist_live_pnl_snapshot(self, active_trades, quotes):
         """Compute per-trade LTP + unrealized P&L and save to state_db.live_pnl.

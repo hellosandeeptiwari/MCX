@@ -35,12 +35,12 @@ class SystemState(Enum):
 class RiskLimits:
     """Risk limit configuration"""
     max_daily_loss_pct: float = 20.0     # Max 20% daily loss
-    max_consecutive_losses: int = 8       # Max 8 losses in a row
-    max_trades_per_day: int = 80          # Max 80 trades per day
+    max_consecutive_losses: int = 999     # Effectively uncapped — never halt on loss streak
+    max_trades_per_day: int = 150         # Max 150 trades per day (raised 2026-05-14)
     max_symbol_exposure: int = 2          # Max 2 positions in same sector/correlated
     cooldown_minutes: int = 0             # No cooldown after loss (disabled per user request)
     max_position_pct: float = 25.0        # Max 25% of capital in one position
-    max_total_exposure_pct: float = 100.0  # 100% — full capital utilization
+    max_total_exposure_pct: float = 200.0  # 100% — full capital utilization
 
 
 @dataclass

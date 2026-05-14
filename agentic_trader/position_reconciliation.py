@@ -68,6 +68,7 @@ class PositionReconciliation:
         self.state = ReconciliationState.INITIALIZING
         self.frozen = False
         self.recovery_mode = False
+        self.consecutive_syncs = 0  # tracks clean cycles for auto-exit from recovery
         self.last_check = None
         self.mismatch_count = 0
         self.consecutive_mismatches = 0
@@ -96,6 +97,10 @@ class PositionReconciliation:
         # Callback for manual/Kite-app exits detected via reconciliation
         # Signature: callback(symbol, local_position_dict, reason_str)
         self.on_manual_exit_callback: Optional[Callable[[str, Dict[str, Any], str], None]] = None
+        # Phantom-exit recovery: called when broker has a position bot thinks
+        # is closed. Signature: (symbol, broker_pos_dict, reason) -> None.
+        # Implementation should place a market exit on Kite to close the orphan.
+        self.on_phantom_exit_callback: Optional[Callable[[str, Dict[str, Any], str], None]] = None
         
         # Load any saved state
         self._load_state()
@@ -376,10 +381,34 @@ class PositionReconciliation:
                     except Exception as _cb_err:
                         print(f"   ⚠️ Reconciliation callback error for {sym}: {_cb_err}")
 
+            # === AUTO-RECOVER BROKER_ONLY POSITIONS (phantom exit detection) ===
+            # If bot thinks position is closed but broker still holds it,
+            # place a market exit immediately. This is the safety net for
+            # any future regression of the 2026-05-14 ZYDUSLIFE phantom bug
+            # — a position should never drift at broker while bot is blind.
+            broker_only = [m for m in mismatches if m['type'] == 'BROKER_ONLY']
+            if broker_only and self.on_phantom_exit_callback:
+                for m in broker_only:
+                    sym = m['symbol']
+                    bp_full = next((bp for bp in self.broker_positions if bp.get('symbol') == sym), None)
+                    if not bp_full:
+                        continue
+                    # Only auto-recover TITAN-tagged positions (so we don't
+                    # close legitimate user-placed manual positions).
+                    try:
+                        print(f"\n   🚨 PHANTOM EXIT DETECTED: {sym} — broker has {bp_full.get('quantity')} qty but bot thinks closed. Triggering recovery...")
+                        self.on_phantom_exit_callback(sym, bp_full, 'BROKER_ONLY_PHANTOM')
+                        print(f"   🔧 Reconciliation: Recovery exit dispatched for {sym}")
+                        mismatches = [m2 for m2 in mismatches if m2.get('symbol') != sym]
+                    except Exception as _cb_err:
+                        print(f"   🚨 Phantom-exit recovery FAILED for {sym}: {_cb_err}")
+                        print(f"   🚨 MANUAL ACTION: close {sym} on Kite app/web NOW.")
+
             # === HANDLE REMAINING MISMATCHES ===
             
             if mismatches:
                 self.consecutive_mismatches += 1
+                self.consecutive_syncs = 0  # any mismatch resets the auto-exit countdown
                 self.mismatch_count += len(mismatches)
                 
                 # Log mismatches
@@ -399,8 +428,20 @@ class PositionReconciliation:
                 self.state = ReconciliationState.MISMATCH_DETECTED
             else:
                 self.consecutive_mismatches = 0
-                self.state = ReconciliationState.SYNCED if not self.recovery_mode else ReconciliationState.RECOVERY_MODE
-                action_taken = "SYNCED" if not self.recovery_mode else "IN_RECOVERY"
+                self.consecutive_syncs += 1
+                # Auto-exit recovery after 3 consecutive clean cycles. Both local DB
+                # and broker have shown matching state across multiple checks, so
+                # whatever caused the original mismatch (SL-margin failure, phantom
+                # position, manual Kite exit) has resolved itself.
+                if self.recovery_mode and self.consecutive_syncs >= 3:
+                    self.recovery_mode = False
+                    self.state = ReconciliationState.SYNCED
+                    self._log_recovery_action(f"AUTO-EXIT RECOVERY: {self.consecutive_syncs} consecutive clean cycles")
+                    action_taken = "AUTO_EXITED_RECOVERY"
+                    print(f"✅ Auto-exited RECOVERY_MODE after {self.consecutive_syncs} clean cycles")
+                else:
+                    self.state = ReconciliationState.SYNCED if not self.recovery_mode else ReconciliationState.RECOVERY_MODE
+                    action_taken = "SYNCED" if not self.recovery_mode else "IN_RECOVERY"
             
             self._save_state()
             

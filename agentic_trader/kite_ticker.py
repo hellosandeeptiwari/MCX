@@ -25,7 +25,7 @@ import os
 import threading
 from typing import Dict, List, Optional, Set
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 
 try:
     from kiteconnect import KiteTicker as _KiteTicker
@@ -91,7 +91,186 @@ class TitanTicker:
         
         # === BREAKOUT WATCHER (initialized later via attach_breakout_watcher) ===
         self._breakout_watcher: Optional['BreakoutWatcher'] = None
-    
+
+        # === OI VELOCITY OBSERVABILITY (2026-05-10 — pure logging, no behavior) ===
+        # Per-tick OI is captured in _quote_cache for futures tokens.
+        # Sample at 30s cadence — for each subscribed future, dump
+        #   {ts, sym, oi, oi_30s_ago, delta_oi_30s, delta_pct, oi_day_high}
+        # to a daily JSONL. Builds the corpus needed to validate Option 2
+        # (WebSocket OI velocity as a parallel signal independent of Dhan).
+        # Runs piggyback in on_ticks (no new thread). Disable: AP_OI_VELOCITY_LOG=0
+        self._oiv_enabled = os.environ.get('AP_OI_VELOCITY_LOG', '1') not in ('0', 'false', 'False', 'no')
+        self._oiv_sample_interval = 30  # seconds between samples
+        self._oiv_last_dump_ts = 0.0
+        self._oiv_history: Dict[int, deque] = {}  # token -> deque[(ts, oi, oi_day_high)] (last ~5 min)
+        self._oiv_lock = threading.Lock()
+        self._oiv_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'oi_velocity_corpus')
+
+        # === TICK-VOLUME SPLIT TRACKER (2026-05-13) ====================
+        # Per-token uptick/downtick volume aggregator. For each tick we
+        # compare current LTP to previous LTP: up→green bucket, down→red,
+        # same→skip. Quantity used = tick['last_traded_quantity'].
+        # State: per-token current minute being built + ring buffer of past
+        # ~120 minutes. Cleared at start-of-day when first tick arrives in
+        # a new IST date.
+        self._tsplit_prev_ltp: Dict[int, float] = {}          # token → last LTP seen
+        self._tsplit_current: Dict[int, dict] = {}            # token → {minute_ts, green, red, total}
+        self._tsplit_history: Dict[int, deque] = {}           # token → deque[(minute_ts, green, red, total)]
+
+    def _update_tick_split(self, token: int, ltp: float, last_qty: int):
+        """Called on each tick. Updates the up/down volume split for
+        token's current minute. Cheap (no IO, no locks beyond the caller's)."""
+        if not token or ltp <= 0 or last_qty <= 0:
+            return
+        try:
+            now = time.time()
+            minute_ts = int(now // 60) * 60
+            cur = self._tsplit_current.get(token)
+            if cur is None or cur['minute_ts'] != minute_ts:
+                # New minute — archive previous one (if any) to history
+                if cur is not None:
+                    hist = self._tsplit_history.get(token)
+                    if hist is None:
+                        hist = deque(maxlen=120)
+                        self._tsplit_history[token] = hist
+                    hist.append((cur['minute_ts'], cur['green'], cur['red'], cur['total']))
+                cur = {'minute_ts': minute_ts, 'green': 0, 'red': 0, 'total': 0}
+                self._tsplit_current[token] = cur
+            # Classify direction
+            prev_ltp = self._tsplit_prev_ltp.get(token)
+            if prev_ltp is None:
+                # First tick — can't classify, just count to total
+                cur['total'] += last_qty
+            else:
+                if ltp > prev_ltp:
+                    cur['green'] += last_qty
+                elif ltp < prev_ltp:
+                    cur['red'] += last_qty
+                # equal — skip (neither)
+                cur['total'] += last_qty
+            self._tsplit_prev_ltp[token] = ltp
+        except Exception:
+            pass  # never break ticker on observability code
+
+    def get_tick_volume_split(self, symbol: str, minutes: int = 60) -> list:
+        """Return [{ts, green, red, total}, ...] for last `minutes` minutes
+        including current building minute. ts is epoch seconds (minute start)."""
+        token = self._symbol_to_token.get(symbol)
+        if not token:
+            return []
+        out = []
+        hist = self._tsplit_history.get(token, [])
+        cutoff = int(time.time() // 60) * 60 - (minutes * 60)
+        for ts, g, r, t in hist:
+            if ts >= cutoff:
+                out.append({'ts': ts, 'green': g, 'red': r, 'total': t})
+        cur = self._tsplit_current.get(token)
+        if cur is not None:
+            out.append({'ts': cur['minute_ts'], 'green': cur['green'],
+                        'red': cur['red'], 'total': cur['total']})
+        return out
+
+    # 2026-05-13: cross-process bridge — bot dumps splits to a shared file
+    # every ~2s, dashboard process reads it. Otherwise dashboard can't see
+    # the bot's in-memory tick_split dict (separate gunicorn process).
+    _TSPLIT_DUMP_PATH = '/tmp/titan_tick_split.json'
+    _TSPLIT_DUMP_INTERVAL_S = 2.0
+    _tsplit_last_dump_ts: float = 0.0
+
+    def _dump_tick_splits(self):
+        """Periodic JSONL dump of all token splits to shared file.
+        Called from on_ticks, internally throttled to ~2s.
+        File format: {"symbol": [{ts,green,red,total}, ...], ...}"""
+        try:
+            now = time.time()
+            if now - self._tsplit_last_dump_ts < self._TSPLIT_DUMP_INTERVAL_S:
+                return
+            self._tsplit_last_dump_ts = now
+            data = {}
+            # Combine all tokens that have any split data
+            tokens_with_data = set(self._tsplit_history.keys()) | set(self._tsplit_current.keys())
+            for token in tokens_with_data:
+                sym = self._token_to_symbol.get(token)
+                if not sym:
+                    continue
+                rows = []
+                for ts, g, r, t in self._tsplit_history.get(token, []):
+                    rows.append({'ts': ts, 'green': g, 'red': r, 'total': t})
+                cur = self._tsplit_current.get(token)
+                if cur is not None:
+                    rows.append({'ts': cur['minute_ts'], 'green': cur['green'],
+                                 'red': cur['red'], 'total': cur['total']})
+                if rows:
+                    data[sym] = rows[-90:]  # cap at 90min per symbol
+            tmp_path = self._TSPLIT_DUMP_PATH + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self._TSPLIT_DUMP_PATH)
+        except Exception:
+            pass  # never break ticker on observability code
+
+    def _sample_oi_velocity(self):
+        """Per-30s, dump WS OI snapshot for all subscribed futures to JSONL.
+        Pure observability — does not change any decision logic.
+        """
+        if not self._oiv_enabled:
+            return
+        now = time.time()
+        if now - self._oiv_last_dump_ts < self._oiv_sample_interval:
+            return
+        self._oiv_last_dump_ts = now
+        if not hasattr(self, '_futures_tokens'):
+            return
+        try:
+            os.makedirs(self._oiv_log_dir, exist_ok=True)
+            from datetime import datetime as _oiv_dt
+            log_file = os.path.join(self._oiv_log_dir,
+                                     f'oi_velocity_{_oiv_dt.now().strftime("%Y-%m-%d")}.jsonl')
+            rows = []
+            with self._lock:
+                for sym, token in self._futures_tokens.items():
+                    q = self._quote_cache.get(token)
+                    if not q:
+                        continue
+                    oi_now = q.get('oi', 0)
+                    oi_dh = q.get('oi_day_high', 0)
+                    if oi_now <= 0:
+                        continue
+                    # Update per-token history (5-min retention)
+                    hist = self._oiv_history.get(token)
+                    if hist is None:
+                        hist = deque(maxlen=20)  # 20 × 30s = 10 min headroom
+                        self._oiv_history[token] = hist
+                    # Look back for 30s and 60s prior readings
+                    oi_30s = None
+                    oi_60s = None
+                    oi_120s = None
+                    for h_ts, h_oi, _ in hist:
+                        gap = now - h_ts
+                        if 25 <= gap <= 35 and oi_30s is None:
+                            oi_30s = h_oi
+                        if 55 <= gap <= 65 and oi_60s is None:
+                            oi_60s = h_oi
+                        if 115 <= gap <= 125 and oi_120s is None:
+                            oi_120s = h_oi
+                    hist.append((now, oi_now, oi_dh))
+                    rows.append({
+                        'ts': now, 'sym': sym, 'oi': oi_now, 'oi_dh': oi_dh,
+                        'oi_30s': oi_30s, 'oi_60s': oi_60s, 'oi_120s': oi_120s,
+                        'd_oi_30s': (oi_now - oi_30s) if oi_30s else None,
+                        'd_oi_60s': (oi_now - oi_60s) if oi_60s else None,
+                        'd_pct_60s': ((oi_now - oi_60s) / oi_60s * 100) if oi_60s else None,
+                    })
+            if rows:
+                with self._oiv_lock:
+                    with open(log_file, 'a') as f:
+                        for r in rows:
+                            f.write(json.dumps(r) + '\n')
+        except Exception as e:
+            # Fail silently — observability must NEVER break the ticker
+            print(f"⚠️ FALLBACK [ticker/oiv_sampler]: {e}")
+
     def _load_instruments(self):
         """Load instrument token mapping from Kite (once per day)"""
         if self._instruments_loaded or not self.kite:
@@ -309,6 +488,11 @@ class TitanTicker:
         
         return result
     
+    # Max age before a cached quote is considered stale. Thin options can
+    # stop emitting ticks for minutes when there are no trades, causing AP
+    # to see a frozen LTP. 15s is short enough for AP's 1Hz reverse rule.
+    STALE_QUOTE_SECS = 15.0
+
     def get_quote(self, symbol: str) -> Optional[Dict]:
         """
         Get full quote (OHLC, volume, OI, LTP) from cache.
@@ -318,18 +502,52 @@ class TitanTicker:
         if token:
             with self._lock:
                 quote = self._quote_cache.get(token)
-                if quote:
+                last_upd = self._last_update.get(token, 0)
+                age = time.time() - last_upd if last_upd else 9999
+                # Fresh cache hit — return immediately
+                if quote and age < self.STALE_QUOTE_SECS:
                     self._stats['cache_hits'] += 1
                     return quote
-        
-        # REST fallback
+                # Stale cache: fall through to REST refresh below. Don't
+                # return the stale quote — that's what produced the SONACOMS
+                # phantom 0% P&L on 2026-05-14.
+
+        # REST fallback (also reached when cache stale)
         if self.kite:
             try:
                 self._stats['fallback_calls'] += 1
                 data = self.kite.quote([symbol])
-                return data.get(symbol)
+                fresh = data.get(symbol)
+                # Update cache with the fresh REST result so subsequent
+                # callers don't all hit Kite (rate limit: 1 req/sec).
+                if fresh and token:
+                    with self._lock:
+                        _ltp_fresh = fresh.get('last_price')
+                        if _ltp_fresh:
+                            self._ltp_cache[token] = _ltp_fresh
+                        self._quote_cache[token] = {
+                            'instrument_token': token,
+                            'last_price': _ltp_fresh,
+                            'ohlc': fresh.get('ohlc', {}),
+                            'volume': fresh.get('volume', 0),
+                            'oi': fresh.get('oi', 0),
+                            'oi_day_high': fresh.get('oi_day_high', 0),
+                            'oi_day_low': fresh.get('oi_day_low', 0),
+                            'last_trade_time': fresh.get('last_trade_time'),
+                            'last_quantity': fresh.get('last_quantity', 0),
+                            'buy_quantity': fresh.get('buy_quantity', 0),
+                            'sell_quantity': fresh.get('sell_quantity', 0),
+                            'average_price': fresh.get('average_price', 0),
+                            'depth': fresh.get('depth', {}),
+                        }
+                        self._last_update[token] = time.time()
+                return fresh
             except Exception as e:
                 print(f"⚠️ FALLBACK [ticker/get_quote_REST]: {symbol} — {e}")
+                # Last-resort: return the stale cache rather than None.
+                if token:
+                    with self._lock:
+                        return self._quote_cache.get(token)
                 return None
         return None
     
@@ -468,7 +686,19 @@ class TitanTicker:
                 
                 self._last_update[token] = time.time()
                 self._stats['ticks_received'] += 1
-                
+
+                # 2026-05-13: per-tick uptick/downtick volume split tracking
+                # Cheap (in-memory dict updates, no IO). Skips silently on error.
+                _ltq = tick.get('last_traded_quantity') or tick.get('last_quantity') or 0
+                if ltp and _ltq:
+                    self._update_tick_split(token, ltp, int(_ltq))
+
+                # OI velocity sampler (30s cadence, internally throttled, fail-safe)
+                if self._stats['ticks_received'] % 100 == 0:
+                    self._sample_oi_velocity()
+                    # 2026-05-13: dump tick-split data for cross-process read by dashboard
+                    self._dump_tick_splits()
+
                 # Periodic tick count log (every 10,000 ticks)
                 if self._stats['ticks_received'] % 10000 == 0:
                     _bw_stats = self._breakout_watcher.stats if self._breakout_watcher else {}

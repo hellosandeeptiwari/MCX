@@ -149,6 +149,16 @@ HARD_RULES = {
     # Also cap max units per trade to prevent outsized exposure.
     "MIN_OPTION_PREMIUM": 3.0,      # Reject options with LTP < ₹3 (avoids penny traps)
     "MAX_UNITS_PER_TRADE": 30000,   # Hard cap on units (lots × lot_size) per single trade
+    "MAX_LOTS_PER_TRADE": 1,        # User safety cap (2026-05-14): max lots per single trade
+    # === THIN-OPTION PROTECTION (2026-05-14 SAMMAANCAP fix) ===
+    "LIQ_GATE_MAX_SPREAD_PCT": 4.0,           # entry: reject if bid-ask spread > 4%
+    "LIQ_GATE_MIN_TOP3_DEPTH_RATIO": 1.0,     # entry: top-3 depth must >= 1x order qty
+    "LIQ_GATE_MAX_SLIPPAGE_PCT": 2.5,         # entry: reject if depth-walk projected slip > 2.5%
+    "REV_GATE_MAX_SPREAD_PCT": 1.5,           # reverse: avg spread cap (round-trip vs SL)
+    "REV_GATE_HARD_SPREAD_PCT": 4.0,          # reverse: single-leg hard cap
+    "SPIRAL_MAX_REVERSES": 2,                 # spiral: max reverses per underlying / window
+    "SPIRAL_WINDOW_SECS": 600,                # spiral: rolling window (10min)
+    "SPIRAL_BLOCK_DURATION_SECS": 0,          # spiral: 0 = rest-of-session, >0 = N seconds
 }
 
 # === FULL F&O UNIVERSE SCAN ===
@@ -184,7 +194,7 @@ BREAKOUT_WATCHER = {
     # --- Sustain Filter (signal-aware — Mar 12 latency fix) ---
     # Retrace check (>50% retrace = fail) is the real fakeout filter.
     # Signal-specific sustain times: stronger signals need less proof time.
-    "sustain_seconds": 15,            # PRICE_SPIKE: 15s quick sanity check (OI fetched inline at drain provides real conviction)
+    "sustain_seconds": 12,            # PRICE_SPIKE: 12s quick sanity check (was 15 — faster onboarding for high-vol spikes)
     "sustain_seconds_extreme": 20,    # DAY_HIGH/LOW break — 20s proof
     "sustain_seconds_volume": 20,     # VOLUME_SURGE with confirmed ticks — 20s proof
     "sustain_seconds_grind": 45,      # SLOW_GRIND: 45s sustain proof (was 30 — tighten to filter weak grinds)

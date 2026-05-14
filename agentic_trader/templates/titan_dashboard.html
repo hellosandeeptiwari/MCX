@@ -419,6 +419,37 @@ a{color:var(--blue);text-decoration:none}
     </span>
   </div>
   <div style="display:flex;align-items:center;gap:12px;font-size:.8rem;color:var(--txt2)">
+    <!-- 2026-05-11: NIFTY + VIX macro strip -->
+    <span id="macro-strip" style="display:inline-flex;gap:14px;align-items:center;
+         font-variant-numeric:tabular-nums;background:#f8fafc;
+         padding:4px 10px;border-radius:6px;border:1px solid #e2e8f0">
+      <span title="NIFTY 50 live">
+        <span style="color:#94a3b8;font-weight:600;letter-spacing:.5px">NIFTY</span>
+        <span id="macro-nifty-ltp" style="color:#1e293b;font-weight:700;margin:0 4px">—</span>
+        <span id="macro-nifty-chg" style="font-weight:600">—</span>
+      </span>
+      <span style="color:#cbd5e1">|</span>
+      <span title="India VIX">
+        <span style="color:#94a3b8;font-weight:600;letter-spacing:.5px">VIX</span>
+        <span id="macro-vix-ltp" style="color:#1e293b;font-weight:700;margin:0 4px">—</span>
+        <span id="macro-vix-chg" style="font-weight:600">—</span>
+      </span>
+    </span>
+    <!-- 2026-05-14: BROKER STATE strip — single source of truth from Kite -->
+    <span id="broker-strip" style="display:inline-flex;gap:14px;align-items:center;
+         font-variant-numeric:tabular-nums;background:#f8fafc;
+         padding:4px 10px;border-radius:6px;border:1px solid #e2e8f0;
+         cursor:pointer" title="Click for broker positions detail">
+      <span style="color:#94a3b8;font-weight:600;letter-spacing:.5px">BROKER</span>
+      <span id="bk-open" style="color:#1e293b;font-weight:700">0 pos</span>
+      <span style="color:#cbd5e1">|</span>
+      <span id="bk-rpnl" style="font-weight:600">P&L —</span>
+      <span style="color:#cbd5e1">|</span>
+      <span id="bk-free" style="color:#64748b">free —</span>
+      <span id="bk-mismatch" style="display:none;background:#dc2626;color:#fff;
+            padding:2px 6px;border-radius:4px;font-weight:700;font-size:.7rem;
+            margin-left:6px">⚠ MISMATCH</span>
+    </span>
     <span id="clock"></span>
     <span id="uptime-label"></span>
     <div id="bot-controls" style="display:flex;gap:6px;margin-left:8px">
@@ -1602,7 +1633,7 @@ async function loadPositions() {
           const tip = `Auto-Pilot (this session): ${apInfo.executed||0} executed (${apInfo.adds||0} add / ${apInfo.reverses||0} rev), ${apInfo.vetoed||0} vetoed, ${apInfo.failed||0} failed\nLast: ${last.outcome||''} ${last.action||''} at ${lastTs}\n${last.reason||''}`;
           apBadge = '<br><span title="' + tip.replace(/"/g,'&quot;') + '" style="font-size:.62rem;font-weight:700;display:inline-block;margin-top:2px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.3)">🤖 ' + parts.join(' ') + '</span>';
         }
-        return '<tr style="' + rowStyle + ';cursor:pointer" data-exchange="' + exch + '" data-sym="' + (p.symbol || p.option_symbol || '') + '" data-entry="' + entry + '" data-qty="' + qty + '" data-dir="' + dir + '" data-side="' + sideAttr + '" data-premium="' + premium + '" data-spread="' + ((p.is_debit_spread||p.is_credit_spread||p.is_iron_condor)?1:0) + '" onclick="if(!event.target.closest(\'button,select,a,input\'))showChart(\'' + underlying + '\',\'' + exch + '\',\'' + (p.symbol || p.option_symbol || '').replace(/'/g, "\\'") + '\')">' +
+        return '<tr style="' + rowStyle + ';cursor:pointer" data-exchange="' + exch + '" data-sym="' + (p.symbol || p.option_symbol || '') + '" data-entry="' + entry + '" data-sl="' + (sl || 0) + '" data-target="' + (target || 0) + '" data-trail-sl="' + (p.current_sl || 0) + '" data-qty="' + qty + '" data-dir="' + dir + '" data-side="' + sideAttr + '" data-premium="' + premium + '" data-spread="' + ((p.is_debit_spread||p.is_credit_spread||p.is_iron_condor)?1:0) + '" onclick="if(!event.target.closest(\'button,select,a,input\'))showChart(\'' + underlying + '\',\'' + exch + '\',\'' + (p.symbol || p.option_symbol || '').replace(/'/g, "\\'") + '\')">' +
           '<td>' + timeHtml + '</td>' +
           '<td><strong>' + sym + '</strong>' + (p.option_type ? ' <span class="badge" style="font-size:.65rem">' + p.strike + ' ' + p.option_type + '</span>' : '') + (p.commodity ? '<br><span style="font-size:.6rem;color:#d97706">' + p.commodity + '</span>' : '') + apBadge + '</td>' +
           '<td><span class="badge ' + (dir==='SELL'?'badge-loss':'badge-win') + '">' + dir + '</span></td>' +
@@ -2139,6 +2170,95 @@ async function togglePause() {
 refreshControlBar();
 setInterval(refreshControlBar, 5000);
 
+// 2026-05-11: NIFTY + VIX macro strip — refresh every 5s
+async function refreshMacro() {
+  try {
+    const r = await fetch('/api/macro', { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok) return;
+    const nLtp = document.getElementById('macro-nifty-ltp');
+    const nChg = document.getElementById('macro-nifty-chg');
+    const vLtp = document.getElementById('macro-vix-ltp');
+    const vChg = document.getElementById('macro-vix-chg');
+    if (nLtp) nLtp.textContent = (d.nifty_ltp || 0).toLocaleString('en-IN');
+    if (nChg) {
+      const c = d.nifty_chg_pct || 0;
+      nChg.textContent = (c >= 0 ? '+' : '') + c.toFixed(2) + '%';
+      nChg.style.color = c >= 0 ? '#16a34a' : '#dc2626';
+    }
+    if (vLtp) vLtp.textContent = (d.vix_ltp || 0).toFixed(2);
+    if (vChg) {
+      const c = d.vix_chg || 0;
+      vChg.textContent = (c >= 0 ? '+' : '') + c.toFixed(2);
+      // VIX up = fear → red; VIX down = calm → green (inverse of NIFTY semantics)
+      vChg.style.color = c > 0 ? '#dc2626' : '#16a34a';
+    }
+  } catch (e) { /* fail silently */ }
+}
+refreshMacro();
+setInterval(refreshMacro, 5000);
+
+// 2026-05-14: BROKER STATE polling — single source of truth from Kite
+async function refreshBrokerState() {
+  try {
+    const r = await fetch('/api/broker_state', { cache: 'no-store' });
+    const d = await r.json();
+    const openEl = document.getElementById('bk-open');
+    const rpnlEl = document.getElementById('bk-rpnl');
+    const freeEl = document.getElementById('bk-free');
+    const misEl  = document.getElementById('bk-mismatch');
+    if (!d.ok) {
+      if (openEl) openEl.textContent = 'unavailable';
+      return;
+    }
+    if (openEl) openEl.textContent = (d.open_count || 0) + ' pos';
+    if (rpnlEl) {
+      const p = (d.realised_pnl || 0) + (d.unrealised_pnl || 0);
+      rpnlEl.textContent = 'P&L ' + (p >= 0 ? '+' : '') + p.toLocaleString('en-IN', { maximumFractionDigits: 0 });
+      rpnlEl.style.color = p >= 0 ? '#16a34a' : '#dc2626';
+    }
+    if (freeEl) freeEl.textContent = 'free ' + (d.net_free || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+    // Mismatch detection: count bot's open positions vs broker's
+    let botCount = 0;
+    try {
+      const rows = document.querySelectorAll('#positions-tbl tbody tr[data-sym]');
+      botCount = rows.length;
+    } catch (e) {}
+    if (misEl) {
+      if (botCount !== (d.open_count || 0)) {
+        misEl.style.display = 'inline-block';
+        misEl.title = `Bot tracks ${botCount} positions, broker has ${d.open_count}. Click broker badge for details.`;
+      } else {
+        misEl.style.display = 'none';
+      }
+    }
+    // Store data so click reveals details
+    window._brokerStateData = d;
+  } catch (e) { /* fail silently */ }
+}
+refreshBrokerState();
+setInterval(refreshBrokerState, 5000);
+// Click broker strip to show details
+document.addEventListener('DOMContentLoaded', () => {
+  const strip = document.getElementById('broker-strip');
+  if (strip) strip.addEventListener('click', () => {
+    const d = window._brokerStateData || {};
+    let msg = `BROKER STATE (live from Kite)\n\n`;
+    msg += `Open positions: ${d.open_count || 0}\n`;
+    msg += `Free margin:    ₹${(d.net_free || 0).toLocaleString('en-IN')}\n`;
+    msg += `Used margin:    ₹${(d.used_margin || 0).toLocaleString('en-IN')}\n`;
+    msg += `Realised P&L:   ₹${(d.realised_pnl || 0).toLocaleString('en-IN')}\n`;
+    msg += `Unreal. M2M:    ₹${(d.unrealised_pnl || 0).toLocaleString('en-IN')}\n`;
+    if (d.positions && d.positions.length) {
+      msg += `\nOpen at broker:\n`;
+      for (const p of d.positions) {
+        msg += `  ${p.tradingsymbol}  qty=${p.quantity}  avg=₹${p.avg_price}  ltp=₹${p.last_price}  pnl=₹${p.pnl.toLocaleString('en-IN')}\n`;
+      }
+    }
+    alert(msg);
+  });
+});
+
 // Auto-refresh positions when that tab is active (every 40s).
 // LTP / P&L / totals are already patched in-place every 3s by patchLivePnl().
 // The full reload only matters for row-count changes (new trade / exit), which
@@ -2206,22 +2326,35 @@ async function patchLivePnl() {
       const isSpread = (tr.getAttribute('data-spread') || '0') === '1';
 
       const rawLtp = +info.ltp || 0;
+      // Server-computed realizable exit price (walks bid/ask book for our qty).
+      // Fall back to LTP if server didn't provide one (older response).
+      const rawExit = (+info.exit_px > 0) ? +info.exit_px : rawLtp;
       // EMA smooth the LTP (prevents oscillating +/- on sub-tick bid/ask flips)
       let sLtp;
       if (rawLtp > 0) {
         sLtp = (_ltpSmooth[sym] == null) ? rawLtp : _ltpSmooth[sym] + _LTP_ALPHA * (rawLtp - _ltpSmooth[sym]);
         _ltpSmooth[sym] = sLtp;
       } else {
-        // No fresh LTP this tick → keep last smoothed value so we never paint 0
         sLtp = _ltpSmooth[sym] || 0;
       }
+      // Same EMA for realizable exit price — used for the P&L that matters
+      if (!window._exitSmooth) window._exitSmooth = {};
+      let sExit;
+      if (rawExit > 0) {
+        sExit = (window._exitSmooth[sym] == null) ? rawExit : window._exitSmooth[sym] + _LTP_ALPHA * (rawExit - window._exitSmooth[sym]);
+        window._exitSmooth[sym] = sExit;
+      } else {
+        sExit = window._exitSmooth[sym] || 0;
+      }
 
-      // Recompute upnl from smoothed LTP
+      // Recompute upnl from REALIZABLE exit price, not LTP. This is the P&L
+      // the user will actually book when hitting Exit — fixes the LTP/fill
+      // mismatch that produced +7k UI vs +1.5k Kite on HINDPETRO 14-May.
       let upnl;
       if (isSpread) {
         upnl = +info.upnl || 0;
-      } else if (entry > 0 && qty > 0 && sLtp > 0) {
-        upnl = (side === 'SELL' || side === 'SHORT') ? (entry - sLtp) * qty : (sLtp - entry) * qty;
+      } else if (entry > 0 && qty > 0 && sExit > 0) {
+        upnl = (side === 'SELL' || side === 'SHORT') ? (entry - sExit) * qty : (sExit - entry) * qty;
       } else {
         upnl = +info.upnl || 0;
       }
@@ -2245,9 +2378,16 @@ async function patchLivePnl() {
       cell.className = upnlClass;
       cell.setAttribute('data-pnl-cell', '1');
       let html;
+      // 2026-05-14: simplified — main P&L IS Kite-style ground truth.
+      // Only show LTP (small reference) + SLIP (entry cost, fixed).
       if (sLtp > 0) {
         const pctStr = pct !== 0 ? ('<br><span class="pnl-pct">' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>') : '';
-        html = fmtPnl(upnl) + pctStr + ' <span style="font-size:.7rem;color:var(--txt3)">LTP:' + fmt(sLtp) + '</span>';
+        let slipTag = '';
+        const slipInr = +info.entry_slip_inr || 0;
+        if (Math.abs(slipInr) >= 1) {
+          slipTag = ' <span style="font-size:.7rem;color:#9333ea" title="Entry slippage — cost paid crossing the bid-ask at order placement.">SLIP:' + (slipInr >= 0 ? '+' : '') + '₹' + Math.round(slipInr) + '</span>';
+        }
+        html = fmtPnl(upnl) + pctStr + ' <span style="font-size:.7rem;color:var(--txt3)">LTP:' + fmt(sLtp) + '</span>' + slipTag;
       } else {
         html = 'Awaiting LTP';
       }
@@ -2535,6 +2675,26 @@ function _initLwcChart() {
     color: '#cbd5e1',
   });
   _lwcVolume.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+  // 2026-05-13: split-volume bars on UNDERLYING chart — green (uptick) above
+  // baseline, red (downtick) below. Polls /api/tick_volume_split every 1.5s
+  // for the current underlying symbol (_chartSymbol).
+  _lwcVolGreen = _lwcChart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'tvsplit',
+    color: 'rgba(34, 197, 94, 0.85)',
+    base: 0,
+  });
+  _lwcVolRed = _lwcChart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'tvsplit',
+    color: 'rgba(239, 68, 68, 0.85)',
+    base: 0,
+  });
+  _lwcChart.priceScale('tvsplit').applyOptions({
+    scaleMargins: { top: 0.65, bottom: 0.05 },
+    visible: false,
+  });
 }
 
 function openChartExternal() {
@@ -2592,6 +2752,10 @@ function showChart(underlying, exch, optionSym) {
   _chartPollTimer = setInterval(() => { if (_chartSymbol) reloadChart(true); }, 20000);
   if (_chartTickTimer) clearInterval(_chartTickTimer);
   _chartTickTimer = setInterval(tickChartLtp, 1000);
+  // 2026-05-13: split-volume polling for UNDERLYING — green/red bars build live
+  if (_tvSplitTimer) clearInterval(_tvSplitTimer);
+  refreshTickVolumeSplit();
+  _tvSplitTimer = setInterval(refreshTickVolumeSplit, 1500);
   // Kick the side-by-side option chart with the position's NFO option symbol.
   // Strip any existing exchange prefix; the option lives on NFO.
   const rawOpt = (optionSym || '').trim();
@@ -2784,7 +2948,10 @@ function closeChart() {
   _chartSymbol = '';
   if (_chartPollTimer) { clearInterval(_chartPollTimer); _chartPollTimer = null; }
   if (_chartTickTimer) { clearInterval(_chartTickTimer); _chartTickTimer = null; }
+  if (_tvSplitTimer)   { clearInterval(_tvSplitTimer);   _tvSplitTimer = null; }
   _chartLastCandle = null;
+  if (_lwcVolGreen) { try { _lwcVolGreen.setData([]); } catch(e){} }
+  if (_lwcVolRed)   { try { _lwcVolRed.setData([]); } catch(e){} }
   closeOptionChart();
 }
 // Escape key no longer applicable (chart is embedded, not a modal)
@@ -2794,6 +2961,10 @@ let _chartSymbolOpt = '';
 let _lwcChartOpt = null;
 let _lwcCandleOpt = null;
 let _lwcVolumeOpt = null;
+// 2026-05-13: split-volume bars (green up-tick / red down-tick per minute) — UNDERLYING chart
+let _lwcVolGreen = null;
+let _lwcVolRed = null;
+let _tvSplitTimer = null;
 let _chartPollTimerOpt = null;
 let _chartTickTimerOpt = null;
 let _chartLastCandleOpt = null;
@@ -2821,7 +2992,10 @@ function _initLwcChartOpt() {
       secondsVisible: false,
       tickMarkFormatter: (t) => _fmtIstTime(t),
     },
-    rightPriceScale: { borderColor: '#d1d5db' },
+    // 2026-05-14: price axis on LEFT (user preference). Entry/SL/Target
+    // labels now appear on the left edge instead of the right.
+    leftPriceScale: { visible: true, borderColor: '#d1d5db' },
+    rightPriceScale: { visible: false },
     crosshair: { mode: 1 },
     localization: { timeFormatter: (t) => _fmtIstDateTime(t) },
     autoSize: true,
@@ -2832,6 +3006,7 @@ function _initLwcChartOpt() {
     priceLineVisible: true,
     lastValueVisible: true,
     crosshairMarkerVisible: true,
+    priceScaleId: 'left',  // bind to left scale so labels render on the left
   });
   _lwcVolumeOpt = _lwcChartOpt.addHistogramSeries({
     priceFormat: { type: 'volume' },
@@ -2841,11 +3016,52 @@ function _initLwcChartOpt() {
   _lwcVolumeOpt.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 }
 
+// 2026-05-11: trade-level horizontal lines on option chart (Entry/SL/Target/Trailing-SL)
+let _tradeLines = [];  // refs to created price lines so we can remove them on symbol switch
+function _clearTradeLines() {
+  if (!_lwcCandleOpt) return;
+  try {
+    _tradeLines.forEach(pl => { try { _lwcCandleOpt.removePriceLine(pl); } catch(e){} });
+  } catch(e){}
+  _tradeLines = [];
+}
+function _drawTradeLines() {
+  if (!_lwcCandleOpt || typeof LightweightCharts === 'undefined') return;
+  _clearTradeLines();
+  // Read from the selected row's data attributes
+  const sel = document.querySelector('#positions-tbl tbody tr.row-selected');
+  if (!sel) return;
+  const entry = +sel.getAttribute('data-entry') || 0;
+  const sl = +sel.getAttribute('data-sl') || 0;
+  const target = +sel.getAttribute('data-target') || 0;
+  const trail = +sel.getAttribute('data-trail-sl') || 0;
+  const mk = (price, color, title) => {
+    if (!price || price <= 0) return;
+    try {
+      const pl = _lwcCandleOpt.createPriceLine({
+        price, color, lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: true, title,
+      });
+      _tradeLines.push(pl);
+    } catch(e){}
+  };
+  mk(entry, '#64748b', 'Entry');
+  mk(sl, '#dc2626', 'SL');
+  mk(target, '#16a34a', 'Target');
+  // Trailing-SL only differs once trailing has armed; draw if different from SL
+  if (trail > 0 && Math.abs(trail - sl) > 0.01) {
+    mk(trail, '#2563eb', 'Trail SL');
+  }
+}
+
 function _paintCandlesOpt(candles, vols, iv, fromCache) {
   if (!_lwcCandleOpt) return;
   _lwcCandleOpt.setData(candles);
   if (_lwcVolumeOpt && vols) _lwcVolumeOpt.setData(vols);
   _chartLastCandleOpt = candles.length ? { ...candles[candles.length - 1] } : null;
+  // Draw entry / SL / target / trailing-SL lines on the option chart
+  _drawTradeLines();
   try {
     const chgEl = document.getElementById('chart-ltp-chg-opt');
     const symEl = document.getElementById('chart-ltp-sym-opt');
@@ -3045,6 +3261,40 @@ function showOptionChart(nfoSymbol) {
   _chartTickTimerOpt = setInterval(tickChartLtpOpt, 1000);
 }
 
+// 2026-05-13: poll /api/tick_volume_split for the UNDERLYING symbol and
+// paint green (positive) / red (negative) histogram bars in the volume pane.
+async function refreshTickVolumeSplit() {
+  if (!_chartSymbol || !_lwcVolGreen || !_lwcVolRed) return;
+  if (document.hidden) return;
+  try {
+    const r = await fetch('/api/tick_volume_split?symbol=' +
+                           encodeURIComponent(_chartSymbol) + '&minutes=3',
+                          { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok || !Array.isArray(d.data)) return;
+    // 2026-05-14: NET volume per bucket (buys - sells). Single bar with
+    // per-tick color: green if net buying, red if net selling. Single series
+    // (_lwcVolGreen) carries everything; _lwcVolRed cleared.
+    const TZ_OFFSET = 5.5 * 3600;
+    const nets = [];
+    for (const row of d.data) {
+      if (!row || !row.ts) continue;
+      const t = row.ts + TZ_OFFSET;
+      const g = row.green || 0;
+      const r_ = row.red || 0;
+      const net = g - r_;
+      if (net === 0) continue;
+      nets.push({
+        time: t,
+        value: net,
+        color: net >= 0 ? 'rgba(34, 197, 94, 0.85)' : 'rgba(239, 68, 68, 0.85)',
+      });
+    }
+    _lwcVolGreen.setData(nets);
+    _lwcVolRed.setData([]);
+  } catch (e) { /* fail silently */ }
+}
+
 function closeOptionChart() {
   _chartSymbolOpt = '';
   if (_chartPollTimerOpt) { clearInterval(_chartPollTimerOpt); _chartPollTimerOpt = null; }
@@ -3060,6 +3310,36 @@ function closeOptionChart() {
 
 // =========== +1 REVERSE TRADE LOGIC ===========
 function placeReverse(btn, symbol, underlying, dir, qty, ltp, optType, strike, expiry, lots, isOption) {
+  // L4 SPREAD WARNING (2026-05-14 SAMMAANCAP fix): if the realizable exit
+  // price (depth-walked bid) is significantly below LTP, show projected
+  // round-trip cost and require explicit confirmation. User can still
+  // proceed — L2/L3 server-side gates are the hard stops.
+  try {
+    const _sExit = (window._exitSmooth && window._exitSmooth[symbol]) || 0;
+    if (_sExit > 0 && ltp > 0 && qty > 0 && isOption) {
+      const _spreadPct = Math.abs(ltp - _sExit) / ltp * 100;
+      if (_spreadPct >= 2.0) {
+        const _legCost = Math.abs(ltp - _sExit) * qty;
+        const _roundTripCost = _legCost * 2;
+        const _msg = (
+          '\u26a0\ufe0f WIDE SPREAD WARNING\n\n' +
+          'Spread on ' + symbol + ' is ' + _spreadPct.toFixed(1) + '%.\n' +
+          'LTP: \u20b9' + ltp.toFixed(2) + '  |  Bid-walked exit: \u20b9' + _sExit.toFixed(2) + '\n\n' +
+          'Reversing crosses the spread TWICE (sell old + buy new):\n' +
+          '  \u2022 Per-leg cost: ~\u20b9' + _legCost.toFixed(0) + '\n' +
+          '  \u2022 Round-trip cost: ~\u20b9' + _roundTripCost.toFixed(0) + '\n\n' +
+          'This is MORE than the 2.3% SL threshold benefit. Reversing on\n' +
+          'a wide-spread option typically locks in a guaranteed loss.\n\n' +
+          'Continue anyway?'
+        );
+        if (!confirm(_msg)) {
+          // User cancelled — leave button enabled, do nothing.
+          return;
+        }
+      }
+    }
+  } catch(_e) { /* never block reverse on UI gate failure */ }
+
   btn.disabled = true;
   btn.style.opacity = '0.4';
   // Always BUY — flip option type to express opposite view (PE→CE, CE→PE)
@@ -3077,6 +3357,12 @@ function placeReverse(btn, symbol, underlying, dir, qty, ltp, optType, strike, e
     btn.style.opacity = '1';
     if(d.ok) {
       btn.textContent = '\u2713';
+      // 2026-05-14: partial-success (exit-only) — surface message via toast
+      try {
+        if (d.partial && typeof showToast === 'function' && d.msg) {
+          showToast(d.msg, false);
+        }
+      } catch(_e) { /* noop */ }
       // Immediately refresh positions so the user sees the flipped position with correct symbol/SL/target
       // (prevents stale row where clicking Reverse again would target the already-exited symbol).
       // First loadPositions renders the new row with data-entry=market_ltp and invokes patchLivePnl,
@@ -3087,6 +3373,13 @@ function placeReverse(btn, symbol, underlying, dir, qty, ltp, optType, strike, e
       setTimeout(() => { btn.textContent = 'Reverse'; }, 1500);
     } else {
       btn.textContent = '\u2717';
+      // Surface the rejection reason so user can see WHY (L2 spread, L3 spiral, pause, etc).
+      // Without this, button just flashed ✗ and user got no feedback.
+      try {
+        if (typeof showToast === 'function' && d.msg) {
+          showToast(d.msg, false);
+        }
+      } catch(_e) { /* noop */ }
       setTimeout(() => { btn.textContent = 'Reverse'; }, 2000);
     }
   }).catch(() => {
